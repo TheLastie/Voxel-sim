@@ -26,8 +26,9 @@ validated continuum simulator.
 ![Wood strike preview](validation/knife-cut-demo.gif)
 
 - [4.54-second strike video](validation/knife-cut-demo.mp4), with a 1-second
-  lead-in and 1-second outro. It shows the dense impact sequence and 0.25 seconds
-  of simulated post-impact motion; the last state is held for the rest of the outro.
+  held setup frame and a 1-second outro. It shows the dense impact sequence and
+  0.25 seconds of simulated post-impact motion; the last state is held for the
+  rest of the outro.
 - [Cut-onset still](validation/knife-cut-final-frame.png)
 - Detailed results: [validation status](validation/STATUS.md) and
   [knife diagnosis](validation/knife-diagnosis.md).
