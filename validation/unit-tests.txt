@@ -1,0 +1,12 @@
+PASS `cargo test --offline --no-default-features --lib --bin physics_smoke_tests`
+
+Library: 17 passed, 0 failed.
+Physics smoke binary: 4 passed, 0 failed.
+
+The new regression `mixed_wood_shear_failure_does_not_wait_for_higher_yield_stress`
+checks that a mixed wood bond accumulates damage above its shear limit even
+when no plastic strain has yet occurred.
+
+`actual_vertical_wood_bonds_are_stronger_than_horizontal_bonds` selects real
+Z and X neighbor pairs and checks tension, compression, shear and stiffness
+directionality with the current 40:1 tensile-strength ratio.

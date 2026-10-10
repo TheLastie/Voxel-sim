@@ -1,0 +1,31 @@
+// Z is up. 1 REV = 0.01 m; main trunk = 30 × 30 × 300 = 90,000 REVs.
+(
+    dimensions: (30, 30, 300),
+    // A separate thin-branch test coupon, 4 × 4 cm cross section.
+    branch_dimensions: (40, 4, 4),
+    ground_dimensions: (120, 120, 2),
+    tool_dimensions: (50, 5, 20),
+    fibers: (0.0, 0.0, 1.0),
+    anisotropy: 1.0,
+    gravity: (0.0, 0.0, -9.81),
+    fixed_dt: 0.016666668,
+    substeps: 4,
+    iterations: 40,
+    solver_relative_tolerance: 0.00001,
+    corotation_iterations: 4,
+    fracture: (
+        damage_rate: 35.0,
+        energy_release: 0.005,
+        propagation_delay: 1,
+        fatigue_cycles: 1000.0,
+        fatigue_exponent: 3.0,
+        fatigue_threshold: 0.5,
+        plastic_heat_fraction: 0.9,
+        fragment_min_size: 10,
+        cluster_interval: 10,
+        friction: 0.35,
+        restitution: 0.1,
+    ),
+    initial_speed: 8.5,
+    tool_start: (-0.65, 0.0, 1.0),
+)

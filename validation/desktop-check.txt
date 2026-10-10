@@ -1,0 +1,13 @@
+    Checking voxel-physics-lab v0.2.0 (/workspace/scratch/92fcfc86c696)
+warning: field `window` is never read
+  --> src/render.rs:64:9
+   |
+63 | pub struct Renderer {
+   |            -------- field in this struct
+64 |     pub window: Arc<Window>,
+   |         ^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `voxel-physics-lab` (bin "voxel-physics-lab") generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.48s

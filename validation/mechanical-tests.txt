@@ -1,0 +1,13 @@
+Current mechanical regression checkpoint
+
+PASS tension_10x10x10: parallel=1,022,767.250 N perpendicular=25,920.164 N ratio=39.458 first_breaks=900/900
+PASS compression_10x10x10: parallel=284,145.156 N perpendicular=8,732.482 N ratio=32.539 first_breaks=3/4
+PASS knife_cut_onset_12x12x30: broken_bonds=1,298 wood_clusters=1 at 30 ms, 6.0 m/s, fixture damage_rate=15
+PASS actual_vertical_wood_bonds_are_stronger_than_horizontal_bonds: tension=100/2.5 MPa, compression=50/2 MPa, shear=12/3 MPa
+
+The fiber regression selects actual +Z and +X neighbors from the six-neighbor
+bond graph. It verifies directional stiffness and normal and shear failure
+limits, rather than passing arbitrary direction vectors to the material law.
+
+The all-scenarios command previously exited with code 137 during bending.
+Bending and wedge remain unverified in this checkpoint.
