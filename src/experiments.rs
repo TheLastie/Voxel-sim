@@ -416,7 +416,6 @@ pub fn capture_knife(
     config.branch_dimensions = [0; 3];
     config.ground_dimensions = [0; 3];
     config.fibers = Vec3::Z.to_array();
-    config.gravity = [0.0; 3];
     config.fixed_dt = 0.001;
     config.substeps = 4;
     config.iterations = 120;
@@ -450,7 +449,10 @@ pub fn capture_knife(
             .iter()
             .map(|&p| -(t.rotation * p).x)
             .fold(0.0f32, f32::max);
-        t.position.x = specimen_x_max + leading_extent;
+        // `leading_extent` is measured between cell centers. Add one REV so
+        // the blade edge starts at first contact instead of sharing centers
+        // with the outer wood layer and being depenetrated before the strike.
+        t.position.x = specimen_x_max + leading_extent + CELL;
     }
     let x_min = scene
         .positions
@@ -493,7 +495,7 @@ pub fn capture_knife(
         if frame > 0 {
             solver::step_with_targets(&mut scene, &mut tool, &targets);
         }
-        if frame % stride != 0 && frame != frames {
+        if frame > 60 && frame % stride != 0 && frame != frames {
             continue;
         }
         let t = tool.as_ref().unwrap();

@@ -54,6 +54,96 @@ pub fn fracture_strength(scene: &Scene, i: usize, j: usize, direction: Vec3) -> 
     bond_limits(scene, i, j, direction).tension
 }
 
+/// Set a world-space force that remains active until changed or cleared.
+pub fn set_force(scene: &mut Scene, voxel: usize, force: Vec3) -> Result<(), &'static str> {
+    let mass = scene
+        .voxels
+        .get(voxel)
+        .ok_or("voxel index out of range")?
+        .mass;
+    if !mass.is_finite() {
+        return Err("cannot apply a force to a fixed voxel");
+    }
+    if !force.is_finite() {
+        return Err("force must be finite");
+    }
+    scene.external_forces[voxel] = force;
+    Ok(())
+}
+
+/// Add to a persistent force. Repeated calls accumulate until cleared.
+pub fn add_force(scene: &mut Scene, voxel: usize, force: Vec3) -> Result<(), &'static str> {
+    let current = *scene
+        .external_forces
+        .get(voxel)
+        .ok_or("voxel index out of range")?;
+    set_force(scene, voxel, current + force)
+}
+
+/// Set a persistent acceleration input. It is converted to force using the
+/// voxel's current mass on every solver step, so composition changes affect it.
+pub fn set_acceleration(
+    scene: &mut Scene,
+    voxel: usize,
+    acceleration: Vec3,
+) -> Result<(), &'static str> {
+    let mass = scene
+        .voxels
+        .get(voxel)
+        .ok_or("voxel index out of range")?
+        .mass;
+    if !mass.is_finite() {
+        return Err("cannot accelerate a fixed voxel");
+    }
+    if !acceleration.is_finite() {
+        return Err("acceleration must be finite");
+    }
+    scene.external_accelerations[voxel] = acceleration;
+    Ok(())
+}
+
+/// Set a voxel's initial or current world-space velocity in m/s.
+pub fn set_velocity(scene: &mut Scene, voxel: usize, velocity: Vec3) -> Result<(), &'static str> {
+    let body = scene
+        .voxels
+        .get_mut(voxel)
+        .ok_or("voxel index out of range")?;
+    if !body.mass.is_finite() {
+        return Err("cannot set velocity on a fixed voxel");
+    }
+    if !velocity.is_finite() {
+        return Err("velocity must be finite");
+    }
+    body.velocity = velocity;
+    Ok(())
+}
+
+/// Apply a one-time impulse in N·s, conserving the corresponding momentum.
+pub fn apply_impulse(scene: &mut Scene, voxel: usize, impulse: Vec3) -> Result<(), &'static str> {
+    let body = scene
+        .voxels
+        .get_mut(voxel)
+        .ok_or("voxel index out of range")?;
+    if !body.mass.is_finite() {
+        return Err("cannot impulse a fixed voxel");
+    }
+    if !impulse.is_finite() {
+        return Err("impulse must be finite");
+    }
+    body.velocity += impulse / body.mass;
+    Ok(())
+}
+
+/// Clear persistent force and acceleration inputs for one voxel.
+pub fn clear_applied_actions(scene: &mut Scene, voxel: usize) -> Result<(), &'static str> {
+    if voxel >= scene.voxels.len() {
+        return Err("voxel index out of range");
+    }
+    scene.external_forces[voxel] = Vec3::ZERO;
+    scene.external_accelerations[voxel] = Vec3::ZERO;
+    Ok(())
+}
+
 /// Local polar fits make the vector constraints invariant to rigid rotation.
 fn fit_rotations(scene: &mut Scene) {
     let n = scene.voxels.len();
@@ -141,6 +231,20 @@ pub fn step_with_axis_targets_and_loads(
 ) {
     assert!(targets.is_empty() || targets.len() == scene.voxels.len());
     assert!(loads.is_empty() || loads.len() == scene.voxels.len());
+    let applied_loads: Vec<_> = scene
+        .voxels
+        .iter()
+        .enumerate()
+        .map(|(i, voxel)| {
+            if voxel.mass.is_finite() {
+                scene.external_forces[i]
+                    + scene.external_accelerations[i] * voxel.mass
+                    + loads.get(i).copied().unwrap_or(Vec3::ZERO)
+            } else {
+                Vec3::ZERO
+            }
+        })
+        .collect();
     let h = scene.config.fixed_dt / scene.config.substeps as f32;
     let gravity = Vec3::from_array(scene.config.gravity);
     let mut topology_changed = false;
@@ -187,7 +291,7 @@ pub fn step_with_axis_targets_and_loads(
         let predicted = scene.positions.clone();
         for _ in 0..scene.config.corotation_iterations {
             fit_rotations(scene);
-            solve_coupled(scene, h, targets, loads, &predicted);
+            solve_coupled(scene, h, targets, &applied_loads, &predicted);
         }
         for (p, v) in scene.positions.iter_mut().zip(&scene.voxels) {
             if v.mass.is_finite() {
@@ -316,6 +420,45 @@ mod tests {
         c.ground_dimensions = [2, 2, 1];
         c.gravity = [0.0; 3];
         Scene::new(c)
+    }
+    fn free_voxel() -> Scene {
+        let mut c = crate::scene::SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        c.dimensions = [1, 1, 1];
+        c.branch_dimensions = [0; 3];
+        c.ground_dimensions = [0; 3];
+        c.gravity = [0.0; 3];
+        c.fixed_dt = 0.01;
+        c.substeps = 1;
+        c.iterations = 1;
+        c.corotation_iterations = 1;
+        Scene::new(c)
+    }
+    #[test]
+    fn persistent_force_and_acceleration_use_voxel_mass() {
+        let mut s = free_voxel();
+        let mass = s.voxels[0].mass;
+        set_force(&mut s, 0, Vec3::X * (3.0 * mass)).unwrap();
+        set_acceleration(&mut s, 0, Vec3::Y * 2.0).unwrap();
+        let mut tool = None;
+        step(&mut s, &mut tool);
+        assert!((s.voxels[0].velocity.x - 0.03).abs() < 1e-5);
+        assert!((s.voxels[0].velocity.y - 0.02).abs() < 1e-5);
+        step(&mut s, &mut tool);
+        assert!((s.voxels[0].velocity.x - 0.06).abs() < 1e-5);
+        assert!((s.voxels[0].velocity.y - 0.04).abs() < 1e-5);
+        clear_applied_actions(&mut s, 0).unwrap();
+        step(&mut s, &mut tool);
+        assert!((s.voxels[0].velocity.x - 0.06).abs() < 1e-5);
+        assert!((s.voxels[0].velocity.y - 0.04).abs() < 1e-5);
+    }
+    #[test]
+    fn velocity_and_impulse_are_mass_consistent() {
+        let mut s = free_voxel();
+        let mass = s.voxels[0].mass;
+        set_velocity(&mut s, 0, Vec3::X * 1.5).unwrap();
+        apply_impulse(&mut s, 0, Vec3::Y * (mass * 2.0)).unwrap();
+        assert!((s.voxels[0].velocity.x - 1.5).abs() < 1e-6);
+        assert!((s.voxels[0].velocity.y - 2.0).abs() < 1e-6);
     }
     #[test]
     fn rest_and_rigid_rotation_have_no_strain() {

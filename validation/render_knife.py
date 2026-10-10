@@ -79,6 +79,7 @@ mini = ImageFont.truetype(font_path, 13)
 SQRT_HALF = math.sqrt(0.5)
 SQRT_2_3 = math.sqrt(2.0 / 3.0)
 SQRT_1_6 = math.sqrt(1.0 / 6.0)
+STAGE = (60, 120, 910, 825)
 
 def iso(p):
     """Equal-scale isometric projection; p is in REV units."""
@@ -115,34 +116,39 @@ def cube_faces(center, half, project):
         face([(-1,-1,1),(1,-1,1),(1,1,1),(-1,1,1)]),
     ]
 
+# Use one camera for the whole clip. Reframing each snapshot made the specimen
+# appear to drift and change size while the knife moved.
+camera_points = []
+for fr in frames.values():
+    wood_centers = [(x / CELL, y / CELL, z / CELL)
+                    for _, x, y, z, _, _ in fr['vox']]
+    camera_points.extend(iso(p) for p in wood_centers)
+    camera_points.extend(iso(p) for p in blade_cells(fr))
+min_x = min(p[0] for p in camera_points) - 1
+max_x = max(p[0] for p in camera_points) + 1
+min_y = min(p[1] for p in camera_points) - 1
+max_y = max(p[1] for p in camera_points) + 1
+scale = min((STAGE[2]-STAGE[0])/(max_x-min_x),
+            (STAGE[3]-STAGE[1])/(max_y-min_y))
+cx = (STAGE[0]+STAGE[2])*0.5
+cy = (STAGE[1]+STAGE[3])*0.5
+pcx = (min_x+max_x)*0.5
+pcy = (min_y+max_y)*0.5
+def project(p):
+    sx, sy = iso(p)
+    return (cx+(sx-pcx)*scale, cy+(sy-pcy)*scale)
+
 def render(n, dst):
     fr = frames[n]
     wood = fr['vox']
     blade = list(blade_cells(fr))
     wood_centers = [(x/CELL, y/CELL, z/CELL) for _,x,y,z,_,_ in wood]
-    all_centers = wood_centers + blade
-    projected = [iso(p) for p in all_centers]
-    min_x = min(p[0] for p in projected) - 1
-    max_x = max(p[0] for p in projected) + 1
-    min_y = min(p[1] for p in projected) - 1
-    max_y = max(p[1] for p in projected) + 1
-    stage = (60, 120, 910, 825)
-    scale = min((stage[2]-stage[0])/(max_x-min_x),
-                (stage[3]-stage[1])/(max_y-min_y))
-    cx = (stage[0]+stage[2])*0.5
-    cy = (stage[1]+stage[3])*0.5
-    pcx = (min_x+max_x)*0.5
-    pcy = (min_y+max_y)*0.5
-    def project(p):
-        sx, sy = iso(p)
-        return (cx+(sx-pcx)*scale, cy+(sy-pcy)*scale)
-
     im = Image.new('RGB', (W,H), (13,19,28))
     d = ImageDraw.Draw(im)
     d.text((42,25), 'VOXEL PHYSICS LAB  /  KNIFE CUT', font=title, fill=(237,242,248))
-    d.text((44,65), '1 cm cells shown individually  •  Isometric view  •  Solver snapshot',
+    d.text((44,65), '1 cm cells shown individually  •  Fixed isometric camera  •  Solver states',
            font=small, fill=(145,163,184))
-    d.rounded_rectangle(stage, radius=16, fill=(17,25,36), outline=(39,52,68), width=2)
+    d.rounded_rectangle(STAGE, radius=16, fill=(17,25,36), outline=(39,52,68), width=2)
 
     items = []
     for voxel, center in zip(wood, wood_centers):
@@ -233,7 +239,7 @@ def render(n, dst):
         d.rectangle((bx,yy,bx+18,yy+18),fill=color,outline=(35,47,60))
         d.text((bx+29,yy-2),label,font=small,fill=(185,197,211))
     d.text((bx,735),'Each block is a separate simulated REV.',font=mini,fill=(133,151,171))
-    d.text((42,865),'Orthographic isometric camera • voxel edges are separated for readability • geometry from saved solver states',
+    d.text((42,865),'Voxel geometry, bond damage and motion are reconstructed from saved solver states.',
            font=mini,fill=(112,130,151))
     im.save(dst)
     return im

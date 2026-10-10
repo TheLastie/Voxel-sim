@@ -33,9 +33,17 @@ the interactive scene still uses its scene-level starting speed and damage rate.
 | Compression, 10³ wood sample | PASS; parallel/perpendicular force ratio 32.539× |
 | Physics smoke tests | PASS; 4/4 |
 
-The latest saved capture has 1,438 broken bonds at 30 ms and 1,461 at 60 ms,
-with one connected piece at both points. The video contains 61 consecutive
-solver states (0–60 ms); the 30 ms still shows the developing cut.
+An earlier saved capture had 1,438 broken bonds at 30 ms and 1,461 at 60 ms,
+with one connected piece at both points. The existing video contains 61
+consecutive solver states (0–60 ms); the 30 ms still shows the developing cut.
+
+The capture fixture initially placed the blade's leading-cell center on the
+outer wood-cell center, so contact depenetration occurred before the strike.
+The fixture now places those centers one REV apart. At 6 m/s the 60 ms capture
+shows 1,328 broken bonds and a partial notch, but still one connected wood
+component. This is a geometry correction, not evidence of complete severing;
+the collision and fracture response still need work before a full-cut video is
+presented.
 
 ## Fibers and strike angle
 

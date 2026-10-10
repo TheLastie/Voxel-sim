@@ -73,13 +73,31 @@ fn ground_support() -> Check {
     }
 }
 
+fn constant_force() -> Check {
+    let mut s = scene([1, 1, 1], [0; 3], Vec3::ZERO);
+    let mass = s.voxels[0].mass;
+    solver::set_force(&mut s, 0, Vec3::X * (10.0 * mass)).unwrap();
+    let mut tool = None;
+    for _ in 0..100 {
+        solver::step(&mut s, &mut tool);
+    }
+    let expected = 10.0 * s.config.fixed_dt * 100.0;
+    let actual = s.voxels[0].velocity.x;
+    let error = (actual - expected).abs();
+    Check {
+        name: "constant_force_100ms",
+        passed: error < 1e-4,
+        detail: format!("vx={actual:.6} m/s expected={expected:.6} m/s error={error:.2e}"),
+    }
+}
+
 fn head_on_collision() -> Check {
     let mut s = scene([2, 1, 1], [0; 3], Vec3::ZERO);
     s.bonds[0][0].neighbor = EMPTY;
     s.workspace[0][0].rest_neighbor = EMPTY;
     solver::rebuild_clusters(&mut s);
-    s.voxels[0].velocity = Vec3::X * 20.0;
-    s.voxels[1].velocity = -Vec3::X * 20.0;
+    solver::set_velocity(&mut s, 0, Vec3::X * 20.0).unwrap();
+    solver::set_velocity(&mut s, 1, -Vec3::X * 20.0).unwrap();
     let momentum_before: f32 = s
         .voxels
         .iter()
@@ -155,6 +173,7 @@ fn main() {
     let checks = [
         free_fall(),
         ground_support(),
+        constant_force(),
         head_on_collision(),
         rigid_tool_contact(),
     ];
@@ -185,6 +204,11 @@ mod tests {
     #[test]
     fn ground_contact_prevents_sinking() {
         assert!(ground_support().passed);
+    }
+
+    #[test]
+    fn constant_force_has_the_expected_mass_response() {
+        assert!(constant_force().passed);
     }
 
     #[test]

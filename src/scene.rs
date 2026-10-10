@@ -55,6 +55,10 @@ impl SceneConfig {
 pub struct Scene {
     pub config: SceneConfig,
     pub voxels: Vec<Voxel>,
+    /// Persistent per-voxel forces in newtons, retained until explicitly reset.
+    pub external_forces: Vec<Vec3>,
+    /// Persistent per-voxel acceleration inputs in m/s².
+    pub external_accelerations: Vec<Vec3>,
     pub positions: Vec<Vec3>,
     pub rest_positions: Vec<Vec3>,
     pub previous: Vec<Vec3>,
@@ -189,6 +193,8 @@ impl Scene {
             .collect();
         Self {
             config,
+            external_forces: vec![Vec3::ZERO; n],
+            external_accelerations: vec![Vec3::ZERO; n],
             previous: positions.clone(),
             rest_positions: positions.clone(),
             positions,

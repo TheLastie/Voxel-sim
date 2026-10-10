@@ -18,17 +18,44 @@ validated continuum simulator.
   checks real vertical and horizontal neighbors, including shear limits.
 - The voxelized blade has a beveled one-REV edge. Its collision impulse and
   friction load the same bond stress law used by other materials.
+- Any finite-mass voxel can receive a persistent world-space force or
+  acceleration, a one-time impulse, or a directly assigned initial velocity.
+  These inputs enter the same coupled solve, contact projection, and bond
+  fracture path; persistent inputs remain active until cleared.
+- A free REV under constant force reaches 1.000 m/s after 100 ms within
+  3.2×10⁻⁵ m/s; two moving REVs collide without overlap and conserve momentum.
 - An experimental strike-pitch parameter is available in the capture tool;
   nonzero-pitch collision stability still needs validation.
+
+### Applying motion to voxels
+
+The public `solver` API accepts inputs by voxel index, without material- or
+tool-specific branches:
+
+```rust
+solver::set_force(&mut scene, voxel, Vec3::new(0.0, 0.0, 0.2)).unwrap();
+solver::set_acceleration(&mut scene, voxel, Vec3::new(0.0, 0.0, -9.81)).unwrap();
+solver::set_velocity(&mut scene, voxel, Vec3::new(1.0, 0.0, 0.0)).unwrap();
+solver::apply_impulse(&mut scene, voxel, Vec3::new(0.0, 0.0, 0.01)).unwrap();
+solver::clear_applied_actions(&mut scene, voxel).unwrap();
+```
+
+`set_force` and `set_acceleration` persist across solver steps. Acceleration is
+converted to force using the voxel's current mass; an impulse changes momentum
+once by `J`, so `Δv = J / m`. Fixed voxels reject these inputs. Force-driven
+motion is covered by the 100 ms constant-force smoke test and by the same
+head-on collision check used for moving voxels.
+
+Thermally activated bonding, diffusion, and alloy formation are not implemented
+yet; a collision alone does not claim to weld two metal voxels.
 
 ### Demos
 
 ![Wood strike preview](validation/knife-cut-demo.gif)
 
-- [4.54-second strike video](validation/knife-cut-demo.mp4), with a 1-second
-  held setup frame and a 1-second outro. It shows the dense impact sequence and
-  0.25 seconds of simulated post-impact motion; the last state is held for the
-  rest of the outro.
+- [Knife contact video](validation/knife-cut-demo.mp4) shows the earlier
+  contact-onset prototype. It does not demonstrate complete severing or a
+  calibrated post-impact fall; those remain open physics work.
 - [Cut-onset still](validation/knife-cut-final-frame.png)
 - Detailed results: [validation status](validation/STATUS.md) and
   [knife diagnosis](validation/knife-diagnosis.md).
