@@ -98,6 +98,9 @@ pub fn set_acceleration(
     if !acceleration.is_finite() {
         return Err("acceleration must be finite");
     }
+    if !(acceleration * mass).is_finite() {
+        return Err("acceleration is too large for this voxel's mass");
+    }
     scene.external_accelerations[voxel] = acceleration;
     Ok(())
 }
@@ -130,7 +133,11 @@ pub fn apply_impulse(scene: &mut Scene, voxel: usize, impulse: Vec3) -> Result<(
     if !impulse.is_finite() {
         return Err("impulse must be finite");
     }
-    body.velocity += impulse / body.mass;
+    let velocity = body.velocity + impulse / body.mass;
+    if !velocity.is_finite() {
+        return Err("impulse would produce a non-finite velocity");
+    }
+    body.velocity = velocity;
     Ok(())
 }
 
@@ -221,8 +228,9 @@ pub fn step_with_axis_targets(
     step_with_axis_targets_and_loads(scene, tool, targets, &[]);
 }
 
-/// Advance with optional world-space nodal forces in newtons. Forces are applied
-/// through the same coupled solve as bonds and are shared by every substep.
+/// Advance with optional per-step world-space nodal forces in newtons, in
+/// addition to persistent inputs stored on `Scene`. All enter the same coupled
+/// solve as bonds and are shared by every substep.
 pub fn step_with_axis_targets_and_loads(
     scene: &mut Scene,
     tool: &mut Option<Tool>,
@@ -459,6 +467,16 @@ mod tests {
         apply_impulse(&mut s, 0, Vec3::Y * (mass * 2.0)).unwrap();
         assert!((s.voxels[0].velocity.x - 1.5).abs() < 1e-6);
         assert!((s.voxels[0].velocity.y - 2.0).abs() < 1e-6);
+    }
+    #[test]
+    fn external_actions_reject_fixed_and_missing_voxels() {
+        let mut s = scene();
+        let fixed = s.voxels.iter().position(|v| !v.mass.is_finite()).unwrap();
+        assert!(set_force(&mut s, fixed, Vec3::X).is_err());
+        assert!(set_acceleration(&mut s, fixed, Vec3::X).is_err());
+        assert!(apply_impulse(&mut s, fixed, Vec3::X).is_err());
+        assert!(set_velocity(&mut s, usize::MAX, Vec3::X).is_err());
+        assert!(set_force(&mut s, 0, Vec3::splat(f32::NAN)).is_err());
     }
     #[test]
     fn rest_and_rigid_rotation_have_no_strain() {

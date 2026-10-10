@@ -4,7 +4,7 @@ Current checkpoint after fixing knife contact loading and mixed wood fracture.
 
 | Check | Result |
 |---|---|
-| Physics library | PASS, 19 unit tests |
+| Physics library | PASS, 21 unit tests |
 | Contact/motion smoke tests | PASS, 5 tests |
 | Constant force on a free REV | PASS, 10 m/s² for 100 ms gives 1.000 m/s (error 3.2×10⁻⁵ m/s) |
 | Velocity-set head-on collision | PASS, 20 m/s inputs; no overlap and momentum conserved |
@@ -35,6 +35,7 @@ fix before angled strikes can be presented as a result. Longer fracture
 propagation also needs calibration.
 
 Per-voxel force, acceleration, impulse, and velocity inputs now use the general
-solver APIs and have mass-response and momentum tests. Thermally activated
+solver APIs and have mass-response and momentum tests. Rigid voxel groups also
+accept applied force and torque. Thermally activated
 adhesion, welding, and alloy formation are not implemented; a metal collision
 does not fuse voxels in this checkpoint.

@@ -112,10 +112,12 @@ fn candidate_pairs(scene: &Scene, starts: &[Vec3]) -> Vec<(usize, usize)> {
             }
         }
     }
-    unique
+    let mut pairs: Vec<_> = unique
         .into_iter()
         .map(|key| ((key >> 32) as usize, key as u32 as usize))
-        .collect()
+        .collect();
+    pairs.sort_unstable();
+    pairs
 }
 
 fn is_bonded(scene: &Scene, i: usize, j: usize) -> bool {

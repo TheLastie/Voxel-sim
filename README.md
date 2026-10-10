@@ -22,6 +22,8 @@ validated continuum simulator.
   acceleration, a one-time impulse, or a directly assigned initial velocity.
   These inputs enter the same coupled solve, contact projection, and bond
   fracture path; persistent inputs remain active until cleared.
+- Rigid voxel groups also accept persistent external force and torque, so an
+  applied push can act through the body's mass and inertia.
 - A free REV under constant force reaches 1.000 m/s after 100 ms within
   3.2×10⁻⁵ m/s; two moving REVs collide without overlap and conserve momentum.
 - An experimental strike-pitch parameter is available in the capture tool;
@@ -38,6 +40,10 @@ solver::set_acceleration(&mut scene, voxel, Vec3::new(0.0, 0.0, -9.81)).unwrap()
 solver::set_velocity(&mut scene, voxel, Vec3::new(1.0, 0.0, 0.0)).unwrap();
 solver::apply_impulse(&mut scene, voxel, Vec3::new(0.0, 0.0, 0.01)).unwrap();
 solver::clear_applied_actions(&mut scene, voxel).unwrap();
+
+tool.set_external_force(Vec3::new(-5.0, 0.0, 0.0)).unwrap();
+tool.set_external_torque(Vec3::new(0.0, 0.0, 0.1)).unwrap();
+tool.clear_external_wrench();
 ```
 
 `set_force` and `set_acceleration` persist across solver steps. Acceleration is

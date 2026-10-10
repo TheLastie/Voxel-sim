@@ -218,6 +218,7 @@ mod tests {
 
     #[test]
     fn rigid_tool_stays_outside_voxel_without_energy_gain() {
-        assert!(rigid_tool_contact().passed);
+        let result = rigid_tool_contact();
+        assert!(result.passed, "{}", result.detail);
     }
 }

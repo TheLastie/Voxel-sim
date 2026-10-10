@@ -22,6 +22,9 @@ pub struct Tool {
     pub rotation: Quat,
     pub velocity: Vec3,
     pub angular_velocity: Vec3,
+    /// Persistent world-space force and torque, analogous to voxel inputs.
+    pub external_force: Vec3,
+    pub external_torque: Vec3,
     pub inverse_inertia: Vec3,
     pub color: [f32; 4],
 }
@@ -80,9 +83,29 @@ impl Tool {
             rotation: Quat::from_rotation_arc(Vec3::X, direction.normalize()),
             velocity: direction.normalize() * speed,
             angular_velocity: Vec3::ZERO,
+            external_force: Vec3::ZERO,
+            external_torque: Vec3::ZERO,
             inverse_inertia: inertia.recip(),
             color,
         }
+    }
+    pub fn set_external_force(&mut self, force: Vec3) -> Result<(), &'static str> {
+        if !force.is_finite() {
+            return Err("force must be finite");
+        }
+        self.external_force = force;
+        Ok(())
+    }
+    pub fn set_external_torque(&mut self, torque: Vec3) -> Result<(), &'static str> {
+        if !torque.is_finite() {
+            return Err("torque must be finite");
+        }
+        self.external_torque = torque;
+        Ok(())
+    }
+    pub fn clear_external_wrench(&mut self) {
+        self.external_force = Vec3::ZERO;
+        self.external_torque = Vec3::ZERO;
     }
     pub fn world_cells(&self) -> impl Iterator<Item = Vec3> + '_ {
         self.cells
@@ -102,12 +125,21 @@ impl Tool {
     ) -> Vec<Vec3> {
         let mut contact_velocity = vec![Vec3::ZERO; scene.positions.len()];
         let tool_radius = self.cells.iter().map(|p| p.length()).fold(0.0, f32::max);
-        let linear_steps = self.velocity.length() * dt / (CELL * 0.4);
-        let angular_steps = self.angular_velocity.length() * dt * tool_radius / (CELL * 0.4);
+        let gravity = Vec3::from_array(scene.config.gravity);
+        let linear_acceleration = gravity + self.external_force / self.mass;
+        let angular_acceleration = self.angular_response(self.external_torque);
+        let linear_distance =
+            self.velocity.length() * dt + 0.5 * linear_acceleration.length() * dt * dt;
+        let angular_distance = (self.angular_velocity.length() * dt
+            + 0.5 * angular_acceleration.length() * dt * dt)
+            * tool_radius;
+        let linear_steps = linear_distance / (CELL * 0.4);
+        let angular_steps = angular_distance / (CELL * 0.4);
         let steps = (linear_steps.max(angular_steps).ceil() as usize).max(1);
         let h = dt / steps as f32;
         for _ in 0..steps {
-            self.velocity += Vec3::from_array(scene.config.gravity) * h;
+            self.velocity += linear_acceleration * h;
+            self.angular_velocity += self.angular_response(self.external_torque) * h;
             self.position += self.velocity * h;
             let angle = self.angular_velocity.length() * h;
             if angle > 1e-8 {
@@ -334,6 +366,27 @@ fn obb_aabb_contact(center: Vec3, axes: [Vec3; 3], voxel: Vec3) -> Option<(Vec3,
 mod tests {
     use super::*;
     use crate::{scene::SceneConfig, solver};
+
+    #[test]
+    fn external_force_accelerates_and_persists_on_rigid_voxel_group() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [1; 3];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        config.gravity = [0.0; 3];
+        config.tool_dimensions = [2; 3];
+        let mut scene = Scene::new(config);
+        let mut tool = Tool::new(Shape::Blade, &scene, Vec3::splat(1.0), Vec3::X, 0.0);
+        tool.set_external_force(Vec3::X * (tool.mass * 3.0))
+            .unwrap();
+        tool.advance(&mut scene, 0.01, &[]);
+        assert!((tool.velocity.x - 0.03).abs() < 1e-6);
+        tool.advance(&mut scene, 0.01, &[]);
+        assert!((tool.velocity.x - 0.06).abs() < 1e-6);
+        tool.clear_external_wrench();
+        tool.advance(&mut scene, 0.01, &[]);
+        assert!((tool.velocity.x - 0.06).abs() < 1e-6);
+    }
 
     fn kinetic_energy(scene: &Scene, tool: &Tool) -> f64 {
         let wood: f64 = scene
