@@ -103,7 +103,8 @@ constrained environments; run fixtures individually to inspect each result.
 The solver simulates a reduced active region. The material model uses a small
 illustrative table; wood species, moisture, fracture-energy calibration,
 independent fragment collisions, and large-scene real-time performance still
-need validation. The current 299,440-voxel scene takes about 20 seconds per
-release solver step and misses the 10 FPS target by a wide margin. Long strikes
+need validation. The current 299,440-voxel scene takes 16–17 seconds per
+release solver step after reusing solver work buffers, down from 20.4 seconds;
+it still misses the 10 FPS target by a wide margin. Long strikes
 can propagate damage too broadly. See
 `validation/STATUS.md` for the latest verified checkpoint.

@@ -260,6 +260,8 @@ pub fn step_with_axis_targets_and_loads(
     let h = scene.config.fixed_dt / scene.config.substeps as f32;
     let gravity = Vec3::from_array(scene.config.gravity);
     let mut topology_changed = false;
+    // Reuse large solver buffers across substeps and corotation corrections.
+    let mut solver_scratch = SolverScratch::default();
     for _ in 0..scene.config.substeps {
         scene.previous.clone_from(&scene.positions);
         let mut drift_velocity = vec![Vec3::ZERO; scene.voxels.len()];
@@ -303,7 +305,14 @@ pub fn step_with_axis_targets_and_loads(
         let predicted = scene.positions.clone();
         fit_rotations(scene);
         for iteration in 0..scene.config.corotation_iterations {
-            solve_coupled(scene, h, targets, &applied_loads, &predicted);
+            solve_coupled(
+                scene,
+                h,
+                targets,
+                &applied_loads,
+                &predicted,
+                &mut solver_scratch,
+            );
             if iteration + 1 == scene.config.corotation_iterations {
                 break;
             }
@@ -640,10 +649,25 @@ struct Constraint {
     k: Mat3,
     rest: Vec3,
 }
+#[derive(Default)]
+struct SolverScratch {
+    free: Vec<Vec3>,
+    masses: Vec<f32>,
+    incidence: Vec<[u32; 6]>,
+    incidence_len: Vec<u8>,
+    diagonal: Vec<Mat3>,
+    rhs: Vec<Vec3>,
+    constraints: Vec<Constraint>,
+    dx: Vec<Vec3>,
+    ap: Vec<Vec3>,
+    r: Vec<Vec3>,
+    z: Vec<Vec3>,
+    p: Vec<Vec3>,
+}
 fn make_constraint(scene: &Scene, i: usize, axis: usize, j: usize) -> Constraint {
     let frame = basis(axis, scene.rotations[i].slerp(scene.rotations[j], 0.5));
-    let local = stiffness_matrix(scene, i, j, frame)
-        * (1. - scene.bonds[axis][i].damage).max(0.001);
+    let local =
+        stiffness_matrix(scene, i, j, frame) * (1. - scene.bonds[axis][i].damage).max(0.001);
     let k = frame * local * frame.transpose();
     let bond = scene.bonds[axis][i];
     let rest = frame * (Vec3::X * CELL + Vec3::from_array(bond.plastic_strain) * CELL);
@@ -665,13 +689,13 @@ fn solve_coupled(
     targets: &[[Option<f32>; 3]],
     loads: &[Vec3],
     predicted: &[Vec3],
+    scratch: &mut SolverScratch,
 ) {
     let n = scene.voxels.len();
-    let free: Vec<_> = scene
-        .voxels
-        .iter()
-        .enumerate()
-        .map(|(i, v)| {
+    scratch.free.clear();
+    scratch
+        .free
+        .extend(scene.voxels.iter().enumerate().map(|(i, v)| {
             Vec3::from_array(std::array::from_fn(|a| {
                 if v.mass.is_infinite() || targets.get(i).and_then(|t| t[a]).is_some() {
                     0.
@@ -679,35 +703,30 @@ fn solve_coupled(
                     1.
                 }
             }))
-        })
-        .collect();
-    let masses: Vec<_> = scene
-        .voxels
-        .iter()
-        .map(|v| {
-            if v.mass.is_finite() {
-                v.mass / (h * h)
-            } else {
-                0.
-            }
-        })
-        .collect();
+        }));
+    scratch.masses.clear();
+    scratch.masses.extend(scene.voxels.iter().map(|v| {
+        if v.mass.is_finite() {
+            v.mass / (h * h)
+        } else {
+            0.
+        }
+    }));
     // The bond graph is face-connected, so each voxel can touch at most six
     // constraints. Fixed slots avoid millions of tiny heap allocations on a
     // large scene, while preserving the same per-node gather in the solver.
-    let mut incidence = vec![[u32::MAX; 6]; n];
-    let mut incidence_len = vec![0_u8; n];
-    let mut diagonal: Vec<_> = masses
-        .iter()
-        .map(|&m| Mat3::from_diagonal(Vec3::splat(m)))
-        .collect();
-    let mut rhs: Vec<_> = (0..n)
-        .map(|i| {
-            (predicted[i] - scene.positions[i]) * masses[i]
-                + loads.get(i).copied().unwrap_or(Vec3::ZERO)
-        })
-        .collect();
-    let mut constraints = Vec::new();
+    scratch.incidence.resize(n, [u32::MAX; 6]);
+    scratch.incidence.fill([u32::MAX; 6]);
+    scratch.incidence_len.resize(n, 0);
+    scratch.incidence_len.fill(0);
+    scratch.diagonal.resize(n, Mat3::ZERO);
+    scratch.rhs.resize(n, Vec3::ZERO);
+    for i in 0..n {
+        scratch.diagonal[i] = Mat3::from_diagonal(Vec3::splat(scratch.masses[i]));
+        scratch.rhs[i] = (predicted[i] - scene.positions[i]) * scratch.masses[i]
+            + loads.get(i).copied().unwrap_or(Vec3::ZERO);
+    }
+    scratch.constraints.clear();
     for axis in 0..3 {
         for i in 0..n {
             let bond = scene.bonds[axis][i];
@@ -715,32 +734,38 @@ fn solve_coupled(
                 continue;
             }
             let j = bond.neighbor as usize;
-            if free[i] == Vec3::ZERO && free[j] == Vec3::ZERO {
+            if scratch.free[i] == Vec3::ZERO && scratch.free[j] == Vec3::ZERO {
                 continue;
             }
             let constraint = make_constraint(scene, i, axis, j);
             let force = constraint.k * (scene.positions[j] - scene.positions[i] - constraint.rest);
-            rhs[i] += force;
-            rhs[j] -= force;
-            diagonal[i] += constraint.k;
-            diagonal[j] += constraint.k;
-            let edge = u32::try_from(constraints.len())
+            scratch.rhs[i] += force;
+            scratch.rhs[j] -= force;
+            scratch.diagonal[i] += constraint.k;
+            scratch.diagonal[j] += constraint.k;
+            let edge = u32::try_from(scratch.constraints.len())
                 .expect("bond constraint count exceeds the voxel index range");
             for vertex in [i, j] {
-                let slot = incidence_len[vertex] as usize;
+                let slot = scratch.incidence_len[vertex] as usize;
                 debug_assert!(slot < 6, "face-connected voxel has more than six bonds");
-                incidence[vertex][slot] = edge;
-                incidence_len[vertex] += 1;
+                scratch.incidence[vertex][slot] = edge;
+                scratch.incidence_len[vertex] += 1;
             }
-            constraints.push(constraint);
+            scratch.constraints.push(constraint);
         }
     }
     for i in 0..n {
-        rhs[i] *= free[i];
-        let projection = Mat3::from_diagonal(free[i]);
-        diagonal[i] =
-            (projection * diagonal[i] * projection + Mat3::IDENTITY - projection).inverse();
+        scratch.rhs[i] *= scratch.free[i];
+        let projection = Mat3::from_diagonal(scratch.free[i]);
+        scratch.diagonal[i] =
+            (projection * scratch.diagonal[i] * projection + Mat3::IDENTITY - projection).inverse();
     }
+    let free = &scratch.free;
+    let masses = &scratch.masses;
+    let incidence = &scratch.incidence;
+    let incidence_len = &scratch.incidence_len;
+    let diagonal = &scratch.diagonal;
+    let constraints = &scratch.constraints;
     let apply = |v: &[Vec3], out: &mut [Vec3]| {
         out.par_iter_mut().enumerate().for_each(|(i, out)| {
             if free[i] == Vec3::ZERO {
@@ -759,15 +784,20 @@ fn solve_coupled(
     };
     let dot =
         |a: &[Vec3], b: &[Vec3]| -> f64 { a.iter().zip(b).map(|(x, y)| x.dot(*y) as f64).sum() };
-    let mut dx = vec![Vec3::ZERO; n];
-    let mut ap = vec![Vec3::ZERO; n];
-    let mut r = rhs;
-    let mut z: Vec<_> = r
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| diagonal[i] * v)
-        .collect();
-    let mut p = z.clone();
+    scratch.dx.resize(n, Vec3::ZERO);
+    scratch.dx.fill(Vec3::ZERO);
+    scratch.ap.resize(n, Vec3::ZERO);
+    scratch.r.clone_from(&scratch.rhs);
+    scratch.z.resize(n, Vec3::ZERO);
+    for i in 0..n {
+        scratch.z[i] = diagonal[i] * scratch.r[i];
+    }
+    scratch.p.clone_from(&scratch.z);
+    let dx = &mut scratch.dx;
+    let ap = &mut scratch.ap;
+    let r = &mut scratch.r;
+    let z = &mut scratch.z;
+    let p = &mut scratch.p;
     let mut rz = dot(&r, &z);
     let initial = dot(&r, &r).sqrt();
     scene.solver_residual = 0.;
@@ -775,7 +805,7 @@ fn solve_coupled(
         if initial <= 1e-12 {
             break;
         }
-        apply(&p, &mut ap);
+        apply(p, ap);
         let denom = dot(&p, &ap);
         if denom <= 1e-30 {
             break;

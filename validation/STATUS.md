@@ -17,7 +17,7 @@ Current checkpoint after fixing knife contact loading and mixed wood fracture.
 | Pitched axe strike | NOT PASSING; current 10° contact response ejects the tool within 5 ms |
 | Full mechanical suite | INCOMPLETE; process exited 137 during bending, so wedge and bending were not rechecked |
 | Window/GPU runtime | NOT MEASURED |
-| Full-scene real-time target | NOT PASSING; release headless step on 299,440 voxels took 20.374 s, with PCG residual 3.36×10⁻¹ |
+| Full-scene real-time target | NOT PASSING; release headless step on 299,440 voxels took 16.064 s and 16.698 s in two runs, with PCG residual 3.36×10⁻¹ |
 
 The knife uses a voxel bevel that tapers from a five-REV spine to a one-REV
 edge. Contact impulse displacement is integrated in the same substep as bond
@@ -44,6 +44,10 @@ does not fuse voxels in this checkpoint.
 
 Corotational solves can stop before their configured maximum only when both
 the orientation change and the PCG residual meet their independent tolerances.
-The full-scene timing above shows the linear solver is still far from its
-residual target after 40 iterations; multilevel preconditioning is the next
-major performance and convergence task. The 10 FPS target has not been met.
+The solver now reuses its large work buffers across substeps and corotation
+corrections. Two full-scene runs took 16.1–16.7 s, down from the 20.374 s
+baseline, with the same 4,816 broken bonds, 156 clusters, and 3.36×10⁻¹ PCG
+residual. This reduces allocation churn without changing the computed result.
+The linear solver remains far from its residual target after 40 iterations;
+multilevel preconditioning is still the major performance and convergence
+task. The 10 FPS target has not been met.
