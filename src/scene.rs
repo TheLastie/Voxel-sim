@@ -23,6 +23,7 @@ pub struct SceneConfig {
     pub substeps: usize,
     pub iterations: usize,
     pub solver_relative_tolerance: f32,
+    pub corotation_tolerance: f32,
     pub corotation_iterations: usize,
     pub fracture: crate::fracture::FractureConfig,
 
@@ -43,6 +44,8 @@ impl SceneConfig {
             || result.corotation_iterations == 0
             || !result.solver_relative_tolerance.is_finite()
             || result.solver_relative_tolerance <= 0.0
+            || !result.corotation_tolerance.is_finite()
+            || result.corotation_tolerance <= 0.0
             || !result.fracture.validate()
             || Vec3::from_array(result.fibers).length_squared() < 1e-8
         {

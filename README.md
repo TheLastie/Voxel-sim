@@ -24,6 +24,9 @@ validated continuum simulator.
   fracture path; persistent inputs remain active until cleared.
 - Rigid voxel groups also accept persistent external force and torque, so an
   applied push can act through the body's mass and inertia.
+- Corotational passes have a convergence-based early exit; they stop only when
+  both orientation change and the linear-solver residual meet their configured
+  tolerances. The configured pass count remains the maximum.
 - A free REV under constant force reaches 1.000 m/s after 100 ms within
   3.2×10⁻⁵ m/s; two moving REVs collide without overlap and conserve momentum.
 - An experimental strike-pitch parameter is available in the capture tool;
@@ -100,5 +103,7 @@ constrained environments; run fixtures individually to inspect each result.
 The solver simulates a reduced active region. The material model uses a small
 illustrative table; wood species, moisture, fracture-energy calibration,
 independent fragment collisions, and large-scene real-time performance still
-need validation. Long strikes can propagate damage too broadly. See
+need validation. The current 299,440-voxel scene takes about 20 seconds per
+release solver step and misses the 10 FPS target by a wide margin. Long strikes
+can propagate damage too broadly. See
 `validation/STATUS.md` for the latest verified checkpoint.

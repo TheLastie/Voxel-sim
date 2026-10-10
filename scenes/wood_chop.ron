@@ -12,6 +12,7 @@
     substeps: 4,
     iterations: 40,
     solver_relative_tolerance: 0.00001,
+    corotation_tolerance: 0.00001,
     corotation_iterations: 4,
     fracture: (
         damage_rate: 35.0,

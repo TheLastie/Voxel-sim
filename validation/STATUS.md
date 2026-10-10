@@ -11,11 +11,13 @@ Current checkpoint after fixing knife contact loading and mixed wood fracture.
 | Tension, 10³ wood sample | PASS, measured parallel/perpendicular force ratio 39.458× |
 | Compression, 10³ wood sample | PASS, measured parallel/perpendicular force ratio 32.539× |
 | Knife strike, corrected initial clearance | 1,328 bonds broken, 1 connected piece, and 3.975 m/s tool speed after 60 ms at 6 m/s |
+| Knife onset regression with adaptive corotation | PASS, 1,105 bonds broken and 1 connected wood piece after 30 ms |
 | Complete knife severing | NOT VERIFIED; the corrected strike still produces a partial cut only |
 | Directional wood fibers | PASS, 100/2.5 MPa tension (40×), 50/2 MPa compression (25×), and 12/3 MPa shear (4×) |
 | Pitched axe strike | NOT PASSING; current 10° contact response ejects the tool within 5 ms |
 | Full mechanical suite | INCOMPLETE; process exited 137 during bending, so wedge and bending were not rechecked |
 | Window/GPU runtime | NOT MEASURED |
+| Full-scene real-time target | NOT PASSING; release headless step on 299,440 voxels took 20.374 s, with PCG residual 3.36×10⁻¹ |
 
 The knife uses a voxel bevel that tapers from a five-REV spine to a one-REV
 edge. Contact impulse displacement is integrated in the same substep as bond
@@ -39,3 +41,9 @@ solver APIs and have mass-response and momentum tests. Rigid voxel groups also
 accept applied force and torque. Thermally activated
 adhesion, welding, and alloy formation are not implemented; a metal collision
 does not fuse voxels in this checkpoint.
+
+Corotational solves can stop before their configured maximum only when both
+the orientation change and the PCG residual meet their independent tolerances.
+The full-scene timing above shows the linear solver is still far from its
+residual target after 40 iterations; multilevel preconditioning is the next
+major performance and convergence task. The 10 FPS target has not been met.

@@ -53,13 +53,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let seconds = start.elapsed().as_secs_f64();
         println!(
-            "voxels={} steps={} elapsed_s={:.3} steps_per_s={:.2} broken={} clusters={}",
+            "voxels={} steps={} elapsed_s={:.3} steps_per_s={:.2} broken={} clusters={} linear_residual={:.2e}",
             scene.voxels.len(),
             steps,
             seconds,
             steps as f64 / seconds,
             scene.broken,
-            scene.cluster_count
+            scene.cluster_count,
+            scene.solver_residual
         );
         if scene.positions.iter().any(|p| !p.is_finite()) {
             return Err("Non-finite solver output".into());

@@ -152,7 +152,8 @@ pub fn clear_applied_actions(scene: &mut Scene, voxel: usize) -> Result<(), &'st
 }
 
 /// Local polar fits make the vector constraints invariant to rigid rotation.
-fn fit_rotations(scene: &mut Scene) {
+/// Returns the largest quaternion angle changed by this fit.
+fn fit_rotations(scene: &mut Scene) -> f32 {
     let n = scene.voxels.len();
     let mut gradients = vec![Mat3::ZERO; n];
     let mut counts = vec![Vec3::ZERO; n];
@@ -180,7 +181,8 @@ fn fit_rotations(scene: &mut Scene) {
         .rotations
         .par_iter_mut()
         .enumerate()
-        .for_each(|(i, q)| {
+        .map(|(i, q)| {
+            let previous = *q;
             let old = Mat3::from_quat(*q);
             let mut f = gradients[i];
             for axis in 0..3 {
@@ -196,7 +198,7 @@ fn fit_rotations(scene: &mut Scene) {
                 };
             }
             if f.determinant() <= 1e-6 {
-                return;
+                return 0.0;
             }
             for _ in 0..5 {
                 f = (f + f.inverse().transpose()) * 0.5;
@@ -207,7 +209,9 @@ fn fit_rotations(scene: &mut Scene) {
             if x.length_squared() > 0.5 && y.length_squared() > 0.5 {
                 *q = Quat::from_mat3(&Mat3::from_cols(x, y, x.cross(y))).normalize();
             }
-        });
+            2.0 * previous.dot(*q).abs().clamp(0.0, 1.0).acos()
+        })
+        .reduce(|| 0.0, f32::max)
 }
 
 pub fn step(scene: &mut Scene, tool: &mut Option<Tool>) {
@@ -297,9 +301,18 @@ pub fn step_with_axis_targets_and_loads(
             *p += delta_v * (0.5 * h);
         }
         let predicted = scene.positions.clone();
-        for _ in 0..scene.config.corotation_iterations {
-            fit_rotations(scene);
+        fit_rotations(scene);
+        for iteration in 0..scene.config.corotation_iterations {
             solve_coupled(scene, h, targets, &applied_loads, &predicted);
+            if iteration + 1 == scene.config.corotation_iterations {
+                break;
+            }
+            let orientation_change = fit_rotations(scene);
+            if orientation_change <= scene.config.corotation_tolerance
+                && scene.solver_residual <= scene.config.solver_relative_tolerance
+            {
+                break;
+            }
         }
         for (p, v) in scene.positions.iter_mut().zip(&scene.voxels) {
             if v.mass.is_finite() {
@@ -627,6 +640,22 @@ struct Constraint {
     k: Mat3,
     rest: Vec3,
 }
+fn make_constraint(scene: &Scene, i: usize, axis: usize, j: usize) -> Constraint {
+    let frame = basis(axis, scene.rotations[i].slerp(scene.rotations[j], 0.5));
+    let local = stiffness_matrix(scene, i, j, frame)
+        * (1. - scene.bonds[axis][i].damage).max(0.001);
+    let k = frame * local * frame.transpose();
+    let bond = scene.bonds[axis][i];
+    let rest = frame * (Vec3::X * CELL + Vec3::from_array(bond.plastic_strain) * CELL);
+    Constraint {
+        i,
+        j,
+        axis,
+        frame,
+        k,
+        rest,
+    }
+}
 /// Primal form of the coupled vector XPBD system for a frozen corotational frame.
 /// Eliminates multipliers: (M/h² + Jᵀ K J) dx = -Jᵀ K C.
 /// This is algebraically the same compliant solve, with global coupling retained.
@@ -663,8 +692,11 @@ fn solve_coupled(
             }
         })
         .collect();
-    let mut constraints = Vec::new();
-    let mut incidence = vec![Vec::new(); n];
+    // The bond graph is face-connected, so each voxel can touch at most six
+    // constraints. Fixed slots avoid millions of tiny heap allocations on a
+    // large scene, while preserving the same per-node gather in the solver.
+    let mut incidence = vec![[u32::MAX; 6]; n];
+    let mut incidence_len = vec![0_u8; n];
     let mut diagonal: Vec<_> = masses
         .iter()
         .map(|&m| Mat3::from_diagonal(Vec3::splat(m)))
@@ -675,6 +707,7 @@ fn solve_coupled(
                 + loads.get(i).copied().unwrap_or(Vec3::ZERO)
         })
         .collect();
+    let mut constraints = Vec::new();
     for axis in 0..3 {
         for i in 0..n {
             let bond = scene.bonds[axis][i];
@@ -685,26 +718,21 @@ fn solve_coupled(
             if free[i] == Vec3::ZERO && free[j] == Vec3::ZERO {
                 continue;
             }
-            let frame = basis(axis, scene.rotations[i].slerp(scene.rotations[j], 0.5));
-            let local = stiffness_matrix(scene, i, j, frame) * (1. - bond.damage).max(0.001);
-            let k = frame * local * frame.transpose();
-            let rest = frame * (Vec3::X * CELL + Vec3::from_array(bond.plastic_strain) * CELL);
-            let force = k * (scene.positions[j] - scene.positions[i] - rest);
+            let constraint = make_constraint(scene, i, axis, j);
+            let force = constraint.k * (scene.positions[j] - scene.positions[i] - constraint.rest);
             rhs[i] += force;
             rhs[j] -= force;
-            diagonal[i] += k;
-            diagonal[j] += k;
-            let edge = constraints.len();
-            incidence[i].push(edge);
-            incidence[j].push(edge);
-            constraints.push(Constraint {
-                i,
-                j,
-                axis,
-                frame,
-                k,
-                rest,
-            });
+            diagonal[i] += constraint.k;
+            diagonal[j] += constraint.k;
+            let edge = u32::try_from(constraints.len())
+                .expect("bond constraint count exceeds the voxel index range");
+            for vertex in [i, j] {
+                let slot = incidence_len[vertex] as usize;
+                debug_assert!(slot < 6, "face-connected voxel has more than six bonds");
+                incidence[vertex][slot] = edge;
+                incidence_len[vertex] += 1;
+            }
+            constraints.push(constraint);
         }
     }
     for i in 0..n {
@@ -713,26 +741,26 @@ fn solve_coupled(
         diagonal[i] =
             (projection * diagonal[i] * projection + Mat3::IDENTITY - projection).inverse();
     }
-    let apply = |v: &[Vec3]| -> Vec<Vec3> {
-        (0..n)
-            .into_par_iter()
-            .map(|i| {
-                if free[i] == Vec3::ZERO {
-                    return Vec3::ZERO;
-                }
-                let mut out = v[i] * masses[i];
-                for &edge in &incidence[i] {
-                    let c = &constraints[edge];
-                    let j = if c.i == i { c.j } else { c.i };
-                    out += c.k * (v[i] - v[j]);
-                }
-                out * free[i]
-            })
-            .collect()
+    let apply = |v: &[Vec3], out: &mut [Vec3]| {
+        out.par_iter_mut().enumerate().for_each(|(i, out)| {
+            if free[i] == Vec3::ZERO {
+                *out = Vec3::ZERO;
+                return;
+            }
+            let vi = v[i];
+            let mut value = vi * masses[i];
+            for &edge in &incidence[i][..incidence_len[i] as usize] {
+                let c = &constraints[edge as usize];
+                let j = if c.i == i { c.j } else { c.i };
+                value += c.k * (vi - v[j]);
+            }
+            *out = value * free[i];
+        });
     };
     let dot =
         |a: &[Vec3], b: &[Vec3]| -> f64 { a.iter().zip(b).map(|(x, y)| x.dot(*y) as f64).sum() };
     let mut dx = vec![Vec3::ZERO; n];
+    let mut ap = vec![Vec3::ZERO; n];
     let mut r = rhs;
     let mut z: Vec<_> = r
         .iter()
@@ -747,7 +775,7 @@ fn solve_coupled(
         if initial <= 1e-12 {
             break;
         }
-        let ap = apply(&p);
+        apply(&p, &mut ap);
         let denom = dot(&p, &ap);
         if denom <= 1e-30 {
             break;
