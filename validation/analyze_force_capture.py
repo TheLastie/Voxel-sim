@@ -61,9 +61,12 @@ assert len(sizes)==int(f[10]), 'saved cluster count differs from reconstructed c
 def budget(n):
  f=frames[n]
  return sum(f[i] for i in [12,13,15,16,17,18,19])+energy[n][1]
+gaps={n:budget(n)-budget(keys[0])-load[n][1] for n in keys}
+peak_gap_frame=max(keys,key=lambda n:abs(gaps[n]))
 from collections import Counter
 summary={'physical_seconds':last*dt,'post_contact_seconds':last*dt-ramp[2], 'snapshots':len(keys),
  'force_peak_N':ramp[0],'ramp_duration_seconds':ramp[1],'hold_seconds':last*dt-ramp[2]-ramp[1],
+ 'max_recorded_applied_force_N':max(v[0] for v in load.values()),
  'force_error_max_N':max(errors),'drive_work_estimate_J':load[last][1],
  'broken_bonds':int(f[9]),'components':len(sizes),'component_sizes':sizes,
  'max_recorded_components':max(int(v[10]) for v in frames.values()),
@@ -78,6 +81,9 @@ summary={'physical_seconds':last*dt,'post_contact_seconds':last*dt-ramp[2], 'sna
  'initial_accounted_energy_J':budget(keys[0]),'final_accounted_energy_J':budget(last),
  'final_energy_reservoirs_J':dict(zip(['wood_kinetic','tool_kinetic','pending_release','surface_work','damage_heat','plastic_heat','stored_plastic','elastic'],[f[12],f[13],f[15],f[16],f[17],f[18],f[19],energy[last][1]])),
  'energy_gap_after_drive_work_estimate_J':budget(last)-budget(keys[0])-load[last][1],
+ 'max_abs_recorded_energy_gap_J':abs(gaps[peak_gap_frame]),
+ 'max_abs_energy_gap_at_physical_seconds':peak_gap_frame*dt,
  'final_PCG_relative_residual':energy[last][2],
+ 'peak_recorded_PCG_relative_residual':max(v[2] for v in energy.values()),
  'work_note':'COM force times net displacement per outer step, including contact projection; diagnostic estimate, not an exact substep energy ledger.'}
 out=src.with_name(src.stem+'-measurements.json'); out.write_text(json.dumps(summary,indent=2)+'\n'); print(json.dumps({k:v for k,v in summary.items() if k!='component_sizes'},indent=2))

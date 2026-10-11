@@ -1,0 +1,26 @@
+{
+  "capture_binary_build": "after local continuum contact fix; before display-only Scene method and renderer changes",
+  "rayon_threads": 4,
+  "sha256": {
+    "src/collision.rs": "1934d851bafe831a6928a995715e61c56e5fcada144e3645c851247f88f686e0",
+    "src/solver.rs": "127b30336aee5ae42f34260cdc812a7c19921754b0b3adc105b89c61074fc43a",
+    "src/tool.rs": "59db9f43971c6e1a490b5493e52654d328557a2a52b42198e0141d7edefbd5c9",
+    "src/fracture.rs": "bdd46253070af4764977db4630a3e6b4e03508c78c30e66061d4ef673e63bb1d",
+    "src/experiments.rs": "7d2ff6fd60c253540576daf5dd8fdf5e604c4c097fd835f434f0f6b4660fd9af",
+    "src/bin/knife_capture.rs": "ca3cc7648d1fe28d39268c484b229ee930196aed337d5cfbd219f1ccb19095f5",
+    "scenes/wood_chop.ron": "ed5b0193c5508f59687ba2e7e3ac3c397d6ac2727554be37d5385b8eb0a6114a",
+    "src/material.rs": "c31516c0d39c26d6b754033ed406cca538c7ddeb7a640753189f5f2ce95c8497",
+    "target/release/knife_capture": "2131c334e8ee5ef28d1afcca1147aa917f6a30025f0790b6c36f04c5868032e7"
+  },
+  "final_source_and_trace_sha256": {
+    "src/scene.rs": "3eb4d02d6bfada9c14e91827b6ef6df9004721921de6ebecb375d7b99618b0e0",
+    "src/render.rs": "48fb8d37ed45b0a261720507c3acc4245e27f47cb4209fc02fbe2fd44783fb84",
+    "README.md": "ed769609a511e0d7dc8fddd4b993b2a7530fae5c24ca6a63a56d33ef02ca6eb6",
+    "validation/render_knife.py": "31e79c7b17121fa042e52c1be7505f5e2449314f8363c0e562b9d655d16e0016",
+    "validation/encode_long_capture.py": "6804106b74a0cc19783af36ab708a1aca42cb8cc44d88283aa03bbe79e35c0f9",
+    "validation/analyze_force_capture.py": "172fffa0f2c858253499550ac6acfe1a6ce88bbf7b03c072fad54729d3b2cc04",
+    "validation/verify_knife_video.py": "e93fe45bab46911cb2da10c2dc59e893a2e2125d18fcb8fbcdf6989e8c455b97",
+    "validation/report_local_capture.py": "165de0c54fdeb4fda91725eb5c7a8c88f5f61785981a03a5f3df0011070a2962",
+    "validation/knife-local.csv": "20b4d6359acc0049c383d386ab9e30aa46b9a1bd98c31953fb59a0ce69899376"
+  }
+}

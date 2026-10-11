@@ -61,7 +61,8 @@ measurement_path = Path(SRC).with_name(Path(SRC).stem+'-measurements.json')
 energy_failed = False
 if measurement_path.exists():
     measurement = json.loads(measurement_path.read_text())
-    gap = measurement.get('energy_gap_after_drive_work_estimate_J', 0)
+    gap = max(abs(measurement.get('energy_gap_after_drive_work_estimate_J', 0)),
+              measurement.get('max_abs_recorded_energy_gap_J', 0))
     reference = measurement.get('initial_accounted_energy_J', 0)+abs(measurement.get('drive_work_estimate_J', 0))
     energy_failed = abs(gap) > max(1.0, reference*0.01)
 

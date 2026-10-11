@@ -1,0 +1,17 @@
+{
+  "full_decode_passed": true,
+  "physical_seconds": 6.0,
+  "saved_states": 190,
+  "first_state": 0,
+  "last_state": 6000,
+  "mp4_frames_including_final_hold": 191,
+  "mp4_duration_seconds": 17.1,
+  "gif_frames": 190,
+  "gif_duration_seconds": 17.08,
+  "resolution": [
+    1440,
+    900
+  ],
+  "codec": "h264",
+  "pixel_format": "yuv420p"
+}

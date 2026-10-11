@@ -150,6 +150,15 @@ slows the contact interval 20 times and the rest twice. See the saved measuremen
 and run log for final connectivity and energy results; bond damage alone does
 not establish a complete cut or a validated energy balance.
 
+The completed recording has 894 broken bonds and two components (4319 + 1 REV),
+with no more than two components throughout the saved trace. It took 1226.6 s
+to compute 6 s of physical time and encodes to a 17.1 s diagnostic MP4. Full
+decoding passed. The peak recorded energy-accounting gap is 45.62 J during
+impact, so this is a partial-fracture result, not validated complete cutting.
+The applied world-space force remains active after the free blade leaves
+contact; its final speed must not be interpreted as a cutting speed.
+See `validation/knife-local-report.md` for the exact conditions and limits.
+
 ## Repository map
 
 - `src/scene.rs`, `src/voxel.rs`, `src/material.rs`: REV state, composition,

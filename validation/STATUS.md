@@ -14,6 +14,8 @@
 | Compression | PASS, parallel/perpendicular force ratio 25.877× |
 | Bending | PASS, 9/9 bonds cut in one cross-section at 3.9 kN; residual 8.178×10⁻⁶ |
 | 4 m/s pilot, 0.5 s after contact | 812 broken bonds, two pieces of 4318 and 2 REV |
+| 4 m/s, 6 s capture, 12 N/s to 60 N | 894 broken bonds; two pieces of 4319 and 1 REV; maximum two components throughout the saved trace |
+| Encoded capture | PASS, 17.10 s MP4 at 1440×900 and 17.08 s GIF; all frames decoded |
 | Complete blade severing | NOT VERIFIED; a band of damaged bonds is not a complete cut |
 | Energy balance | NOT VALIDATED; contact dissipation and projection/integration work need a complete ledger |
 
