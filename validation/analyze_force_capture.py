@@ -2,8 +2,10 @@
 import csv, math, json, sys
 from pathlib import Path
 src=Path(sys.argv[1]); frames={}; load={}; energy={}; quats={}; broken={}; count={}; ramp=None; header=None
+initial_positions={}; final_positions={}; peak_displacement=0.0; fixed_drift=0.0
 for r in csv.reader(src.open()):
- if r[0]=='H': header=r
+ if r[0]=='H':
+  header=r; nx,ny,_=map(int,r[3:6]); anchors={0,nx-1,nx*(ny-1),nx*ny-1}
  elif r[0]=='R': ramp=list(map(float,r[1:4]))
  elif r[0]=='F': frames[int(r[1])]=list(map(float,r[2:]))
  elif r[0]=='L': load[int(r[1])]=list(map(float,r[2:]))
@@ -13,6 +15,11 @@ for r in csv.reader(src.open()):
  elif r[0]=='V':
   n=int(r[1]); count[n]=count.get(n,0)+1
   assert all(math.isfinite(float(x)) for x in r[3:7]), 'nonfinite voxel state'
+  i=int(r[2]); p=tuple(map(float,r[3:6])); final_positions[i]=p
+  if n==0: initial_positions[i]=p
+  displacement=math.sqrt(sum((a-b)**2 for a,b in zip(p,initial_positions[i])))
+  peak_displacement=max(peak_displacement,displacement)
+  if i in anchors: fixed_drift=max(fixed_drift,displacement)
 keys=sorted(frames); last=keys[-1]; dt=float(header[2]); nx,ny,nz=map(int,header[3:6]); size=nx*ny*nz
 assert all(count.get(n)==size and n in quats and n in load and n in energy for n in keys)
 assert all(abs(sum(x*x for x in q)-1)<2e-5 for q in quats.values())
@@ -23,6 +30,7 @@ for n in keys:
  expected=ramp[0]*max(0,min(1,((n-.5)*dt-ramp[2])/ramp[1])) if n else 0
  errors.append(abs(expected-load[n][0]))
 assert max(errors)<0.001, 'force ramp differs from requested load'
+assert fixed_drift<1e-7, 'fixed support moved'
 parent=list(range(size))
 def find(i):
  while parent[i]!=i:
@@ -50,6 +58,10 @@ summary={'physical_seconds':last*dt,'post_contact_seconds':last*dt-ramp[2], 'sna
  'component_size_histogram':dict(sorted(Counter(sizes).items())),
  'largest_component_voxels':sizes[0],'singleton_components':sizes.count(1),
  'peak_recorded_voxel_speed_m_s':max(v[11] for v in frames.values()),
+ 'peak_recorded_stress_ratio':max(v[20] for v in frames.values()),
+ 'peak_recorded_voxel_displacement_m':peak_displacement,
+ 'final_max_voxel_displacement_m':max(math.sqrt(sum((a-b)**2 for a,b in zip(p,initial_positions[i]))) for i,p in final_positions.items()),
+ 'max_fixed_support_drift_m':fixed_drift,
  'final_tool_speed_m_s':math.sqrt(sum(x*x for x in f[3:6])),
  'initial_accounted_energy_J':budget(keys[0]),'final_accounted_energy_J':budget(last),
  'final_energy_reservoirs_J':dict(zip(['wood_kinetic','tool_kinetic','pending_release','surface_work','damage_heat','plastic_heat','stored_plastic','elastic'],[f[12],f[13],f[15],f[16],f[17],f[18],f[19],energy[last][1]])),

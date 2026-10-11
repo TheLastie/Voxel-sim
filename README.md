@@ -109,6 +109,16 @@ The work estimate includes net COM displacement across contact projection and
 does not replace a substep energy ledger. The current force experiment exposes
 a large energy imbalance and widespread fragmentation; it is diagnostic data.
 
+For a gentler comparison, use a 1 m/s approach and a five-second ramp to 20 N
+(4 N/s rather than 125 N/s), keeping the wood and solver settings unchanged:
+
+```sh
+RAYON_NUM_THREADS=1 cargo run --release --no-default-features --bin knife_capture -- validation/knife-gentle.csv 1 6000 50 0 1 0 20 5
+python3 validation/analyze_force_capture.py validation/knife-gentle.csv
+python3 validation/render_knife.py validation/knife-gentle.csv validation/knife-gentle-final.png video
+python3 validation/encode_long_capture.py knife-gentle
+```
+
 ## Repository map
 
 - `src/scene.rs`, `src/voxel.rs`, `src/material.rs`: REV state, composition,

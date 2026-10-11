@@ -11,7 +11,7 @@ rows = list(csv.reader(Path(f'validation/{prefix}.csv').open()))
 frames = sorted(int(r[1]) for r in rows if r[0] == 'F')
 durations = []
 slow_motion = []
-base_slowdown = 2 if prefix == 'knife-ramp' else 1
+base_slowdown = 2 if prefix in ('knife-ramp', 'knife-gentle') else 1
 for a, b in zip(frames, frames[1:]):
     dt = (b-a)*0.001
     overlap = max(0.0, min(b*0.001, 1.24)-max(a*0.001, 0.96))

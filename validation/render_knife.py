@@ -238,8 +238,8 @@ def render(n, dst):
     d.text((44,65), f'1 cm REV  •  {max(frames)*DT:.3f} s physical run  •  Exact poses / bonds' if schema>=2 else '1 cm cells shown individually  •  Saved solver states  •  20 ms physical run',
            font=small, fill=(145,163,184))
     d.rounded_rectangle(STAGE, radius=16, fill=(17,25,36), outline=(39,52,68), width=2)
-    if saved_load and n*DT > 1.8:
-        d.text((STAGE[0]+15,STAGE[1]+12),f'Camera zooms out with wood cloud / {CELL/scale*1000:.2f} mm per pixel',font=mini,fill=(161,177,196))
+    if saved_load and n*DT > 1.8 and scale < contact_camera[0]*0.98:
+        d.text((450,95),f'Camera follows specimen extent / {CELL/scale*1000:.2f} mm per pixel',font=mini,fill=(161,177,196))
 
     items = []
     for voxel, center in zip(wood, wood_centers):
