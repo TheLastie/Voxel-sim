@@ -334,6 +334,7 @@ impl Renderer {
         ui: &[Rect],
         show_bonds: bool,
     ) -> Result<(), wgpu::SurfaceError> {
+        let damage = scene.incident_bond_damage();
         let mut instances: Vec<_> = scene
             .positions
             .iter()
@@ -341,8 +342,13 @@ impl Renderer {
             .map(|(i, &p)| {
                 let color = if scene.voxels[i].mass.is_infinite() {
                     [0.24, 0.28, 0.3, 1.]
+                } else if damage[i].1 >= 2 {
+                    [0.83, 0.28, 0.24, 1.]
+                } else if damage[i].1 == 1 {
+                    [0.92, 0.52, 0.24, 1.]
                 } else {
-                    [0.55, 0.32, 0.12, 1.]
+                    let d = damage[i].0;
+                    [0.55 + 0.39*d, 0.32 + 0.43*d, 0.12 + 0.18*d, 1.]
                 };
                 Instance::cube(p, scene.rotations[i], color)
             })

@@ -1,5 +1,29 @@
 # Acceptance status
 
+## 2026-10-11: local contacts and derived damage colors
+
+| Check | Result |
+|---|---|
+| Physics library | PASS, 30 unit tests |
+| Contact/motion smoke tests | PASS, 5 checks |
+| Rigidly rotated intact 3³ sample | PASS, no internal AABB projection |
+| Crack and nonlocal self-contact exclusions | PASS, broken face and remote pairs remain eligible for contact |
+| Damage display | PASS, intact outside faces stay intact; both endpoints show partial damage and broken bonds |
+| Desktop build | PASS, `cargo check --offline`; GPU/window runtime not measured |
+| Tension | PASS, parallel/perpendicular force ratio 39.458× |
+| Compression | PASS, parallel/perpendicular force ratio 25.877× |
+| Bending | PASS, 9/9 bonds cut in one cross-section at 3.9 kN; residual 8.178×10⁻⁶ |
+| 4 m/s pilot, 0.5 s after contact | 812 broken bonds, two pieces of 4318 and 2 REV |
+| Complete blade severing | NOT VERIFIED; a band of damaged bonds is not a complete cut |
+| Energy balance | NOT VALIDATED; contact dissipation and projection/integration work need a complete ledger |
+
+The force-ramp recording and final diagnostics are in `knife-local-run.txt`
+and `knife-local-measurements.json`. There is no fragment-count clamp, material
+strength reduction, or prescribed fracture plane. The capture keeps the
+material inputs and fracture parameters used by the earlier recordings.
+
+## Earlier checkpoint
+
 Current checkpoint after fixing knife contact loading and mixed wood fracture.
 
 | Check | Result |

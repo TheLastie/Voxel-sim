@@ -1,0 +1,15 @@
+{
+  "capture_binary_build": "after local continuum contact fix; before display-only Scene method and renderer changes",
+  "rayon_threads": 4,
+  "sha256": {
+    "src/collision.rs": "1934d851bafe831a6928a995715e61c56e5fcada144e3645c851247f88f686e0",
+    "src/solver.rs": "127b30336aee5ae42f34260cdc812a7c19921754b0b3adc105b89c61074fc43a",
+    "src/tool.rs": "59db9f43971c6e1a490b5493e52654d328557a2a52b42198e0141d7edefbd5c9",
+    "src/fracture.rs": "bdd46253070af4764977db4630a3e6b4e03508c78c30e66061d4ef673e63bb1d",
+    "src/experiments.rs": "7d2ff6fd60c253540576daf5dd8fdf5e604c4c097fd835f434f0f6b4660fd9af",
+    "src/bin/knife_capture.rs": "ca3cc7648d1fe28d39268c484b229ee930196aed337d5cfbd219f1ccb19095f5",
+    "scenes/wood_chop.ron": "ed5b0193c5508f59687ba2e7e3ac3c397d6ac2727554be37d5385b8eb0a6114a",
+    "src/material.rs": "c31516c0d39c26d6b754033ed406cca538c7ddeb7a640753189f5f2ce95c8497",
+    "target/release/knife_capture": "2131c334e8ee5ef28d1afcca1147aa917f6a30025f0790b6c36f04c5868032e7"
+  }
+}

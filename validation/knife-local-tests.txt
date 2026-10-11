@@ -1,0 +1,40 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling voxel-physics-lab v0.2.0 (/workspace/scratch/2cecc6c5f3ec/voxel-sim)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.69s
+     Running unittests src/lib.rs (target/debug/deps/voxel_physics_lab-ea57a9f4856a5c80)
+
+running 30 tests
+test collision::tests::local_exclusion_does_not_hide_a_crack_or_remote_self_contact ... ok
+test collision::tests::moving_voxel_cannot_tunnel_through_fixed_voxel ... ok
+test fracture::tests::brittle_failure_has_no_plasticity ... ok
+test fracture::tests::cyclic_subcritical_load_accumulates_damage ... ok
+test collision::tests::rigidly_rotated_continuum_has_no_internal_box_contacts ... ok
+test fracture::tests::energy_removed_is_not_duplicated ... ok
+test fracture::tests::small_release_does_not_reverse_approaching_pair ... ok
+test fracture::tests::mixed_wood_shear_failure_does_not_wait_for_higher_yield_stress ... ok
+test fracture::tests::release_conserves_momentum_and_adds_only_budgeted_energy ... ok
+test scene::damage_display_tests::original_boundary_is_intact_and_both_crack_endpoints_show_damage ... ok
+test fracture::tests::sustained_subcritical_load_does_not_count_as_cycles ... ok
+test solver::tests::actual_vertical_wood_bonds_are_stronger_than_horizontal_bonds ... ok
+test fracture::tests::wood_has_tension_and_compression_anisotropy ... ok
+test solver::tests::fracture_release_respects_fixed_axes_and_accounts_for_heat ... ok
+test solver::tests::damage_splits_connectivity ... ok
+test solver::tests::external_actions_reject_fixed_and_missing_voxels ... ok
+test solver::tests::stiffness_has_shear_and_is_symmetric ... ok
+test solver::tests::persistent_force_and_acceleration_use_voxel_mass ... ok
+test solver::tests::velocity_and_impulse_are_mass_consistent ... ok
+test collision::tests::unbonded_voxels_cannot_tunnel_through_each_other ... ok
+test solver::tests::rest_and_rigid_rotation_have_no_strain ... ok
+test collision::tests::free_fall_has_no_invisible_ground ... ok
+test solver::tests::coupled_solve_has_uniform_axial_traction ... ok
+test collision::tests::initially_overlapping_voxels_are_projected_to_touching ... ok
+test tool::tests::external_force_accelerates_and_persists_on_rigid_voxel_group ... ok
+test tool::tests::off_center_contact_preserves_linear_and_angular_momentum ... ok
+test solver::tests::equilibrium_does_not_break ... ok
+test tool::tests::one_cube_contact_does_not_turn_overlap_correction_into_energy ... ok
+test fracture::tests::metal_yields_heats_and_only_then_tears ... ok
+test tool::tests::tapered_blade_uses_center_of_mass_and_preserves_geometry ... ok
+
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.41s
+

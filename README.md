@@ -119,6 +119,37 @@ python3 validation/render_knife.py validation/knife-gentle.csv validation/knife-
 python3 validation/encode_long_capture.py knife-gentle
 ```
 
+## Local fracture and damage display
+
+The 20 N / 1 m/s capture remained below the wood failure threshold and did not
+demonstrate a cut. The desktop renderer also used a constant wood color even
+after bonds broke. It now derives color from all incident original bonds:
+partial damage is yellow, one broken bond is orange, and multiple broken bonds
+are red. Original outside faces are intact, and both crack endpoints are shown.
+These colors represent bond state, not temperature.
+
+Contact projection no longer treats intact edge/corner neighbors inside an
+elementary lattice cell as independent boxes. Exclusion requires a monotone
+path of intact face bonds within that original cell; it cannot bypass a broken
+face or disable contact between remote parts of a connected body. This removes
+spurious local contact under rigid rotation without imposing a fragment limit.
+The remaining contact geometry is still an AABB approximation.
+
+The new six-second diagnostic uses a 4 m/s impact followed by a 12 N/s force
+ramp to 60 N. Material properties and fracture parameters remain unchanged:
+
+```sh
+RAYON_NUM_THREADS=4 cargo run --release --no-default-features --bin knife_capture -- validation/knife-local.csv 4 6000 50 0 1 0 60 5
+python3 validation/analyze_force_capture.py validation/knife-local.csv
+python3 validation/render_knife.py validation/knife-local.csv validation/knife-local-final.png video
+python3 validation/encode_long_capture.py knife-local
+```
+
+Physical time is one second of approach and five seconds after contact. Playback
+slows the contact interval 20 times and the rest twice. See the saved measurements
+and run log for final connectivity and energy results; bond damage alone does
+not establish a complete cut or a validated energy balance.
+
 ## Repository map
 
 - `src/scene.rs`, `src/voxel.rs`, `src/material.rs`: REV state, composition,

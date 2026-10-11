@@ -25,6 +25,17 @@ assert all(count.get(n)==size and n in quats and n in load and n in energy for n
 assert all(abs(sum(x*x for x in q)-1)<2e-5 for q in quats.values())
 assert all(math.isfinite(x) for v in frames.values() for x in v)
 assert all(load[b][0]>=load[a][0] for a,b in zip(keys,keys[1:]))
+previous_broken=set()
+for n in keys:
+ current=set(broken.get(n,[]))
+ assert len(current)==len(broken.get(n,[]))==int(frames[n][9]), 'broken bond count mismatch'
+ assert previous_broken.issubset(current), 'this fixture has no bond healing'
+ for i,j in current:
+  assert 0<=i<j<size, 'invalid broken endpoint'
+  assert ((j-i==1 and i%nx<nx-1) or
+          (j-i==nx and (i//nx)%ny<ny-1) or
+          (j-i==nx*ny and i//(nx*ny)<nz-1)), 'broken bond is not an original face neighbor'
+ previous_broken=current
 errors=[]
 for n in keys:
  expected=ramp[0]*max(0,min(1,((n-.5)*dt-ramp[2])/ramp[1])) if n else 0
@@ -55,6 +66,7 @@ summary={'physical_seconds':last*dt,'post_contact_seconds':last*dt-ramp[2], 'sna
  'force_peak_N':ramp[0],'ramp_duration_seconds':ramp[1],'hold_seconds':last*dt-ramp[2]-ramp[1],
  'force_error_max_N':max(errors),'drive_work_estimate_J':load[last][1],
  'broken_bonds':int(f[9]),'components':len(sizes),'component_sizes':sizes,
+ 'max_recorded_components':max(int(v[10]) for v in frames.values()),
  'component_size_histogram':dict(sorted(Counter(sizes).items())),
  'largest_component_voxels':sizes[0],'singleton_components':sizes.count(1),
  'peak_recorded_voxel_speed_m_s':max(v[11] for v in frames.values()),

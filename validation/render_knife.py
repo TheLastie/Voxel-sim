@@ -242,12 +242,20 @@ def render(n, dst):
         d.text((450,95),f'Camera follows specimen extent / {CELL/scale*1000:.2f} mm per pixel',font=mini,fill=(161,177,196))
 
     items = []
+    # Schema 2 has exact broken endpoints: both sides of a crack must be colored,
+    # including the endpoint whose outgoing positive-axis bonds remain intact.
+    broken_incidence = {}
+    for i,j in saved_b.get(n,[]):
+        broken_incidence[i] = broken_incidence.get(i,0)+1
+        broken_incidence[j] = broken_incidence.get(j,0)+1
     for voxel, center in zip(wood, wood_centers):
         i, x, y, z, damage, lost = voxel
         # lost is an aggregate of missing positive-axis neighbor bonds; remove
         # the specimen boundaries from the count before coloring.
         gx, gy, gz = i%12, (i//12)%12, i//144
         lost = max(0, lost-(gx==11)-(gy==11)-(gz==29))
+        if schema >= 2:
+            lost = broken_incidence.get(i,0)
         if lost >= 2:
             base = (212,72,62)
         elif lost == 1:
@@ -353,11 +361,22 @@ def render(n, dst):
         d.text((bx, 505), f'Force: {force:.1f} N   Work estimate: {work:.1f} J', font=small, fill=(238,190,115))
 
     d.text((bx,535),'Bond / material state',font=small,fill=(164,180,199))
-    legend=[((113,153,111),'Intact bonds'),((239,190,76),'Damaged bonds'),((235,133,62),'Multiple broken bonds'),((239,74,77),'Visible local separation'),((177,196,218),'Steel REV')]
-    for j,(color,label) in enumerate(legend):
+    legend=[((113,153,111),'Intact bonds'),((239,190,76),'Damaged bonds'),((235,133,62),'One broken bond'),((212,72,62),'Multiple broken bonds'),((239,74,77),'Visible local separation'),((177,196,218),'Steel REV')]
+    for j,(color,label) in enumerate([] if saved_load else legend):
         yy=565+j*30
         d.rectangle((bx,yy,bx+18,yy+18),fill=color,outline=(35,47,60))
         d.text((bx+29,yy-2),label,font=small,fill=(185,197,211))
+    # The force graph occupies the right-hand legend area. Keep a compact
+    # state legend below the specimen so fracture colors remain explained.
+    if saved_load:
+        lx, ly = 60, 839
+        d.text((lx,ly),'Bonds:',font=mini,fill=(164,180,199))
+        lx += 58
+        for color,label in zip([item[0] for item in legend],
+                               ['Intact','Damage','1 broken','2+ broken','Open gap','Steel']):
+            d.rectangle((lx,ly+2,lx+13,ly+15),fill=color)
+            d.text((lx+20,ly),label,font=mini,fill=(185,197,211))
+            lx += 38 + d.textlength(label,font=mini)
     if saved_load:
         d.rectangle((bx,530,bx+448,715),fill=(13,19,28))
         d.text((bx,535),'APPLIED FORCE / PHYSICAL TIME',font=small,fill=(164,180,199))

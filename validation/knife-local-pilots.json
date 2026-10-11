@@ -1,0 +1,51 @@
+[
+  {
+    "capture": "knife-local-pilot",
+    "speed_m_s": 3,
+    "physical_seconds": 0.5,
+    "broken_bonds": 0,
+    "component_sizes": [
+      4320
+    ],
+    "peak_recorded_stress_ratio": 0.8863567,
+    "energy_gap_J": -29.712112352710513
+  },
+  {
+    "capture": "knife-local-mid",
+    "speed_m_s": 4,
+    "physical_seconds": 0.5,
+    "broken_bonds": 812,
+    "component_sizes": [
+      4318,
+      2
+    ],
+    "peak_recorded_stress_ratio": 1.8029343,
+    "energy_gap_J": -12.688535216658975
+  },
+  {
+    "capture": "knife-local-fast",
+    "speed_m_s": 6,
+    "physical_seconds": 0.2,
+    "broken_bonds": 1062,
+    "component_sizes": [
+      4295,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "peak_recorded_stress_ratio": 3.020362,
+    "energy_gap_J": -19.881781818099757
+  }
+]
