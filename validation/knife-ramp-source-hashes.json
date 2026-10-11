@@ -1,0 +1,14 @@
+{
+  "README.md": "6fe17e8b332722b5b431f3c22ce2b46f62d5b54576e0f17f03f8d5d1d0f02071",
+  "src/experiments.rs": "7d2ff6fd60c253540576daf5dd8fdf5e604c4c097fd835f434f0f6b4660fd9af",
+  "src/bin/knife_capture.rs": "ca3cc7648d1fe28d39268c484b229ee930196aed337d5cfbd219f1ccb19095f5",
+  "src/tool.rs": "59db9f43971c6e1a490b5493e52654d328557a2a52b42198e0141d7edefbd5c9",
+  "src/solver.rs": "127b30336aee5ae42f34260cdc812a7c19921754b0b3adc105b89c61074fc43a",
+  "src/collision.rs": "b80b60fca39becca16319ace94899fca4c2b3dffd16989fa325951d8b36d494c",
+  "src/fracture.rs": "bdd46253070af4764977db4630a3e6b4e03508c78c30e66061d4ef673e63bb1d",
+  "validation/render_knife.py": "15c16c5766b582fd9110d0372c2398f712cc11ca836c1e40b795fe14a4593f4a",
+  "validation/encode_long_capture.py": "4f9ceb23e1b0cd5f87fdc6f7c9f6ef6a8be9ed392af7373e25ab257b860e8cfe",
+  "validation/analyze_force_capture.py": "8226de4578b9d75c7687c2c17af2174b27a4fc1283fa84d51ada1ff0e126a8ad",
+  "target/release/knife_capture": "46beed76f1d49621c5a4f47eceb4e6e4576bb2a0486e9b0569956ceb48ee129b",
+  "validation/knife-ramp.csv": "6b78ec28f9127f2886fca8a15a9ff6fbcc7d7b0671fa3cbb3e62a8d9cd89b556"
+}

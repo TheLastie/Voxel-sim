@@ -86,6 +86,29 @@ cargo run --release --bin voxel-physics-lab
 The full mechanical sequence includes a bending case that can exceed memory in
 constrained environments; run fixtures individually to inspect each result.
 
+## Longer force-ramp capture
+
+The capture CLI accepts `path speed frames stride pitch approach roll peak_force ramp_seconds`.
+Angles are in degrees, speed in m/s, force in N, and durations in seconds.
+The optional force defaults to zero. A nonzero force acts through the blade's
+center of mass in the initial strike direction, ramps after the approach,
+and remains at its peak until the run ends, including after separation.
+Velocity and rotation remain dynamic. This contact fixture disables gravity.
+
+```sh
+RAYON_NUM_THREADS=1 cargo run --release --no-default-features --bin knife_capture -- validation/knife-ramp.csv 6 6000 50 0 1 0 500 4
+python3 validation/analyze_force_capture.py validation/knife-ramp.csv
+python3 validation/render_knife.py validation/knife-ramp.csv validation/knife-ramp-final.png video
+python3 validation/encode_long_capture.py knife-ramp
+```
+
+This records one second of approach and five seconds after contact: a four-second
+ramp to 500 N followed by a one-second hold. `L` records the applied force and
+an estimate of accumulated actuator work; `R` records the ramp parameters.
+The work estimate includes net COM displacement across contact projection and
+does not replace a substep energy ledger. The current force experiment exposes
+a large energy imbalance and widespread fragmentation; it is diagnostic data.
+
 ## Repository map
 
 - `src/scene.rs`, `src/voxel.rs`, `src/material.rs`: REV state, composition,

@@ -408,11 +408,20 @@ pub fn capture_knife(
     attack_angle_degrees: f32,
     approach_seconds: f32,
     roll_degrees: f32,
+    ramp_force_newtons: f32,
+    ramp_seconds: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::{
         fs::File,
         io::{BufWriter, Write},
     };
+    if !ramp_force_newtons.is_finite() || ramp_force_newtons < 0.0
+        || !ramp_seconds.is_finite() || ramp_seconds <= 0.0
+        || !approach_seconds.is_finite() || approach_seconds < 0.0
+        || !speed.is_finite() || speed < 0.0
+    {
+        return Err("capture requires finite nonnegative speed, approach and force, and positive ramp duration".into());
+    }
     let mut config = SceneConfig::load("scenes/wood_chop.ron")?;
     config.dimensions = [12, 12, 30];
     config.branch_dimensions = [0; 3];
@@ -505,9 +514,19 @@ pub fn capture_knife(
         writeln!(out, "T,{},{},{}", p.x, p.y, p.z)?;
     }
     let stride = stride.max(1);
+    let drive_direction = Quat::from_rotation_y(attack_angle_degrees.to_radians()) * -Vec3::X;
+    let mut drive_work = 0.0f64;
+    writeln!(out, "R,{ramp_force_newtons},{ramp_seconds},{approach_seconds}")?;
     for frame in 0..=frames {
         if frame > 0 {
+            // A real force through the blade COM, not a prescribed trajectory.
+            // Midpoint sampling integrates a linear ramp without a frame bias.
+            let time = (frame as f32 - 0.5) * scene.config.fixed_dt;
+            let force = ramp_force_newtons * ((time - approach_seconds) / ramp_seconds).clamp(0.0, 1.0);
+            let before = tool.as_ref().unwrap().position;
+            tool.as_mut().unwrap().set_external_force(drive_direction * force)?;
             solver::step_with_targets(&mut scene, &mut tool, &targets);
+            drive_work += (drive_direction * force).dot(tool.as_ref().unwrap().position - before) as f64;
         }
         if frame % 100 == 0 {
             eprintln!("frame={frame}/{frames} sim={:.3}s wall={:.3}s broken={} clusters={} residual={:.3e}",
@@ -520,6 +539,7 @@ pub fn capture_knife(
             continue;
         }
         let t = tool.as_ref().unwrap();
+        writeln!(out, "L,{frame},{},{drive_work}", t.external_force.length())?;
         writeln!(out, "Q,{frame},{},{},{},{}", t.rotation.x, t.rotation.y, t.rotation.z, t.rotation.w)?;
         let mut elastic_energy = 0.0f64;
         for axis in 0..3 {
