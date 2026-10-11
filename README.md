@@ -181,3 +181,45 @@ release solver step after reusing solver work buffers, down from 20.4 seconds;
 it still misses the 10 FPS target by a wide margin. Long strikes
 can propagate damage too broadly. See
 `validation/STATUS.md` for the latest verified checkpoint.
+
+### Floor, gravity and supports
+
+The desktop default is now `scenes/mounted_axe.ron`: 4,320 wood REVs,
+6,400 fixed floor REVs, gravity `(0, 0, -9.81)` m/s² and a 1 m/s axe.
+The floor surface is Z=0; support uses contacts with actual floor voxels.
+`--scene scenes/wood_chop.ron` selects the previous larger scene.
+The axe (key 1 / wedge) is mounted on a fixed-orientation linear guide through
+its rear base. It can move along the selected strike direction but cannot move
+sideways or rotate. The blue rail/base show this external support; the rail is
+not another collision body. Other tools remain free. This is a sliding mount,
+not a swinging hinge. Gravity still acts on free tools, wood and fragments.
+
+Persistent voxel constraints apply in ordinary `solver::step`, including contacts
+and fracture impulses. Coordinates are world coordinates in metres, axes 0/1/2
+are X/Y/Z. They preserve finite voxel mass on unconstrained axes.
+
+```rust
+solver::fix_voxel(&mut scene, i, [true, true, false])?; // current X/Y; free Z
+solver::fix_voxel_at(&mut scene, i, Vec3::new(0.0, 0.0, 0.1))?; // fix XYZ
+solver::fix_voxel_axis(&mut scene, i, 2, Some(0.2))?; // set only Z
+solver::fix_voxel_axes(&mut scene, i, [None, Some(0.0), Some(0.1)])?;
+solver::release_voxel(&mut scene, i)?;
+// Local base coordinate, world guide direction; locks rotation.
+tool.mount_base(local_base, Vec3::X)?;
+tool.mount_base(local_base, Vec3::ZERO)?; // completely fixed base
+// Detach; subsequent gravity and impulses act without support.
+tool.unmount();
+```
+
+Setting a constraint places that axis immediately at its target and clears its
+velocity. `fix_voxel_axes` replaces all three constraints; `fix_voxel_axis`
+changes just one. Nonfinite coordinates/invalid indices fail without mutation.
+Per-step target coordinates override persistent targets on specified axes;
+`None` retains persistent fixation. Call the release functions to free an axis.
+The historical `knife_capture` fixture remains an explicitly isolated benchmark
+without gravity/floor, rather than representing the desktop scene.
+
+Validation: `cargo test --no-default-features --lib --test supports` checks floor
+settling, partial-axis motion and release, constrained impulses, mounted contact
+reactions and complete base fixation/unmounting. Desktop compilation is checked
+separately; this update does not establish real-time performance or a complete cut.

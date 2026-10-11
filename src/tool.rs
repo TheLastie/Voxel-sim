@@ -13,6 +13,15 @@ pub enum Shape {
     Rod,
     Rounded,
 }
+/// A fixed-orientation support for a local base point. A unit direction permits
+/// sliding along one world axis; zero direction fixes the base completely.
+#[derive(Clone, Copy, Debug)]
+pub struct GuideMount {
+    pub local_base: Vec3,
+    pub world_base: Vec3,
+    pub direction: Vec3,
+    pub rotation: Quat,
+}
 /// A rigid voxel object. The collision law never branches on Shape.
 pub struct Tool {
     pub cells: Vec<Vec3>,
@@ -27,6 +36,7 @@ pub struct Tool {
     pub external_torque: Vec3,
     pub inverse_inertia: Vec3,
     pub color: [f32; 4],
+    pub mount: Option<GuideMount>,
 }
 impl Tool {
     pub fn new(shape: Shape, scene: &Scene, position: Vec3, direction: Vec3, speed: f32) -> Self {
@@ -94,6 +104,7 @@ impl Tool {
             external_torque: Vec3::ZERO,
             inverse_inertia: inertia.recip(),
             color,
+            mount: None,
         }
     }
     pub fn set_external_force(&mut self, force: Vec3) -> Result<(), &'static str> {
@@ -114,13 +125,44 @@ impl Tool {
         self.external_force = Vec3::ZERO;
         self.external_torque = Vec3::ZERO;
     }
+    /// Anchor a base to a fixed-orientation guide. Zero direction fixes all motion.
+    pub fn mount_base(&mut self, local_base: Vec3, direction: Vec3) -> Result<(), &'static str> {
+        if !local_base.is_finite() || !direction.is_finite() { return Err("mount coordinates must be finite"); }
+        let direction = direction.try_normalize().unwrap_or(Vec3::ZERO);
+        self.mount = Some(GuideMount { local_base, world_base: self.position + self.rotation * local_base,
+            direction, rotation: self.rotation });
+        self.velocity = self.project_translation(self.velocity);
+        self.angular_velocity = Vec3::ZERO;
+        Ok(())
+    }
+    pub fn unmount(&mut self) { self.mount = None; }
+    fn project_translation(&self, vector: Vec3) -> Vec3 {
+        self.mount.map_or(vector, |m| m.direction * m.direction.dot(vector))
+    }
+    fn linear_response(&self, impulse: Vec3) -> Vec3 { self.project_translation(impulse) / self.mass }
+    fn constrain_pose(&mut self) {
+        if let Some(m) = self.mount {
+            self.rotation = m.rotation;
+            let base = self.position + self.rotation * m.local_base;
+            self.position += m.world_base + m.direction * (base - m.world_base).dot(m.direction) - base;
+            self.velocity = self.project_translation(self.velocity);
+            self.angular_velocity = Vec3::ZERO;
+        }
+    }
+    fn contact_correction(&self, normal: Vec3, penetration: f32) -> Vec3 {
+        let projected = self.project_translation(normal);
+        let mobility = normal.dot(projected);
+        if mobility > 1e-6 { -projected * penetration / mobility } else { Vec3::ZERO }
+    }
     pub fn world_cells(&self) -> impl Iterator<Item = Vec3> + '_ {
         self.cells
             .iter()
             .map(|&p| self.position + self.rotation * p)
     }
     fn angular_response(&self, torque: Vec3) -> Vec3 {
-        self.rotation * (self.inverse_inertia * (self.rotation.conjugate() * torque))
+        if self.mount.is_some() { Vec3::ZERO } else {
+            self.rotation * (self.inverse_inertia * (self.rotation.conjugate() * torque))
+        }
     }
     /// Finite rigid mass, friction and angular impulse, with equal/opposite reaction.
     /// Microsteps prevent tunnelling through a 1 cm REV at typical strike speeds.
@@ -130,10 +172,11 @@ impl Tool {
         dt: f32,
         targets: &[[Option<f32>; 3]],
     ) -> Vec<Vec3> {
+        self.constrain_pose();
         let mut contact_velocity = vec![Vec3::ZERO; scene.positions.len()];
         let tool_radius = self.cells.iter().map(|p| p.length()).fold(0.0, f32::max);
         let gravity = Vec3::from_array(scene.config.gravity);
-        let linear_acceleration = gravity + self.external_force / self.mass;
+        let linear_acceleration = self.project_translation(gravity + self.external_force / self.mass);
         let angular_acceleration = self.angular_response(self.external_torque);
         let linear_distance =
             self.velocity.length() * dt + 0.5 * linear_acceleration.length() * dt * dt;
@@ -214,7 +257,7 @@ impl Tool {
                                         0.0
                                     };
                                     let denom = wi
-                                        + self.mass.recip()
+                                        + n.dot(self.linear_response(n))
                                         + n.dot(self.angular_response(arm.cross(n)).cross(arm));
                                     if closing > 0.0 {
                                         // This is a persistent, multi-point manifold. Applying
@@ -249,7 +292,7 @@ impl Tool {
                                             0.0
                                         };
                                         let tangent_denom = tangent_voxel_w
-                                            + self.mass.recip()
+                                            + tangent_dir.dot(self.linear_response(tangent_dir))
                                             + tangent_dir.dot(
                                                 self.angular_response(arm.cross(tangent_dir))
                                                     .cross(arm),
@@ -262,7 +305,7 @@ impl Tool {
                                         let voxel_delta_v = impulse * free / scene.voxels[i].mass;
                                         scene.voxels[i].velocity += voxel_delta_v;
                                         contact_velocity[i] += voxel_delta_v;
-                                        self.velocity -= impulse / self.mass;
+                                        self.velocity -= self.linear_response(impulse);
                                         self.angular_velocity -=
                                             self.angular_response(arm.cross(impulse));
                                     }
@@ -270,7 +313,7 @@ impl Tool {
                                     // non-penetration without turning depenetration into energy.
                                     if penetration > max_penetration {
                                         max_penetration = penetration;
-                                        correction = -n * penetration;
+                                        correction = self.contact_correction(n, penetration);
                                     }
                                 }
                             }
@@ -281,6 +324,7 @@ impl Tool {
             // Keep projection separate from momentum. The contact impulses
             // carry the load into the bonded material; this only removes overlap.
             self.position += correction;
+            self.constrain_pose();
             // Multiple nearby surface contacts can constrain different axes.
             // Reproject the rigid shape as a whole until every sampled OBB/AABB
             // pair is clear, rather than leaving a corner embedded after one pass.
@@ -304,7 +348,7 @@ impl Tool {
                                     };
                                     if penetration > max_penetration {
                                         max_penetration = penetration;
-                                        correction = -normal * penetration;
+                                        correction = self.contact_correction(normal, penetration);
                                     }
                                 }
                             }
@@ -315,6 +359,7 @@ impl Tool {
                     break;
                 }
                 self.position += correction;
+                self.constrain_pose();
             }
         }
         contact_velocity

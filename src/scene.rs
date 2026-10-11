@@ -38,6 +38,11 @@ impl SceneConfig {
             || result.ground_dimensions.contains(&0)
             || result.tool_dimensions.iter().any(|&n| n < 2)
             || !(0.0..=1.0).contains(&result.anisotropy)
+            || !Vec3::from_array(result.gravity).is_finite()
+            || !Vec3::from_array(result.tool_start).is_finite()
+            || !result.initial_speed.is_finite()
+            || result.initial_speed < 0.0
+            || !Vec3::from_array(result.fibers).is_finite()
             || !result.fixed_dt.is_finite()
             || result.fixed_dt <= 0.0
             || result.substeps == 0
@@ -63,6 +68,8 @@ pub struct Scene {
     pub external_forces: Vec<Vec3>,
     /// Persistent per-voxel acceleration inputs in m/s².
     pub external_accelerations: Vec<Vec3>,
+    /// Persistent world-coordinate constraints; None leaves an axis free.
+    pub axis_targets: Vec<[Option<f32>; 3]>,
     pub positions: Vec<Vec3>,
     pub rest_positions: Vec<Vec3>,
     pub previous: Vec<Vec3>,
@@ -219,6 +226,7 @@ impl Scene {
             config,
             external_forces: vec![Vec3::ZERO; n],
             external_accelerations: vec![Vec3::ZERO; n],
+            axis_targets: vec![[None; 3]; n],
             previous: positions.clone(),
             rest_positions: positions.clone(),
             positions,

@@ -19,7 +19,12 @@ use winit::{
 };
 
 fn launch(shape: Shape, scene: &Scene, ui: &Ui) -> Tool {
-    Tool::new(shape, scene, ui.start(), ui.direction(), ui.speed)
+    let mut tool = Tool::new(shape, scene, ui.start(), ui.direction(), ui.speed);
+    if matches!(shape, Shape::Wedge) {
+        let rear = tool.cells.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+        tool.mount_base(Vec3::new(rear, 0.0, 0.0), ui.direction()).expect("finite guide");
+    }
+    tool
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
@@ -27,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .windows(2)
         .find(|p| p[0] == "--scene")
         .map(|p| p[1].as_str())
-        .unwrap_or("scenes/wood_chop.ron");
+        .unwrap_or("scenes/mounted_axe.ron");
     let config = SceneConfig::load(path)?;
     let mut scene = Scene::new(config.clone());
     let mut ui = Ui::new(config.initial_speed, Vec3::from_array(config.tool_start));
@@ -77,6 +82,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut renderer = pollster::block_on(Renderer::new(window.clone()))?;
     let mut camera = Camera::new();
+    let height = config.dimensions[2] as f32 * scene::CELL;
+    camera.target = Vec3::Z * (height * 0.5);
+    camera.radius = (height * 1.5).max(config.ground_dimensions[0].max(config.ground_dimensions[1]) as f32 * scene::CELL * 1.6);
     let mut tool = None;
     let mut pointer = (0.0f32, 0.0f32);
     let mut orbit = false;
