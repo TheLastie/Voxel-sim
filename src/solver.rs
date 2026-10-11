@@ -323,11 +323,6 @@ pub fn step_with_axis_targets_and_loads(
                 break;
             }
         }
-        for (p, v) in scene.positions.iter_mut().zip(&scene.voxels) {
-            if v.mass.is_finite() {
-                p.z = p.z.max(scene.ground_top + CELL * 0.5);
-            }
-        }
         // Preserve the accurately integrated drift velocity. Recover only the
         // velocity correction from the much smaller constraint displacement;
         // subtracting two large f32 positions every step otherwise accumulates
@@ -401,7 +396,7 @@ pub fn step_with_axis_targets_and_loads(
             // Run a zero-time geometric/impulse pass before leaving the substep.
             let _ = t.advance(scene, 0.0, targets);
         }
-        apply_releases(scene);
+        apply_releases(scene, targets);
         scene.substep_index += 1;
     }
     if topology_changed {
@@ -443,6 +438,21 @@ pub fn rebuild_clusters(scene: &mut Scene) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fracture_release_respects_fixed_axes_and_accounts_for_heat() {
+        let mut s = scene();
+        s.energy.pending_release = 0.25;
+        s.releases.push(crate::fracture::Release { i: 0, j: 1, energy: 0.25, due: 0 });
+        let targets = vec![[Some(0.0); 3]; s.voxels.len()];
+        let e0 = s.voxels[0].internal_energy + s.voxels[1].internal_energy;
+        apply_releases(&mut s, &targets);
+        assert_eq!(s.voxels[0].velocity, Vec3::ZERO);
+        assert_eq!(s.voxels[1].velocity, Vec3::ZERO);
+        assert_eq!(s.energy.pending_release, 0.0);
+        assert_eq!(s.energy.damage_heat, 0.25);
+        assert_eq!(s.energy.kinetic_release, 0.0);
+        assert!((s.voxels[0].internal_energy + s.voxels[1].internal_energy - e0 - 0.25).abs() < 1e-4);
+    }
     fn scene() -> Scene {
         let mut c = crate::scene::SceneConfig::load("scenes/wood_chop.ron").unwrap();
         c.dimensions = [2, 2, 2];
@@ -610,7 +620,7 @@ mod tests {
     }
 }
 
-fn apply_releases(scene: &mut Scene) {
+fn apply_releases(scene: &mut Scene, targets: &[[Option<f32>; 3]]) {
     let releases = std::mem::take(&mut scene.releases);
     for r in releases {
         if r.due > scene.substep_index {
@@ -620,18 +630,25 @@ fn apply_releases(scene: &mut Scene) {
         let normal = (scene.positions[r.j] - scene.positions[r.i]).normalize_or_zero();
         let wi = scene.voxels[r.i].mass.recip();
         let wj = scene.voxels[r.j].mass.recip();
+        let free = |i: usize| Vec3::from_array(std::array::from_fn(|axis| {
+            if targets.get(i).and_then(|t| t[axis]).is_some() { 0.0 } else { 1.0 }
+        }));
+        let fi = free(r.i);
+        let fj = free(r.j);
+        let effective_i = wi * normal.dot(normal * fi);
+        let effective_j = wj * normal.dot(normal * fj);
         let impulse = crate::fracture::release_impulse(
-            scene.voxels[r.i].velocity,
-            scene.voxels[r.j].velocity,
-            wi,
-            wj,
+            scene.voxels[r.i].velocity * fi,
+            scene.voxels[r.j].velocity * fj,
+            effective_i,
+            effective_j,
             normal,
             r.energy,
         );
-        scene.voxels[r.i].velocity -= impulse * wi;
-        scene.voxels[r.j].velocity += impulse * wj;
+        scene.voxels[r.i].velocity -= impulse * wi * fi;
+        scene.voxels[r.j].velocity += impulse * wj * fj;
         scene.energy.pending_release -= r.energy;
-        if wi + wj > 0.0 && normal.length_squared() > 0.5 {
+        if effective_i + effective_j > 0.0 && normal.length_squared() > 0.5 {
             scene.energy.kinetic_release += r.energy;
         } else {
             scene.energy.damage_heat += r.energy;

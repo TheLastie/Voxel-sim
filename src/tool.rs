@@ -71,6 +71,13 @@ impl Tool {
         let material = Material::mixed(&composition, &scene.materials);
         let cell_mass = material.density * CELL.powi(3);
         let mass = cells.len() as f32 * cell_mass;
+        let rotation = Quat::from_rotation_arc(Vec3::X, direction.normalize());
+        // Dynamics are expressed about the occupied volume's center of mass.
+        // Shift the reference position too, preserving every world-space cell.
+        let centroid = cells.iter().copied().sum::<Vec3>() / cells.len() as f32;
+        for p in &mut cells {
+            *p -= centroid;
+        }
         let mut inertia = Vec3::ZERO;
         for &p in &cells {
             inertia += (Vec3::splat(p.length_squared() + CELL * CELL / 6.0) - p * p) * cell_mass;
@@ -79,8 +86,8 @@ impl Tool {
             cells,
             composition,
             mass,
-            position,
-            rotation: Quat::from_rotation_arc(Vec3::X, direction.normalize()),
+            position: position + rotation * centroid,
+            rotation,
             velocity: direction.normalize() * speed,
             angular_velocity: Vec3::ZERO,
             external_force: Vec3::ZERO,
@@ -172,12 +179,15 @@ impl Tool {
                             if let Some(indices) = spatial.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) {
                                 for &i in indices {
                                     let p = scene.positions[i];
-                                    let Some((n, penetration, contact_point)) =
+                                    let Some((n, penetration, _contact_point)) =
                                         obb_aabb_contact(center, axes, p)
                                     else {
                                         continue;
                                     };
-                                    let arm = contact_point - self.position;
+                                    // The scene REV carries linear momentum at its node.
+                                    // Use that same point for the rigid reaction, otherwise
+                                    // the equal/opposite pair creates angular momentum.
+                                    let arm = p - self.position;
                                     let rel = self.velocity + self.angular_velocity.cross(arm)
                                         - scene.voxels[i].velocity;
                                     let closing = rel.dot(n);
@@ -349,23 +359,35 @@ fn obb_aabb_contact(center: Vec3, axes: [Vec3; 3], voxel: Vec3) -> Option<(Vec3,
     if best_normal == Vec3::ZERO {
         return None;
     }
-    let tool_support = axes.into_iter().fold(Vec3::ZERO, |point, axis| {
-        point + axis * (best_normal.dot(axis).signum() * half)
+    let closest = axes.into_iter().fold(center, |point, axis| {
+        point + axis * delta.dot(axis).clamp(-half, half)
     });
-    let voxel_support = Vec3::new(
-        best_normal.x.signum() * half,
-        best_normal.y.signum() * half,
-        best_normal.z.signum() * half,
-    );
-    let a = center + tool_support;
-    let b = voxel - voxel_support;
-    Some((best_normal, best_overlap, (a + b) * 0.5))
+    Some((best_normal, best_overlap, closest))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{scene::SceneConfig, solver};
+
+    #[test]
+    fn tapered_blade_uses_center_of_mass_and_preserves_geometry() {
+        let config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        let scene = Scene::new(config);
+        let origin = Vec3::new(0.4, 0.2, 0.3);
+        let tool = Tool::new(Shape::Blade, &scene, origin, Vec3::Y, 0.0);
+        let centroid = tool.cells.iter().copied().sum::<Vec3>() / tool.cells.len() as f32;
+        assert!(centroid.length() < 1e-6);
+        let dims = scene.config.tool_dimensions;
+        let expected_min_x = -(dims[0] as f32 - 1.0) * CELL * 0.5;
+        let min_x = tool.world_cells().map(|p| (tool.rotation.conjugate() * (p-origin)).x)
+            .fold(f32::INFINITY, f32::min);
+        assert!((min_x - expected_min_x).abs() < 1e-6);
+        let cell_mass = tool.mass / tool.cells.len() as f32;
+        let inertia = tool.cells.iter().fold(Vec3::ZERO, |sum, &p|
+            sum + (Vec3::splat(p.length_squared() + CELL*CELL/6.0)-p*p)*cell_mass);
+        assert!((inertia * tool.inverse_inertia - Vec3::ONE).length() < 1e-5);
+    }
 
     #[test]
     fn external_force_accelerates_and_persists_on_rigid_voxel_group() {
@@ -403,6 +425,39 @@ mod tests {
             );
         wood + 0.5 * tool.mass as f64 * tool.velocity.length_squared() as f64
             + angular_energy as f64
+    }
+
+    #[test]
+    fn off_center_contact_preserves_linear_and_angular_momentum() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [1; 3];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        config.gravity = [0.0; 3];
+        config.tool_dimensions = [2; 3];
+        config.fracture.friction = 0.0;
+        let mut scene = Scene::new(config);
+        let mut tool = Tool::new(Shape::Blade, &scene,
+            Vec3::new(0.0199, 0.006, 0.005), -Vec3::X, 0.1);
+        let momentum = |s: &Scene, t: &Tool| {
+            let p = t.velocity * t.mass + s.voxels[0].velocity * s.voxels[0].mass;
+            let spin = t.rotation * (t.inverse_inertia.recip()
+                * (t.rotation.conjugate() * t.angular_velocity));
+            // Use the original COM: position projection is a geometric split,
+            // not a physical translation carrying angular momentum.
+            (p, spin)
+        };
+        let com = tool.position;
+        let before = momentum(&scene, &tool);
+        let e0 = kinetic_energy(&scene, &tool);
+        tool.advance(&mut scene, 0.0, &[]);
+        let after = momentum(&scene, &tool);
+        let orbital = (scene.positions[0] - com)
+            .cross(scene.voxels[0].velocity * scene.voxels[0].mass);
+        assert!((after.0-before.0).length() < 1e-7);
+        assert!((after.1 + orbital - before.1).length() < 1e-8);
+        assert!(scene.voxels[0].velocity.length() > 0.0);
+        assert!(kinetic_energy(&scene, &tool) <= e0 * (1.0+1e-5));
     }
 
     #[test]

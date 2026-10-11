@@ -87,10 +87,9 @@ def iso(p):
     return ((x + y) * SQRT_HALF,
             (x - y) * SQRT_1_6 - z * SQRT_2_3)
 
-def blade_cells(fr):
+def blade_local_cells():
     # Match Shape::Blade in Tool::new: 20 x 5 x 14, tapering to a one-REV edge.
-    q = fr['rotation']
-    center = fr['tool']
+    local_cells = []
     for ix in range(20):
         for iy in range(5):
             for iz in range(14):
@@ -101,8 +100,20 @@ def blade_cells(fr):
                 local = ((ix + 0.5 - 10.0) * CELL,
                          local_y,
                          (iz + 0.5 - 7.0) * CELL)
-                offset = rotate(q, local)
-                yield tuple((center[k] + offset[k]) / CELL for k in range(3))
+                local_cells.append(local)
+    centroid = tuple(sum(p[k] for p in local_cells)/len(local_cells) for k in range(3))
+    return local_cells, centroid
+
+LOCAL_BLADE, BLADE_CENTROID = blade_local_cells()
+
+def blade_cells(fr):
+    q = fr['rotation']
+    center = fr['tool']  # Tool position now tracks its occupied-volume COM.
+    for local in LOCAL_BLADE:
+        # Tool::new preserves the original shape while shifting its local
+        # origin to the center of mass. Reapply that same centroid here.
+        offset = rotate(q, tuple(local[k]-BLADE_CENTROID[k] for k in range(3)))
+        yield tuple((center[k] + offset[k]) / CELL for k in range(3))
 
 def cube_faces(center, half, project):
     x, y, z = center
@@ -145,16 +156,16 @@ def render(n, dst):
     wood_centers = [(x/CELL, y/CELL, z/CELL) for _,x,y,z,_,_ in wood]
     im = Image.new('RGB', (W,H), (13,19,28))
     d = ImageDraw.Draw(im)
-    d.text((42,25), 'VOXEL PHYSICS LAB  /  KNIFE CUT', font=title, fill=(237,242,248))
-    d.text((44,65), '1 cm cells shown individually  •  Fixed isometric camera  •  Solver states',
+    d.text((42,25), 'VOXEL PHYSICS LAB  /  CONTACT DIAGNOSTIC', font=title, fill=(237,242,248))
+    d.text((44,65), '1 cm cells shown individually  •  Saved solver states  •  20 ms physical run',
            font=small, fill=(145,163,184))
     d.rounded_rectangle(STAGE, radius=16, fill=(17,25,36), outline=(39,52,68), width=2)
 
     items = []
     for voxel, center in zip(wood, wood_centers):
         i, x, y, z, damage, lost = voxel
-        # lost is an aggregate of positive-axis neighbors; remove the three
-        # outer boundaries as the previous renderer did.
+        # lost is an aggregate of missing positive-axis neighbor bonds; remove
+        # the specimen boundaries from the count before coloring.
         gx, gy, gz = i%12, (i//12)%12, i//144
         lost = max(0, lost-(gx==11)-(gy==11)-(gz==29))
         if lost >= 2:
@@ -233,13 +244,18 @@ def render(n, dst):
         d.text((bx+240,yy),value,font=small,fill=(238,242,247))
 
     d.text((bx,535),'Bond / material state',font=small,fill=(164,180,199))
-    legend=[((113,153,111),'Intact'),((239,190,76),'Damaged'),((235,133,62),'Broken REV'),((239,74,77),'Open cut gap'),((177,196,218),'Steel REV')]
+    legend=[((113,153,111),'Intact bonds'),((239,190,76),'Damaged bonds'),((235,133,62),'Multiple broken bonds'),((239,74,77),'Visible local separation'),((177,196,218),'Steel REV')]
     for j,(color,label) in enumerate(legend):
         yy=565+j*30
         d.rectangle((bx,yy,bx+18,yy+18),fill=color,outline=(35,47,60))
         d.text((bx+29,yy-2),label,font=small,fill=(185,197,211))
-    d.text((bx,735),'Each block is a separate simulated REV.',font=mini,fill=(133,151,171))
-    d.text((42,865),'Voxel geometry, bond damage and motion are reconstructed from saved solver states.',
+    d.text((bx,735),'FIXTURE CHECKS',font=small,fill=(140,166,193))
+    checks=[('Tension / fiber ratio','39.46×'),('Compression / fiber ratio','31.12×'),('Bending','9 / 9 bonds'),('Wedge','264 breaks; 1 piece')]
+    for j,(label,value) in enumerate(checks):
+        yy=762+j*24
+        d.text((bx,yy),label,font=mini,fill=(161,177,196))
+        d.text((bx+260,yy),value,font=mini,fill=(238,190,115) if j==3 else (238,242,247))
+    d.text((42,865),'Diagnostic only: many bonds break, but the wood remains one connected piece.',
            font=mini,fill=(112,130,151))
     im.save(dst)
     return im

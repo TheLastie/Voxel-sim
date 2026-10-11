@@ -1,0 +1,32 @@
+{
+  "scene": {
+    "wood_REV": 4320,
+    "blade_REV": 840,
+    "dt": 0.001,
+    "substeps": 4,
+    "pcg_iterations": 120,
+    "corotation_iterations": 2,
+    "speed_m_s": 6,
+    "capture_frames": 20,
+    "pitch_degrees": 0
+  },
+  "initial_tool_KE_J": 118.99438762664795,
+  "final": {
+    "broken_bonds": 1097,
+    "components": 1,
+    "vmax_m_s": 5.0698028,
+    "wood_KE_J": 0.20962775563396566,
+    "tool_KE_J": 84.4973777641012,
+    "kinetic_release_J": 0.2078210003954807,
+    "pending_release_J": 0.00031541819096775244,
+    "surface_work_J": 20.5959532023309,
+    "damage_heat_J": 41.41914822914572,
+    "plastic_heat_J": 2.307415063648353,
+    "stored_plastic_J": 0.25637951943384607
+  },
+  "maximum_wood_KE_J": 0.3213036694461357,
+  "maximum_vmax_m_s": 5.9565196,
+  "wall_seconds": 5.924,
+  "simulated_seconds": 0.02,
+  "wall_to_simulation_ratio": 296.2
+}

@@ -1,0 +1,2 @@
+   Compiling voxel-physics-lab v0.2.0 (/workspace/scratch/2cecc6c5f3ec/voxel-sim)
+    Finished `release` profile [optimized + debuginfo] target(s) in 1.63s

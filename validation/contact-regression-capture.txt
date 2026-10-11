@@ -1,0 +1,2 @@
+Captured knife solver states to validation/contact-regression-capture.csv at 6 m/s for 20 frames (stride 1, attack angle 0°)
+Exit status: 0; wall time: 5.924 s; simulated time: 0.020 s

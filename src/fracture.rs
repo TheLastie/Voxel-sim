@@ -265,13 +265,30 @@ pub fn release_impulse(vi: Vec3, vj: Vec3, wi: f32, wj: f32, normal: Vec3, energ
         return Vec3::ZERO;
     }
     let relative = (vj - vi).dot(normal) as f64;
-    let magnitude = (-relative + (relative * relative + 2.0 * w * energy).sqrt()) / w;
+    // Choose the root continuous at zero released energy. The positive root
+    // would reverse an approaching pair even for an arbitrarily tiny budget.
+    // Rationalization also avoids cancellation for small energies.
+    let sign = if relative < 0.0 { -1.0 } else { 1.0 };
+    let magnitude = sign * 2.0 * energy
+        / (relative.abs() + (relative * relative + 2.0 * w * energy).sqrt());
     normal * magnitude as f32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn small_release_does_not_reverse_approaching_pair() {
+        let vi = Vec3::X;
+        let vj = -Vec3::X;
+        let impulse = release_impulse(vi, vj, 1.0, 1.0, Vec3::X, 1e-8);
+        assert!(impulse.length() < 1e-7);
+        assert!(((vj + impulse) - (vi - impulse)).x < 0.0);
+        let energy = 0.25;
+        let impulse = release_impulse(vi, vj, 1.0, 1.0, Vec3::X, energy);
+        let delta = 0.5 * ((vi-impulse).length_squared() + (vj+impulse).length_squared()) - 1.0;
+        assert!((delta as f64 - energy).abs() < 1e-6);
+    }
     fn config() -> FractureConfig {
         crate::scene::SceneConfig::load("scenes/wood_chop.ron")
             .unwrap()

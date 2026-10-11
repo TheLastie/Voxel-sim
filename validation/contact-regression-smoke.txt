@@ -1,0 +1,5 @@
+PASS free_fall_100ms | z=0.055460 m expected=0.055459 m error=3.73e-8 m vz=-0.980999/-0.981000 m/s
+PASS ground_support_250ms | bottom=0.000001 m ground=0.000000 m penetration=0.00e0 m vz=0.0000 m/s
+PASS constant_force_100ms | vx=0.999968 m/s expected=1.000000 m/s error=3.17e-5
+PASS head_on_ccd_20mps | gap=0.010001 m relative_v=0.000 m/s momentum_error=0.00e0 kg·m/s
+PASS rigid_tool_contact | tool_vx=-0.0993 m/s kinetic_energy=4.72200e-4→4.68972e-4 J overlap=false
