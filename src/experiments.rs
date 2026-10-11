@@ -406,6 +406,8 @@ pub fn capture_knife(
     speed: f32,
     frames: usize,
     attack_angle_degrees: f32,
+    approach_seconds: f32,
+    roll_degrees: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::{
         fs::File,
@@ -423,6 +425,9 @@ pub fn capture_knife(
     config.tool_dimensions = [20, 5, 14];
     config.fracture.energy_release = 0.005;
     config.fracture.damage_rate = 15.0;
+    // Isolated contact fixture: gravity would drop a free blade by almost
+    // five metres during a one-second horizontal approach.
+    config.gravity = [0.0; 3];
     let mut scene = Scene::new(config);
     let specimen_x_max = scene
         .positions
@@ -440,7 +445,8 @@ pub fn capture_knife(
     if let Some(t) = &mut tool {
         let base = Quat::from_mat3(&Mat3::from_cols(-Vec3::X, Vec3::Z, Vec3::Y));
         let pitch = Quat::from_rotation_y(attack_angle_degrees.to_radians());
-        t.rotation = (pitch * base).normalize();
+        let roll = Quat::from_rotation_x(roll_degrees.to_radians());
+        t.rotation = (pitch * roll * base).normalize();
         // The swing follows the pitched blade so a negative angle chops down
         // through the wood instead of merely rotating the silhouette.
         t.velocity = (pitch * -Vec3::X) * speed;
@@ -453,6 +459,7 @@ pub fn capture_knife(
         // the blade edge starts at first contact instead of sharing centers
         // with the outer wood layer and being depenetrated before the strike.
         t.position.x = specimen_x_max + leading_extent + CELL;
+        t.position -= t.velocity * approach_seconds;
     }
     let x_min = scene
         .positions
@@ -490,15 +497,52 @@ pub fn capture_knife(
         .collect();
     let out = File::create(path)?;
     let mut out = BufWriter::new(out);
+    let wall_start = std::time::Instant::now();
+    writeln!(out, "H,2,{},{},{},{},{},{},{}", scene.config.fixed_dt,
+        scene.config.dimensions[0], scene.config.dimensions[1], scene.config.dimensions[2],
+        approach_seconds, roll_degrees, speed)?;
+    for p in &tool.as_ref().unwrap().cells {
+        writeln!(out, "T,{},{},{}", p.x, p.y, p.z)?;
+    }
     let stride = stride.max(1);
     for frame in 0..=frames {
         if frame > 0 {
             solver::step_with_targets(&mut scene, &mut tool, &targets);
         }
-        if frame > 60 && frame % stride != 0 && frame != frames {
+        if frame % 100 == 0 {
+            eprintln!("frame={frame}/{frames} sim={:.3}s wall={:.3}s broken={} clusters={} residual={:.3e}",
+                frame as f32 * scene.config.fixed_dt, wall_start.elapsed().as_secs_f64(),
+                scene.broken, scene.cluster_count, scene.solver_residual);
+        }
+        let impact_frame = (approach_seconds / scene.config.fixed_dt).round() as usize;
+        let near_impact = frame >= impact_frame.saturating_sub(10) && frame <= impact_frame + 60;
+        if !near_impact && frame % stride != 0 && frame != frames {
             continue;
         }
         let t = tool.as_ref().unwrap();
+        writeln!(out, "Q,{frame},{},{},{},{}", t.rotation.x, t.rotation.y, t.rotation.z, t.rotation.w)?;
+        let mut elastic_energy = 0.0f64;
+        for axis in 0..3 {
+            for i in 0..scene.positions.len() {
+                let b = &scene.bonds[axis][i];
+                let original_j = scene.workspace[axis][i].rest_neighbor;
+                if b.neighbor == crate::bond::EMPTY {
+                    if original_j != crate::bond::EMPTY {
+                        writeln!(out, "B,{frame},{i},{original_j}")?;
+                    }
+                    continue;
+                }
+                let j = b.neighbor as usize;
+                let q = scene.rotations[i].slerp(scene.rotations[j], 0.5);
+                let axes = [Vec3::X, Vec3::Y, Vec3::Z];
+                let basis = Mat3::from_cols(q * axes[axis], q * axes[(axis+1)%3], q * axes[(axis+2)%3]);
+                let k = solver::stiffness_matrix(&scene, i, j, basis);
+                let u = basis.transpose() * (scene.positions[j]-scene.positions[i])
+                    - Vec3::X * CELL - Vec3::from_array(b.plastic_strain) * CELL;
+                elastic_energy += (0.5 * (1.0-b.damage) * u.dot(k*u)).max(0.0) as f64;
+            }
+        }
+        writeln!(out, "E,{frame},{},{elastic_energy},{}", frame as f32 * scene.config.fixed_dt, scene.solver_residual)?;
         let vmax = scene
             .voxels
             .iter()
@@ -602,5 +646,7 @@ pub fn capture_knife(
         }
     }
     out.flush()?;
+    eprintln!("complete simulated={:.3}s wall={:.3}s", frames as f32 * scene.config.fixed_dt,
+        wall_start.elapsed().as_secs_f64());
     Ok(())
 }
