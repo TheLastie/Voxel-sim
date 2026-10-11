@@ -1,0 +1,59 @@
+//! Real solver capture of floor, gravity and the mounted axe (no scripted trajectories).
+use glam::Vec3;
+use std::{fs::File, io::{BufWriter, Write}};
+use voxel_physics_lab::{scene::{Scene, SceneConfig}, solver, tool::{Shape, Tool}, bond::EMPTY};
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::env::args().nth(1).unwrap_or("validation/supports.csv".into());
+    let steps: usize = std::env::args().nth(2).unwrap_or("1500".into()).parse()?;
+    let mut cfg = SceneConfig::load("scenes/mounted_axe.ron")?;
+    // A separate 3 cm coupon starts above the floor, to make gravity visible.
+    cfg.branch_dimensions = [3; 3];
+    let mut scene = Scene::new(cfg);
+    let probe_start = 4320;
+    let probe_end = 4347;
+    for axis in 0..3 { for i in 0..scene.voxels.len() {
+        let j = scene.bonds[axis][i].neighbor;
+        if j != EMPTY && (i >= probe_start && i < probe_end) != (j as usize >= probe_start && (j as usize) < probe_end) {
+            scene.bonds[axis][i].neighbor = EMPTY;
+            scene.workspace[axis][i].rest_neighbor = EMPTY;
+        }
+    }}
+    for i in probe_start..probe_end {
+        scene.positions[i] += Vec3::new(0.15, 0.12, 0.22);
+        scene.previous[i] = scene.positions[i];
+        scene.rest_positions[i] = scene.positions[i];
+    }
+    solver::rebuild_clusters(&mut scene);
+    let mut axe = Tool::new(Shape::Wedge, &scene, Vec3::from_array(scene.config.tool_start), Vec3::X, scene.config.initial_speed);
+    let rear = axe.cells.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+    axe.mount_base(Vec3::new(rear, 0.0, 0.0), Vec3::X)?;
+    let mount = axe.mount.unwrap();
+    let mut tool = Some(axe);
+    let mut out = BufWriter::new(File::create(path)?);
+    writeln!(out, "H,{},{}", scene.config.fixed_dt, steps)?;
+    writeln!(out, "M,{},{},{},{},{},{}",mount.world_base.x,mount.world_base.y,mount.world_base.z,mount.local_base.x,mount.local_base.y,mount.local_base.z)?;
+    for p in &tool.as_ref().unwrap().cells { writeln!(out,"T,{},{},{}",p.x,p.y,p.z)?; }
+    for i in probe_end..scene.voxels.len() { let p=scene.positions[i];writeln!(out,"P,{},{},{}",p.x,p.y,p.z)?; }
+    let clock = std::time::Instant::now();
+    let mut drift = 0.0f32;
+    for frame in 0..=steps {
+        if frame > 0 {
+            // Mild ramp: 12 N/s, cap 18 N; same generic persistent-force API.
+            let force = (frame as f32 * scene.config.fixed_dt * 12.0).min(18.0);
+            tool.as_mut().unwrap().set_external_force(Vec3::X * force)?;
+            solver::step(&mut scene, &mut tool);
+        }
+        let t=tool.as_ref().unwrap();
+        let base=t.position+t.rotation*mount.local_base;
+        drift=drift.max(Vec3::new(0.0,base.y-mount.world_base.y,base.z-mount.world_base.z).length());
+        if frame % 100 == 0 { eprintln!("frame={frame}/{steps} wall={:.1}s broken={} drift={drift:.3e} tool_x={:.5}",clock.elapsed().as_secs_f64(),scene.broken,t.position.x); }
+        if frame % 10 != 0 && frame != steps { continue; }
+        assert!(scene.positions.iter().all(|p| p.is_finite()));
+        writeln!(out,"F,{frame},{},{},{},{},{},{},{},{},{},{},{},{}", t.position.x,t.position.y,t.position.z,t.rotation.x,t.rotation.y,t.rotation.z,t.rotation.w,t.velocity.x,t.external_force.x,scene.broken,scene.cluster_count,drift)?;
+        let damage=scene.incident_bond_damage();
+        for i in 0..probe_end { let p=scene.positions[i];writeln!(out,"V,{frame},{i},{},{},{},{},{}",p.x,p.y,p.z,damage[i].0,damage[i].1)?; }
+    }
+    out.flush()?;
+    eprintln!("complete drift={drift:.3e} gravity={:?}",scene.config.gravity);
+    Ok(())
+}
