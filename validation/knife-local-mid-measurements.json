@@ -1,0 +1,43 @@
+{
+  "physical_seconds": 0.5,
+  "post_contact_seconds": 0.5,
+  "snapshots": 83,
+  "force_peak_N": 60.0,
+  "ramp_duration_seconds": 5.0,
+  "hold_seconds": -4.5,
+  "force_error_max_N": 5.999999999062311e-07,
+  "drive_work_estimate_J": -0.00024379304719168715,
+  "broken_bonds": 812,
+  "components": 2,
+  "component_sizes": [
+    4318,
+    2
+  ],
+  "component_size_histogram": {
+    "2": 1,
+    "4318": 1
+  },
+  "largest_component_voxels": 4318,
+  "singleton_components": 0,
+  "peak_recorded_voxel_speed_m_s": 3.969493,
+  "peak_recorded_stress_ratio": 1.8029343,
+  "peak_recorded_voxel_displacement_m": 0.0005498106337276494,
+  "final_max_voxel_displacement_m": 0.0001581910058758056,
+  "max_fixed_support_drift_m": 0.0,
+  "final_tool_speed_m_s": 0.2153256422096408,
+  "initial_accounted_energy_J": 52.88640515846415,
+  "final_accounted_energy_J": 40.19762614875798,
+  "final_energy_reservoirs_J": {
+    "wood_kinetic": 0.0001904665470297388,
+    "tool_kinetic": 0.15325601101053987,
+    "pending_release": -5.64996386807036e-17,
+    "surface_work": 15.35927473743373,
+    "damage_heat": 24.64038377128126,
+    "plastic_heat": 0.0033989756399002147,
+    "stored_plastic": 0.0003776640600356984,
+    "elastic": 0.040744522785487125
+  },
+  "energy_gap_after_drive_work_estimate_J": -12.688535216658975,
+  "final_PCG_relative_residual": 0.00017446607,
+  "work_note": "COM force times net displacement per outer step, including contact projection; diagnostic estimate, not an exact substep energy ledger."
+}

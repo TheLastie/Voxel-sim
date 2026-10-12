@@ -1,0 +1,8 @@
+frame=0/500 sim=0.000s wall=0.000s broken=0 clusters=1 residual=0.000e0
+frame=100/500 sim=0.100s wall=21.174s broken=0 clusters=1 residual=7.122e-5
+frame=200/500 sim=0.200s wall=40.869s broken=0 clusters=1 residual=1.071e-4
+frame=300/500 sim=0.300s wall=63.557s broken=0 clusters=1 residual=5.886e-5
+frame=400/500 sim=0.400s wall=90.562s broken=0 clusters=1 residual=5.663e-5
+frame=500/500 sim=0.500s wall=109.763s broken=0 clusters=1 residual=6.608e-5
+complete simulated=0.500s wall=109.766s
+Captured knife solver states to validation/knife-local-pilot.csv at 3 m/s for 500 frames (stride 20, attack angle 0°)
