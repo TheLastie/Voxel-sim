@@ -9,7 +9,7 @@ pub struct Voxel {
     pub mass: f32,
     /// A kinematic boundary condition, separate from physical mass.
     #[serde(default)]
-    pub(crate) kinematic: bool,
+    pub kinematic: bool,
     pub composition: Composition,
     pub internal_energy: f32,
     pub velocity: Vec3,

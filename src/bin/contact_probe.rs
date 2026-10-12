@@ -10,7 +10,7 @@ fn total_ke(scene: &Scene, tool: &Tool) -> f64 {
     let wood: f64 = scene
         .voxels
         .iter()
-        .filter(|v| !v.is_kinematic())
+        .filter(|v| !v.kinematic)
         .map(|v| 0.5 * v.mass as f64 * v.velocity.length_squared() as f64)
         .sum();
     let inertia = tool.inverse_inertia.recip();
@@ -105,7 +105,7 @@ fn run(bonded: bool, fractures: bool) {
                 s.energy.pending_release,
                 s.broken,
                 s.solver_residual,
-                s.voxels.iter().filter(|v|!v.is_kinematic()).map(|v|v.velocity.length()).fold(0.,f32::max)
+                s.voxels.iter().filter(|v|!v.kinematic).map(|v|v.velocity.length()).fold(0.,f32::max)
             );
         }
     }
@@ -140,7 +140,7 @@ fn run_elastic_kick() {
             let ke: f64 = s
                 .voxels
                 .iter()
-                .filter(|v| !v.is_kinematic())
+                .filter(|v| !v.kinematic)
                 .map(|v| 0.5 * v.mass as f64 * v.velocity.length_squared() as f64)
                 .sum();
             println!("elastic-kick frame={frame} KE={ke:.9} J elastic={:.9} J total={:.9} J residual={:.3e}",elastic_energy(&s),ke+elastic_energy(&s),s.solver_residual);

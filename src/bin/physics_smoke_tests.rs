@@ -101,7 +101,7 @@ fn head_on_collision() -> Check {
     let momentum_before: f32 = s
         .voxels
         .iter()
-        .filter(|v| !v.is_kinematic())
+        .filter(|v| !v.kinematic)
         .map(|v| v.mass * v.velocity.x)
         .sum();
     let mut tool = None;
@@ -109,7 +109,7 @@ fn head_on_collision() -> Check {
     let momentum_after: f32 = s
         .voxels
         .iter()
-        .filter(|v| !v.is_kinematic())
+        .filter(|v| !v.kinematic)
         .map(|v| v.mass * v.velocity.x)
         .sum();
     let gap = s.positions[1].x - s.positions[0].x;
@@ -130,7 +130,7 @@ fn kinetic_energy(s: &Scene, t: &Tool) -> f32 {
     let voxels: f32 = s
         .voxels
         .iter()
-        .filter(|v| !v.is_kinematic())
+        .filter(|v| !v.kinematic)
         .map(|v| 0.5 * v.mass * v.velocity.length_squared())
         .sum();
     let inertia = t.inverse_inertia.recip();
