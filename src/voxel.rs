@@ -5,7 +5,11 @@ use smallvec::SmallVec;
 /// A 1 cm representative elementary volume. SI units throughout.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Voxel {
+    /// Physical mass remains finite even when motion is constrained.
     pub mass: f32,
+    /// A kinematic boundary condition, separate from physical mass.
+    #[serde(default)]
+    pub kinematic: bool,
     pub composition: Composition,
     pub internal_energy: f32,
     pub velocity: Vec3,

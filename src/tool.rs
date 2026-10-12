@@ -4,6 +4,7 @@ use crate::{
     voxel::Composition,
 };
 use glam::{Quat, Vec3};
+use smallvec::SmallVec;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy)]
@@ -25,6 +26,8 @@ pub struct GuideMount {
 /// A rigid voxel object. The collision law never branches on Shape.
 pub struct Tool {
     pub cells: Vec<Vec3>,
+    spatial_bins: HashMap<[i32; 3], SmallVec<[usize; 2]>>,
+    center_cache: Vec<Vec3>,
     pub composition: Composition,
     pub mass: f32,
     pub position: Vec3,
@@ -94,6 +97,8 @@ impl Tool {
         }
         Self {
             cells,
+            spatial_bins: HashMap::new(),
+            center_cache: Vec::new(),
             composition,
             mass,
             position: position + rotation * centroid,
@@ -127,24 +132,36 @@ impl Tool {
     }
     /// Anchor a base to a fixed-orientation guide. Zero direction fixes all motion.
     pub fn mount_base(&mut self, local_base: Vec3, direction: Vec3) -> Result<(), &'static str> {
-        if !local_base.is_finite() || !direction.is_finite() { return Err("mount coordinates must be finite"); }
+        if !local_base.is_finite() || !direction.is_finite() {
+            return Err("mount coordinates must be finite");
+        }
         let direction = direction.try_normalize().unwrap_or(Vec3::ZERO);
-        self.mount = Some(GuideMount { local_base, world_base: self.position + self.rotation * local_base,
-            direction, rotation: self.rotation });
+        self.mount = Some(GuideMount {
+            local_base,
+            world_base: self.position + self.rotation * local_base,
+            direction,
+            rotation: self.rotation,
+        });
         self.velocity = self.project_translation(self.velocity);
         self.angular_velocity = Vec3::ZERO;
         Ok(())
     }
-    pub fn unmount(&mut self) { self.mount = None; }
-    fn project_translation(&self, vector: Vec3) -> Vec3 {
-        self.mount.map_or(vector, |m| m.direction * m.direction.dot(vector))
+    pub fn unmount(&mut self) {
+        self.mount = None;
     }
-    fn linear_response(&self, impulse: Vec3) -> Vec3 { self.project_translation(impulse) / self.mass }
+    fn project_translation(&self, vector: Vec3) -> Vec3 {
+        self.mount
+            .map_or(vector, |m| m.direction * m.direction.dot(vector))
+    }
+    fn linear_response(&self, impulse: Vec3) -> Vec3 {
+        self.project_translation(impulse) / self.mass
+    }
     fn constrain_pose(&mut self) {
         if let Some(m) = self.mount {
             self.rotation = m.rotation;
             let base = self.position + self.rotation * m.local_base;
-            self.position += m.world_base + m.direction * (base - m.world_base).dot(m.direction) - base;
+            self.position +=
+                m.world_base + m.direction * (base - m.world_base).dot(m.direction) - base;
             self.velocity = self.project_translation(self.velocity);
             self.angular_velocity = Vec3::ZERO;
         }
@@ -152,7 +169,11 @@ impl Tool {
     fn contact_correction(&self, normal: Vec3, penetration: f32) -> Vec3 {
         let projected = self.project_translation(normal);
         let mobility = normal.dot(projected);
-        if mobility > 1e-6 { -projected * penetration / mobility } else { Vec3::ZERO }
+        if mobility > 1e-6 {
+            -projected * penetration / mobility
+        } else {
+            Vec3::ZERO
+        }
     }
     pub fn world_cells(&self) -> impl Iterator<Item = Vec3> + '_ {
         self.cells
@@ -160,7 +181,9 @@ impl Tool {
             .map(|&p| self.position + self.rotation * p)
     }
     fn angular_response(&self, torque: Vec3) -> Vec3 {
-        if self.mount.is_some() { Vec3::ZERO } else {
+        if self.mount.is_some() {
+            Vec3::ZERO
+        } else {
             self.rotation * (self.inverse_inertia * (self.rotation.conjugate() * torque))
         }
     }
@@ -176,7 +199,8 @@ impl Tool {
         let mut contact_velocity = vec![Vec3::ZERO; scene.positions.len()];
         let tool_radius = self.cells.iter().map(|p| p.length()).fold(0.0, f32::max);
         let gravity = Vec3::from_array(scene.config.gravity);
-        let linear_acceleration = self.project_translation(gravity + self.external_force / self.mass);
+        let linear_acceleration =
+            self.project_translation(gravity + self.external_force / self.mass);
         let angular_acceleration = self.angular_response(self.external_torque);
         let linear_distance =
             self.velocity.length() * dt + 0.5 * linear_acceleration.length() * dt * dt;
@@ -187,6 +211,8 @@ impl Tool {
         let angular_steps = angular_distance / (CELL * 0.4);
         let steps = (linear_steps.max(angular_steps).ceil() as usize).max(1);
         let h = dt / steps as f32;
+        let mut spatial = std::mem::take(&mut self.spatial_bins);
+        let mut centers_cache = std::mem::take(&mut self.center_cache);
         for _ in 0..steps {
             self.velocity += linear_acceleration * h;
             self.angular_velocity += self.angular_response(self.external_torque) * h;
@@ -197,7 +223,7 @@ impl Tool {
                     * self.rotation)
                     .normalize();
             }
-            let mut spatial: HashMap<[i32; 3], Vec<usize>> = HashMap::new();
+            spatial.clear();
             for (i, &p) in scene.positions.iter().enumerate() {
                 spatial.entry(key(p)).or_default().push(i);
             }
@@ -206,115 +232,126 @@ impl Tool {
                 self.rotation * Vec3::Y,
                 self.rotation * Vec3::Z,
             ];
-            let centers: Vec<_> = self.world_cells().collect();
+            centers_cache.clear();
+            centers_cache.extend(self.world_cells());
             // Several adjacent tool cells can overlap the same REV during one
             // microstep. Accumulate only the deepest correction; applying the
             // full depenetration once per pair would push the whole tool back
             // by the number of contacts and prevent it from loading the wood.
             let mut correction = Vec3::ZERO;
             let mut max_penetration = 0.0f32;
-            for center in centers {
-                let k = key(center);
-                // Rotated REV bounds can reach into neighboring spatial bins.
-                for dz in -2..=2 {
-                    for dy in -2..=2 {
-                        for dx in -2..=2 {
-                            if let Some(indices) = spatial.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) {
-                                for &i in indices {
-                                    let p = scene.positions[i];
-                                    let Some((n, penetration, _contact_point)) =
-                                        obb_aabb_contact(center, axes, p)
-                                    else {
-                                        continue;
-                                    };
-                                    // The scene REV carries linear momentum at its node.
-                                    // Use that same point for the rigid reaction, otherwise
-                                    // the equal/opposite pair creates angular momentum.
-                                    let arm = p - self.position;
-                                    let rel = self.velocity + self.angular_velocity.cross(arm)
-                                        - scene.voxels[i].velocity;
-                                    let closing = rel.dot(n);
-                                    let free = Vec3::new(
-                                        if targets.get(i).and_then(|t| t[0]).is_none() {
+            for &center in &centers_cache {
+                let (lo, hi) = obb_bin_bounds(center, axes);
+                for z in lo[2]..=hi[2] {
+                    for y in lo[1]..=hi[1] {
+                        for x in lo[0]..=hi[0] {
+                            let Some(indices) = spatial.get(&[x, y, z]) else {
+                                continue;
+                            };
+                            for &i in indices {
+                                let p = scene.positions[i];
+                                let Some((n, penetration, _contact_point)) =
+                                    obb_aabb_contact(center, axes, p)
+                                else {
+                                    continue;
+                                };
+                                // The scene REV carries linear momentum at its node.
+                                // Use that same point for the rigid reaction, otherwise
+                                // the equal/opposite pair creates angular momentum.
+                                let arm = p - self.position;
+                                let rel = self.velocity + self.angular_velocity.cross(arm)
+                                    - scene.voxels[i].velocity;
+                                let closing = rel.dot(n);
+                                let free = Vec3::new(
+                                    if !scene.voxels[i].kinematic
+                                        && targets.get(i).and_then(|t| t[0]).is_none()
+                                    {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    },
+                                    if !scene.voxels[i].kinematic
+                                        && targets.get(i).and_then(|t| t[1]).is_none()
+                                    {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    },
+                                    if !scene.voxels[i].kinematic
+                                        && targets.get(i).and_then(|t| t[2]).is_none()
+                                    {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    },
+                                );
+                                let wi = if !scene.voxels[i].kinematic {
+                                    (n * free).dot(n) / scene.voxels[i].mass
+                                } else {
+                                    0.0
+                                };
+                                let denom = wi
+                                    + n.dot(self.linear_response(n))
+                                    + n.dot(self.angular_response(arm.cross(n)).cross(arm));
+                                if closing > 0.0 {
+                                    // This is a persistent, multi-point manifold. Applying
+                                    // restitution at every cell contact repeatedly adds
+                                    // energy as the active normal changes. Use an inelastic
+                                    // normal solve here; friction and fracture dissipate it.
+                                    let normal_impulse = closing / denom.max(1e-9);
+                                    let tangent = rel - closing * n;
+                                    let tangent_dir = tangent.try_normalize().unwrap_or(Vec3::ZERO);
+                                    let tangent_free = Vec3::new(
+                                        if !scene.voxels[i].kinematic
+                                            && targets.get(i).and_then(|t| t[0]).is_none()
+                                        {
                                             1.0
                                         } else {
                                             0.0
                                         },
-                                        if targets.get(i).and_then(|t| t[1]).is_none() {
+                                        if !scene.voxels[i].kinematic
+                                            && targets.get(i).and_then(|t| t[1]).is_none()
+                                        {
                                             1.0
                                         } else {
                                             0.0
                                         },
-                                        if targets.get(i).and_then(|t| t[2]).is_none() {
+                                        if !scene.voxels[i].kinematic
+                                            && targets.get(i).and_then(|t| t[2]).is_none()
+                                        {
                                             1.0
                                         } else {
                                             0.0
                                         },
                                     );
-                                    let wi = if scene.voxels[i].mass.is_finite() {
-                                        (n * free).dot(n) / scene.voxels[i].mass
+                                    let tangent_voxel_w = if !scene.voxels[i].kinematic {
+                                        (tangent_dir * tangent_free).dot(tangent_dir)
+                                            / scene.voxels[i].mass
                                     } else {
                                         0.0
                                     };
-                                    let denom = wi
-                                        + n.dot(self.linear_response(n))
-                                        + n.dot(self.angular_response(arm.cross(n)).cross(arm));
-                                    if closing > 0.0 {
-                                        // This is a persistent, multi-point manifold. Applying
-                                        // restitution at every cell contact repeatedly adds
-                                        // energy as the active normal changes. Use an inelastic
-                                        // normal solve here; friction and fracture dissipate it.
-                                        let normal_impulse = closing / denom.max(1e-9);
-                                        let tangent = rel - closing * n;
-                                        let tangent_dir =
-                                            tangent.try_normalize().unwrap_or(Vec3::ZERO);
-                                        let tangent_free = Vec3::new(
-                                            if targets.get(i).and_then(|t| t[0]).is_none() {
-                                                1.0
-                                            } else {
-                                                0.0
-                                            },
-                                            if targets.get(i).and_then(|t| t[1]).is_none() {
-                                                1.0
-                                            } else {
-                                                0.0
-                                            },
-                                            if targets.get(i).and_then(|t| t[2]).is_none() {
-                                                1.0
-                                            } else {
-                                                0.0
-                                            },
+                                    let tangent_denom = tangent_voxel_w
+                                        + tangent_dir.dot(self.linear_response(tangent_dir))
+                                        + tangent_dir.dot(
+                                            self.angular_response(arm.cross(tangent_dir))
+                                                .cross(arm),
                                         );
-                                        let tangent_voxel_w = if scene.voxels[i].mass.is_finite() {
-                                            (tangent_dir * tangent_free).dot(tangent_dir)
-                                                / scene.voxels[i].mass
-                                        } else {
-                                            0.0
-                                        };
-                                        let tangent_denom = tangent_voxel_w
-                                            + tangent_dir.dot(self.linear_response(tangent_dir))
-                                            + tangent_dir.dot(
-                                                self.angular_response(arm.cross(tangent_dir))
-                                                    .cross(arm),
-                                            );
-                                        let friction = tangent_dir
-                                            * (tangent.length() / tangent_denom.max(1e-9)).min(
-                                                scene.config.fracture.friction * normal_impulse,
-                                            );
-                                        let impulse = normal_impulse * n + friction;
-                                        let voxel_delta_v = impulse * free / scene.voxels[i].mass;
-                                        scene.voxels[i].velocity += voxel_delta_v;
-                                        contact_velocity[i] += voxel_delta_v;
-                                        self.velocity -= self.linear_response(impulse);
-                                        self.angular_velocity -=
-                                            self.angular_response(arm.cross(impulse));
-                                    }
-                                    // Split positional correction from velocity. It enforces
-                                    // non-penetration without turning depenetration into energy.
-                                    if penetration > max_penetration {
-                                        max_penetration = penetration;
-                                        correction = self.contact_correction(n, penetration);
-                                    }
+                                    let friction = tangent_dir
+                                        * (tangent.length() / tangent_denom.max(1e-9))
+                                            .min(scene.config.fracture.friction * normal_impulse);
+                                    let impulse = normal_impulse * n + friction;
+                                    let voxel_delta_v = impulse * free / scene.voxels[i].mass;
+                                    scene.voxels[i].velocity += voxel_delta_v;
+                                    contact_velocity[i] += voxel_delta_v;
+                                    self.velocity -= self.linear_response(impulse);
+                                    self.angular_velocity -=
+                                        self.angular_response(arm.cross(impulse));
+                                }
+                                // Split positional correction from velocity. It enforces
+                                // non-penetration without turning depenetration into energy.
+                                if penetration > max_penetration {
+                                    max_penetration = penetration;
+                                    correction = self.contact_correction(n, penetration);
                                 }
                             }
                         }
@@ -332,12 +369,11 @@ impl Tool {
                 let mut correction = Vec3::ZERO;
                 let mut max_penetration = 1e-6f32;
                 for center in self.world_cells() {
-                    let k = key(center);
-                    for dz in -2..=2 {
-                        for dy in -2..=2 {
-                            for dx in -2..=2 {
-                                let Some(indices) = spatial.get(&[k[0] + dx, k[1] + dy, k[2] + dz])
-                                else {
+                    let (lo, hi) = obb_bin_bounds(center, axes);
+                    for z in lo[2]..=hi[2] {
+                        for y in lo[1]..=hi[1] {
+                            for x in lo[0]..=hi[0] {
+                                let Some(indices) = spatial.get(&[x, y, z]) else {
                                     continue;
                                 };
                                 for &i in indices {
@@ -362,11 +398,21 @@ impl Tool {
                 self.constrain_pose();
             }
         }
+        self.spatial_bins = spatial;
+        self.center_cache = centers_cache;
         contact_velocity
     }
 }
 fn key(p: Vec3) -> [i32; 3] {
     (p / CELL).floor().as_ivec3().to_array()
+}
+
+/// Grid bins intersecting the tool REV's conservative world-space AABB,
+/// expanded by the scene REV half-width and contact tolerance.
+fn obb_bin_bounds(center: Vec3, axes: [Vec3; 3]) -> ([i32; 3], [i32; 3]) {
+    let half = CELL * 0.5;
+    let extent = (axes[0].abs() + axes[1].abs() + axes[2].abs()) * half + Vec3::splat(half + 1e-6);
+    (key(center - extent), key(center + extent))
 }
 
 /// Separating axis test for a rotated tool REV against an axis-aligned scene
@@ -425,12 +471,15 @@ mod tests {
         assert!(centroid.length() < 1e-6);
         let dims = scene.config.tool_dimensions;
         let expected_min_x = -(dims[0] as f32 - 1.0) * CELL * 0.5;
-        let min_x = tool.world_cells().map(|p| (tool.rotation.conjugate() * (p-origin)).x)
+        let min_x = tool
+            .world_cells()
+            .map(|p| (tool.rotation.conjugate() * (p - origin)).x)
             .fold(f32::INFINITY, f32::min);
         assert!((min_x - expected_min_x).abs() < 1e-6);
         let cell_mass = tool.mass / tool.cells.len() as f32;
-        let inertia = tool.cells.iter().fold(Vec3::ZERO, |sum, &p|
-            sum + (Vec3::splat(p.length_squared() + CELL*CELL/6.0)-p*p)*cell_mass);
+        let inertia = tool.cells.iter().fold(Vec3::ZERO, |sum, &p| {
+            sum + (Vec3::splat(p.length_squared() + CELL * CELL / 6.0) - p * p) * cell_mass
+        });
         assert!((inertia * tool.inverse_inertia - Vec3::ONE).length() < 1e-5);
     }
 
@@ -459,7 +508,7 @@ mod tests {
         let wood: f64 = scene
             .voxels
             .iter()
-            .filter(|v| v.mass.is_finite())
+            .filter(|v| !v.kinematic)
             .map(|v| 0.5 * v.mass as f64 * v.velocity.length_squared() as f64)
             .sum();
         let rotational_inertia = tool.inverse_inertia.recip();
@@ -482,12 +531,17 @@ mod tests {
         config.tool_dimensions = [2; 3];
         config.fracture.friction = 0.0;
         let mut scene = Scene::new(config);
-        let mut tool = Tool::new(Shape::Blade, &scene,
-            Vec3::new(0.0199, 0.006, 0.005), -Vec3::X, 0.1);
+        let mut tool = Tool::new(
+            Shape::Blade,
+            &scene,
+            Vec3::new(0.0199, 0.006, 0.005),
+            -Vec3::X,
+            0.1,
+        );
         let momentum = |s: &Scene, t: &Tool| {
             let p = t.velocity * t.mass + s.voxels[0].velocity * s.voxels[0].mass;
-            let spin = t.rotation * (t.inverse_inertia.recip()
-                * (t.rotation.conjugate() * t.angular_velocity));
+            let spin = t.rotation
+                * (t.inverse_inertia.recip() * (t.rotation.conjugate() * t.angular_velocity));
             // Use the original COM: position projection is a geometric split,
             // not a physical translation carrying angular momentum.
             (p, spin)
@@ -497,12 +551,12 @@ mod tests {
         let e0 = kinetic_energy(&scene, &tool);
         tool.advance(&mut scene, 0.0, &[]);
         let after = momentum(&scene, &tool);
-        let orbital = (scene.positions[0] - com)
-            .cross(scene.voxels[0].velocity * scene.voxels[0].mass);
-        assert!((after.0-before.0).length() < 1e-7);
+        let orbital =
+            (scene.positions[0] - com).cross(scene.voxels[0].velocity * scene.voxels[0].mass);
+        assert!((after.0 - before.0).length() < 1e-7);
         assert!((after.1 + orbital - before.1).length() < 1e-8);
         assert!(scene.voxels[0].velocity.length() > 0.0);
-        assert!(kinetic_energy(&scene, &tool) <= e0 * (1.0+1e-5));
+        assert!(kinetic_energy(&scene, &tool) <= e0 * (1.0 + 1e-5));
     }
 
     #[test]

@@ -1,0 +1,260 @@
+.version 7.0
+.target sm_75
+.address_size 64
+.visible .entry block_sparse_matvec(
+    .param .u64 mass_ptr,
+    .param .u64 x_ptr,
+    .param .u64 neighbors_ptr,
+    .param .u64 blocks_ptr,
+    .param .u64 y_ptr,
+    .param .u32 count
+) {
+    .reg .pred %p<4>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<23>;
+    ld.param.u64 %rd1, [mass_ptr];
+    ld.param.u64 %rd2, [x_ptr];
+    ld.param.u64 %rd3, [neighbors_ptr];
+    ld.param.u64 %rd4, [blocks_ptr];
+    ld.param.u64 %rd5, [y_ptr];
+    ld.param.u32 %r8, [count];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    setp.ge.u32 %p1, %r4, %r8;
+    @%p1 bra DONE;
+
+    mul.wide.u32 %rd6, %r4, 4;
+    add.u64 %rd7, %rd1, %rd6;
+    ld.global.f32 %f1, [%rd7];
+    mul.wide.u32 %rd8, %r4, 12;
+    add.u64 %rd9, %rd2, %rd8;
+    ld.global.f32 %f2, [%rd9];
+    ld.global.f32 %f3, [%rd9+4];
+    ld.global.f32 %f4, [%rd9+8];
+    mul.f32 %f5, %f1, %f2;
+    mul.f32 %f6, %f1, %f3;
+    mul.f32 %f7, %f1, %f4;
+
+    mul.lo.u32 %r5, %r4, 6;
+    mov.u32 %r6, 0;
+LOOP:
+    add.u32 %r7, %r5, %r6;
+    mul.wide.u32 %rd10, %r7, 4;
+    add.u64 %rd11, %rd3, %rd10;
+    ld.global.u32 %r9, [%rd11];
+    setp.eq.u32 %p2, %r9, 0xffffffff;
+    @%p2 bra NEXT;
+    mul.wide.u32 %rd12, %r9, 12;
+    add.u64 %rd13, %rd2, %rd12;
+    ld.global.f32 %f8, [%rd13];
+    ld.global.f32 %f9, [%rd13+4];
+    ld.global.f32 %f10, [%rd13+8];
+    sub.f32 %f11, %f2, %f8;
+    sub.f32 %f12, %f3, %f9;
+    sub.f32 %f13, %f4, %f10;
+
+    mul.lo.u32 %r10, %r7, 36;
+    mul.wide.u32 %rd14, %r10, 1;
+    add.u64 %rd15, %rd4, %rd14;
+    ld.global.f32 %f14, [%rd15];
+    ld.global.f32 %f15, [%rd15+4];
+    ld.global.f32 %f16, [%rd15+8];
+    ld.global.f32 %f17, [%rd15+12];
+    ld.global.f32 %f18, [%rd15+16];
+    ld.global.f32 %f19, [%rd15+20];
+    ld.global.f32 %f20, [%rd15+24];
+    ld.global.f32 %f21, [%rd15+28];
+    ld.global.f32 %f22, [%rd15+32];
+    fma.rn.f32 %f5, %f14, %f11, %f5;
+    fma.rn.f32 %f5, %f15, %f12, %f5;
+    fma.rn.f32 %f5, %f16, %f13, %f5;
+    fma.rn.f32 %f6, %f17, %f11, %f6;
+    fma.rn.f32 %f6, %f18, %f12, %f6;
+    fma.rn.f32 %f6, %f19, %f13, %f6;
+    fma.rn.f32 %f7, %f20, %f11, %f7;
+    fma.rn.f32 %f7, %f21, %f12, %f7;
+    fma.rn.f32 %f7, %f22, %f13, %f7;
+NEXT:
+    add.u32 %r6, %r6, 1;
+    setp.lt.u32 %p3, %r6, 6;
+    @%p3 bra LOOP;
+
+    add.u64 %rd6, %rd5, %rd8;
+    st.global.f32 [%rd6], %f5;
+    st.global.f32 [%rd6+4], %f6;
+    st.global.f32 [%rd6+8], %f7;
+DONE:
+    ret;
+}
+.visible .entry block_jacobi(
+    .param .u64 inverse_ptr,
+    .param .u64 residual_ptr,
+    .param .u64 output_ptr,
+    .param .u32 count
+) {
+    .reg .pred %p<2>;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<7>;
+    .reg .f32 %f<14>;
+    ld.param.u64 %rd1, [inverse_ptr];
+    ld.param.u64 %rd2, [residual_ptr];
+    ld.param.u64 %rd3, [output_ptr];
+    ld.param.u32 %r1, [count];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.u32 %r0, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r0, %r1;
+    @%p1 bra J_DONE;
+    mul.wide.u32 %rd4, %r0, 12;
+    add.u64 %rd5, %rd2, %rd4;
+    ld.global.f32 %f1, [%rd5];
+    ld.global.f32 %f2, [%rd5+4];
+    ld.global.f32 %f3, [%rd5+8];
+    mul.wide.u32 %rd6, %r0, 36;
+    add.u64 %rd6, %rd1, %rd6;
+    ld.global.f32 %f4, [%rd6];
+    ld.global.f32 %f5, [%rd6+4];
+    ld.global.f32 %f6, [%rd6+8];
+    ld.global.f32 %f7, [%rd6+12];
+    ld.global.f32 %f8, [%rd6+16];
+    ld.global.f32 %f9, [%rd6+20];
+    ld.global.f32 %f10, [%rd6+24];
+    ld.global.f32 %f11, [%rd6+28];
+    ld.global.f32 %f12, [%rd6+32];
+    mul.f32 %f13, %f4, %f1;
+    fma.rn.f32 %f13, %f5, %f2, %f13;
+    fma.rn.f32 %f13, %f6, %f3, %f13;
+    mul.f32 %f4, %f7, %f1;
+    fma.rn.f32 %f4, %f8, %f2, %f4;
+    fma.rn.f32 %f4, %f9, %f3, %f4;
+    mul.f32 %f5, %f10, %f1;
+    fma.rn.f32 %f5, %f11, %f2, %f5;
+    fma.rn.f32 %f5, %f12, %f3, %f5;
+    add.u64 %rd5, %rd3, %rd4;
+    st.global.f32 [%rd5], %f13;
+    st.global.f32 [%rd5+4], %f4;
+    st.global.f32 [%rd5+8], %f5;
+J_DONE:
+    ret;
+}
+.visible .entry pcg_update(
+    .param .u64 dx_ptr,
+    .param .u64 r_ptr,
+    .param .u64 p_ptr,
+    .param .u64 ap_ptr,
+    .param .f32 alpha,
+    .param .u32 count
+) {
+    .reg .pred %p<2>;
+    .reg .b32 %r<7>;
+    .reg .b64 %rd<9>;
+    .reg .f32 %f<6>;
+    ld.param.u64 %rd1, [dx_ptr];
+    ld.param.u64 %rd2, [r_ptr];
+    ld.param.u64 %rd3, [p_ptr];
+    ld.param.u64 %rd4, [ap_ptr];
+    ld.param.f32 %f1, [alpha];
+    ld.param.u32 %r1, [count];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.u32 %r5, %r2, %r3, %r4;
+    mul.lo.u32 %r1, %r1, 3;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra U_DONE;
+    mul.wide.u32 %rd8, %r5, 4;
+    add.u64 %rd6, %rd1, %rd8;
+    add.u64 %rd7, %rd2, %rd8;
+    add.u64 %rd5, %rd3, %rd8;
+    add.u64 %rd8, %rd4, %rd8;
+    ld.global.f32 %f2, [%rd6];
+    ld.global.f32 %f3, [%rd5];
+    ld.global.f32 %f4, [%rd8];
+    ld.global.f32 %f5, [%rd7];
+    fma.rn.f32 %f2, %f1, %f3, %f2;
+    neg.f32 %f1, %f1;
+    fma.rn.f32 %f5, %f1, %f4, %f5;
+    st.global.f32 [%rd6], %f2;
+    st.global.f32 [%rd7], %f5;
+U_DONE:
+    ret;
+}
+.visible .entry pcg_update_direction(
+    .param .u64 p_ptr,
+    .param .u64 z_ptr,
+    .param .f32 beta,
+    .param .u32 count
+) {
+    .reg .pred %p<2>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<6>;
+    .reg .f32 %f<4>;
+    ld.param.u64 %rd1, [p_ptr];
+    ld.param.u64 %rd2, [z_ptr];
+    ld.param.f32 %f1, [beta];
+    ld.param.u32 %r1, [count];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.u32 %r5, %r2, %r3, %r4;
+    mul.lo.u32 %r1, %r1, 3;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra D_DONE;
+    mul.wide.u32 %rd3, %r5, 4;
+    add.u64 %rd4, %rd1, %rd3;
+    add.u64 %rd3, %rd2, %rd3;
+    ld.global.f32 %f2, [%rd4];
+    ld.global.f32 %f3, [%rd3];
+    fma.rn.f32 %f2, %f1, %f2, %f3;
+    st.global.f32 [%rd4], %f2;
+D_DONE:
+    ret;
+}
+.visible .entry dot_product(
+    .param .u64 left_ptr,
+    .param .u64 right_ptr,
+    .param .u64 output_ptr,
+    .param .u32 count
+) {
+    .reg .pred %p<2>;
+    .reg .b32 %r<3>;
+    .reg .b64 %rd<6>;
+    .reg .f32 %f<7>;
+    .reg .f64 %fd<5>;
+    ld.param.u64 %rd1, [left_ptr];
+    ld.param.u64 %rd2, [right_ptr];
+    ld.param.u64 %rd3, [output_ptr];
+    ld.param.u32 %r1, [count];
+    mov.u32 %r2, 0;
+    mov.f64 %fd1, 0d0000000000000000;
+DOT_LOOP:
+    setp.ge.u32 %p1, %r2, %r1;
+    @%p1 bra DOT_DONE;
+    mul.wide.u32 %rd4, %r2, 12;
+    add.u64 %rd5, %rd1, %rd4;
+    add.u64 %rd4, %rd2, %rd4;
+    ld.global.f32 %f1, [%rd5];
+    ld.global.f32 %f2, [%rd4];
+    ld.global.f32 %f3, [%rd5+4];
+    ld.global.f32 %f4, [%rd4+4];
+    ld.global.f32 %f5, [%rd5+8];
+    ld.global.f32 %f6, [%rd4+8];
+    cvt.f64.f32 %fd2, %f1;
+    cvt.f64.f32 %fd3, %f2;
+    fma.rn.f64 %fd1, %fd2, %fd3, %fd1;
+    cvt.f64.f32 %fd2, %f3;
+    cvt.f64.f32 %fd3, %f4;
+    fma.rn.f64 %fd1, %fd2, %fd3, %fd1;
+    cvt.f64.f32 %fd2, %f5;
+    cvt.f64.f32 %fd3, %f6;
+    fma.rn.f64 %fd1, %fd2, %fd3, %fd1;
+    add.u32 %r2, %r2, 1;
+    bra DOT_LOOP;
+DOT_DONE:
+    st.global.f64 [%rd3], %fd1;
+    ret;
+}

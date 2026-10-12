@@ -1581,6 +1581,7 @@ version = "0.2.0"
 dependencies = [
  "bytemuck",
  "glam",
+ "libloading 0.8.9",
  "pollster",
  "rayon",
  "ron",

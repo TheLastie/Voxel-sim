@@ -12,7 +12,9 @@ validated continuum simulator.
   example material table sets bond limits to 100 MPa tension, 50 MPa compression
   and 12 MPa shear along the grain; across the grain the limits are 2.5 MPa,
   2 MPa and 3 MPa. The corresponding directional stiffness uses the same grain
-  axis. These are illustrative calibration values.
+  axis. Fracture surface work is also directional: the example uses 350 J/m²
+  along grain and 80 J/m² across it. These are illustrative inputs, not
+  species-calibrated values.
 - Displacement-controlled 10³-REV tests measure parallel/transverse force
   ratios of 39.458 in tension and 32.539 in compression. The bond regression
   checks real vertical and horizontal neighbors, including shear limits.
@@ -69,10 +71,37 @@ yet; a collision alone does not claim to weld two metal voxels.
 - Detailed results: [validation status](validation/STATUS.md) and
   [knife diagnosis](validation/knife-diagnosis.md).
 
+For live solver frames, start the browser viewer against the capture CSV before
+starting the model:
+
+```sh
+python3 validation/live_viewer.py --port 8765 --csv validation/live-support.csv --label "Mounted axe and gravity"
+RUSTUP_HOME="$PWD/.toolchain/rustup" CARGO_HOME="$PWD/.toolchain/cargo" RAYON_NUM_THREADS=1 ./.toolchain/cargo/bin/cargo run --release --no-default-features --bin support_capture -- validation/live-support.csv 210
+```
+
+Open `http://127.0.0.1:8765`. The page displays the matching GIF as its main
+visual and serves it at `/gif`; the current animation was generated from the
+saved full solver recording. The CSV capture still flushes each saved state
+and is available from the viewer while the model runs. Regenerate the GIF after
+a new completed capture with `validation/render_supports.py`.
+If a matching `validation/live-support.mp4` exists, the page also links to that
+video; the `/video` endpoint supports browser seeking. For another completed
+capture, start the viewer with `--video path/to/capture.mp4 --label "Run description"`
+and place an optional same-name `.gif` next to it.
+
 ## Build and run
 
 Requires Rust 2021 and Cargo. The desktop frontend uses optional `wgpu` and
 `winit` dependencies.
+
+The renderer requests a high performance wgpu adapter and reports its name at
+startup. `cargo run --bin gpu_info` lists both wgpu adapters and devices exposed
+by the CUDA Driver API. In WSL, wgpu currently sees llvmpipe while CUDA can
+access the host RTX 5060. `python3 validation/cuda_probe.py` JIT-compiles a PTX
+vector kernel and checks its output. `python3 validation/cuda_sparse_probe.py`
+checks the block sparse matrix-vector operator used by PCG on CUDA against a
+CPU reference. This is still a standalone synthetic probe: the physics solver
+and its preconditioner continue to run on CPU.
 
 ```sh
 cargo test --no-default-features --lib

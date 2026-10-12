@@ -281,7 +281,7 @@ pub fn wedge_split() -> TestResult {
     let sizes = {
         let mut counts = std::collections::HashMap::<u32, usize>::new();
         for (&cluster, voxel) in scene.clusters.iter().zip(&scene.voxels) {
-            if voxel.mass.is_finite() {
+            if !voxel.kinematic {
                 *counts.entry(cluster).or_default() += 1;
             }
         }
@@ -415,10 +415,14 @@ pub fn capture_knife(
         fs::File,
         io::{BufWriter, Write},
     };
-    if !ramp_force_newtons.is_finite() || ramp_force_newtons < 0.0
-        || !ramp_seconds.is_finite() || ramp_seconds <= 0.0
-        || !approach_seconds.is_finite() || approach_seconds < 0.0
-        || !speed.is_finite() || speed < 0.0
+    if !ramp_force_newtons.is_finite()
+        || ramp_force_newtons < 0.0
+        || !ramp_seconds.is_finite()
+        || ramp_seconds <= 0.0
+        || !approach_seconds.is_finite()
+        || approach_seconds < 0.0
+        || !speed.is_finite()
+        || speed < 0.0
     {
         return Err("capture requires finite nonnegative speed, approach and force, and positive ramp duration".into());
     }
@@ -507,26 +511,41 @@ pub fn capture_knife(
     let out = File::create(path)?;
     let mut out = BufWriter::new(out);
     let wall_start = std::time::Instant::now();
-    writeln!(out, "H,2,{},{},{},{},{},{},{}", scene.config.fixed_dt,
-        scene.config.dimensions[0], scene.config.dimensions[1], scene.config.dimensions[2],
-        approach_seconds, roll_degrees, speed)?;
+    writeln!(
+        out,
+        "H,2,{},{},{},{},{},{},{}",
+        scene.config.fixed_dt,
+        scene.config.dimensions[0],
+        scene.config.dimensions[1],
+        scene.config.dimensions[2],
+        approach_seconds,
+        roll_degrees,
+        speed
+    )?;
     for p in &tool.as_ref().unwrap().cells {
         writeln!(out, "T,{},{},{}", p.x, p.y, p.z)?;
     }
     let stride = stride.max(1);
     let drive_direction = Quat::from_rotation_y(attack_angle_degrees.to_radians()) * -Vec3::X;
     let mut drive_work = 0.0f64;
-    writeln!(out, "R,{ramp_force_newtons},{ramp_seconds},{approach_seconds}")?;
+    writeln!(
+        out,
+        "R,{ramp_force_newtons},{ramp_seconds},{approach_seconds}"
+    )?;
     for frame in 0..=frames {
         if frame > 0 {
             // A real force through the blade COM, not a prescribed trajectory.
             // Midpoint sampling integrates a linear ramp without a frame bias.
             let time = (frame as f32 - 0.5) * scene.config.fixed_dt;
-            let force = ramp_force_newtons * ((time - approach_seconds) / ramp_seconds).clamp(0.0, 1.0);
+            let force =
+                ramp_force_newtons * ((time - approach_seconds) / ramp_seconds).clamp(0.0, 1.0);
             let before = tool.as_ref().unwrap().position;
-            tool.as_mut().unwrap().set_external_force(drive_direction * force)?;
+            tool.as_mut()
+                .unwrap()
+                .set_external_force(drive_direction * force)?;
             solver::step_with_targets(&mut scene, &mut tool, &targets);
-            drive_work += (drive_direction * force).dot(tool.as_ref().unwrap().position - before) as f64;
+            drive_work +=
+                (drive_direction * force).dot(tool.as_ref().unwrap().position - before) as f64;
         }
         if frame % 100 == 0 {
             eprintln!("frame={frame}/{frames} sim={:.3}s wall={:.3}s broken={} clusters={} residual={:.3e}",
@@ -540,7 +559,11 @@ pub fn capture_knife(
         }
         let t = tool.as_ref().unwrap();
         writeln!(out, "L,{frame},{},{drive_work}", t.external_force.length())?;
-        writeln!(out, "Q,{frame},{},{},{},{}", t.rotation.x, t.rotation.y, t.rotation.z, t.rotation.w)?;
+        writeln!(
+            out,
+            "Q,{frame},{},{},{},{}",
+            t.rotation.x, t.rotation.y, t.rotation.z, t.rotation.w
+        )?;
         let mut elastic_energy = 0.0f64;
         for axis in 0..3 {
             for i in 0..scene.positions.len() {
@@ -555,24 +578,34 @@ pub fn capture_knife(
                 let j = b.neighbor as usize;
                 let q = scene.rotations[i].slerp(scene.rotations[j], 0.5);
                 let axes = [Vec3::X, Vec3::Y, Vec3::Z];
-                let basis = Mat3::from_cols(q * axes[axis], q * axes[(axis+1)%3], q * axes[(axis+2)%3]);
+                let basis = Mat3::from_cols(
+                    q * axes[axis],
+                    q * axes[(axis + 1) % 3],
+                    q * axes[(axis + 2) % 3],
+                );
                 let k = solver::stiffness_matrix(&scene, i, j, basis);
-                let u = basis.transpose() * (scene.positions[j]-scene.positions[i])
-                    - Vec3::X * CELL - Vec3::from_array(b.plastic_strain) * CELL;
-                elastic_energy += (0.5 * (1.0-b.damage) * u.dot(k*u)).max(0.0) as f64;
+                let u = basis.transpose() * (scene.positions[j] - scene.positions[i])
+                    - Vec3::X * CELL
+                    - Vec3::from_array(b.plastic_strain) * CELL;
+                elastic_energy += (0.5 * (1.0 - b.damage) * u.dot(k * u)).max(0.0) as f64;
             }
         }
-        writeln!(out, "E,{frame},{},{elastic_energy},{}", frame as f32 * scene.config.fixed_dt, scene.solver_residual)?;
+        writeln!(
+            out,
+            "E,{frame},{},{elastic_energy},{}",
+            frame as f32 * scene.config.fixed_dt,
+            scene.solver_residual
+        )?;
         let vmax = scene
             .voxels
             .iter()
-            .filter(|v| v.mass.is_finite())
+            .filter(|v| !v.kinematic)
             .map(|v| v.velocity.length())
             .fold(0.0, f32::max);
         let wood_ke: f64 = scene
             .voxels
             .iter()
-            .filter(|v| v.mass.is_finite())
+            .filter(|v| !v.kinematic)
             .map(|v| 0.5 * v.mass as f64 * v.velocity.length_squared() as f64)
             .sum();
         let tool_ke = 0.5 * t.mass as f64 * t.velocity.length_squared() as f64
@@ -666,7 +699,10 @@ pub fn capture_knife(
         }
     }
     out.flush()?;
-    eprintln!("complete simulated={:.3}s wall={:.3}s", frames as f32 * scene.config.fixed_dt,
-        wall_start.elapsed().as_secs_f64());
+    eprintln!(
+        "complete simulated={:.3}s wall={:.3}s",
+        frames as f32 * scene.config.fixed_dt,
+        wall_start.elapsed().as_secs_f64()
+    );
     Ok(())
 }

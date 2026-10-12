@@ -22,7 +22,8 @@ fn launch(shape: Shape, scene: &Scene, ui: &Ui) -> Tool {
     let mut tool = Tool::new(shape, scene, ui.start(), ui.direction(), ui.speed);
     if matches!(shape, Shape::Wedge) {
         let rear = tool.cells.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
-        tool.mount_base(Vec3::new(rear, 0.0, 0.0), ui.direction()).expect("finite guide");
+        tool.mount_base(Vec3::new(rear, 0.0, 0.0), ui.direction())
+            .expect("finite guide");
     }
     tool
 }
@@ -84,7 +85,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut camera = Camera::new();
     let height = config.dimensions[2] as f32 * scene::CELL;
     camera.target = Vec3::Z * (height * 0.5);
-    camera.radius = (height * 1.5).max(config.ground_dimensions[0].max(config.ground_dimensions[1]) as f32 * scene::CELL * 1.6);
+    camera.radius = (height * 1.5).max(
+        config.ground_dimensions[0].max(config.ground_dimensions[1]) as f32 * scene::CELL * 1.6,
+    );
     let mut tool = None;
     let mut pointer = (0.0f32, 0.0f32);
     let mut orbit = false;

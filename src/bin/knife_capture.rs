@@ -18,11 +18,25 @@ fn main() {
         .nth(5)
         .map(|v| v.parse().expect("attack angle must be numeric"))
         .unwrap_or(0.0);
-    let approach = std::env::args().nth(6).map(|v| v.parse().expect("approach must be numeric")).unwrap_or(0.0);
-    let roll = std::env::args().nth(7).map(|v| v.parse().expect("roll must be numeric")).unwrap_or(0.0);
-    let force = std::env::args().nth(8).map(|v| v.parse().expect("force must be numeric")).unwrap_or(0.0);
-    let ramp = std::env::args().nth(9).map(|v| v.parse().expect("ramp duration must be numeric")).unwrap_or(4.0);
-    voxel_physics_lab::experiments::capture_knife(&path, stride, speed, frames, angle, approach, roll, force, ramp)
-        .expect("capture knife solver states");
+    let approach = std::env::args()
+        .nth(6)
+        .map(|v| v.parse().expect("approach must be numeric"))
+        .unwrap_or(0.0);
+    let roll = std::env::args()
+        .nth(7)
+        .map(|v| v.parse().expect("roll must be numeric"))
+        .unwrap_or(0.0);
+    let force = std::env::args()
+        .nth(8)
+        .map(|v| v.parse().expect("force must be numeric"))
+        .unwrap_or(0.0);
+    let ramp = std::env::args()
+        .nth(9)
+        .map(|v| v.parse().expect("ramp duration must be numeric"))
+        .unwrap_or(4.0);
+    voxel_physics_lab::experiments::capture_knife(
+        &path, stride, speed, frames, angle, approach, roll, force, ramp,
+    )
+    .expect("capture knife solver states");
     println!("Captured knife solver states to {path} at {speed} m/s for {frames} frames (stride {stride}, attack angle {angle}°)");
 }

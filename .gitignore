@@ -13,6 +13,7 @@
 /validation/*.png
 !/validation/knife-cut-demo.mp4
 !/validation/knife-cut-demo.gif
+!/validation/live-support.gif
 !/validation/knife-cut-final-frame.png
 /voxel-physics-lab.zip
 /*.mp4

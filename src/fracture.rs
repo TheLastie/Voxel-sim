@@ -92,7 +92,12 @@ pub fn pair_limits(
             hardening: m.hardening_modulus,
             plastic_failure: m.failure_plastic_strain,
             ductility,
-            fracture_energy: m.fracture_energy,
+            fracture_energy: directional(
+                m.fracture_energy,
+                m.fracture_energy_perp,
+                alignment[k],
+                anisotropy[k],
+            ),
         }
     };
     let x = one(a, 0);
@@ -269,8 +274,8 @@ pub fn release_impulse(vi: Vec3, vj: Vec3, wi: f32, wj: f32, normal: Vec3, energ
     // would reverse an approaching pair even for an arbitrarily tiny budget.
     // Rationalization also avoids cancellation for small energies.
     let sign = if relative < 0.0 { -1.0 } else { 1.0 };
-    let magnitude = sign * 2.0 * energy
-        / (relative.abs() + (relative * relative + 2.0 * w * energy).sqrt());
+    let magnitude =
+        sign * 2.0 * energy / (relative.abs() + (relative * relative + 2.0 * w * energy).sqrt());
     normal * magnitude as f32
 }
 
@@ -286,7 +291,7 @@ mod tests {
         assert!(((vj + impulse) - (vi - impulse)).x < 0.0);
         let energy = 0.25;
         let impulse = release_impulse(vi, vj, 1.0, 1.0, Vec3::X, energy);
-        let delta = 0.5 * ((vi-impulse).length_squared() + (vj+impulse).length_squared()) - 1.0;
+        let delta = 0.5 * ((vi - impulse).length_squared() + (vj + impulse).length_squared()) - 1.0;
         assert!((delta as f64 - energy).abs() < 1e-6);
     }
     fn config() -> FractureConfig {
@@ -419,6 +424,18 @@ mod tests {
         assert!(along.compression / across.compression >= 10.);
         assert_eq!(across.ductility, 0.);
         assert_eq!(along.ductility, 1.);
+    }
+    #[test]
+    fn wood_fracture_energy_follows_bond_alignment() {
+        let m = &Material::table()[1];
+        let along = pair_limits(m, m, [1.; 2], [1.; 2]);
+        let across = pair_limits(m, m, [0.; 2], [1.; 2]);
+        let diagonal = pair_limits(m, m, [0.5; 2], [1.; 2]);
+        let isotropic = pair_limits(m, m, [0.; 2], [0.; 2]);
+        assert_eq!(along.fracture_energy, 350.);
+        assert_eq!(across.fracture_energy, 80.);
+        assert_eq!(diagonal.fracture_energy, 215.);
+        assert_eq!(isotropic.fracture_energy, 350.);
     }
     #[test]
     fn mixed_wood_shear_failure_does_not_wait_for_higher_yield_stress() {

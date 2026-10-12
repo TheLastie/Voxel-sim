@@ -7,6 +7,15 @@ pub enum FractureMode {
     Mixed,
 }
 
+/// Thermodynamic state derived from a voxel's conserved internal energy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PhaseState {
+    pub temperature_kelvin: f32,
+    pub solid_fraction: f32,
+    pub liquid_fraction: f32,
+    pub gas_fraction: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Material {
     pub name: String,
@@ -29,8 +38,14 @@ pub struct Material {
     pub heat_capacity: f32,
     pub thermal_cond: f32,
     pub melt_temp: f32,
+    pub boil_temp: f32,
+    pub latent_fusion: f32,
+    pub latent_vaporization: f32,
     /// Fracture energy per newly separated area, J/m².
     pub fracture_energy: f32,
+    /// Fracture energy for a bond perpendicular to the material's fiber axis, J/m².
+    /// `fracture_energy` is the parallel value; isotropic materials use equal values.
+    pub fracture_energy_perp: f32,
 }
 impl Material {
     pub fn table() -> Vec<Self> {
@@ -51,6 +66,10 @@ impl Material {
                 0.026,
                 f32::INFINITY,
                 0.0,
+                0.0,
+                f32::INFINITY,
+                0.0,
+                0.0,
             ),
             Self::new(
                 "wood",
@@ -68,17 +87,70 @@ impl Material {
                 0.15,
                 f32::INFINITY,
                 350.0,
+                80.0,
+                f32::INFINITY,
+                0.0,
+                0.0,
             ),
             Self::new(
-                "iron", 7870.0, 200e9, 200e9, 77e9, 350e6, 350e6, 350e6, 200e6, 200e6, 450.0, 80.0,
-                1811.0, 30000.0,
+                "iron",
+                7870.0,
+                200e9,
+                200e9,
+                77e9,
+                350e6,
+                350e6,
+                350e6,
+                200e6,
+                200e6,
+                450.0,
+                80.0,
+                1811.0,
+                30000.0,
+                30000.0,
+                3134.0,
+                247_000.0,
+                6_300_000.0,
             ),
             Self::new(
-                "stone", 2700.0, 50e9, 50e9, 20e9, 7e6, 7e6, 120e6, 12e6, 100e6, 790.0, 2.5,
-                1500.0, 80.0,
+                "stone",
+                2700.0,
+                50e9,
+                50e9,
+                20e9,
+                7e6,
+                7e6,
+                120e6,
+                12e6,
+                100e6,
+                790.0,
+                2.5,
+                1500.0,
+                80.0,
+                80.0,
+                f32::INFINITY,
+                300_000.0,
+                0.0,
             ),
             Self::new(
-                "water", 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4184.0, 0.6, 273.15, 0.0,
+                "water",
+                1000.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                4184.0,
+                0.6,
+                273.15,
+                0.0,
+                0.0,
+                373.15,
+                333_500.0,
+                2_256_000.0,
             ),
         ];
         table[1].fracture_mode = FractureMode::Mixed;
@@ -107,6 +179,10 @@ impl Material {
         thermal_cond: f32,
         melt_temp: f32,
         fracture_energy: f32,
+        fracture_energy_perp: f32,
+        boil_temp: f32,
+        latent_fusion: f32,
+        latent_vaporization: f32,
     ) -> Self {
         Self {
             name: name.into(),
@@ -129,7 +205,11 @@ impl Material {
             heat_capacity,
             thermal_cond,
             melt_temp,
+            boil_temp,
+            latent_fusion,
+            latent_vaporization,
             fracture_energy,
+            fracture_energy_perp,
         }
     }
     pub fn mixed(c: &Composition, table: &[Self]) -> Self {
@@ -154,7 +234,12 @@ impl Material {
             hardness,
             heat_capacity,
             thermal_cond,
-            fracture_energy
+            melt_temp,
+            boil_temp,
+            latent_fusion,
+            latent_vaporization,
+            fracture_energy,
+            fracture_energy_perp
         );
         if c.components
             .iter()
@@ -162,10 +247,74 @@ impl Material {
         {
             result.fracture_mode = FractureMode::Mixed;
         }
-        // No phase transitions in this prototype; EOS assumes constant heat capacity.
         result
     }
+
+    /// Enthalpy relative to 0 K for the compact constant-heat-capacity EOS.
+    pub fn energy_at_temperature(&self, mass: f32, temperature_kelvin: f32) -> f32 {
+        let mass = mass.max(0.0);
+        let temperature = temperature_kelvin.max(0.0);
+        let mut specific = self.heat_capacity * temperature;
+        if temperature > self.melt_temp {
+            specific += self.latent_fusion;
+        }
+        if temperature > self.boil_temp {
+            specific += self.latent_vaporization;
+        }
+        mass * specific
+    }
+
+    /// Invert conserved energy into temperature and equilibrium phase fractions.
+    pub fn phase_state(&self, mass: f32, energy: f32) -> PhaseState {
+        let mass = mass.max(1e-20);
+        let specific = (energy / mass).max(0.0);
+        let cp = self.heat_capacity.max(1e-12);
+        let mut state = PhaseState {
+            temperature_kelvin: specific / cp,
+            solid_fraction: 1.0,
+            liquid_fraction: 0.0,
+            gas_fraction: 0.0,
+        };
+
+        if self.melt_temp.is_finite() {
+            let melt_enthalpy = cp * self.melt_temp;
+            if specific >= melt_enthalpy {
+                let fusion = self.latent_fusion.max(0.0);
+                if fusion > 0.0 && specific < melt_enthalpy + fusion {
+                    state.temperature_kelvin = self.melt_temp;
+                    state.solid_fraction =
+                        (1.0 - (specific - melt_enthalpy) / fusion).clamp(0.0, 1.0);
+                    state.liquid_fraction = 1.0 - state.solid_fraction;
+                    return state;
+                }
+                state.solid_fraction = 0.0;
+                state.liquid_fraction = 1.0;
+                state.temperature_kelvin = (specific - fusion) / cp;
+            }
+        }
+
+        if self.boil_temp.is_finite() {
+            let vapor_start = cp * self.boil_temp + self.latent_fusion.max(0.0);
+            if specific >= vapor_start {
+                let vaporization = self.latent_vaporization.max(0.0);
+                if vaporization > 0.0 && specific < vapor_start + vaporization {
+                    state.temperature_kelvin = self.boil_temp;
+                    state.liquid_fraction =
+                        (1.0 - (specific - vapor_start) / vaporization).clamp(0.0, 1.0);
+                    state.gas_fraction = 1.0 - state.liquid_fraction;
+                    return state;
+                }
+                state.solid_fraction = 0.0;
+                state.liquid_fraction = 0.0;
+                state.gas_fraction = 1.0;
+                state.temperature_kelvin =
+                    (specific - self.latent_fusion.max(0.0) - vaporization) / cp;
+            }
+        }
+        state
+    }
+
     pub fn temperature(&self, mass: f32, energy: f32) -> f32 {
-        energy / (mass * self.heat_capacity)
+        self.phase_state(mass, energy).temperature_kelvin
     }
 }

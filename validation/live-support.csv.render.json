@@ -1,0 +1,139 @@
+{
+  "frames": 22,
+  "dt": 0.001,
+  "seconds": 0.21,
+  "stats": [
+    {
+      "frame": 0,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41999998
+    },
+    {
+      "frame": 10,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41949725
+    },
+    {
+      "frame": 20,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41801345
+    },
+    {
+      "frame": 30,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.4155487
+    },
+    {
+      "frame": 40,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41210293
+    },
+    {
+      "frame": 50,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.4076762
+    },
+    {
+      "frame": 60,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.40226843
+    },
+    {
+      "frame": 70,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.39587968
+    },
+    {
+      "frame": 80,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.38850998
+    },
+    {
+      "frame": 90,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.3801592
+    },
+    {
+      "frame": 100,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.3708275
+    },
+    {
+      "frame": 110,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.36051473
+    },
+    {
+      "frame": 120,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.34922102
+    },
+    {
+      "frame": 130,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.33694627
+    },
+    {
+      "frame": 140,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.32369053
+    },
+    {
+      "frame": 150,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.3094538
+    },
+    {
+      "frame": 160,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.29423606
+    },
+    {
+      "frame": 170,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.2780374
+    },
+    {
+      "frame": 180,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.26085764
+    },
+    {
+      "frame": 190,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.24269698
+    },
+    {
+      "frame": 200,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.22355516
+    },
+    {
+      "frame": 210,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.20343184
+    }
+  ]
+}

@@ -150,6 +150,11 @@ impl Renderer {
             })
             .await
             .ok_or("No graphics adapter")?;
+        let adapter_info = adapter.get_info();
+        eprintln!(
+            "wgpu renderer adapter: {} ({:?}, {:?}) — {}",
+            adapter_info.name, adapter_info.device_type, adapter_info.backend, adapter_info.driver
+        );
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -340,7 +345,7 @@ impl Renderer {
             .iter()
             .enumerate()
             .map(|(i, &p)| {
-                let color = if scene.voxels[i].mass.is_infinite() {
+                let color = if scene.voxels[i].kinematic {
                     [0.24, 0.28, 0.3, 1.]
                 } else if scene.axis_targets[i].iter().any(Option::is_some) {
                     [0.18, 0.55, 0.85, 1.]
@@ -350,7 +355,7 @@ impl Renderer {
                     [0.92, 0.52, 0.24, 1.]
                 } else {
                     let d = damage[i].0;
-                    [0.55 + 0.39*d, 0.32 + 0.43*d, 0.12 + 0.18*d, 1.]
+                    [0.55 + 0.39 * d, 0.32 + 0.43 * d, 0.12 + 0.18 * d, 1.]
                 };
                 Instance::cube(p, scene.rotations[i], color)
             })
@@ -358,7 +363,11 @@ impl Renderer {
         if let Some(t) = tool {
             if let Some(m) = t.mount {
                 // External guide visualization, not an additional collision body.
-                let direction = if m.direction == Vec3::ZERO { Vec3::X } else { m.direction };
+                let direction = if m.direction == Vec3::ZERO {
+                    Vec3::X
+                } else {
+                    m.direction
+                };
                 let offset = Vec3::Y * 0.045;
                 instances.push(Instance {
                     center: (m.world_base + offset).to_array(),
@@ -377,7 +386,7 @@ impl Renderer {
         if show_bonds {
             for axis in 0..3 {
                 for (i, b) in scene.bonds[axis].iter().enumerate() {
-                    if b.neighbor == EMPTY || scene.voxels[i].mass.is_infinite() {
+                    if b.neighbor == EMPTY || scene.voxels[i].kinematic {
                         continue;
                     }
                     let a = scene.positions[i];
@@ -395,7 +404,7 @@ impl Renderer {
             }
             // Shrink cubes to expose the lattice; absent bonds are never drawn.
             for i in 0..scene.voxels.len() {
-                if scene.voxels[i].mass.is_finite() {
+                if !scene.voxels[i].kinematic {
                     instances[i].size = [CELL * 0.35; 3];
                 }
             }

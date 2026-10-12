@@ -1,6 +1,6 @@
 use crate::{
     bond::{Bond, BondWorkspace, EMPTY},
-    material::Material,
+    material::{Material, PhaseState},
     voxel::{Composition, Microstructure, Voxel},
 };
 use glam::{Quat, Vec3};
@@ -62,6 +62,10 @@ impl SceneConfig {
 }
 /// Positions are separate arrays; material identity exists only in composition.
 pub struct Scene {
+    /// Capacity-reusing workspace retained between physical steps.
+    pub(crate) solver_scratch: crate::solver::SolverScratch,
+    /// Capacity-reusing spatial data for broadphase collision detection.
+    pub(crate) collision_scratch: crate::collision::CollisionScratch,
     pub config: SceneConfig,
     pub voxels: Vec<Voxel>,
     /// Persistent per-voxel forces in newtons, retained until explicitly reset.
@@ -90,6 +94,34 @@ pub struct Scene {
     pub solver_residual: f32,
 }
 impl Scene {
+    /// Physical mass of every REV, including kinematic boundary material.
+    pub fn total_mass_kg(&self) -> f64 {
+        self.voxels.iter().map(|voxel| voxel.mass as f64).sum()
+    }
+
+    /// Temperature derived from mass, internal energy, and current composition.
+    pub fn temperature_kelvin(&self, voxel: usize) -> Option<f32> {
+        let state = self.voxels.get(voxel)?;
+        let material = Material::mixed(&state.composition, &self.materials);
+        Some(material.temperature(state.mass, state.internal_energy))
+    }
+
+    /// Phase fractions derived from conserved mass, energy, and composition.
+    pub fn phase_state(&self, voxel: usize) -> Option<PhaseState> {
+        let state = self.voxels.get(voxel)?;
+        let material = Material::mixed(&state.composition, &self.materials);
+        Some(material.phase_state(state.mass, state.internal_energy))
+    }
+
+    /// Add heat to a REV; temperature and phase fractions update as derived state.
+    pub fn add_heat_joules(&mut self, voxel: usize, joules: f32) -> bool {
+        if !joules.is_finite() || self.voxels.get(voxel).is_none() {
+            return false;
+        }
+        self.voxels[voxel].internal_energy = (self.voxels[voxel].internal_energy + joules).max(0.0);
+        true
+    }
+
     /// Derived display data for all incident bonds, including the negative-axis
     /// endpoint. Original outside faces are not damage. No visual state is stored.
     pub fn incident_bond_damage(&self) -> Vec<(f32, u8)> {
@@ -97,7 +129,9 @@ impl Scene {
         for axis in 0..3 {
             for (i, bond) in self.bonds[axis].iter().enumerate() {
                 let original = self.workspace[axis][i].rest_neighbor;
-                if original == EMPTY { continue; }
+                if original == EMPTY {
+                    continue;
+                }
                 let j = original as usize;
                 let broken = bond.neighbor == EMPTY;
                 let damage = if broken { 1.0 } else { bond.damage };
@@ -132,9 +166,10 @@ impl Scene {
                         + Vec3::splat(CELL * 0.5),
                 );
                 voxels.push(Voxel {
-                    mass: if fixed { f32::INFINITY } else { mass },
+                    mass,
+                    kinematic: fixed,
                     composition: Composition::pure(component),
-                    internal_energy: mass * m.heat_capacity * 293.15,
+                    internal_energy: m.energy_at_temperature(mass, 293.15),
                     velocity: Vec3::ZERO,
                     microstructure: Microstructure {
                         orientation,
@@ -210,7 +245,7 @@ impl Scene {
                 neighbor[axis] += 1;
                 if let Some(&j) = occupancy.get(&neighbor) {
                     // Ground supports by contact; do not glue different bodies together.
-                    if voxels[i].mass.is_infinite() == voxels[j].mass.is_infinite() {
+                    if voxels[i].kinematic == voxels[j].kinematic {
                         bonds[axis][i].neighbor = j as u32;
                         workspace[axis][i].rest_neighbor = j as u32;
                         colors[axis * 2 + key[axis].rem_euclid(2) as usize].push(i);
@@ -224,6 +259,8 @@ impl Scene {
             .collect();
         Self {
             config,
+            solver_scratch: Default::default(),
+            collision_scratch: Default::default(),
             external_forces: vec![Vec3::ZERO; n],
             external_accelerations: vec![Vec3::ZERO; n],
             axis_targets: vec![[None; 3]; n],

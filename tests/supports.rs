@@ -1,5 +1,9 @@
 use glam::Vec3;
-use voxel_physics_lab::{scene::{Scene, SceneConfig, CELL}, solver, tool::{Shape, Tool}};
+use voxel_physics_lab::{
+    scene::{Scene, SceneConfig, CELL},
+    solver,
+    tool::{Shape, Tool},
+};
 
 fn scene(floor: bool) -> Scene {
     let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
@@ -20,7 +24,9 @@ fn persistent_axis_constraints_allow_gravity_and_floor_support() {
     solver::fix_voxel_axis(&mut s, 0, 2, None).unwrap();
     solver::set_force(&mut s, 0, Vec3::new(100.0, -100.0, 0.0)).unwrap();
     let floor = s.positions[1..].to_vec();
-    for _ in 0..250 { solver::step(&mut s, &mut None); }
+    for _ in 0..250 {
+        solver::step(&mut s, &mut None);
+    }
     assert_eq!(s.positions[0].x, start.x);
     assert_eq!(s.positions[0].y, start.y);
     assert!(s.positions[0].z < start.z - 0.02);
@@ -53,12 +59,15 @@ fn axe_guide_carries_lateral_gravity_torque_and_contact_reactions() {
     let base = Vec3::new(-0.02, 0.0, 0.0);
     tool.mount_base(base, Vec3::X).unwrap();
     let mount = tool.mount.unwrap();
-    tool.set_external_force(Vec3::new(0.0, 100.0, -100.0)).unwrap();
+    tool.set_external_force(Vec3::new(0.0, 100.0, -100.0))
+        .unwrap();
     tool.set_external_torque(Vec3::splat(100.0)).unwrap();
     let mut tool = Some(tool);
     // Fix the target so its reaction slows the sliding axe, instead of drifting away.
     solver::fix_voxel(&mut s, 0, [true; 3]).unwrap();
-    for _ in 0..100 { solver::step(&mut s, &mut tool); }
+    for _ in 0..100 {
+        solver::step(&mut s, &mut tool);
+    }
     let t = tool.unwrap();
     let final_base = t.position + t.rotation * base;
     assert!((final_base.y - mount.world_base.y).abs() < 1e-7);
@@ -75,7 +84,8 @@ fn axe_guide_carries_lateral_gravity_torque_and_contact_reactions() {
 fn fully_fixed_base_stays_put_and_unmount_restores_gravity() {
     let mut s = scene(false);
     let mut t = Tool::new(Shape::Blade, &s, Vec3::splat(1.0), Vec3::X, 3.0);
-    t.mount_base(Vec3::new(-0.01, 0.0, 0.0), Vec3::ZERO).unwrap();
+    t.mount_base(Vec3::new(-0.01, 0.0, 0.0), Vec3::ZERO)
+        .unwrap();
     let start = t.position;
     t.set_external_force(Vec3::splat(100.0)).unwrap();
     t.advance(&mut s, 0.05, &[]);
@@ -93,9 +103,13 @@ fn default_scene_has_explicit_floor_and_gravity() {
     let config = SceneConfig::load("scenes/mounted_axe.ron").unwrap();
     assert_eq!(config.gravity, [0.0, 0.0, -9.81]);
     let s = Scene::new(config);
-    assert_eq!(s.voxels.iter().filter(|v| v.mass.is_finite()).count(), 4320);
-    assert_eq!(s.voxels.iter().filter(|v| !v.mass.is_finite()).count(), 6400);
-    assert!(s.positions.iter().zip(&s.voxels).filter(|(_, v)| !v.mass.is_finite())
+    assert_eq!(s.voxels.iter().filter(|v| !v.kinematic).count(), 4320);
+    assert_eq!(s.voxels.iter().filter(|v| v.kinematic).count(), 6400);
+    assert!(s
+        .positions
+        .iter()
+        .zip(&s.voxels)
+        .filter(|(_, v)| v.kinematic)
         .all(|(p, _)| (p.z + CELL * 0.5).abs() < 1e-7));
 }
 
@@ -115,5 +129,8 @@ fn oblique_guide_preserves_its_line_and_projected_force() {
     assert!(displacement.cross(direction).length() < 2e-7);
     let previous_mount = t.mount;
     assert!(t.mount_base(Vec3::splat(f32::NAN), direction).is_err());
-    assert_eq!(t.mount.unwrap().world_base, previous_mount.unwrap().world_base);
+    assert_eq!(
+        t.mount.unwrap().world_base,
+        previous_mount.unwrap().world_base
+    );
 }
