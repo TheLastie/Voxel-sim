@@ -117,7 +117,9 @@ pub fn set_velocity(scene: &mut Scene, voxel: usize, velocity: Vec3) -> Result<(
     if !velocity.is_finite() {
         return Err("velocity must be finite");
     }
-    body.velocity = velocity;
+    body.velocity = Vec3::from_array(std::array::from_fn(|a| {
+        if scene.axis_targets[voxel][a].is_some() { 0.0 } else { velocity[a] }
+    }));
     Ok(())
 }
 
@@ -137,7 +139,9 @@ pub fn apply_impulse(scene: &mut Scene, voxel: usize, impulse: Vec3) -> Result<(
     if !velocity.is_finite() {
         return Err("impulse would produce a non-finite velocity");
     }
-    body.velocity = velocity;
+    body.velocity = Vec3::from_array(std::array::from_fn(|a| {
+        if scene.axis_targets[voxel][a].is_some() { 0.0 } else { velocity[a] }
+    }));
     Ok(())
 }
 
@@ -149,6 +153,41 @@ pub fn clear_applied_actions(scene: &mut Scene, voxel: usize) -> Result<(), &'st
     scene.external_forces[voxel] = Vec3::ZERO;
     scene.external_accelerations[voxel] = Vec3::ZERO;
     Ok(())
+}
+
+/// Fix selected world axes at specified coordinates (metres). None releases an axis.
+/// Coordinates are imposed immediately; the remaining axes retain mass and motion.
+pub fn fix_voxel_axes(scene: &mut Scene, voxel: usize, coordinates: [Option<f32>; 3]) -> Result<(), &'static str> {
+    if voxel >= scene.voxels.len() { return Err("voxel index out of range"); }
+    if coordinates.iter().flatten().any(|p| !p.is_finite()) { return Err("coordinates must be finite"); }
+    scene.axis_targets[voxel] = coordinates;
+    for axis in 0..3 {
+        if let Some(p) = coordinates[axis] {
+            scene.positions[voxel][axis] = p;
+            scene.previous[voxel][axis] = p;
+            scene.voxels[voxel].velocity[axis] = 0.0;
+        }
+    }
+    Ok(())
+}
+/// Fix all axes at a world coordinate.
+pub fn fix_voxel_at(scene: &mut Scene, voxel: usize, coordinate: Vec3) -> Result<(), &'static str> {
+    fix_voxel_axes(scene, voxel, coordinate.to_array().map(Some))
+}
+/// Fix selected axes at their current coordinates; false leaves an axis free.
+pub fn fix_voxel(scene: &mut Scene, voxel: usize, axes: [bool; 3]) -> Result<(), &'static str> {
+    let p = *scene.positions.get(voxel).ok_or("voxel index out of range")?;
+    fix_voxel_axes(scene, voxel, std::array::from_fn(|a| axes[a].then_some(p[a])))
+}
+/// Change one constraint without changing the other axes. None releases it.
+pub fn fix_voxel_axis(scene: &mut Scene, voxel: usize, axis: usize, coordinate: Option<f32>) -> Result<(), &'static str> {
+    if axis >= 3 { return Err("axis must be 0 (X), 1 (Y), or 2 (Z)"); }
+    let mut targets = *scene.axis_targets.get(voxel).ok_or("voxel index out of range")?;
+    targets[axis] = coordinate;
+    fix_voxel_axes(scene, voxel, targets)
+}
+pub fn release_voxel(scene: &mut Scene, voxel: usize) -> Result<(), &'static str> {
+    fix_voxel_axes(scene, voxel, [None; 3])
 }
 
 /// Local polar fits make the vector constraints invariant to rigid rotation.
@@ -243,6 +282,12 @@ pub fn step_with_axis_targets_and_loads(
 ) {
     assert!(targets.is_empty() || targets.len() == scene.voxels.len());
     assert!(loads.is_empty() || loads.len() == scene.voxels.len());
+    // Explicit per-step coordinates override persistent constraints on that axis.
+    let merged_targets: Vec<_> = scene.axis_targets.iter().enumerate().map(|(i, fixed)| {
+        std::array::from_fn(|a| targets.get(i).and_then(|t| t[a]).or(fixed[a]))
+    }).collect();
+    assert!(merged_targets.iter().flatten().flatten().all(|p| p.is_finite()));
+    let targets = merged_targets.as_slice();
     let applied_loads: Vec<_> = scene
         .voxels
         .iter()
@@ -273,6 +318,7 @@ pub fn step_with_axis_targets_and_loads(
         {
             if v.mass.is_finite() {
                 v.velocity += gravity * h;
+                for a in 0..3 { if targets[i][a].is_some() { v.velocity[a] = 0.0; } }
                 drift_velocity[i] = v.velocity;
                 *p += v.velocity * h;
             }
@@ -321,11 +367,6 @@ pub fn step_with_axis_targets_and_loads(
                 && scene.solver_residual <= scene.config.solver_relative_tolerance
             {
                 break;
-            }
-        }
-        for (p, v) in scene.positions.iter_mut().zip(&scene.voxels) {
-            if v.mass.is_finite() {
-                p.z = p.z.max(scene.ground_top + CELL * 0.5);
             }
         }
         // Preserve the accurately integrated drift velocity. Recover only the
@@ -401,7 +442,7 @@ pub fn step_with_axis_targets_and_loads(
             // Run a zero-time geometric/impulse pass before leaving the substep.
             let _ = t.advance(scene, 0.0, targets);
         }
-        apply_releases(scene);
+        apply_releases(scene, targets);
         scene.substep_index += 1;
     }
     if topology_changed {
@@ -443,6 +484,21 @@ pub fn rebuild_clusters(scene: &mut Scene) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fracture_release_respects_fixed_axes_and_accounts_for_heat() {
+        let mut s = scene();
+        s.energy.pending_release = 0.25;
+        s.releases.push(crate::fracture::Release { i: 0, j: 1, energy: 0.25, due: 0 });
+        let targets = vec![[Some(0.0); 3]; s.voxels.len()];
+        let e0 = s.voxels[0].internal_energy + s.voxels[1].internal_energy;
+        apply_releases(&mut s, &targets);
+        assert_eq!(s.voxels[0].velocity, Vec3::ZERO);
+        assert_eq!(s.voxels[1].velocity, Vec3::ZERO);
+        assert_eq!(s.energy.pending_release, 0.0);
+        assert_eq!(s.energy.damage_heat, 0.25);
+        assert_eq!(s.energy.kinetic_release, 0.0);
+        assert!((s.voxels[0].internal_energy + s.voxels[1].internal_energy - e0 - 0.25).abs() < 1e-4);
+    }
     fn scene() -> Scene {
         let mut c = crate::scene::SceneConfig::load("scenes/wood_chop.ron").unwrap();
         c.dimensions = [2, 2, 2];
@@ -610,7 +666,7 @@ mod tests {
     }
 }
 
-fn apply_releases(scene: &mut Scene) {
+fn apply_releases(scene: &mut Scene, targets: &[[Option<f32>; 3]]) {
     let releases = std::mem::take(&mut scene.releases);
     for r in releases {
         if r.due > scene.substep_index {
@@ -620,18 +676,25 @@ fn apply_releases(scene: &mut Scene) {
         let normal = (scene.positions[r.j] - scene.positions[r.i]).normalize_or_zero();
         let wi = scene.voxels[r.i].mass.recip();
         let wj = scene.voxels[r.j].mass.recip();
+        let free = |i: usize| Vec3::from_array(std::array::from_fn(|axis| {
+            if targets.get(i).and_then(|t| t[axis]).is_some() { 0.0 } else { 1.0 }
+        }));
+        let fi = free(r.i);
+        let fj = free(r.j);
+        let effective_i = wi * normal.dot(normal * fi);
+        let effective_j = wj * normal.dot(normal * fj);
         let impulse = crate::fracture::release_impulse(
-            scene.voxels[r.i].velocity,
-            scene.voxels[r.j].velocity,
-            wi,
-            wj,
+            scene.voxels[r.i].velocity * fi,
+            scene.voxels[r.j].velocity * fj,
+            effective_i,
+            effective_j,
             normal,
             r.energy,
         );
-        scene.voxels[r.i].velocity -= impulse * wi;
-        scene.voxels[r.j].velocity += impulse * wj;
+        scene.voxels[r.i].velocity -= impulse * wi * fi;
+        scene.voxels[r.j].velocity += impulse * wj * fj;
         scene.energy.pending_release -= r.energy;
-        if wi + wj > 0.0 && normal.length_squared() > 0.5 {
+        if effective_i + effective_j > 0.0 && normal.length_squared() > 0.5 {
             scene.energy.kinetic_release += r.energy;
         } else {
             scene.energy.damage_heat += r.energy;

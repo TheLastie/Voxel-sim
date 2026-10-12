@@ -4,25 +4,50 @@ import csv
 import math
 import os
 import sys
+import json
+from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 SRC = sys.argv[1] if len(sys.argv) > 1 else 'validation/knife_capture_fixed.csv'
 OUT = sys.argv[2] if len(sys.argv) > 2 else 'validation/knife-fixed-frame.png'
 MAKE_VIDEO_FRAMES = len(sys.argv) > 3 and sys.argv[3] == 'video'
 CELL = 0.01
+DT = 0.001
+APPROACH = 0.0
+schema = 1
+saved_q, saved_b, saved_e = {}, {}, {}
+saved_load = {}
+ramp_peak = 0.0
+saved_tool_cells = []
 frames = {}
 with open(SRC, newline='') as f:
     for row in csv.reader(f):
         if not row:
             continue
-        if row[0] == 'F':
+        if row[0] == 'H':
+            schema, DT, APPROACH = int(row[1]), float(row[2]), float(row[6])
+        elif row[0] == 'T':
+            saved_tool_cells.append(tuple(map(float,row[1:4])))
+        elif row[0] == 'Q':
+            x,y,z,w = map(float,row[2:6])
+            saved_q[int(row[1])] = (w,x,y,z)
+        elif row[0] == 'B':
+            saved_b.setdefault(int(row[1]),[]).append(tuple(map(int,row[2:4])))
+        elif row[0] == 'E':
+            saved_e[int(row[1])] = tuple(map(float,row[2:5]))
+        elif row[0] == 'L':
+            if ramp_peak > 0.0:
+                saved_load[int(row[1])] = tuple(map(float,row[2:4]))
+        elif row[0] == 'R':
+            ramp_peak = float(row[1])
+        elif row[0] == 'F':
             frame = int(row[1])
             frames[frame] = {
                 'tool': tuple(map(float, row[2:5])),
                 'vel': tuple(map(float, row[5:8])),
                 'omega': tuple(map(float, row[8:11])),
                 'broken': int(row[11]), 'clusters': int(row[12]),
-                'vmax': float(row[13]), 'vox': [],
+                'vmax': float(row[13]), 'wood_ke':float(row[14]), 'tool_ke':float(row[15]), 'vox': [],
             }
         elif row[0] == 'V':
             frame = int(row[1])
@@ -32,6 +57,14 @@ with open(SRC, newline='') as f:
                 ))
 if not frames:
     raise SystemExit('No complete frames in capture')
+measurement_path = Path(SRC).with_name(Path(SRC).stem+'-measurements.json')
+energy_failed = False
+if measurement_path.exists():
+    measurement = json.loads(measurement_path.read_text())
+    gap = max(abs(measurement.get('energy_gap_after_drive_work_estimate_J', 0)),
+              measurement.get('max_abs_recorded_energy_gap_J', 0))
+    reference = measurement.get('initial_accounted_energy_J', 0)+abs(measurement.get('drive_work_estimate_J', 0))
+    energy_failed = abs(gap) > max(1.0, reference*0.01)
 
 # Rebuild the rigid blade's saved orientation from the initial fixture rotation
 # and recorded angular velocity. The old image drew a world-aligned rectangle,
@@ -69,6 +102,9 @@ for prev, cur in zip(ordered_frames, ordered_frames[1:]):
         norm = math.sqrt(sum(v*v for v in q))
         q = tuple(v / norm for v in q)
     frames[cur]['rotation'] = q
+if saved_q:
+    for n in ordered_frames:
+        frames[n]['rotation'] = saved_q[n]
 
 W, H = 1440, 900
 font_path = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
@@ -87,10 +123,9 @@ def iso(p):
     return ((x + y) * SQRT_HALF,
             (x - y) * SQRT_1_6 - z * SQRT_2_3)
 
-def blade_cells(fr):
+def blade_local_cells():
     # Match Shape::Blade in Tool::new: 20 x 5 x 14, tapering to a one-REV edge.
-    q = fr['rotation']
-    center = fr['tool']
+    local_cells = []
     for ix in range(20):
         for iy in range(5):
             for iz in range(14):
@@ -101,14 +136,41 @@ def blade_cells(fr):
                 local = ((ix + 0.5 - 10.0) * CELL,
                          local_y,
                          (iz + 0.5 - 7.0) * CELL)
-                offset = rotate(q, local)
-                yield tuple((center[k] + offset[k]) / CELL for k in range(3))
+                local_cells.append(local)
+    centroid = tuple(sum(p[k] for p in local_cells)/len(local_cells) for k in range(3))
+    return local_cells, centroid
 
-def cube_faces(center, half, project):
+LOCAL_BLADE, BLADE_CENTROID = blade_local_cells()
+if saved_tool_cells:
+    LOCAL_BLADE, BLADE_CENTROID = saved_tool_cells, (0.0,0.0,0.0)
+
+def blade_cells(fr):
+    q = fr['rotation']
+    center = fr['tool']  # Tool position now tracks its occupied-volume COM.
+    for local in LOCAL_BLADE:
+        # Tool::new preserves the original shape while shifting its local
+        # origin to the center of mass. Reapply that same centroid here.
+        offset = rotate(q, tuple(local[k]-BLADE_CENTROID[k] for k in range(3)))
+        yield tuple((center[k] + offset[k]) / CELL for k in range(3))
+
+def cube_faces(center, half, project, rotation=None):
     x, y, z = center
     a = half
     def face(points):
-        return [project((x+px*a, y+py*a, z+pz*a)) for px, py, pz in points]
+        offsets = [(px*a,py*a,pz*a) for px,py,pz in points]
+        if rotation is not None:
+            offsets = [rotate(rotation,p) for p in offsets]
+        return [project((x+px,y+py,z+pz)) for px,py,pz in offsets]
+    if rotation is not None:
+        candidates=[
+            ((1,0,0),[(1,-1,-1),(1,1,-1),(1,1,1),(1,-1,1)]),
+            ((-1,0,0),[(-1,-1,-1),(-1,-1,1),(-1,1,1),(-1,1,-1)]),
+            ((0,-1,0),[(-1,-1,-1),(1,-1,-1),(1,-1,1),(-1,-1,1)]),
+            ((0,1,0),[(-1,1,-1),(-1,1,1),(1,1,1),(1,1,-1)]),
+            ((0,0,1),[(-1,-1,1),(1,-1,1),(1,1,1),(-1,1,1)]),
+            ((0,0,-1),[(-1,-1,-1),(-1,1,-1),(1,1,-1),(1,-1,-1)])]
+        return [face(points) for normal,points in candidates
+                if sum(a*b for a,b in zip(rotate(rotation,normal),(1,-1,1)))>1e-6]
     # Camera direction sees the +X, -Y and +Z faces.
     return [
         face([(1,-1,-1),(1,1,-1),(1,1,1),(1,-1,1)]),
@@ -119,11 +181,19 @@ def cube_faces(center, half, project):
 # Use one camera for the whole clip. Reframing each snapshot made the specimen
 # appear to drift and change size while the knife moved.
 camera_points = []
-for fr in frames.values():
+for n,fr in frames.items():
+    # Close camera covers the original specimen and the contact region. The
+    # complete metre-scale approach is represented by the X overview strip.
+    if schema >= 2 and (n*DT < APPROACH or (saved_load and n*DT > APPROACH+0.24)):
+        continue
     wood_centers = [(x / CELL, y / CELL, z / CELL)
                     for _, x, y, z, _, _ in fr['vox']]
     camera_points.extend(iso(p) for p in wood_centers)
     camera_points.extend(iso(p) for p in blade_cells(fr))
+if not camera_points:
+    camera_points.extend(iso((x/CELL,y/CELL,z/CELL)) for _,x,y,z,_,_ in frames[ordered_frames[0]]['vox'])
+overview_min = min([fr['tool'][0] for fr in frames.values()]+[-0.15])
+overview_max = max([fr['tool'][0] for fr in frames.values()]+[0.15])
 min_x = min(p[0] for p in camera_points) - 1
 max_x = max(p[0] for p in camera_points) + 1
 min_y = min(p[1] for p in camera_points) - 1
@@ -134,29 +204,59 @@ cx = (STAGE[0]+STAGE[2])*0.5
 cy = (STAGE[1]+STAGE[3])*0.5
 pcx = (min_x+max_x)*0.5
 pcy = (min_y+max_y)*0.5
+contact_camera = (scale, pcx, pcy)
 def project(p):
     sx, sy = iso(p)
     return (cx+(sx-pcx)*scale, cy+(sy-pcy)*scale)
 
 def render(n, dst):
+    global scale, pcx, pcy
     fr = frames[n]
     wood = fr['vox']
     blade = list(blade_cells(fr))
     wood_centers = [(x/CELL, y/CELL, z/CELL) for _,x,y,z,_,_ in wood]
+    scale, pcx, pcy = contact_camera
+    if saved_load and n*DT > 1.8:
+        # The force experiment can disperse most of the specimen. Expand the
+        # main view to include the full wood cloud; all tool centers remain
+        # represented in the separate world overview. This is camera motion,
+        # not a rescaling of any saved world coordinate.
+        projected = [iso(p) for p in wood_centers]
+        lo_x=min(min_x,min(p[0] for p in projected)-1)
+        hi_x=max(max_x,max(p[0] for p in projected)+1)
+        lo_y=min(min_y,min(p[1] for p in projected)-1)
+        hi_y=max(max_y,max(p[1] for p in projected)+1)
+        target_scale=min((STAGE[2]-STAGE[0])/(hi_x-lo_x),(STAGE[3]-STAGE[1])/(hi_y-lo_y))
+        alpha=min(1.0,(n*DT-1.8)/0.4)
+        scale=contact_camera[0]**(1-alpha)*target_scale**alpha
+        pcx=contact_camera[1]*(1-alpha)+(lo_x+hi_x)/2*alpha
+        pcy=contact_camera[2]*(1-alpha)+(lo_y+hi_y)/2*alpha
     im = Image.new('RGB', (W,H), (13,19,28))
     d = ImageDraw.Draw(im)
-    d.text((42,25), 'VOXEL PHYSICS LAB  /  KNIFE CUT', font=title, fill=(237,242,248))
-    d.text((44,65), '1 cm cells shown individually  •  Fixed isometric camera  •  Solver states',
+    tool_mask = Image.new('L',(W,H),0)
+    tool_mask_draw = ImageDraw.Draw(tool_mask)
+    d.text((42,25), 'VOXEL PHYSICS LAB  /  CONTACT DIAGNOSTIC', font=title, fill=(237,242,248))
+    d.text((44,65), f'1 cm REV  •  {max(frames)*DT:.3f} s physical run  •  Exact poses / bonds' if schema>=2 else '1 cm cells shown individually  •  Saved solver states  •  20 ms physical run',
            font=small, fill=(145,163,184))
     d.rounded_rectangle(STAGE, radius=16, fill=(17,25,36), outline=(39,52,68), width=2)
+    if saved_load and n*DT > 1.8 and scale < contact_camera[0]*0.98:
+        d.text((450,95),f'Camera follows specimen extent / {CELL/scale*1000:.2f} mm per pixel',font=mini,fill=(161,177,196))
 
     items = []
+    # Schema 2 has exact broken endpoints: both sides of a crack must be colored,
+    # including the endpoint whose outgoing positive-axis bonds remain intact.
+    broken_incidence = {}
+    for i,j in saved_b.get(n,[]):
+        broken_incidence[i] = broken_incidence.get(i,0)+1
+        broken_incidence[j] = broken_incidence.get(j,0)+1
     for voxel, center in zip(wood, wood_centers):
         i, x, y, z, damage, lost = voxel
-        # lost is an aggregate of positive-axis neighbors; remove the three
-        # outer boundaries as the previous renderer did.
+        # lost is an aggregate of missing positive-axis neighbor bonds; remove
+        # the specimen boundaries from the count before coloring.
         gx, gy, gz = i%12, (i//12)%12, i//144
         lost = max(0, lost-(gx==11)-(gy==11)-(gz==29))
+        if schema >= 2:
+            lost = broken_incidence.get(i,0)
         if lost >= 2:
             base = (212,72,62)
         elif lost == 1:
@@ -175,7 +275,18 @@ def render(n, dst):
 
     # Separate each 1 cm REV slightly so its cubic outline remains visible.
     for _, is_blade, center, color in sorted(items, key=lambda item: item[0]):
-        faces = cube_faces(center, 0.44, project)
+        if saved_load and scale < 2.0:
+            px,py=project(center)
+            if STAGE[0]<=px<=STAGE[2] and STAGE[1]<=py<=STAGE[3]:
+                d.ellipse((px-1,py-1,px+1,py+1),fill=color)
+                if is_blade:
+                    tool_mask_draw.ellipse((px-1,py-1,px+1,py+1),fill=255)
+            continue
+        pc = project(center)
+        if schema>=2 and not (STAGE[0]+10 <= pc[0] <= STAGE[2]-10 and STAGE[1]+10 <= pc[1] <= STAGE[3]-10):
+            continue
+        faces = cube_faces(center, 0.5 if is_blade else 0.49, project,
+                           fr['rotation'] if is_blade else None)
         if is_blade:
             shades = [(146,166,192), (171,190,213), (221,230,240)]
             outline = (45,59,76)
@@ -185,6 +296,8 @@ def render(n, dst):
             outline = (29,42,52)
         for polygon, shade in zip(faces, shades):
             d.polygon(polygon, fill=shade, outline=outline)
+            if is_blade:
+                tool_mask_draw.polygon(polygon,fill=255)
 
     # Mark actual gaps between originally adjacent cells. The CSV stores lost
     # bond counts, not per-axis flags, so require both a lost bond and a visible
@@ -195,7 +308,18 @@ def render(n, dst):
         gx, gy, gz = i%12, (i//12)%12, i//144
         outside = int(gx==11) + int(gy==11) + int(gz==29)
         by_id[i] = (center, max(0, raw_lost-outside))
-    for i,(a,lost_a) in by_id.items():
+    if schema>=2:
+        for i,j in saved_b.get(n,[]):
+            if i not in by_id or j not in by_id:
+                continue
+            a,b = by_id[i][0],by_id[j][0]
+            gap = math.dist(a,b)
+            pa,pb = project(a),project(b)
+            probes=[pa,pb,((pa[0]+pb[0])*.5,(pa[1]+pb[1])*.5)]
+            blade_occludes = any(tool_mask.getpixel((max(0,min(W-1,round(p[0]))),max(0,min(H-1,round(p[1]))))) for p in probes)
+            if not blade_occludes and 1.02 < gap < 2.0 and all(STAGE[0]<p[0]<STAGE[2] and STAGE[1]<p[1]<STAGE[3] for p in [pa,pb]):
+                d.line([pa,pb],fill=(239,74,77),width=2)
+    for i,(a,lost_a) in ([] if schema>=2 else by_id.items()):
         gx = i % 12
         # The knife advances through world X, so the cut surface is traced by
         # missing X-neighbor ties only; showing all axes looked like a red cage.
@@ -220,26 +344,93 @@ def render(n, dst):
     d.rounded_rectangle((bx,by,1398,490),radius=18,fill=(25,34,47),outline=(49,65,83),width=2)
     d.text((bx+24,by+22),'SIMULATION STATE',font=small,fill=(140,166,193))
     rows = [('Frame',f'{n:04d} / {max(frames):04d}'),
-            ('Simulation time',f'{n/1000:.3f} s'),
+            ('Simulation time',f'{n*DT:.3f} s'),
             ('Tool speed',f'{math.sqrt(sum(v*v for v in fr["vel"])):.3f} m/s'),
             ('Broken bonds',f'{fr["broken"]:,}'),
             ('Connected pieces',str(fr['clusters'])),
             ('Peak voxel speed',f'{fr["vmax"]:.2f} m/s'),
             ('Wood voxels',f'{len(wood):,} × 1 cm'),
             ('Knife voxels',f'{len(blade):,} × 1 cm')]
+    if schema>=2:
+        rows=rows[:6]+[('Tool / wood KE',f'{fr["tool_ke"]:.2f} / {fr["wood_ke"]:.2f} J'),('Elastic energy',f'{saved_e[n][1]:.3f} J')]
     for j,(label,value) in enumerate(rows):
         yy=by+62+j*37
         d.text((bx+24,yy),label,font=small,fill=(161,177,196))
         d.text((bx+240,yy),value,font=small,fill=(238,242,247))
+    if saved_load:
+        force, work = saved_load[n]
+        d.text((bx, 505), f'Force: {force:.1f} N   Work estimate: {work:.1f} J', font=small, fill=(238,190,115))
 
     d.text((bx,535),'Bond / material state',font=small,fill=(164,180,199))
-    legend=[((113,153,111),'Intact'),((239,190,76),'Damaged'),((235,133,62),'Broken REV'),((239,74,77),'Open cut gap'),((177,196,218),'Steel REV')]
-    for j,(color,label) in enumerate(legend):
+    legend=[((113,153,111),'Intact bonds'),((239,190,76),'Damaged bonds'),((235,133,62),'One broken bond'),((212,72,62),'Multiple broken bonds'),((239,74,77),'Visible local separation'),((177,196,218),'Steel REV')]
+    for j,(color,label) in enumerate([] if saved_load else legend):
         yy=565+j*30
         d.rectangle((bx,yy,bx+18,yy+18),fill=color,outline=(35,47,60))
         d.text((bx+29,yy-2),label,font=small,fill=(185,197,211))
-    d.text((bx,735),'Each block is a separate simulated REV.',font=mini,fill=(133,151,171))
-    d.text((42,865),'Voxel geometry, bond damage and motion are reconstructed from saved solver states.',
+    # The force graph occupies the right-hand legend area. Keep a compact
+    # state legend below the specimen so fracture colors remain explained.
+    if saved_load:
+        lx, ly = 60, 839
+        d.text((lx,ly),'Bonds:',font=mini,fill=(164,180,199))
+        lx += 58
+        for color,label in zip([item[0] for item in legend],
+                               ['Intact','Damage','1 broken','2+ broken','Open gap','Steel']):
+            d.rectangle((lx,ly+2,lx+13,ly+15),fill=color)
+            d.text((lx+20,ly),label,font=mini,fill=(185,197,211))
+            lx += 38 + d.textlength(label,font=mini)
+    if saved_load:
+        d.rectangle((bx,530,bx+448,715),fill=(13,19,28))
+        d.text((bx,535),'APPLIED FORCE / PHYSICAL TIME',font=small,fill=(164,180,199))
+        peak = max(1.0, max(v[0] for v in saved_load.values()))
+        def load_point(f):
+            return (bx+16+f/max(frames)*416, 678-saved_load[f][0]/peak*108)
+        d.line([load_point(f) for f in sorted(saved_load)],fill=(238,190,115),width=3)
+        px,py=load_point(n)
+        d.line([(px,565),(px,680)],fill=(100,126,155),width=1)
+        d.ellipse((px-4,py-4,px+4,py+4),fill=(255,240,194))
+        d.text((bx+16,690),'0 s',font=mini,fill=(161,177,196))
+        d.text((bx+355,690),f'{max(frames)*DT:.1f} s',font=mini,fill=(161,177,196))
+    d.text((bx,735),'FIXTURE CHECKS',font=small,fill=(140,166,193))
+    checks=[('Tension / fiber ratio','39.46×'),('Compression / fiber ratio','31.12×'),('Bending','9 / 9 bonds'),('Wedge','264 breaks; 1 piece')]
+    for j,(label,value) in enumerate(checks):
+        yy=762+j*24
+        d.text((bx,yy),label,font=mini,fill=(161,177,196))
+        d.text((bx+260,yy),value,font=mini,fill=(238,190,115) if j==3 else (238,242,247))
+    if schema>=2:
+        d.rectangle((bx,728,1439,850),fill=(13,19,28))
+        d.text((bx,735),'FULL APPROACH / X POSITION',font=small,fill=(140,166,193))
+        def strip(x): return bx+12+(x-overview_min)/(overview_max-overview_min)*420
+        sy=790
+        d.line([(bx+12,sy),(bx+432,sy)],fill=(88,108,129),width=2)
+        wx=strip(0.0)
+        d.rectangle((wx-3,sy-14,wx+3,sy+14),fill=(113,153,111))
+        tx=strip(fr['tool'][0])
+        d.ellipse((tx-5,sy-5,tx+5,sy+5),fill=(221,230,240))
+        d.text((bx,815),f'Initial wood x=0 m    Knife x={fr["tool"][0]:.3f} m',font=mini,fill=(161,177,196))
+    if saved_load:
+        # Fixed close view preserves contact scale. This overview includes
+        # every saved center, even when fragments leave the contact viewport.
+        d.rectangle((bx,728,1439,850),fill=(13,19,28))
+        d.text((bx,731),'ALL REV OVERVIEW / AUTO SCALE',font=mini,fill=(140,166,193))
+        pts=[(iso(p),(113,153,111)) for p in wood_centers]+[(iso(p),(177,196,218)) for p in blade]
+        xmin=min(p[0] for p,c in pts); xmax=max(p[0] for p,c in pts)
+        ymin=min(p[1] for p,c in pts); ymax=max(p[1] for p,c in pts)
+        overview_scale=min(420/max(xmax-xmin,1),80/max(ymax-ymin,1))
+        for (x,y),color in pts:
+            px=bx+224+(x-(xmin+xmax)/2)*overview_scale
+            py=792+(y-(ymin+ymax)/2)*overview_scale
+            d.point((round(px),round(py)),fill=color)
+        outside=sum(not (STAGE[0]<=project(p)[0]<=STAGE[2] and STAGE[1]<=project(p)[1]<=STAGE[3]) for p in wood_centers)
+        if outside:
+            d.text((STAGE[0]+15,STAGE[3]-26),f'{outside} wood REV outside close view; see overview',font=mini,fill=(238,190,115))
+        d.text((bx,834),f'Knife COM x={fr["tool"][0]:.3f} m',font=mini,fill=(161,177,196))
+        if scale < 2.0:
+            d.text((STAGE[0]+15,STAGE[3]-26),'Distant REV shown as 2 px markers for visibility',font=mini,fill=(161,177,196))
+    footer = 'Recorded solver states. Gravity disabled. Cracks shown only for saved broken neighbor bonds.' if schema>=2 else 'Diagnostic only: many bonds break, but the wood remains one connected piece.'
+    if saved_load:
+        footer=('Force experiment / gravity disabled / energy balance fails: motion is diagnostic, not validated physics.'
+                if energy_failed else 'Force experiment / gravity disabled / recorded motion: physical validity has not been established.')
+    d.text((42,865),footer,
            font=mini,fill=(112,130,151))
     im.save(dst)
     return im

@@ -1,0 +1,24 @@
+frame=0/2100 sim=0.000s wall=0.000s broken=0 clusters=1 residual=0.000e0
+frame=100/2100 sim=0.100s wall=13.959s broken=0 clusters=1 residual=8.808e-6
+frame=200/2100 sim=0.200s wall=27.697s broken=0 clusters=1 residual=8.808e-6
+frame=300/2100 sim=0.300s wall=40.739s broken=0 clusters=1 residual=8.808e-6
+frame=400/2100 sim=0.400s wall=53.161s broken=0 clusters=1 residual=8.808e-6
+frame=500/2100 sim=0.500s wall=66.300s broken=0 clusters=1 residual=8.808e-6
+frame=600/2100 sim=0.600s wall=79.322s broken=0 clusters=1 residual=8.808e-6
+frame=700/2100 sim=0.700s wall=93.089s broken=0 clusters=1 residual=8.808e-6
+frame=800/2100 sim=0.800s wall=106.230s broken=0 clusters=1 residual=8.808e-6
+frame=900/2100 sim=0.900s wall=118.591s broken=0 clusters=1 residual=8.808e-6
+frame=1000/2100 sim=1.000s wall=132.423s broken=0 clusters=1 residual=4.320e-5
+frame=1100/2100 sim=1.100s wall=161.111s broken=1226 clusters=13 residual=1.235e-4
+frame=1200/2100 sim=1.200s wall=188.422s broken=1258 clusters=15 residual=9.096e-5
+frame=1300/2100 sim=1.300s wall=218.032s broken=1259 clusters=15 residual=4.501e-5
+frame=1400/2100 sim=1.400s wall=247.498s broken=1259 clusters=15 residual=5.474e-5
+frame=1500/2100 sim=1.500s wall=278.241s broken=1259 clusters=15 residual=1.282e-4
+frame=1600/2100 sim=1.600s wall=308.015s broken=1260 clusters=16 residual=7.656e-5
+frame=1700/2100 sim=1.700s wall=337.452s broken=1260 clusters=16 residual=1.116e-4
+frame=1800/2100 sim=1.800s wall=366.941s broken=1260 clusters=16 residual=2.165e-4
+frame=1900/2100 sim=1.900s wall=397.467s broken=1263 clusters=16 residual=2.274e-4
+frame=2000/2100 sim=2.000s wall=426.655s broken=1263 clusters=16 residual=1.845e-4
+frame=2100/2100 sim=2.100s wall=457.069s broken=1263 clusters=16 residual=1.587e-4
+complete simulated=2.100s wall=457.073s
+Captured knife solver states to validation/knife-long.csv at 6 m/s for 2100 frames (stride 20, attack angle 0°)

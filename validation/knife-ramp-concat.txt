@@ -1,0 +1,572 @@
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0000.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0050.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0100.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0150.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0200.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0250.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0300.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0350.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0400.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0450.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0500.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0550.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0600.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0650.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0700.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0750.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0800.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0850.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0900.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0950.png'
+option framerate 50
+duration 0.620000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0990.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0991.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0992.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0993.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0994.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0995.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0996.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0997.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0998.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/0999.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1000.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1001.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1002.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1003.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1004.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1005.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1006.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1007.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1008.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1009.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1010.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1011.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1012.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1013.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1014.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1015.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1016.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1017.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1018.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1019.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1020.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1021.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1022.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1023.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1024.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1025.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1026.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1027.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1028.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1029.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1030.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1031.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1032.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1033.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1034.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1035.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1036.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1037.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1038.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1039.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1040.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1041.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1042.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1043.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1044.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1045.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1046.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1047.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1048.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1049.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1050.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1051.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1052.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1053.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1054.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1055.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1056.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1057.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1058.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1059.png'
+option framerate 50
+duration 0.020000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1060.png'
+option framerate 50
+duration 0.800000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1100.png'
+option framerate 50
+duration 1.000000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1150.png'
+option framerate 50
+duration 1.000000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1200.png'
+option framerate 50
+duration 0.820000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1250.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1300.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1350.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1400.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1450.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1500.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1550.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1600.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1650.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1700.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1750.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1800.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1850.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1900.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/1950.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2000.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2050.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2100.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2150.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2200.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2250.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2300.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2350.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2400.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2450.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2500.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2550.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2600.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2650.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2700.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2750.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2800.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2850.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2900.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/2950.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3000.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3050.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3100.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3150.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3200.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3250.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3300.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3350.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3400.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3450.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3500.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3550.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3600.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3650.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3700.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3750.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3800.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3850.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3900.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/3950.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4000.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4050.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4100.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4150.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4200.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4250.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4300.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4350.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4400.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4450.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4500.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4550.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4600.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4650.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4700.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4750.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4800.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4850.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4900.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/4950.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5000.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5050.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5100.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5150.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5200.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5250.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5300.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5350.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5400.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5450.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5500.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5550.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5600.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5650.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5700.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5750.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5800.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5850.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5900.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/5950.png'
+option framerate 50
+duration 0.100000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/6000.png'
+option framerate 50
+duration 0.040000
+file '/workspace/scratch/2cecc6c5f3ec/voxel-sim/validation/knife-ramp-final_frames/6000.png'
+option framerate 50

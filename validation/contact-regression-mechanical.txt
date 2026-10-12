@@ -1,0 +1,7 @@
+PASS tension_10x10x10: parallel=1022767.250 N perpendicular=25920.164 N ratio=39.458 first_breaks=900/900
+PASS compression_10x10x10: parallel=283341.000 N perpendicular=9105.801 N ratio=31.117 first_breaks=10/10
+PASS bending_3x3x30: load=3.5 kN cut=9/9 at x=0.030 m residual=9.545e-6
+FAIL wedge_split_12x12x30: broken_bonds=264 wood_clusters=1 fragments_over_20_REV=1 tool_z=0.035 m
+Acceptance gate closed. Later experiments are not run.
+
+Exit status: 1; wall time: 70.864 s

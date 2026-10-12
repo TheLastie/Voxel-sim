@@ -1,0 +1,10 @@
+{
+  "physical_seconds": 2.1,
+  "playback_seconds_planned": 7.46,
+  "slowdown_interval": [
+    0.96,
+    1.24
+  ],
+  "slowdown_factor": 20,
+  "frame_count": 173
+}

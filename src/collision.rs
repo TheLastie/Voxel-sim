@@ -8,21 +8,24 @@ pub struct Contact {
     pub j: usize,
     /// Unit normal pointing from i toward j.
     pub normal: Vec3,
+    pub new_impact: bool,
 }
 
 /// Project voxel pairs apart and detect swept contacts before they can cross.
-/// Bonded nearest neighbors are governed by the constitutive solver; every
-/// other pair uses REV-sized, axis-aligned contact bounds.
+/// The intact local continuum stencil is governed by the constitutive solver.
+/// Treating its edge/corner neighbors as independent AABBs creates artificial
+/// strain under rigid rotation. Broken face neighbors and nonlocal folded
+/// regions still use REV-sized contact bounds.
 pub fn project(scene: &mut Scene, targets: &[[Option<f32>; 3]]) -> Vec<Contact> {
     let starts = scene.previous.clone();
-    let pairs = candidate_pairs(scene, &starts);
+    let adjacency = adjacency(scene);
+    let pairs: Vec<_> = candidate_pairs(scene, &starts).into_iter()
+        .filter(|&(i, j)| !local_continuum_pair(scene, &adjacency, i, j))
+        .collect();
     let mut contacts = Vec::with_capacity(pairs.len());
     for _ in 0..6 {
         let mut changed = false;
         for &(i, j) in &pairs {
-            if is_bonded(scene, i, j) {
-                continue;
-            }
             let sweep = swept_normal(
                 &starts[i],
                 &starts[j],
@@ -35,7 +38,8 @@ pub fn project(scene: &mut Scene, targets: &[[Option<f32>; 3]]) -> Vec<Contact> 
                     let correction = CELL - separation + 1e-6;
                     changed |= separate(scene, i, j, normal, correction, targets);
                 }
-                contacts.push(Contact { i, j, normal });
+                contacts.push(Contact { i, j, normal,
+                    new_impact: (starts[j]-starts[i]).dot(normal) > CELL + 2e-6 });
                 continue;
             }
             if let Some((normal, penetration)) = overlap_normal(
@@ -44,7 +48,8 @@ pub fn project(scene: &mut Scene, targets: &[[Option<f32>; 3]]) -> Vec<Contact> 
                 starts[j] - starts[i],
             ) {
                 changed |= separate(scene, i, j, normal, penetration + 1e-6, targets);
-                contacts.push(Contact { i, j, normal });
+                contacts.push(Contact { i, j, normal,
+                    new_impact: (starts[j]-starts[i]).dot(normal) > CELL + 2e-6 });
             }
         }
         if !changed {
@@ -59,7 +64,7 @@ pub fn project(scene: &mut Scene, targets: &[[Option<f32>; 3]]) -> Vec<Contact> 
 /// Remove closing normal velocity after position projection. Restitution is
 /// applied once at the contact pair; separating motion is left unchanged.
 pub fn resolve_velocities(scene: &mut Scene, contacts: &[Contact], targets: &[[Option<f32>; 3]]) {
-    for _ in 0..4 {
+    for iteration in 0..4 {
         let mut changed = false;
         for c in contacts {
             let axis = normal_axis(c.normal);
@@ -71,7 +76,14 @@ pub fn resolve_velocities(scene: &mut Scene, contacts: &[Contact], targets: &[[O
             }
             let closing = (scene.voxels[c.j].velocity - scene.voxels[c.i].velocity).dot(c.normal);
             if closing < -1e-6 {
-                let impulse = -(1.0 + scene.config.fracture.restitution) * closing / denom;
+                // A resting manifold must not bounce on each new gravity step.
+                // Restitution applies only if this pair started with a gap.
+                let restitution = if c.new_impact && iteration == 0 {
+                    scene.config.fracture.restitution
+                } else {
+                    0.0
+                };
+                let impulse = -(1.0 + restitution) * closing / denom;
                 scene.voxels[c.i].velocity -= c.normal * (impulse * wi);
                 scene.voxels[c.j].velocity += c.normal * (impulse * wj);
                 changed = true;
@@ -85,10 +97,7 @@ pub fn resolve_velocities(scene: &mut Scene, contacts: &[Contact], targets: &[[O
 
 fn candidate_pairs(scene: &Scene, starts: &[Vec3]) -> Vec<(usize, usize)> {
     let mut bins: HashMap<[i32; 3], Vec<usize>> = HashMap::new();
-    for (i, voxel) in scene.voxels.iter().enumerate() {
-        if !voxel.mass.is_finite() {
-            continue;
-        }
+    for i in 0..scene.voxels.len() {
         let a = starts[i].min(scene.positions[i]) / CELL;
         let b = starts[i].max(scene.positions[i]) / CELL;
         let eps = 1e-5;
@@ -108,6 +117,9 @@ fn candidate_pairs(scene: &Scene, starts: &[Vec3]) -> Vec<(usize, usize)> {
             for b in (a + 1)..ids.len() {
                 let i = ids[a].min(ids[b]);
                 let j = ids[a].max(ids[b]);
+                if !scene.voxels[i].mass.is_finite() && !scene.voxels[j].mass.is_finite() {
+                    continue;
+                }
                 unique.insert(((i as u64) << 32) | j as u64);
             }
         }
@@ -120,11 +132,42 @@ fn candidate_pairs(scene: &Scene, starts: &[Vec3]) -> Vec<(usize, usize)> {
     pairs
 }
 
-fn is_bonded(scene: &Scene, i: usize, j: usize) -> bool {
-    scene
-        .bonds
-        .iter()
-        .any(|axis| axis[i].neighbor == j as u32 || axis[j].neighbor == i as u32)
+fn adjacency(scene: &Scene) -> Vec<[u32; 6]> {
+    let mut result = vec![[crate::bond::EMPTY; 6]; scene.voxels.len()];
+    for axis in 0..3 {
+        for (i, bond) in scene.bonds[axis].iter().enumerate() {
+            if bond.neighbor != crate::bond::EMPTY {
+                let j = bond.neighbor as usize;
+                result[i][2 * axis + 1] = j as u32;
+                result[j][2 * axis] = i as u32;
+            }
+        }
+    }
+    result
+}
+
+fn local_continuum_pair(scene: &Scene, adjacent: &[[u32; 6]], i: usize, j: usize) -> bool {
+    let delta = (scene.rest_positions[j] - scene.rest_positions[i]) / CELL;
+    let steps = delta.round();
+    if (delta - steps).abs().max_element() > 1e-3 || steps.abs().max_element() > 1.0 {
+        return false;
+    }
+    // Only monotone paths inside the original elementary lattice cell qualify.
+    // A broken face cannot be bypassed by a longer path around a crack, and a
+    // remote part of the same connected component retains self-contact.
+    fn connected(adjacent: &[[u32; 6]], i: usize, j: usize, steps: Vec3) -> bool {
+        if steps == Vec3::ZERO { return i == j; }
+        for axis in 0..3 {
+            if steps[axis] == 0.0 { continue; }
+            let next = adjacent[i][2 * axis + usize::from(steps[axis] > 0.0)];
+            if next == crate::bond::EMPTY { continue; }
+            let mut remaining = steps;
+            remaining[axis] = 0.0;
+            if connected(adjacent, next as usize, j, remaining) { return true; }
+        }
+        false
+    }
+    connected(adjacent, i, j, steps)
 }
 
 fn swept_normal(start_i: &Vec3, start_j: &Vec3, end_i: &Vec3, end_j: &Vec3) -> Option<Vec3> {
@@ -246,6 +289,76 @@ fn separate(
 mod tests {
     use super::*;
     use crate::{bond::EMPTY, scene::SceneConfig, solver};
+
+    #[test]
+    fn rigidly_rotated_continuum_has_no_internal_box_contacts() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [3; 3];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        let mut scene = Scene::new(config);
+        let rotation = glam::Quat::from_rotation_z(0.37);
+        for p in &mut scene.positions { *p = rotation * *p; }
+        scene.previous.clone_from(&scene.positions);
+        let before = scene.positions.clone();
+        assert!(project(&mut scene, &[]).is_empty());
+        assert_eq!(scene.positions, before);
+    }
+
+    #[test]
+    fn local_exclusion_does_not_hide_a_crack_or_remote_self_contact() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [3, 2, 1];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        let mut scene = Scene::new(config);
+        let a = adjacency(&scene);
+        assert!(local_continuum_pair(&scene, &a, 0, 4));
+        assert!(!local_continuum_pair(&scene, &a, 0, 2));
+        scene.bonds[0][0].neighbor = EMPTY;
+        let a = adjacency(&scene);
+        assert!(!local_continuum_pair(&scene, &a, 0, 1));
+        scene.positions[1] = scene.positions[0] + Vec3::X * (CELL * 0.5);
+        scene.previous.clone_from(&scene.positions);
+        assert!(project(&mut scene, &[]).iter().any(|c| c.i == 0 && c.j == 1));
+    }
+
+    #[test]
+    fn free_fall_has_no_invisible_ground() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [1; 3];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        config.gravity = [0.0, 0.0, -9.81];
+        config.fixed_dt = 0.001;
+        config.substeps = 1;
+        let mut scene = Scene::new(config);
+        let start = scene.positions[0].z;
+        for _ in 0..100 {
+            solver::step(&mut scene, &mut None);
+        }
+        let expected = start - 9.81 * 0.001 * 0.001 * 5050.0;
+        assert!((scene.positions[0].z - expected).abs() < 2e-6);
+        assert!(scene.positions[0].z < 0.0);
+    }
+
+    #[test]
+    fn moving_voxel_cannot_tunnel_through_fixed_voxel() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [2, 1, 1];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        let mut scene = Scene::new(config);
+        scene.bonds[0][0].neighbor = EMPTY;
+        scene.voxels[1].mass = f32::INFINITY;
+        scene.previous.clone_from(&scene.positions);
+        let wall = scene.positions[1];
+        scene.positions[0].x += 3.0 * CELL;
+        let contacts = project(&mut scene, &[]);
+        assert!(!contacts.is_empty());
+        assert_eq!(scene.positions[1], wall);
+        assert!(wall.x - scene.positions[0].x >= CELL - 1e-6);
+    }
 
     #[test]
     fn unbonded_voxels_cannot_tunnel_through_each_other() {

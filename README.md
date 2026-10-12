@@ -86,6 +86,79 @@ cargo run --release --bin voxel-physics-lab
 The full mechanical sequence includes a bending case that can exceed memory in
 constrained environments; run fixtures individually to inspect each result.
 
+## Longer force-ramp capture
+
+The capture CLI accepts `path speed frames stride pitch approach roll peak_force ramp_seconds`.
+Angles are in degrees, speed in m/s, force in N, and durations in seconds.
+The optional force defaults to zero. A nonzero force acts through the blade's
+center of mass in the initial strike direction, ramps after the approach,
+and remains at its peak until the run ends, including after separation.
+Velocity and rotation remain dynamic. This contact fixture disables gravity.
+
+```sh
+RAYON_NUM_THREADS=1 cargo run --release --no-default-features --bin knife_capture -- validation/knife-ramp.csv 6 6000 50 0 1 0 500 4
+python3 validation/analyze_force_capture.py validation/knife-ramp.csv
+python3 validation/render_knife.py validation/knife-ramp.csv validation/knife-ramp-final.png video
+python3 validation/encode_long_capture.py knife-ramp
+```
+
+This records one second of approach and five seconds after contact: a four-second
+ramp to 500 N followed by a one-second hold. `L` records the applied force and
+an estimate of accumulated actuator work; `R` records the ramp parameters.
+The work estimate includes net COM displacement across contact projection and
+does not replace a substep energy ledger. The current force experiment exposes
+a large energy imbalance and widespread fragmentation; it is diagnostic data.
+
+For a gentler comparison, use a 1 m/s approach and a five-second ramp to 20 N
+(4 N/s rather than 125 N/s), keeping the wood and solver settings unchanged:
+
+```sh
+RAYON_NUM_THREADS=1 cargo run --release --no-default-features --bin knife_capture -- validation/knife-gentle.csv 1 6000 50 0 1 0 20 5
+python3 validation/analyze_force_capture.py validation/knife-gentle.csv
+python3 validation/render_knife.py validation/knife-gentle.csv validation/knife-gentle-final.png video
+python3 validation/encode_long_capture.py knife-gentle
+```
+
+## Local fracture and damage display
+
+The 20 N / 1 m/s capture remained below the wood failure threshold and did not
+demonstrate a cut. The desktop renderer also used a constant wood color even
+after bonds broke. It now derives color from all incident original bonds:
+partial damage is yellow, one broken bond is orange, and multiple broken bonds
+are red. Original outside faces are intact, and both crack endpoints are shown.
+These colors represent bond state, not temperature.
+
+Contact projection no longer treats intact edge/corner neighbors inside an
+elementary lattice cell as independent boxes. Exclusion requires a monotone
+path of intact face bonds within that original cell; it cannot bypass a broken
+face or disable contact between remote parts of a connected body. This removes
+spurious local contact under rigid rotation without imposing a fragment limit.
+The remaining contact geometry is still an AABB approximation.
+
+The new six-second diagnostic uses a 4 m/s impact followed by a 12 N/s force
+ramp to 60 N. Material properties and fracture parameters remain unchanged:
+
+```sh
+RAYON_NUM_THREADS=4 cargo run --release --no-default-features --bin knife_capture -- validation/knife-local.csv 4 6000 50 0 1 0 60 5
+python3 validation/analyze_force_capture.py validation/knife-local.csv
+python3 validation/render_knife.py validation/knife-local.csv validation/knife-local-final.png video
+python3 validation/encode_long_capture.py knife-local
+```
+
+Physical time is one second of approach and five seconds after contact. Playback
+slows the contact interval 20 times and the rest twice. See the saved measurements
+and run log for final connectivity and energy results; bond damage alone does
+not establish a complete cut or a validated energy balance.
+
+The completed recording has 894 broken bonds and two components (4319 + 1 REV),
+with no more than two components throughout the saved trace. It took 1226.6 s
+to compute 6 s of physical time and encodes to a 17.1 s diagnostic MP4. Full
+decoding passed. The peak recorded energy-accounting gap is 45.62 J during
+impact, so this is a partial-fracture result, not validated complete cutting.
+The applied world-space force remains active after the free blade leaves
+contact; its final speed must not be interpreted as a cutting speed.
+See `validation/knife-local-report.md` for the exact conditions and limits.
+
 ## Repository map
 
 - `src/scene.rs`, `src/voxel.rs`, `src/material.rs`: REV state, composition,
@@ -108,3 +181,45 @@ release solver step after reusing solver work buffers, down from 20.4 seconds;
 it still misses the 10 FPS target by a wide margin. Long strikes
 can propagate damage too broadly. See
 `validation/STATUS.md` for the latest verified checkpoint.
+
+### Floor, gravity and supports
+
+The desktop default is now `scenes/mounted_axe.ron`: 4,320 wood REVs,
+6,400 fixed floor REVs, gravity `(0, 0, -9.81)` m/s² and a 1 m/s axe.
+The floor surface is Z=0; support uses contacts with actual floor voxels.
+`--scene scenes/wood_chop.ron` selects the previous larger scene.
+The axe (key 1 / wedge) is mounted on a fixed-orientation linear guide through
+its rear base. It can move along the selected strike direction but cannot move
+sideways or rotate. The blue rail/base show this external support; the rail is
+not another collision body. Other tools remain free. This is a sliding mount,
+not a swinging hinge. Gravity still acts on free tools, wood and fragments.
+
+Persistent voxel constraints apply in ordinary `solver::step`, including contacts
+and fracture impulses. Coordinates are world coordinates in metres, axes 0/1/2
+are X/Y/Z. They preserve finite voxel mass on unconstrained axes.
+
+```rust
+solver::fix_voxel(&mut scene, i, [true, true, false])?; // current X/Y; free Z
+solver::fix_voxel_at(&mut scene, i, Vec3::new(0.0, 0.0, 0.1))?; // fix XYZ
+solver::fix_voxel_axis(&mut scene, i, 2, Some(0.2))?; // set only Z
+solver::fix_voxel_axes(&mut scene, i, [None, Some(0.0), Some(0.1)])?;
+solver::release_voxel(&mut scene, i)?;
+// Local base coordinate, world guide direction; locks rotation.
+tool.mount_base(local_base, Vec3::X)?;
+tool.mount_base(local_base, Vec3::ZERO)?; // completely fixed base
+// Detach; subsequent gravity and impulses act without support.
+tool.unmount();
+```
+
+Setting a constraint places that axis immediately at its target and clears its
+velocity. `fix_voxel_axes` replaces all three constraints; `fix_voxel_axis`
+changes just one. Nonfinite coordinates/invalid indices fail without mutation.
+Per-step target coordinates override persistent targets on specified axes;
+`None` retains persistent fixation. Call the release functions to free an axis.
+The historical `knife_capture` fixture remains an explicitly isolated benchmark
+without gravity/floor, rather than representing the desktop scene.
+
+Validation: `cargo test --no-default-features --lib --test supports` checks floor
+settling, partial-axis motion and release, constrained impulses, mounted contact
+reactions and complete base fixation/unmounting. Desktop compilation is checked
+separately; this update does not establish real-time performance or a complete cut.

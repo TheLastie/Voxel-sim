@@ -30,6 +30,7 @@ pub struct SceneConfig {
     pub initial_speed: f32,
     pub tool_start: [f32; 3],
 }
+
 impl SceneConfig {
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let result: Self = ron::from_str(&fs::read_to_string(path)?)?;
@@ -37,6 +38,11 @@ impl SceneConfig {
             || result.ground_dimensions.contains(&0)
             || result.tool_dimensions.iter().any(|&n| n < 2)
             || !(0.0..=1.0).contains(&result.anisotropy)
+            || !Vec3::from_array(result.gravity).is_finite()
+            || !Vec3::from_array(result.tool_start).is_finite()
+            || !result.initial_speed.is_finite()
+            || result.initial_speed < 0.0
+            || !Vec3::from_array(result.fibers).is_finite()
             || !result.fixed_dt.is_finite()
             || result.fixed_dt <= 0.0
             || result.substeps == 0
@@ -62,6 +68,8 @@ pub struct Scene {
     pub external_forces: Vec<Vec3>,
     /// Persistent per-voxel acceleration inputs in m/s².
     pub external_accelerations: Vec<Vec3>,
+    /// Persistent world-coordinate constraints; None leaves an axis free.
+    pub axis_targets: Vec<[Option<f32>; 3]>,
     pub positions: Vec<Vec3>,
     pub rest_positions: Vec<Vec3>,
     pub previous: Vec<Vec3>,
@@ -82,6 +90,26 @@ pub struct Scene {
     pub solver_residual: f32,
 }
 impl Scene {
+    /// Derived display data for all incident bonds, including the negative-axis
+    /// endpoint. Original outside faces are not damage. No visual state is stored.
+    pub fn incident_bond_damage(&self) -> Vec<(f32, u8)> {
+        let mut result = vec![(0.0f32, 0u8); self.voxels.len()];
+        for axis in 0..3 {
+            for (i, bond) in self.bonds[axis].iter().enumerate() {
+                let original = self.workspace[axis][i].rest_neighbor;
+                if original == EMPTY { continue; }
+                let j = original as usize;
+                let broken = bond.neighbor == EMPTY;
+                let damage = if broken { 1.0 } else { bond.damage };
+                for n in [i, j] {
+                    result[n].0 = result[n].0.max(damage);
+                    result[n].1 += u8::from(broken);
+                }
+            }
+        }
+        result
+    }
+
     pub fn new(config: SceneConfig) -> Self {
         let materials = Material::table();
         let mut voxels = Vec::new();
@@ -198,6 +226,7 @@ impl Scene {
             config,
             external_forces: vec![Vec3::ZERO; n],
             external_accelerations: vec![Vec3::ZERO; n],
+            axis_targets: vec![[None; 3]; n],
             previous: positions.clone(),
             rest_positions: positions.clone(),
             positions,
@@ -217,5 +246,24 @@ impl Scene {
             substep_index: 0,
             solver_residual: 0.0,
         }
+    }
+}
+
+#[cfg(test)]
+mod damage_display_tests {
+    use super::*;
+
+    #[test]
+    fn original_boundary_is_intact_and_both_crack_endpoints_show_damage() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [2, 1, 1];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        let mut scene = Scene::new(config);
+        assert_eq!(scene.incident_bond_damage(), vec![(0.0, 0); 2]);
+        scene.bonds[0][0].damage = 0.4;
+        assert_eq!(scene.incident_bond_damage(), vec![(0.4, 0); 2]);
+        scene.bonds[0][0].neighbor = EMPTY;
+        assert_eq!(scene.incident_bond_damage(), vec![(1.0, 1); 2]);
     }
 }

@@ -334,6 +334,7 @@ impl Renderer {
         ui: &[Rect],
         show_bonds: bool,
     ) -> Result<(), wgpu::SurfaceError> {
+        let damage = scene.incident_bond_damage();
         let mut instances: Vec<_> = scene
             .positions
             .iter()
@@ -341,13 +342,33 @@ impl Renderer {
             .map(|(i, &p)| {
                 let color = if scene.voxels[i].mass.is_infinite() {
                     [0.24, 0.28, 0.3, 1.]
+                } else if scene.axis_targets[i].iter().any(Option::is_some) {
+                    [0.18, 0.55, 0.85, 1.]
+                } else if damage[i].1 >= 2 {
+                    [0.83, 0.28, 0.24, 1.]
+                } else if damage[i].1 == 1 {
+                    [0.92, 0.52, 0.24, 1.]
                 } else {
-                    [0.55, 0.32, 0.12, 1.]
+                    let d = damage[i].0;
+                    [0.55 + 0.39*d, 0.32 + 0.43*d, 0.12 + 0.18*d, 1.]
                 };
                 Instance::cube(p, scene.rotations[i], color)
             })
             .collect();
         if let Some(t) = tool {
+            if let Some(m) = t.mount {
+                // External guide visualization, not an additional collision body.
+                let direction = if m.direction == Vec3::ZERO { Vec3::X } else { m.direction };
+                let offset = Vec3::Y * 0.045;
+                instances.push(Instance {
+                    center: (m.world_base + offset).to_array(),
+                    size: [0.8, 0.008, 0.008],
+                    color: [0.18, 0.55, 0.85, 1.0],
+                    rotation: Quat::from_rotation_arc(Vec3::X, direction).to_array(),
+                });
+                let base = t.position + t.rotation * m.local_base;
+                instances.push(Instance::cube(base, m.rotation, [0.18, 0.55, 0.85, 1.0]));
+            }
             instances.extend(
                 t.world_cells()
                     .map(|p| Instance::cube(p, t.rotation, t.color)),
