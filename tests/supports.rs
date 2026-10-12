@@ -103,13 +103,13 @@ fn default_scene_has_explicit_floor_and_gravity() {
     let config = SceneConfig::load("scenes/mounted_axe.ron").unwrap();
     assert_eq!(config.gravity, [0.0, 0.0, -9.81]);
     let s = Scene::new(config);
-    assert_eq!(s.voxels.iter().filter(|v| !v.kinematic).count(), 4320);
-    assert_eq!(s.voxels.iter().filter(|v| v.kinematic).count(), 6400);
+    assert_eq!(s.voxels.iter().filter(|v| !v.is_kinematic()).count(), 4320);
+    assert_eq!(s.voxels.iter().filter(|v| v.is_kinematic()).count(), 6400);
     assert!(s
         .positions
         .iter()
         .zip(&s.voxels)
-        .filter(|(_, v)| v.kinematic)
+        .filter(|(_, v)| v.is_kinematic())
         .all(|(p, _)| (p.z + CELL * 0.5).abs() < 1e-7));
 }
 

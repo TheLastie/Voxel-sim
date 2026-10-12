@@ -23,6 +23,24 @@ pub struct FractureConfig {
     pub friction: f32,
     pub restitution: f32,
 }
+
+impl Default for FractureConfig {
+    fn default() -> Self {
+        Self {
+            damage_rate: 35.0,
+            energy_release: 0.005,
+            propagation_delay: 1,
+            fatigue_cycles: 1000.0,
+            fatigue_exponent: 3.0,
+            fatigue_threshold: 0.5,
+            plastic_heat_fraction: 0.9,
+            fragment_min_size: 10,
+            cluster_interval: 10,
+            friction: 0.35,
+            restitution: 0.1,
+        }
+    }
+}
 impl FractureConfig {
     pub fn validate(&self) -> bool {
         self.damage_rate.is_finite()

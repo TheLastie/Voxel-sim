@@ -15,6 +15,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or("validation/supports.csv".into());
     let steps: usize = std::env::args().nth(2).unwrap_or("1500".into()).parse()?;
+    let saved_frames: usize = std::env::args()
+        .nth(3)
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or_else(|| steps.div_ceil(10) + 1);
+    if steps == 0 || saved_frames < 2 || saved_frames > steps + 1 {
+        return Err("steps must be positive and saved_frames must be in 2..=steps+1".into());
+    }
     let mut cfg = SceneConfig::load("scenes/mounted_axe.ron")?;
     if let Ok(raw) = std::env::var("VOXEL_CAPTURE_SUBSTEPS") {
         let substeps: usize = raw.parse()?;
@@ -58,7 +66,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mount = axe.mount.unwrap();
     let mut tool = Some(axe);
     let mut out = BufWriter::new(File::create(path)?);
-    writeln!(out, "H,{},{}", scene.config.fixed_dt, steps)?;
+    writeln!(
+        out,
+        "H,{},{},{}",
+        scene.config.fixed_dt, steps, saved_frames
+    )?;
     writeln!(
         out,
         "M,{},{},{},{},{},{}",
@@ -106,7 +118,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 t.position.x
             );
         }
-        if frame % 10 != 0 && frame != steps {
+        let intervals = saved_frames - 1;
+        let is_sample = frame == 0
+            || frame == steps
+            || (frame as u128 * intervals as u128 / steps as u128)
+                > ((frame - 1) as u128 * intervals as u128 / steps as u128);
+        if !is_sample {
             continue;
         }
         assert!(scene.positions.iter().all(|p| p.is_finite()));

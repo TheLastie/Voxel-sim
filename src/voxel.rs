@@ -9,11 +9,18 @@ pub struct Voxel {
     pub mass: f32,
     /// A kinematic boundary condition, separate from physical mass.
     #[serde(default)]
-    pub kinematic: bool,
+    pub(crate) kinematic: bool,
     pub composition: Composition,
     pub internal_energy: f32,
     pub velocity: Vec3,
     pub microstructure: Microstructure,
+}
+
+impl Voxel {
+    /// Whether this REV is fixed in world space by the scene constraints.
+    pub fn is_kinematic(&self) -> bool {
+        self.kinematic
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Composition {

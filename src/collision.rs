@@ -483,7 +483,7 @@ mod tests {
         config.ground_dimensions = [0; 3];
         let mut scene = Scene::new(config);
         scene.bonds[0][0].neighbor = EMPTY;
-        scene.voxels[1].kinematic = true;
+        scene.set_voxel_kinematic(1, true).unwrap();
         scene.previous.clone_from(&scene.positions);
         let wall = scene.positions[1];
         scene.positions[0].x += 3.0 * CELL;

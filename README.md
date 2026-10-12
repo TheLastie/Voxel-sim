@@ -76,7 +76,7 @@ starting the model:
 
 ```sh
 python3 validation/live_viewer.py --port 8765 --csv validation/live-support.csv --label "Mounted axe and gravity"
-RUSTUP_HOME="$PWD/.toolchain/rustup" CARGO_HOME="$PWD/.toolchain/cargo" RAYON_NUM_THREADS=1 ./.toolchain/cargo/bin/cargo run --release --no-default-features --bin support_capture -- validation/live-support.csv 210
+RUSTUP_HOME="$PWD/.toolchain/rustup" CARGO_HOME="$PWD/.toolchain/cargo" RAYON_NUM_THREADS=1 ./.toolchain/cargo/bin/cargo run --release --no-default-features --bin support_capture -- validation/live-support.csv 840 88
 ```
 
 Open `http://127.0.0.1:8765`. The page displays the matching GIF as its main
@@ -88,6 +88,24 @@ If a matching `validation/live-support.mp4` exists, the page also links to that
 video; the `/video` endpoint supports browser seeking. For another completed
 capture, start the viewer with `--video path/to/capture.mp4 --label "Run description"`
 and place an optional same-name `.gif` next to it.
+
+The current extended capture contains 840 solver steps and 88 evenly spaced
+frames (0.84 s of simulated time, 8.8 s of video). Its physical result includes
+catastrophic fragmentation after the long force ramp; the recording shows this
+failure rather than presenting it as a successful chop.
+
+### General scene and engine APIs
+
+`SceneBuilder::standard()` creates an empty custom scene. Add REV states with
+`VoxelSpawn`, resolve built-in components by name, and use engine methods to fix
+or release voxels and configure world bounds. REV outside those bounds are
+removed at a fixed-step boundary and their mass, energy, and momentum are
+recorded in the boundary-removal ledger. Run the small API demonstration with:
+
+```sh
+RUSTUP_HOME="$PWD/.toolchain/rustup" CARGO_HOME="$PWD/.toolchain/cargo" ./.toolchain/cargo/bin/cargo run --release --no-default-features --bin engine_api_probe
+RUSTUP_HOME="$PWD/.toolchain/rustup" CARGO_HOME="$PWD/.toolchain/cargo" ./.toolchain/cargo/bin/cargo run --release --no-default-features --bin thermo_probe
+```
 
 ## Build and run
 

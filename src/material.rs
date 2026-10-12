@@ -48,6 +48,14 @@ pub struct Material {
     pub fracture_energy_perp: f32,
 }
 impl Material {
+    /// Resolve a built-in component name to its composition-table index.
+    pub fn component_id(name: &str) -> Option<u16> {
+        Self::table()
+            .iter()
+            .position(|material| material.name.eq_ignore_ascii_case(name))
+            .and_then(|index| u16::try_from(index).ok())
+    }
+
     pub fn table() -> Vec<Self> {
         // Illustrative engineering inputs, not a calibrated species database.
         let mut table = vec![

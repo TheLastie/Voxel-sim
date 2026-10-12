@@ -549,6 +549,9 @@ pub fn step_with_axis_targets_and_loads(
         rebuild_clusters(scene);
     }
     scene.solver_scratch = solver_scratch;
+    // World exits are a topology event at the fixed-step boundary. This keeps
+    // every solver/contact array in one consistent index space for the step.
+    scene.enforce_world_bounds();
     if profile_step {
         let ms = stage_time.map(|duration| duration.as_secs_f64() * 1000.0);
         eprintln!(
