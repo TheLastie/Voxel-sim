@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 // Launching Rayon jobs for tiny scenes costs more than the work. Keep small
 // scenes local to the calling thread; large active zones still use the pool.
-const PARALLEL_MIN_VOXELS: usize = 32_768;
+// The intended 4k-REV CPU workload must use Rayon; keeping this at 32k made
+// its PCG reductions and vector updates serial on the target scene.
+const PARALLEL_MIN_VOXELS: usize = 2_048;
 
 fn basis(axis: usize, rotation: Quat) -> Mat3 {
     let axes = [Vec3::X, Vec3::Y, Vec3::Z];

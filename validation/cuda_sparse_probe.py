@@ -244,6 +244,27 @@ def main():
         raise RuntimeError(f"CUDA 17-partial reduction mismatch: got {reduction_output[0]}, expected {sum(reduction_input)}")
     print(f"CUDA dot reduction: partials=17, sum={reduction_output[0]:.1f}")
 
+    ratio_reduce = PTR()
+    check(api("cuModuleGetFunction", INT, ctypes.POINTER(PTR), PTR, ctypes.c_char_p)(ctypes.byref(ratio_reduce), module, b"dot_reduce_ratio"), "dot reduce ratio kernel")
+    numerator = array("d", [153.0])
+    ratio_output = array("f", [0.0])
+    numerator_d = device_buffer(numerator)
+    ratio_output_d = device_buffer(ratio_output)
+    launch_args(ratio_reduce, reduction_input_d, numerator_d, ratio_output_d, reduction_count)
+    check(synchronize(), "fused dot ratio synchronize")
+    check(copy_to_host(PTR(ratio_output.buffer_info()[0]), ratio_output_d, ratio_output.itemsize), "fused dot ratio download")
+    if abs(ratio_output[0] - 1.0) > 1e-7:
+        raise RuntimeError(f"CUDA fused dot ratio mismatch: got {ratio_output[0]}, expected 1.0")
+    zero_partials = array("d", [0.0])
+    zero_partials_d = device_buffer(zero_partials)
+    one_partial = U32(1)
+    launch_args(ratio_reduce, zero_partials_d, numerator_d, ratio_output_d, one_partial)
+    check(synchronize(), "zero denominator fused ratio synchronize")
+    check(copy_to_host(PTR(ratio_output.buffer_info()[0]), ratio_output_d, ratio_output.itemsize), "zero denominator fused ratio download")
+    if ratio_output[0] != 0.0:
+        raise RuntimeError(f"CUDA fused dot ratio must be zero for a zero denominator, got {ratio_output[0]}")
+    print("CUDA fused dot ratio: quotient=1.0, zero denominator guarded")
+
     rhs_host = array("f", [1.0, 2.0, 3.0, 4.0, -1.0, 0.5])
     zero_host = array("f", [0.0]) * 6
     diagonal_host = array("f", [2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0] * 2)

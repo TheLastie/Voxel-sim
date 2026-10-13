@@ -948,3 +948,96 @@ mod damage_display_tests {
         assert_eq!(scene.incident_bond_damage(), vec![(1.0, 1); 2]);
     }
 }
+
+#[cfg(test)]
+mod world_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn boundary_removal_compacts_bonds_events_and_all_voxel_arrays() {
+        let iron = Material::component_id("iron").unwrap();
+        let mut scene = Scene::from_voxels(
+            SceneConfig::default(),
+            vec![
+                VoxelSpawn::at_cell([0, 0, 0], iron)
+                    .with_velocity(Vec3::new(-1.0, 2.0, 3.0))
+                    .at_temperature(300.0),
+                VoxelSpawn::at_cell([1, 0, 0], iron).at_temperature(310.0),
+                VoxelSpawn::at_cell([2, 0, 0], iron).at_temperature(320.0),
+            ],
+        )
+        .unwrap();
+        assert_eq!(scene.bonds[0][0].neighbor, 1);
+        assert_eq!(scene.bonds[0][1].neighbor, 2);
+
+        scene.releases = vec![
+            crate::fracture::Release {
+                i: 0,
+                j: 1,
+                energy: 0.25,
+                due: 7,
+            },
+            crate::fracture::Release {
+                i: 1,
+                j: 2,
+                energy: 0.75,
+                due: 9,
+            },
+        ];
+        scene.energy.pending_release = 1.0;
+        let removed = &scene.voxels[0];
+        let expected_mass = removed.mass as f64;
+        let expected_internal = removed.internal_energy as f64;
+        let expected_kinetic = 0.5 * removed.mass as f64 * removed.velocity.length_squared() as f64;
+        let expected_momentum = [
+            removed.mass as f64 * removed.velocity.x as f64,
+            removed.mass as f64 * removed.velocity.y as f64,
+            removed.mass as f64 * removed.velocity.z as f64,
+        ];
+
+        let removed_count = scene
+            .set_world_bounds(Vec3::new(0.01, 0.0, 0.0), Vec3::new(0.03, 0.01, 0.01))
+            .unwrap();
+
+        assert_eq!(removed_count, 1);
+        assert_eq!(scene.voxels.len(), 2);
+        assert!((scene.positions[0] - VoxelSpawn::at_cell([1, 0, 0], iron).center).length() < 1e-7);
+        assert!((scene.positions[1] - VoxelSpawn::at_cell([2, 0, 0], iron).center).length() < 1e-7);
+        assert_eq!(scene.bonds[0].len(), 2);
+        assert_eq!(scene.workspace[0].len(), 2);
+        assert_eq!(scene.bonds[0][0].neighbor, 1);
+        assert_eq!(scene.workspace[0][0].rest_neighbor, 1);
+        assert_eq!(scene.bonds[0][1].neighbor, EMPTY);
+        for axis in 0..3 {
+            assert_eq!(scene.bonds[axis].len(), 2);
+            assert_eq!(scene.workspace[axis].len(), 2);
+        }
+        assert_eq!(scene.voxels.len(), scene.previous.len());
+        assert_eq!(scene.voxels.len(), scene.rest_positions.len());
+        assert_eq!(scene.voxels.len(), scene.external_forces.len());
+        assert_eq!(scene.voxels.len(), scene.external_accelerations.len());
+        assert_eq!(scene.voxels.len(), scene.axis_targets.len());
+        assert_eq!(scene.voxels.len(), scene.properties.len());
+        assert_eq!(scene.voxels.len(), scene.rotations.len());
+        assert_eq!(scene.voxels.len(), scene.clusters.len());
+        assert!(scene
+            .colors
+            .iter()
+            .flatten()
+            .all(|&index| index < scene.voxels.len()));
+        assert_eq!(scene.cluster_count, 1);
+        assert_eq!(scene.releases.len(), 1);
+        assert_eq!(scene.releases[0].i, 0);
+        assert_eq!(scene.releases[0].j, 1);
+        assert_eq!(scene.releases[0].due, 9);
+        assert_eq!(scene.energy.pending_release, 0.75);
+
+        let ledger = scene.boundary_removals();
+        assert_eq!(ledger.voxel_count, 1);
+        assert!((ledger.mass_kg - expected_mass).abs() < 1e-12);
+        assert!((ledger.internal_energy_j - expected_internal).abs() < 1e-9);
+        assert!((ledger.kinetic_energy_j - expected_kinetic).abs() < 1e-12);
+        assert_eq!(ledger.momentum_kg_m_s, expected_momentum);
+        assert_eq!(ledger.pending_bond_energy_j, 0.25);
+    }
+}

@@ -365,6 +365,75 @@ REDUCE_SKIP_ADD:
 REDUCE_DONE:
     ret;
 }
+.visible .entry dot_reduce_ratio(
+    .param .u64 partial_ptr,
+    .param .u64 numerator_ptr,
+    .param .u64 output_ptr,
+    .param .u32 count
+) {
+    .reg .pred %p<4>;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<2>;
+    .reg .f64 %fd<6>;
+    .shared .align 8 .b8 reduce_shared[2048];
+    ld.param.u64 %rd1, [partial_ptr];
+    ld.param.u64 %rd2, [numerator_ptr];
+    ld.param.u64 %rd3, [output_ptr];
+    ld.param.u32 %r1, [count];
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r3, %r2;
+    mov.f64 %fd1, 0d0000000000000000;
+RATIO_REDUCE_LOAD:
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra RATIO_REDUCE_STORE;
+    mul.wide.u32 %rd4, %r3, 8;
+    add.u64 %rd5, %rd1, %rd4;
+    ld.global.f64 %fd2, [%rd5];
+    add.f64 %fd1, %fd1, %fd2;
+    add.u32 %r3, %r3, 256;
+    bra RATIO_REDUCE_LOAD;
+RATIO_REDUCE_STORE:
+    mul.wide.u32 %rd4, %r2, 8;
+    mov.u64 %rd5, reduce_shared;
+    add.u64 %rd5, %rd5, %rd4;
+    st.shared.f64 [%rd5], %fd1;
+    bar.sync 0;
+    mov.u32 %r4, 128;
+RATIO_REDUCE_TREE:
+    setp.ge.u32 %p2, %r2, %r4;
+    @%p2 bra RATIO_REDUCE_SKIP_ADD;
+    mul.wide.u32 %rd4, %r2, 8;
+    mov.u64 %rd5, reduce_shared;
+    add.u64 %rd5, %rd5, %rd4;
+    mul.wide.u32 %rd6, %r4, 8;
+    add.u64 %rd6, %rd5, %rd6;
+    ld.shared.f64 %fd2, [%rd5];
+    ld.shared.f64 %fd3, [%rd6];
+    add.f64 %fd2, %fd2, %fd3;
+    st.shared.f64 [%rd5], %fd2;
+RATIO_REDUCE_SKIP_ADD:
+    bar.sync 0;
+    shr.u32 %r4, %r4, 1;
+    setp.ne.u32 %p2, %r4, 0;
+    @%p2 bra RATIO_REDUCE_TREE;
+    setp.ne.u32 %p2, %r2, 0;
+    @%p2 bra RATIO_REDUCE_DONE;
+    mov.u64 %rd5, reduce_shared;
+    ld.shared.f64 %fd1, [%rd5];
+    ld.global.f64 %fd2, [%rd2];
+    setp.gt.f64 %p3, %fd1, 1.0e-30;
+    @!%p3 bra RATIO_REDUCE_ZERO;
+    div.rn.f64 %fd3, %fd2, %fd1;
+    cvt.rn.f32.f64 %f1, %fd3;
+    bra RATIO_REDUCE_OUTPUT;
+RATIO_REDUCE_ZERO:
+    mov.f32 %f1, 0f00000000;
+RATIO_REDUCE_OUTPUT:
+    st.global.f32 [%rd3], %f1;
+RATIO_REDUCE_DONE:
+    ret;
+}
 .visible .entry scalar_ratio(
     .param .u64 numerator_ptr,
     .param .u64 denominator_ptr,

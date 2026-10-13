@@ -50,7 +50,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     for i in probe_start..probe_end {
-        scene.positions[i] += Vec3::new(-0.25, -0.25, 0.22);
+        // Keep the coupon in the platform interior for its full fall; with the
+        // previous Y offset it rolled past the finite floor edge before impact.
+        scene.positions[i] += Vec3::new(-0.25, 0.0, 0.22);
         scene.previous[i] = scene.positions[i];
         scene.rest_positions[i] = scene.positions[i];
     }

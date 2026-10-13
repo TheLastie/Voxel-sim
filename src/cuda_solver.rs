@@ -39,7 +39,6 @@ type LaunchKernel = unsafe extern "C" fn(
     *mut *mut c_void,
     *mut *mut c_void,
 ) -> Status;
-type ContextSynchronize = unsafe extern "C" fn() -> Status;
 
 struct Driver {
     _library: Library,
@@ -54,14 +53,13 @@ struct Driver {
     copy_htod: CopyHtoD,
     copy_dtoh: CopyDtoH,
     launch_kernel: LaunchKernel,
-    context_synchronize: ContextSynchronize,
 }
 
 struct CudaSolver {
     driver: Driver,
     context: Handle,
     module: Handle,
-    kernels: [Handle; 7],
+    kernels: [Handle; 8],
     buffers: HashMap<&'static str, (DevicePtr, usize)>,
 }
 
@@ -100,7 +98,6 @@ impl CudaSolver {
                 copy_htod: symbol(&library, b"cuMemcpyHtoD_v2\0")?,
                 copy_dtoh: symbol(&library, b"cuMemcpyDtoH_v2\0")?,
                 launch_kernel: symbol(&library, b"cuLaunchKernel\0")?,
-                context_synchronize: symbol(&library, b"cuCtxSynchronize\0")?,
                 _library: library,
             };
             check(unsafe { (driver.init)(0) }, "cuInit")?;
@@ -124,7 +121,7 @@ impl CudaSolver {
                     "cuModuleLoadData(PCG PTX) failed with CUDA status {status}"
                 ));
             }
-            let mut kernels = [0; 7];
+            let mut kernels = [0; 8];
             for (slot, name) in [
                 b"block_sparse_matvec\0".as_slice(),
                 b"block_jacobi\0".as_slice(),
@@ -132,6 +129,7 @@ impl CudaSolver {
                 b"pcg_update_direction\0".as_slice(),
                 b"dot_product\0".as_slice(),
                 b"dot_reduce\0".as_slice(),
+                b"dot_reduce_ratio\0".as_slice(),
                 b"scalar_ratio\0".as_slice(),
             ]
             .into_iter()
@@ -242,21 +240,37 @@ impl CudaSolver {
         self.launch(5, 1, &mut reduce_params)
     }
 
-    fn launch_ratio(
-        &self,
+    fn launch_dot_ratio(
+        &mut self,
+        a: DevicePtr,
+        b: DevicePtr,
+        count: u32,
         numerator: DevicePtr,
-        denominator: DevicePtr,
         output: DevicePtr,
     ) -> Result<(), String> {
-        let mut numerator = numerator;
-        let mut denominator = denominator;
-        let mut output = output;
-        let mut params = [
-            (&mut numerator as *mut DevicePtr).cast(),
-            (&mut denominator as *mut DevicePtr).cast(),
-            (&mut output as *mut DevicePtr).cast(),
+        let partial_count = count.div_ceil(256) as usize;
+        let partials = self.buffer("dot_partials", partial_count * 8)?;
+        let mut a = a;
+        let mut b = b;
+        let mut partials_arg = partials;
+        let mut count_arg = count;
+        let mut dot_params = [
+            (&mut a as *mut DevicePtr).cast(),
+            (&mut b as *mut DevicePtr).cast(),
+            (&mut partials_arg as *mut DevicePtr).cast(),
+            (&mut count_arg as *mut u32).cast(),
         ];
-        self.launch(6, 1, &mut params)
+        self.launch(4, count.div_ceil(256), &mut dot_params)?;
+        let mut numerator = numerator;
+        let mut output = output;
+        let mut partial_count_arg = partial_count as u32;
+        let mut reduce_params = [
+            (&mut partials_arg as *mut DevicePtr).cast(),
+            (&mut numerator as *mut DevicePtr).cast(),
+            (&mut output as *mut DevicePtr).cast(),
+            (&mut partial_count_arg as *mut u32).cast(),
+        ];
+        self.launch(6, 1, &mut reduce_params)
     }
 }
 
@@ -331,7 +345,6 @@ pub(crate) fn solve_pcg(
     let ap = cuda.buffer("ap", flat_rhs.len() * 4)?;
     let rho_a = cuda.buffer("rho_a", 8)?;
     let rho_b = cuda.buffer("rho_b", 8)?;
-    let denominator = cuda.buffer("denominator", 8)?;
     let residual_squared = cuda.buffer("residual_squared", 8)?;
     let alpha = cuda.buffer("alpha", 4)?;
     let beta = cuda.buffer("beta", 4)?;
@@ -405,8 +418,7 @@ pub(crate) fn solve_pcg(
             (&mut count_arg as *mut u32).cast(),
         ];
         cuda.launch(0, grid, &mut matvec_params)?;
-        cuda.launch_dot(p, ap, count, denominator)?;
-        cuda.launch_ratio(rho, denominator, alpha)?;
+        cuda.launch_dot_ratio(p, ap, count, rho, alpha)?;
         let mut dx_arg = dx;
         let mut r_arg = r;
         let mut p_arg = p;
@@ -433,8 +445,7 @@ pub(crate) fn solve_pcg(
             (&mut count_arg as *mut u32).cast(),
         ];
         cuda.launch(1, grid, &mut precondition_params)?;
-        cuda.launch_dot(r, z, count, rho_next)?;
-        cuda.launch_ratio(rho_next, rho, beta)?;
+        cuda.launch_dot_ratio(r, z, count, rho, beta)?;
         let mut p_arg = p;
         let mut z_arg = z;
         let mut beta_arg = beta;
@@ -459,10 +470,6 @@ pub(crate) fn solve_pcg(
                     )
                 },
                 "read PCG residual checkpoint",
-            )?;
-            check(
-                unsafe { (cuda.driver.context_synchronize)() },
-                "synchronize PCG residual checkpoint",
             )?;
             if !residual_squared_host.is_finite() || residual_squared_host < 0.0 {
                 return Err("CUDA PCG produced a non-finite residual norm".into());
