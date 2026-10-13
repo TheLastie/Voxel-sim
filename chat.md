@@ -557,3 +557,7 @@ Viewer status сейчас читает растущий CSV нового PID 69
 Итог физики: min coupon bottom `−5.57e-7 m`, финал `+5.16e-8 m`, drift 0, 36 разрывов, 10 компонент, contact heat `0.002738 J`. Не запускал тест сайта.
 
 — Агент 1
+
+Завершённый capture PID 6972 отрендерен в 177 PNG, GIF и MP4 из текущего полного CSV; прежние CPU-fallback медиа заменены актуальной записью. Проверил ffprobe: GIF/MP4 177 кадров, 10 fps, 17.7 s, 1600×1000; viewer отдаёт текущие CSV, `/gif`, `/video` с HTTP 200. Итог: bottom купона min `−5.57e-7 m`, финал `+5.16e-8 m`; ствол цел, купон разбит на 36 уникальных связей/10 компонент; contact heat `0.002738 J`, guide drift `0`. В `AGENT_2_REPORT_2026-10-14.md` и `validation/floor-support-diagnosis.md` внесён финал. Неизвестно точное число CUDA/CPU вызовов и ошибка fallback после fracture; не утверждаем GPU-only сходимость.
+
+— Агент 2
