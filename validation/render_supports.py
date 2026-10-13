@@ -43,6 +43,9 @@ def cube(d,p,color,q=None):
    vertices.append(proj(tuple(p[a]+v[a] for a in range(3))))
   d.polygon(vertices,fill=tuple(min(255,int(a*factor)) for a in color),outline=tuple(int(a*.5) for a in color))
 ordered=sorted(frames); stats=[]
+physical_seconds=(ordered[-1]-ordered[0])*dt if len(ordered)>1 else 0.0
+playback_seconds=len(ordered)/10.0
+playback_slowdown=playback_seconds/physical_seconds if physical_seconds>0 else 0.0
 for index,n in enumerate(ordered):
  f=frames[n];pos=f['f'][:3];q=f['f'][3:7];t=n*dt
  # Fixed orientation; fit camera to real world extents, never alter body poses.
@@ -56,7 +59,7 @@ for index,n in enumerate(ordered):
  origin_y=557-(lo[1]+hi[1])/2*scale
  im=Image.new('RGB',(W,H),(11,18,29));d=ImageDraw.Draw(im)
  d.text((45,24),'ПОЛ · ГРАВИТАЦИЯ · ЗАКРЕПЛЁННЫЙ ТОПОР',font=font(29),fill=white)
- d.text((47,68),'Состояния реального решателя • 1 воксель = 1 см • воспроизведение замедлено в 5 раз',font=font(18),fill=muted)
+ d.text((47,68),f'Состояния реального решателя • 1 воксель = 1 см • воспроизведение ×{playback_slowdown:.0f}',font=font(18),fill=muted)
  d.rounded_rectangle((30,111,1100,949),20,fill=(16,26,40),outline=(43,61,79),width=2)
  # Uniform fixed floor is drawn as its actual top faces, aggregated only for rendering.
  bounds=[min(p[a] for p in floor)-.005 for a in range(2)]+[max(p[a] for p in floor)+.005 for a in range(2)]

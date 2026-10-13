@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in probe_start..probe_end {
         // Keep the coupon over the platform interior and clear of the axe's
         // swept volume; the previous y=0 offset made it overlap the tool.
-        scene.positions[i] += Vec3::new(-0.25, 0.25, 0.22);
+        scene.positions[i] += Vec3::new(-0.25, 0.25, -0.13);
         scene.previous[i] = scene.positions[i];
         scene.rest_positions[i] = scene.positions[i];
     }
