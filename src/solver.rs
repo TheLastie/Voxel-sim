@@ -1326,6 +1326,7 @@ fn solve_coupled(
     scratch.z.resize(active_count, Vec3::ZERO);
     scratch.preconditioner_work.resize(active_count, Vec3::ZERO);
     let pcg_start = Instant::now();
+    let profile_cuda = std::env::var_os("VOXEL_PROFILE_STEP").is_some();
     let backend = std::env::var("VOXEL_SOLVER_BACKEND").unwrap_or_else(|_| "auto".into());
     let mut cuda_solution = None;
     let try_cuda = *cuda_enabled_for_step
@@ -1395,7 +1396,7 @@ fn solve_coupled(
             &scratch.cuda_diagonal,
             &scratch.cuda_blocks,
             &scratch.cuda_inverse,
-            scene.config.iterations,
+            scene.config.cuda_iterations,
             scene.config.solver_relative_tolerance,
         ) {
             Ok((correction, iterations, residual)) => {
@@ -1405,8 +1406,19 @@ fn solve_coupled(
             }
             Err(error) => {
                 *cuda_enabled_for_step = false;
-                static REPORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                REPORTED.get_or_init(|| eprintln!("CUDA PCG unavailable; using CPU PCG: {error}"));
+                if profile_cuda {
+                    eprintln!(
+                        "CUDA PCG fallback: active={} max_iterations={} tolerance={:.3e} elapsed={:.2} ms reason={error}",
+                        active_count,
+                        scene.config.cuda_iterations,
+                        scene.config.solver_relative_tolerance,
+                        pcg_start.elapsed().as_secs_f64() * 1_000.0,
+                    );
+                } else {
+                    static REPORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    REPORTED
+                        .get_or_init(|| eprintln!("CUDA PCG unavailable; using CPU PCG: {error}"));
+                }
             }
         }
     }
