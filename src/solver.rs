@@ -8,11 +8,10 @@ use glam::{Mat3, Quat, Vec3};
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
 
-// Launching Rayon jobs for tiny scenes costs more than the work. Keep small
-// scenes local to the calling thread; large active zones still use the pool.
-// The intended 4k-REV CPU workload must use Rayon; keeping this at 32k made
-// its PCG reductions and vector updates serial on the target scene.
-const PARALLEL_MIN_VOXELS: usize = 2_048;
+// A controlled 4,203-active-REV physical capture was 7.3x faster with the
+// serial path than with Rayon (same 177 states and identical solver results).
+// Use the pool for larger zones; keep the threshold overridable for A/B runs.
+const PARALLEL_MIN_VOXELS: usize = 32_768;
 
 fn parallel_enabled_for(voxel_count: usize) -> bool {
     static THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();

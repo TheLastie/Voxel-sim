@@ -196,3 +196,92 @@ solver frames, 1600×1000, 10 fps, 17.7 s по `ffprobe`. Физическая �
 Старый рендерер показывал неверную фиксированную подпись «замедлено в 5 раз».
 Агент 1 заменил её вычислением отношения media duration / physical duration.
 Полная проверка мира и цели CPU/GPU производительности остаются открытыми.
+
+### Контролируемый CPU cutoff A/B
+
+Завершены два сопоставимых capture той же короткой support-сцены: default
+`VOXEL_PARALLEL_MIN_VOXELS=2048` и serial override `32768`. Оба запускались на
+Intel Core i5-14450HX, CPU backend, 16 Rayon threads, одном и том же
+`target/release/support_capture`, `dt=1 ms`, 4 подшага, IC(0), 80 PCG iterations;
+в начале сцена содержит 10 747 REV, около 4 203 механически активных. Оба CSV
+имеют header `H,0.001,176,177`, а SHA-256 совпадает побайтно:
+`adf8a17a0f25b14f865360979620d5ffed5f37ab998a590f391b68269b04a470`.
+
+Для профилей после первых 50 шагов (после вступления в контакт) threshold 2 048
+дал median PCG `1059.69 ms`, solve `1119.765 ms`, 304 итерации, residual median
+`8.704e-6` и max `9.957e-6`. Serial threshold 32 768 дал PCG `126.225 ms` и
+solve `182.04 ms`, с теми же 304 итерациями и теми же median/max residual.
+PCG ускорился в `8.40×`, solve — в `6.15×`. Медианная сумма показанных в
+профиле fixed-step стадий (predict/tool + solve + collision + fracture + finish)
+снизилась с `1237.915` до `296.03 ms`; это сумма профилированных стадий, не
+измерение полной wall-clock скорости capture с записью CSV и renderer.
+
+Побайтно одинаковые CSV подтверждают идентичную траекторию для всех 177
+состояний: 18 broken bonds, 4 кластера, min ground gap `+6.46e-8 m`, drift 0,
+contact heat `3.52165e-4 J`. Следовательно, для этой сцены устранение Rayon
+parallel overhead при 4 203 активных REV/16 потоках уменьшило время solve без
+заметного изменения физики. Это короткий контактный прогон длиной 0.176 s;
+полный длинный CPU benchmark и цель 30 FPS всё ещё не подтверждены.
+
+### BlockJacobi full-scene диагностический capture
+
+Агент 1 также записал `support-cpu-block-jacobi.csv` для той же 176-step сцены,
+сменив только preconditioner на `block_jacobi`; CPU backend, cutoff 32 768,
+16 Rayon threads, `dt=1 ms`, 4 подшага, cap 80. CSV имеет те же 177 состояний и
+тот же начальный prelude, что serial IC(0), но SHA траекторий отличается.
+
+После первых 50 шагов медиана PCG — `121.56 ms/fixed step`, solve `173.94 ms`,
+агрегат 640 итераций, residual median `3.065e-4`, max `3.799e-4`. Подробный
+профиль содержит 1 050 PCG calls: 692 (65.9%) завершаются выше tolerance
+`1e-5`; многие доходят до cap 80. Медиана суммарных стадий профиля —
+`284.675 ms`, но прямое сравнение latency до одинаковой точности некорректно,
+потому что BlockJacobi не сошёлся на большинстве solve.
+
+Диагностическая траектория всё же сохраняет 18 разорванных связей и 4 кластера;
+max positional difference от сходившегося serial IC(0) — `1.1777e-4 m`, RMS
+`1.778e-6 m`, минимум зазора купона `+6.30e-8 m`, drift 0, контактное тепло
+`3.51984e-4 J`. Эти физические числа не подтверждают равную точность. Требуется
+увеличить PCG cap до сходимости и повторить сравнение; при внесении этих данных
+PNG/GIF/MP4 ещё рендерились, поэтому состояние media здесь не заявляется.
+
+Для публичного выбора CPU preconditioner добавлен integration test
+`tests/cpu_preconditioners.rs`: IC(0) и BlockJacobi прогоняют одну и ту же
+нагруженную железную сцену с фиксированной гранью и частичным X-ограничением.
+Оба решения должны укладываться в residual tolerance и совпадать по
+координатам в пределах `2e-5 m`. Проверки: `VOXEL_SOLVER_BACKEND=cpu cargo test
+--test cpu_preconditioners` — PASS (1/1); `VOXEL_SOLVER_BACKEND=cpu cargo test
+--lib` — PASS (36/36); `rustfmt --edition 2021 --check
+tests/cpu_preconditioners.rs` и `git diff --check` — PASS.
+
+Рендер BlockJacobi capture завершён: `support-cpu-block-jacobi.gif/.mp4` имеют
+177 кадров, 1600×1000, 10 fps и 17.7 s по ffprobe; MP4 полностью декодируется.
+Viewer 8767 в момент проверки выбирал этот CSV и отдавал `/api/status`, `/gif`
+и `/video` с HTTP 200. Как и для cutoff A/B, физическая длительность данной
+короткой записи — 0.176 s; она не является полным длительным capture.
+
+### BlockJacobi cap160: одинаковый критерий с IC(0)
+
+Повтор `support-cpu-block-jacobi160` использует ту же сцену, CPU backend,
+16 Rayon threads, cutoff 32 768, `dt=1 ms`, 4 подшага, но увеличенный PCG cap
+160. Начальные header и prelude совпадают с serial IC(0), CSV имеет 177/177
+состояний. Подробный лог содержит 1 049 solve calls: ни один не превысил
+residual tolerance `1e-5`; median residual `9.351e-6`, максимум `9.999e-6`,
+median 120 итераций, максимум 134.
+
+После первых 50 шагов медианы BlockJacobi cap160 составили PCG `168.02 ms`,
+solve `215.875 ms`, 963 агрегатные итерации, residual median/max
+`9.0945e-6 / 9.997e-6`. Для serial IC(0) при тех же CPU/threads/scene и cutoff
+медианы были PCG `126.225 ms`, solve `182.04 ms`, 304 итерации, residual
+median/max `8.704e-6 / 9.957e-6`. По внутреннему PCG timer BlockJacobi примерно на
+33% медленнее. Cap160 run включал вывод подробного текста после каждого PCG
+solve; общий `solve` timer включает это дополнительное логирование, поэтому
+`215.875` против `182.04 ms` нельзя считать чистым A/B solve-time.
+
+Физические счётчики остались близкими: 18 разрывов и 4 кластера в обеих
+записях. Разница max координаты — `1.0966e-4 m`, RMS `1.6421e-6 m`; минимум
+зазора BJ `+6.37e-8 m`, drift 0, контактное тепло `3.5189952e-4 J` против
+`3.5216538e-4 J` у IC(0). Физическая длительность — только 0.176 s. Рендер
+завершён: `support-cpu-block-jacobi160.gif/.mp4`, каждый по 177 кадров,
+1600×1000, 10 fps, 17.7 s; ffprobe подтвердил число кадров, MP4 полностью
+декодируется. Viewer 8767 отдаёт `/gif` и `/video` с HTTP 200 и показывает CSV
+этой записи. Длинный 17.6 s CPU capture и цель 30 FPS остаются открытыми.
