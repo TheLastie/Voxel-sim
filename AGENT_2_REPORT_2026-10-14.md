@@ -761,3 +761,51 @@ passes 81/81 tests (65 library, 5 smoke, 1 contact energy, 1 CPU preconditioner,
 3 fatigue topology, 6 supports). `cargo fmt --all -- --check`,
 `cargo check --no-default-features`, renderer `py_compile`, manifest JSON
 parsing and `git diff --check` pass.
+
+#### Automatic thermal fusion follow-up
+
+Moved the trigger into the engine as `ThermalFusionRule` and
+`Scene::set_thermal_fusion_rule(Tmin, Pmin, dwell)`. The solver updates contact
+pressure/dwell from each resolved normal impulse, queues an eligible fusion, and
+commits it only after the fixed-step substeps finish. It rejects constrained,
+bonded, pending-release, nonadjacent, or non-face-contact pairs. Fusion contact
+states are compacted with world-bound reindexing; regressions cover threshold validation, subthreshold pressure, dwell, cache
+reindexing, reset after contact loss/cooling, simultaneous bonding precedence,
+and an end-to-end solver event committed at the fixed-step boundary. `fusion_capture` now only configures the rule and the opposing
+`0.1 N` loads; it no longer calls the fusion API directly.
+
+With both REV at 363.15 K, `Tmin=350 K`, `Pmin=900 Pa` and dwell `0.1 s`,
+automatic fusion occurs on step 12 (`0.12 s`). Final iron/copper fractions are
+`0.46761733/0.53238267`; mass `0.016829997 kg`; momentum error
+`3.601e-8 kg·m/s`; the preliminary capture had an estimated work ledger
+(residual `-3.860e-4 J`, work `1.500e-3 J`), superseded by the accurately
+measured follow-up below; fusion heat `2.094925452e-7 J`; one cluster. The
+capture retains 1,760 steps/177 actual states over 17.6 s and the GIF/MP4 each
+have 177 frames at 1120×700, 10 fps/17.7 s. The catalog selector `:8815` and
+live capture viewer `:8814` serve the current CSV/GIF/MP4 with HTTP 200.
+
+This automatic rule is still a threshold model, not a calibrated sintering or
+welding law. It fuses an unbonded pair and compresses the combined mass into one
+1 cm cell geometry; volume-preserving fusion and mergers within bonded clusters
+remain open.
+
+
+##### Auto-fusion review follow-up
+
+The solver now accumulates `EnergyLedger::external_work` per substep as applied
+nodal force plus gravity dotted with that REV's actual substep displacement,
+before any topology compaction. The fusion capture reads this engine ledger; it
+no longer reconstructs work from already-compacted post-step positions. Current
+release CPU result: external work `4.998999292e-4 J`, total energy residual
+`+6.141e-4 J`, or 1.228 times the measured work. This is an unclosed energy
+balance, not a conservation pass. The residual is written into per-frame CSV W
+rows and shown in GIF/MP4; capture acceptance checks topology, mass, momentum,
+composition and positive fusion heat, not energy closure. The solver's discrete
+contact/integration energy discrepancy remains a limitation requiring a future
+energy-consistent integrator/contact-work model.
+
+Added regressions for actual solver-triggered fusion, dwell reset on missing
+contact/cooling, and simultaneous thermal rules (bond formation prevents a
+pending fusion), plus an external-work ledger check. Full CPU test suite passes
+85/85. GIF and MP4 were regenerated from all 177 saved physical states; each is
+1120×700, 10 fps and 17.7 s.

@@ -169,6 +169,8 @@ pub struct EnergyLedger {
     pub liquid_viscous_heat: f64,
     /// Relative kinetic energy converted to heat during REV fusion (J).
     pub fusion_heat: f64,
+    /// Mechanical work by applied nodal loads and gravity (J).
+    pub external_work: f64,
     pub pending_release: f64,
     pub kinetic_release: f64,
 }

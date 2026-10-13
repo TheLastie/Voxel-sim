@@ -474,8 +474,10 @@ pub fn step_with_axis_targets_and_loads(
     // Fall back once, then avoid repeating the costly CUDA setup until the next
     // fixed step, where the matrix and residual have changed.
     let mut cuda_enabled_for_step = true;
+    let mut substep_start_positions = Vec::with_capacity(scene.positions.len());
     for _ in 0..scene.config.substeps {
         let mut phase_start = Instant::now();
+        substep_start_positions.clone_from(&scene.positions);
         scene.previous.clone_from(&scene.positions);
         let mut drift_velocity = vec![Vec3::ZERO; scene.voxels.len()];
         for (i, (p, v)) in scene
@@ -654,6 +656,9 @@ pub fn step_with_axis_targets_and_loads(
         collision::resolve_liquid_viscosity(scene, &contacts, targets, h);
         let formed_bonds =
             scene.form_thermal_bonds(&contacts, &impact_energies_j, &normal_impulses_ns, h);
+        // A bond formed during this contact solve takes precedence over fusion:
+        // the fusion primitive only accepts unbonded pairs.
+        scene.form_thermal_fusions(&contacts, &normal_impulses_ns, h, targets);
         if formed_bonds > 0 {
             topology_changed = true;
             // Bond assembly changed while the local per-step workspace was out
@@ -669,8 +674,26 @@ pub fn step_with_axis_targets_and_loads(
         if let Err(reason) = scene.conduct_heat(h) {
             eprintln!("thermal transport skipped: {reason}");
         }
+        for i in 0..scene.voxels.len() {
+            if !scene.voxels[i].kinematic {
+                let applied_force = applied_loads[i] + gravity * scene.voxels[i].mass;
+                scene.energy.external_work +=
+                    applied_force.dot(scene.positions[i] - substep_start_positions[i]) as f64;
+            }
+        }
         scene.substep_index += 1;
         stage_time[4] += phase_start.elapsed();
+    }
+    if let Some((i, j)) = scene.take_pending_fusion() {
+        match scene.fuse_adjacent_voxels(i, j) {
+            Ok(_) => {
+                topology_changed = true;
+                solver_scratch = Default::default();
+            }
+            Err(reason) => {
+                eprintln!("automatic thermal fusion cancelled for REV {i}/{j}: {reason}")
+            }
+        }
     }
     if topology_changed {
         rebuild_clusters(scene);
@@ -840,12 +863,16 @@ mod tests {
     fn persistent_force_and_acceleration_use_voxel_mass() {
         let mut s = free_voxel();
         let mass = s.voxels[0].mass;
+        let initial_position = s.positions[0];
         set_force(&mut s, 0, Vec3::X * (3.0 * mass)).unwrap();
         set_acceleration(&mut s, 0, Vec3::Y * 2.0).unwrap();
         let mut tool = None;
         step(&mut s, &mut tool);
         assert!((s.voxels[0].velocity.x - 0.03).abs() < 1e-5);
         assert!((s.voxels[0].velocity.y - 0.02).abs() < 1e-5);
+        let expected_work = (Vec3::X * (3.0 * mass) + Vec3::Y * (2.0 * mass))
+            .dot(s.positions[0] - initial_position) as f64;
+        assert!((s.energy.external_work - expected_work).abs() < 1e-10);
         step(&mut s, &mut tool);
         assert!((s.voxels[0].velocity.x - 0.06).abs() < 1e-5);
         assert!((s.voxels[0].velocity.y - 0.04).abs() < 1e-5);
@@ -853,6 +880,44 @@ mod tests {
         step(&mut s, &mut tool);
         assert!((s.voxels[0].velocity.x - 0.06).abs() < 1e-5);
         assert!((s.voxels[0].velocity.y - 0.04).abs() < 1e-5);
+    }
+
+    #[test]
+    fn solver_commits_automatic_fusion_at_fixed_step_boundary() {
+        let iron = crate::material::Material::component_id("iron").unwrap();
+        let copper = crate::material::Material::component_id("copper").unwrap();
+        let mut s = crate::scene::SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .with_timestep(0.01, 2)
+            .add_voxel(
+                crate::scene::VoxelSpawn::at_cell([0, 0, 0], iron)
+                    .fixed()
+                    .at_temperature(363.15),
+            )
+            .add_voxel(crate::scene::VoxelSpawn::at_cell([1, 0, 0], copper).at_temperature(363.15))
+            .build()
+            .unwrap();
+        s.positions[1].x += 0.005;
+        s.previous[1] = s.positions[1];
+        s.release_voxel(0).unwrap();
+        s.voxels[0].velocity = Vec3::new(0.01, 0.005, 0.0);
+        s.voxels[1].velocity = Vec3::new(-0.01, -0.005, 0.0);
+        s.config.fracture.restitution = 0.0;
+        s.config.fracture.friction = 0.0;
+        set_force(&mut s, 0, Vec3::X * 0.1).unwrap();
+        set_force(&mut s, 1, Vec3::NEG_X * 0.1).unwrap();
+        s.set_thermal_fusion_rule(350.0, 900.0, 0.1).unwrap();
+        let mut tool = None;
+        for _ in 0..20 {
+            step(&mut s, &mut tool);
+            if s.voxels.len() == 1 {
+                break;
+            }
+        }
+        assert_eq!(s.voxels.len(), 1);
+        assert!(s.energy.fusion_heat > 0.0);
+        assert!(s.energy.external_work > 0.0);
+        assert_eq!(s.cluster_count, 1);
     }
     #[test]
     fn velocity_and_impulse_are_mass_consistent() {

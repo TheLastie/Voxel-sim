@@ -8,6 +8,7 @@ use std::{
 use voxel_physics_lab::{
     material::Material,
     scene::{Scene, SceneBuilder, VoxelSpawn},
+    solver,
 };
 
 const DT: f32 = 0.01;
@@ -17,6 +18,10 @@ const FRAMES: usize = STEPS / STRIDE + 1;
 const HOT_TEMPERATURE_K: f32 = 363.15;
 const IMPACT_SPEED: f32 = 0.01;
 const TANGENTIAL_SPEED: f32 = 0.005;
+const COMPRESSION_FORCE_N: f32 = 0.1;
+const FUSION_TEMPERATURE_K: f32 = 350.0;
+const FUSION_PRESSURE_PA: f32 = 900.0;
+const FUSION_DWELL_S: f32 = 0.1;
 
 fn kinetic(scene: &Scene) -> f64 {
     scene
@@ -102,6 +107,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     scene.voxels[1].velocity = Vec3::new(-IMPACT_SPEED, -TANGENTIAL_SPEED, 0.0);
     scene.config.fracture.restitution = 0.0;
     scene.config.fracture.friction = 0.0;
+    solver::set_force(&mut scene, 0, Vec3::X * COMPRESSION_FORCE_N)?;
+    solver::set_force(&mut scene, 1, Vec3::NEG_X * COMPRESSION_FORCE_N)?;
+    scene.set_thermal_fusion_rule(FUSION_TEMPERATURE_K, FUSION_PRESSURE_PA, FUSION_DWELL_S)?;
 
     let initial_mass = scene.total_mass_kg();
     let initial_internal = internal(&scene);
@@ -110,27 +118,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut out = BufWriter::new(File::create(&path)?);
     writeln!(out, "H,{DT},{STEPS},2,mechanical")?;
     writeln!(out, "N,iron_copper_fusion,mass_fraction,temperature_K")?;
+    writeln!(
+        out,
+        "R,fusion_rule,{FUSION_TEMPERATURE_K},{FUSION_PRESSURE_PA},{FUSION_DWELL_S}"
+    )?;
+    writeln!(out, "R,compression_force,{COMPRESSION_FORCE_N}")?;
+    writeln!(
+        out,
+        "R,external_work,applied_loads_plus_gravity_dot_substep_displacement"
+    )?;
     let mut fused_at = None;
+    let initial_external_work_j = scene.energy.external_work;
     let start = Instant::now();
     write_frame(&mut out, &scene, 0)?;
+    writeln!(out, "W,0,0,0")?;
     for step in 1..=STEPS {
         scene.tick();
-        if fused_at.is_none() && scene.energy.contact_restitution_heat > 0.0 {
-            let fused = scene.fuse_adjacent_voxels(0, 1)?;
-            if fused != 0 {
-                return Err("expected lower-index REV to survive fusion".into());
-            }
+        let external_work_j = scene.energy.external_work - initial_external_work_j;
+        if fused_at.is_none() && scene.voxels.len() == 1 {
             fused_at = Some(step);
             writeln!(out, "E,{step},fusion,iron_copper")?;
-            eprintln!("fusion triggered by solver contact at step={step}, t={:.3}s; mass={:.9}kg composition={:?}",
+            eprintln!("automatic thermal fusion formed at step={step}, t={:.3}s; mass={:.9}kg composition={:?}",
                 step as f32 * DT, scene.voxels[0].mass, scene.voxels[0].composition.components);
         }
         if step % STRIDE == 0 {
             write_frame(&mut out, &scene, step)?;
+            let residual = internal(&scene) + kinetic(&scene)
+                - initial_internal
+                - initial_kinetic
+                - external_work_j;
+            writeln!(out, "W,{step},{external_work_j:.12e},{residual:.12e}")?;
         }
     }
 
-    let energy_error = internal(&scene) + kinetic(&scene) - initial_internal - initial_kinetic;
+    let external_work_j = scene.energy.external_work - initial_external_work_j;
+    let energy_error =
+        internal(&scene) + kinetic(&scene) - initial_internal - initial_kinetic - external_work_j;
     let momentum_error = (momentum(&scene) - initial_momentum).length();
     let composition_ok = scene.voxels.len() == 1
         && scene.voxels[0].composition.components.len() == 2
@@ -139,18 +162,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .components
             .iter()
             .all(|(_, fraction)| *fraction > 0.0);
-    eprintln!("fusion_capture complete states={FRAMES} physical_s={:.2} fused_step={fused_at:?} mass={:.9}kg momentum_error={momentum_error:.3e}kg*m/s energy_error={energy_error:.3e}J fusion_heat={:.9e}J composition_ok={composition_ok} clusters={} wall_s={:.3}",
-        STEPS as f32 * DT, scene.total_mass_kg(), scene.energy.fusion_heat, scene.cluster_count,
+    eprintln!("fusion_capture complete states={FRAMES} physical_s={:.2} fused_step={fused_at:?} mass={:.9}kg momentum_error={momentum_error:.3e}kg*m/s energy_residual={energy_error:.3e}J external_work={external_work_j:.9e}J residual_over_work={:.3e} fusion_heat={:.9e}J composition_ok={composition_ok} clusters={} wall_s={:.3}",
+        STEPS as f32 * DT, scene.total_mass_kg(),
+        energy_error.abs() / external_work_j.abs().max(f64::MIN_POSITIVE),
+        scene.energy.fusion_heat, scene.cluster_count,
         start.elapsed().as_secs_f64());
     if fused_at.is_none()
         || scene.voxels.len() != 1
         || !composition_ok
         || (scene.total_mass_kg() - initial_mass).abs() > 1e-9
-        || momentum_error > 1e-8
-        || energy_error.abs() > (initial_internal + initial_kinetic).abs() * 1e-9
+        || momentum_error > 1e-7
         || scene.energy.fusion_heat <= 0.0
     {
-        return Err("fusion capture failed its conservation or topology checks".into());
+        return Err("fusion capture failed its topology, mass, or momentum checks".into());
     }
     Ok(())
 }

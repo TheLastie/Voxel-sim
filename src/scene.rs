@@ -43,6 +43,14 @@ pub struct ThermalBondingRule {
     pub minimum_dwell_seconds: f32,
 }
 
+/// Automatic fusion criterion evaluated from real contact impulses and dwell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThermalFusionRule {
+    pub minimum_temperature_kelvin: f32,
+    pub minimum_contact_pressure_pa: f32,
+    pub minimum_dwell_seconds: f32,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct BondingContactState {
     dwell_seconds: f32,
@@ -331,6 +339,9 @@ pub struct Scene {
     world_bounds: Option<WorldBounds>,
     thermal_bonding_rule: Option<ThermalBondingRule>,
     bonding_contacts: HashMap<(usize, usize), BondingContactState>,
+    thermal_fusion_rule: Option<ThermalFusionRule>,
+    fusion_contacts: HashMap<(usize, usize), BondingContactState>,
+    pending_fusion: Option<(usize, usize)>,
     boundary_removals: BoundaryRemovalLedger,
 }
 impl Scene {
@@ -459,6 +470,9 @@ impl Scene {
             world_bounds: None,
             thermal_bonding_rule: None,
             bonding_contacts: HashMap::new(),
+            thermal_fusion_rule: None,
+            fusion_contacts: HashMap::new(),
+            pending_fusion: None,
             boundary_removals: BoundaryRemovalLedger::default(),
         };
         let mut occupancy = HashMap::with_capacity(spawns.len());
@@ -621,6 +635,133 @@ impl Scene {
 
     pub fn thermal_bonding_rule(&self) -> Option<ThermalBondingRule> {
         self.thermal_bonding_rule
+    }
+
+    /// Configure automatic fusion for hot adjacent REVs under sustained
+    /// contact pressure. Fusion is committed at the fixed-step boundary after
+    /// the complete contact solve, so solver arrays never change mid-substep.
+    pub fn set_thermal_fusion_rule(
+        &mut self,
+        minimum_temperature_kelvin: f32,
+        minimum_contact_pressure_pa: f32,
+        minimum_dwell_seconds: f32,
+    ) -> Result<(), &'static str> {
+        if !minimum_temperature_kelvin.is_finite()
+            || minimum_temperature_kelvin < 0.0
+            || !minimum_contact_pressure_pa.is_finite()
+            || minimum_contact_pressure_pa < 0.0
+            || !minimum_dwell_seconds.is_finite()
+            || minimum_dwell_seconds < 0.0
+        {
+            return Err("fusion thresholds must be finite and nonnegative");
+        }
+        self.thermal_fusion_rule = Some(ThermalFusionRule {
+            minimum_temperature_kelvin,
+            minimum_contact_pressure_pa,
+            minimum_dwell_seconds,
+        });
+        self.fusion_contacts.clear();
+        self.pending_fusion = None;
+        Ok(())
+    }
+
+    pub fn clear_thermal_fusion_rule(&mut self) {
+        self.thermal_fusion_rule = None;
+        self.fusion_contacts.clear();
+        self.pending_fusion = None;
+    }
+
+    pub fn thermal_fusion_rule(&self) -> Option<ThermalFusionRule> {
+        self.thermal_fusion_rule
+    }
+
+    /// Update automatic fusion contact pressure/dwell after impulse resolution.
+    pub(crate) fn form_thermal_fusions(
+        &mut self,
+        contacts: &[crate::collision::Contact],
+        normal_impulses_ns: &[f32],
+        elapsed_seconds: f32,
+        targets: &[[Option<f32>; 3]],
+    ) {
+        let Some(rule) = self.thermal_fusion_rule else {
+            return;
+        };
+        if self.pending_fusion.is_some() {
+            return;
+        }
+        let current_substep = self.substep_index;
+        for (index, contact) in contacts.iter().enumerate() {
+            let i = contact.i;
+            let j = contact.j;
+            let key = if i < j { (i, j) } else { (j, i) };
+            let has_bond = self.bonds.iter().any(|axis| {
+                axis.iter().enumerate().any(|(endpoint, bond)| {
+                    bond.neighbor != EMPTY
+                        && (endpoint == i
+                            || bond.neighbor as usize == i
+                            || endpoint == j
+                            || bond.neighbor as usize == j)
+                })
+            });
+            let constrained = self.voxels[i].kinematic
+                || self.voxels[j].kinematic
+                || self.axis_targets[i].iter().any(Option::is_some)
+                || self.axis_targets[j].iter().any(Option::is_some)
+                || targets
+                    .get(i)
+                    .is_some_and(|target| target.iter().any(Option::is_some))
+                || targets
+                    .get(j)
+                    .is_some_and(|target| target.iter().any(Option::is_some));
+            let pending_release = self.releases.iter().any(|release| {
+                release.i == i || release.j == i || release.i == j || release.j == j
+            });
+            let lattice_delta = (self.rest_positions[j] - self.rest_positions[i]) / CELL;
+            let rounded = lattice_delta.round();
+            let lattice_adjacent = (lattice_delta - rounded).abs().max_element() <= 1e-3
+                && rounded.abs().element_sum() == 1.0;
+            let face_normal = rounded.normalize_or_zero();
+            let separation = self.positions[j] - self.positions[i];
+            let projected = separation.dot(face_normal);
+            let tangent = separation - face_normal * projected;
+            let face_contact =
+                (projected.abs() - CELL).abs() <= CELL * 1e-3 && tangent.abs().max_element() < CELL;
+            let temperature_ok = self.temperature_kelvin(i).unwrap_or(0.0)
+                >= rule.minimum_temperature_kelvin
+                && self.temperature_kelvin(j).unwrap_or(0.0) >= rule.minimum_temperature_kelvin;
+            if has_bond
+                || constrained
+                || pending_release
+                || !temperature_ok
+                || !lattice_adjacent
+                || !face_contact
+            {
+                self.fusion_contacts.remove(&key);
+                continue;
+            }
+            let impulse = normal_impulses_ns.get(index).copied().unwrap_or(0.0);
+            let pressure_pa = impulse / (elapsed_seconds.max(f32::MIN_POSITIVE) * CELL * CELL);
+            let ready = {
+                let state = self.fusion_contacts.entry(key).or_default();
+                state.last_seen_substep = current_substep;
+                if pressure_pa >= rule.minimum_contact_pressure_pa {
+                    state.dwell_seconds += elapsed_seconds;
+                } else {
+                    state.dwell_seconds = 0.0;
+                }
+                state.dwell_seconds + f32::EPSILON >= rule.minimum_dwell_seconds
+            };
+            if ready {
+                self.pending_fusion = Some(key);
+                break;
+            }
+        }
+        self.fusion_contacts
+            .retain(|_, state| state.last_seen_substep == current_substep);
+    }
+
+    pub(crate) fn take_pending_fusion(&mut self) -> Option<(usize, usize)> {
+        self.pending_fusion.take()
     }
 
     /// Advance contact pressure and dwell state after the contact impulse solve.
@@ -1020,6 +1161,13 @@ impl Scene {
                 (keep[i] && keep[j]).then_some(((remap[i] as usize, remap[j] as usize), state))
             })
             .collect();
+        self.fusion_contacts = std::mem::take(&mut self.fusion_contacts)
+            .into_iter()
+            .filter_map(|((i, j), state)| {
+                (keep[i] && keep[j]).then_some(((remap[i] as usize, remap[j] as usize), state))
+            })
+            .collect();
+        self.pending_fusion = None;
         for color in &mut self.colors {
             color.retain(|&i| keep[i]);
             for i in color {
@@ -1089,6 +1237,12 @@ impl Scene {
         }
 
         self.bonding_contacts = std::mem::take(&mut self.bonding_contacts)
+            .into_iter()
+            .filter_map(|((i, j), state)| {
+                (keep[i] && keep[j]).then_some(((remap[i] as usize, remap[j] as usize), state))
+            })
+            .collect();
+        self.fusion_contacts = std::mem::take(&mut self.fusion_contacts)
             .into_iter()
             .filter_map(|((i, j), state)| {
                 (keep[i] && keep[j]).then_some(((remap[i] as usize, remap[j] as usize), state))
@@ -1502,6 +1656,9 @@ impl Scene {
             world_bounds: None,
             thermal_bonding_rule: None,
             bonding_contacts: HashMap::new(),
+            thermal_fusion_rule: None,
+            fusion_contacts: HashMap::new(),
+            pending_fusion: None,
             boundary_removals: BoundaryRemovalLedger::default(),
         }
     }
@@ -1637,16 +1794,27 @@ mod world_bounds_tests {
                 last_seen_substep: 7,
             },
         );
+        scene.fusion_contacts.insert(
+            (1, 2),
+            BondingContactState {
+                dwell_seconds: 0.125,
+                impact_qualified: false,
+                last_seen_substep: 7,
+            },
+        );
         assert_eq!(
             scene.set_world_bounds(Vec3::new(0.01, 0.0, 0.0), Vec3::splat(1.0)),
             Ok(1)
         );
         assert_eq!(scene.bonding_contacts.len(), 1);
         assert_eq!(scene.bonding_contacts[&(0, 1)].dwell_seconds, 0.25);
+        assert_eq!(scene.fusion_contacts.len(), 1);
+        assert_eq!(scene.fusion_contacts[&(0, 1)].dwell_seconds, 0.125);
         assert!(scene
             .set_world_bounds(Vec3::new(0.02, 0.0, 0.0), Vec3::splat(1.0))
             .is_ok());
         assert!(scene.bonding_contacts.is_empty());
+        assert!(scene.fusion_contacts.is_empty());
     }
 }
 
@@ -1932,6 +2100,127 @@ mod topology_mutation_tests {
         assert!(pending.fuse_adjacent_voxels(0, 1).is_err());
         assert_eq!(pending.voxels.len(), 2);
         assert_eq!(pending.releases.len(), 1);
+    }
+
+    #[test]
+    fn thermal_fusion_rule_requires_hot_pressurized_dwell_contact() {
+        let iron = Material::component_id("iron").unwrap();
+        let mut scene = SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .add_voxel(
+                VoxelSpawn::at_cell([0, 0, 0], iron)
+                    .fixed()
+                    .at_temperature(400.0),
+            )
+            .add_voxel(VoxelSpawn::at_cell([1, 0, 0], iron).at_temperature(400.0))
+            .build()
+            .unwrap();
+        scene.release_voxel(0).unwrap();
+        assert!(scene.set_thermal_fusion_rule(f32::NAN, 0.0, 0.0).is_err());
+        assert!(scene.set_thermal_fusion_rule(350.0, -1.0, 0.0).is_err());
+        assert!(scene
+            .set_thermal_fusion_rule(350.0, 1000.0, f32::INFINITY)
+            .is_err());
+        scene.set_thermal_fusion_rule(350.0, 1000.0, 0.02).unwrap();
+        let contact = crate::collision::Contact {
+            i: 0,
+            j: 1,
+            normal: Vec3::X,
+            new_impact: false,
+        };
+
+        let targets = [[None; 3]; 2];
+        let transient_targets = [[Some(0.005), None, None], [None; 3]];
+        scene.form_thermal_fusions(&[contact], &[0.0015], 0.01, &transient_targets);
+        assert_eq!(scene.take_pending_fusion(), None);
+        assert!(scene.fusion_contacts.is_empty());
+        scene.form_thermal_fusions(&[contact], &[0.0005], 0.01, &targets); // 500 Pa
+        assert_eq!(scene.take_pending_fusion(), None);
+        scene.form_thermal_fusions(&[contact], &[0.0015], 0.01, &targets); // 1500 Pa, 10 ms
+        assert_eq!(scene.take_pending_fusion(), None);
+        scene.form_thermal_fusions(&[contact], &[0.0015], 0.01, &targets); // 1500 Pa, 20 ms
+        assert_eq!(scene.take_pending_fusion(), Some((0, 1)));
+        assert_eq!(scene.voxels.len(), 2);
+        assert_eq!(
+            scene
+                .thermal_fusion_rule()
+                .unwrap()
+                .minimum_contact_pressure_pa,
+            1000.0
+        );
+        scene.clear_thermal_fusion_rule();
+        assert_eq!(scene.thermal_fusion_rule(), None);
+        assert!(scene.fusion_contacts.is_empty());
+    }
+
+    #[test]
+    fn thermal_fusion_dwell_resets_on_contact_loss_or_cooling() {
+        let iron = Material::component_id("iron").unwrap();
+        let mut scene = SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], iron).at_temperature(400.0))
+            .add_voxel(VoxelSpawn::at_cell([1, 0, 0], iron).at_temperature(400.0))
+            .build()
+            .unwrap();
+        scene.bonds[0][0] = Bond::default();
+        scene.workspace[0][0] = BondWorkspace::default();
+        scene.set_thermal_fusion_rule(350.0, 1000.0, 0.02).unwrap();
+        let contact = crate::collision::Contact {
+            i: 0,
+            j: 1,
+            normal: Vec3::X,
+            new_impact: false,
+        };
+        let targets = [[None; 3]; 2];
+
+        scene.form_thermal_fusions(&[contact], &[0.0015], 0.01, &targets);
+        assert_eq!(scene.take_pending_fusion(), None);
+        assert_eq!(scene.fusion_contacts[&(0, 1)].dwell_seconds, 0.01);
+
+        scene.substep_index += 1;
+        scene.form_thermal_fusions(&[], &[], 0.01, &targets);
+        assert!(scene.fusion_contacts.is_empty());
+        scene.substep_index += 1;
+        scene.form_thermal_fusions(&[contact], &[0.0015], 0.01, &targets);
+        assert_eq!(scene.take_pending_fusion(), None);
+        assert_eq!(scene.fusion_contacts[&(0, 1)].dwell_seconds, 0.01);
+
+        scene.substep_index += 1;
+        scene.voxels[0].internal_energy = 0.0;
+        scene.voxels[0].internal_energy_remainder_j = 0.0;
+        scene.form_thermal_fusions(&[contact], &[0.0015], 0.01, &targets);
+        assert_eq!(scene.take_pending_fusion(), None);
+        assert!(scene.fusion_contacts.is_empty());
+    }
+
+    #[test]
+    fn thermal_bond_formation_takes_precedence_over_fusion() {
+        let iron = Material::component_id("iron").unwrap();
+        let mut scene = SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], iron).at_temperature(400.0))
+            .add_voxel(VoxelSpawn::at_cell([1, 0, 0], iron).at_temperature(400.0))
+            .build()
+            .unwrap();
+        scene.bonds[0][0] = Bond::default();
+        scene.workspace[0][0] = BondWorkspace::default();
+        crate::solver::rebuild_clusters(&mut scene);
+        scene
+            .set_thermal_bonding_rule("iron", 0.5, 350.0, 0.0, 1000.0, 0.0)
+            .unwrap();
+        scene.set_thermal_fusion_rule(350.0, 1000.0, 0.0).unwrap();
+        let contact = crate::collision::Contact {
+            i: 0,
+            j: 1,
+            normal: Vec3::X,
+            new_impact: true,
+        };
+        let formed = scene.form_thermal_bonds(&[contact], &[0.0], &[0.0015], 0.01);
+        assert_eq!(formed, 1);
+        scene.form_thermal_fusions(&[contact], &[0.0015], 0.01, &[[None; 3]; 2]);
+        assert_eq!(scene.take_pending_fusion(), None);
+        assert_eq!(scene.bonds[0][0].neighbor, 1);
+        assert_eq!(scene.voxels.len(), 2);
     }
 
     #[test]
