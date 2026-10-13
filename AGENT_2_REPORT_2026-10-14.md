@@ -862,3 +862,10 @@ step 1, a maximum about `7.86e-10 J` at step 4, then `7.55e-10 J` through
 fusion/end. Restitution heat is `5.181831960e-4 J`; friction, plastic and damage
 heat are zero; fusion heat is `2.094925452e-7 J`. GIF and MP4 each contain 177
 real frames at 1120x700 and 10 fps. CPU suite passes 86/86.
+
+#### World-bound fixed-step regression
+
+Added and ran `fixed_step_removes_crossing_voxel_and_records_boundary_ledger`:
+a moving REV crosses configured bounds during `Scene::tick`, is removed at the
+fixed-step boundary, and its mass, internal/kinetic energy, and momentum are
+recorded. Targeted test and full CPU suite pass; 87/87 total tests.

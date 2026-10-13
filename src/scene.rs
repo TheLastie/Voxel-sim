@@ -1688,6 +1688,39 @@ mod world_bounds_tests {
     use super::*;
 
     #[test]
+    fn fixed_step_removes_crossing_voxel_and_records_boundary_ledger() {
+        let iron = Material::component_id("iron").unwrap();
+        let mut scene = SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .with_timestep(0.001, 1)
+            .add_voxel(
+                VoxelSpawn::at_cell([0, 0, 0], iron)
+                    .with_velocity(Vec3::new(2.0, 0.0, 0.0))
+                    .at_temperature(325.0),
+            )
+            .build()
+            .unwrap();
+        let voxel = &scene.voxels[0];
+        let expected_mass = voxel.mass as f64;
+        let expected_internal = voxel.total_internal_energy_j();
+        let expected_kinetic = 0.5 * expected_mass * voxel.velocity.length_squared() as f64;
+        let expected_momentum = [expected_mass * 2.0, 0.0, 0.0];
+        scene
+            .set_world_bounds(Vec3::splat(-1.0), Vec3::new(0.006, 1.0, 1.0))
+            .unwrap();
+
+        scene.tick();
+
+        assert!(scene.voxels.is_empty());
+        let ledger = scene.boundary_removals();
+        assert_eq!(ledger.voxel_count, 1);
+        assert!((ledger.mass_kg - expected_mass).abs() < 1e-12);
+        assert!((ledger.internal_energy_j - expected_internal).abs() < 1e-9);
+        assert!((ledger.kinetic_energy_j - expected_kinetic).abs() < 1e-12);
+        assert_eq!(ledger.momentum_kg_m_s, expected_momentum);
+    }
+
+    #[test]
     fn boundary_removal_compacts_bonds_events_and_all_voxel_arrays() {
         let iron = Material::component_id("iron").unwrap();
         let mut scene = Scene::from_voxels(

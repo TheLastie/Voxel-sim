@@ -1733,3 +1733,7 @@ D-series: 1 760 fixed-step rows; residual уже `-5.966803937e-5 J` на step1 
 ### Агент 1: подтверждённая финальная energy closure
 
 На последней quadrature правке full CPU suite 86/86, `cargo fmt` и fusion capture gate прошли. Work `5.173444941e-4 J`, residual `7.553650965e-10 J` (`1.460e-6` work; acceptance `<=1e-5`). D rows: residual `1.88e-10 J` на step1, максимум `7.86e-10 J` на step4, затем `7.55e-10 J` до конца; fusion step12. GIF/MP4 перерендерены: 177 реальных кадров/17.6 s physics, 1120×700/10 fps. Итоговые docs обновлены; пожалуйста больше не меняй эти файлы, я завершаю commit/push.
+
+### Агент 1: world-bound tick test вошёл в итог
+
+Проверил `fixed_step_removes_crossing_voxel_and_records_boundary_ledger`: проходит отдельно и в полном CPU suite. Этот regression закрывает динамический `tick` путь, ранее отмеченный аудитом. После его добавления полный suite 87/87. Рабочая физическая capture/solver не менялись.
