@@ -860,6 +860,24 @@ impl Scene {
         self.boundary_removals
     }
 
+    /// Current recoverable elastic strain energy stored in intact bonds (joules).
+    pub fn elastic_bond_energy_j(&self) -> f64 {
+        let mut energy_j = 0.0;
+        for axis in 0..3 {
+            for (i, bond) in self.bonds[axis].iter().enumerate() {
+                if bond.neighbor != EMPTY {
+                    energy_j += crate::solver::bond_stored_elastic_energy_j(
+                        self,
+                        i,
+                        bond.neighbor as usize,
+                        axis,
+                    );
+                }
+            }
+        }
+        energy_j
+    }
+
     /// Fix or release a REV through the engine API. A transition clears its
     /// velocity to avoid injecting a positional impulse into the solver.
     pub fn set_voxel_kinematic(&mut self, voxel: usize, fixed: bool) -> Result<(), &'static str> {
@@ -1746,14 +1764,21 @@ mod world_bounds_tests {
             .with_gravity(Vec3::ZERO)
             .add_voxel(VoxelSpawn::at_cell([0, 0, 0], iron))
             .add_voxel(VoxelSpawn::at_cell([1, 0, 0], iron))
+            .add_voxel(VoxelSpawn::at_cell([2, 0, 0], iron))
             .build()
             .unwrap();
         scene.positions[1].x += 0.001;
+        scene.positions[2].x += 0.002;
         scene.bonds[0][0].damage = 0.25;
+        scene.bonds[0][1].damage = 0.25;
         let k = crate::solver::stiffness_matrix(&scene, 0, 1, glam::Mat3::IDENTITY);
-        let strain = glam::Vec3::X * 0.001;
-        let expected_energy = (0.5 * 0.75 * strain.dot(k * strain)).max(0.0) as f64;
+        let strain_a = glam::Vec3::X * (scene.positions[1].x - scene.positions[0].x - CELL);
+        let strain_b = glam::Vec3::X * (scene.positions[2].x - scene.positions[1].x - CELL);
+        let expected_energy =
+            (0.5 * 0.75 * (strain_a.dot(k * strain_a) + strain_b.dot(k * strain_b))).max(0.0)
+                as f64;
         assert!(expected_energy > 0.0);
+        assert!((scene.elastic_bond_energy_j() - expected_energy).abs() < expected_energy * 1e-5);
 
         assert_eq!(
             scene.set_world_bounds(Vec3::new(0.02, 0.0, 0.0), Vec3::splat(1.0)),
@@ -1761,12 +1786,14 @@ mod world_bounds_tests {
         );
 
         assert_eq!(scene.boundary_removals().voxel_count, 2);
+        assert_eq!(scene.voxels.len(), 1);
         assert!(
             (scene.boundary_removals().elastic_bond_energy_j - expected_energy).abs()
                 < expected_energy * 1.0e-5,
             "ledger={} expected={expected_energy}",
             scene.boundary_removals().elastic_bond_energy_j
         );
+        assert_eq!(scene.elastic_bond_energy_j(), 0.0);
     }
 
     #[test]

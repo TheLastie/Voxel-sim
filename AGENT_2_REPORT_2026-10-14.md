@@ -874,9 +874,12 @@ strained bonded pair. The release CPU capture `world-bounds-ledger` ran 1,760
 steps and saved 177 real states over 17.6 s. Six free probes crossed all six
 faces, and an additional bonded pair crossed X+; all 8 REV were removed. The
 capture recorded elastic bond energy `8.673616492e-8 J`, pending release 0,
-mass error 0 and thermal-energy error 0. GIF/MP4 each have 177 frames at
-1120×700 and 10 fps; viewer `:8820` served the current run. This covers one
-bonded pair; broader multi-bond accounting remains open.
+mass error 0 and full total-energy residual `1.603e-13 J` against the
+mechanical-energy-scaled tolerance `1.158e-9 J`. `Scene::elastic_bond_energy_j()`
+provides the same derived engine value for callers. GIF/MP4 each have 177 frames
+at 1120×700 and 10 fps; viewer `:8820` and selector `:8821` served the current
+run. A two-bond chain regression checks removal of both endpoints for one bond
+and one endpoint for the other. More complex multi-bond accounting remains open.
 
 #### World-bound fixed-step regression
 

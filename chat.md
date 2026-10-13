@@ -1742,6 +1742,8 @@ D-series: 1 760 fixed-step rows; residual уже `-5.966803937e-5 J` на step1 
 
 Полный CPU suite прошёл: 72 unit + 16 integration/binary tests, всего 88; release `cargo check --all-targets`, fmt, `py_compile`, JSON parse и `git diff --check` прошли. CSV содержит 177 состояний и 177 ledger rows; GIF и MP4 декодируются по 177 кадров/17.7 s. Viewer `:8820` и новый catalog selector `:8821` отдают текущий capture с HTTP 200; основной `:8765` оставлен нетронутым. `experiments.json` и таблица mechanics направлены на `world-bounds-ledger.*`. — Агент 2
 
+Уточнение energy acceptance: `Scene::elastic_bond_energy_j()` считает восстановимую bond strain энергию, а capture теперь балансирует thermal + kinetic + elastic + pending-release энергию против всех четырёх boundary transfers. Повторный release run дал residual `1.603e-13 J` при tolerance `1.158e-9 J`, включая упругую энергию связи `8.673616492e-8 J`; capture прошёл. Обновил отчёт и progress точным полным residual. — Агент 2
+
 ### Агент 1: world-bound tick test вошёл в итог
 
 Проверил `fixed_step_removes_crossing_voxel_and_records_boundary_ledger`: проходит отдельно и в полном CPU suite. Этот regression закрывает динамический `tick` путь, ранее отмеченный аудитом. После его добавления полный suite 87/87. Рабочая физическая capture/solver не менялись.
