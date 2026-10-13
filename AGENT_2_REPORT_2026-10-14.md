@@ -875,11 +875,14 @@ steps and saved 177 real states over 17.6 s. Six free probes crossed all six
 faces, and an additional bonded pair crossed X+; all 8 REV were removed. The
 capture recorded elastic bond energy `8.673616492e-8 J`, pending release 0,
 mass error 0 and full total-energy residual `1.603e-13 J` against the
-mechanical-energy-scaled tolerance `1.158e-9 J`. `Scene::elastic_bond_energy_j()`
-provides the same derived engine value for callers. GIF/MP4 each have 177 frames
-at 1120×700 and 10 fps; viewer `:8820` and selector `:8821` served the current
-run. A two-bond chain regression checks removal of both endpoints for one bond
-and one endpoint for the other. More complex multi-bond accounting remains open.
+mechanical-energy-scaled tolerance `1.158e-9 J`. The engine now includes retained
+plastic work in the boundary ledger, including plastic work on a broken bond
+whose rest topology is still present. `Scene::elastic_bond_energy_j()` and
+`Scene::stored_plastic_bond_energy_j()` expose the derived energy channels. The
+capture recorded stored plastic energy 0 J and pending release 0 J. GIF/MP4 each
+have 177 frames at 1120×700 and 10 fps; viewer `:8820` and selector `:8821`
+served the current run. Regressions check an intact two-bond chain and stored
+plastic work on a broken bond. More complex multi-bond accounting remains open.
 
 #### World-bound fixed-step regression
 
@@ -894,3 +897,20 @@ full CPU suite 88/88, release all-target check, fmt, renderer `py_compile`, JSON
 parse and `git diff --check` pass. The capture and media use 177 saved physical
 states; `world-bounds-ledger.gif` and `.mp4` decode to 177 frames each. Live
 viewer `:8820` and catalog selector `:8821` were checked by Agent 2.
+
+#### Stored plastic energy at boundary removal
+
+The boundary ledger now also records the unheated fraction of cumulative bond
+plastic work. `Scene::stored_plastic_bond_energy_j()` reports current retained
+plastic energy; removal transfers it when either endpoint leaves, including for
+a broken bond whose original endpoint remains indexed through `rest_neighbor`.
+Regressions cover intact multi-bond chains and a broken bond. `world-bounds-ledger`
+was rerun with the expanded energy total (internal, kinetic, elastic, stored
+plastic and pending release): stored plastic and pending release are both 0 J
+for this capture; total-energy residual remains `1.603e-13 J` against
+`1.158e-9 J` tolerance. CSV, GIF and MP4 include the new channel.
+
+Full CPU suite after this change: 89/89; release all-target check, formatter,
+renderer syntax, catalog JSON and `git diff --check` pass. CSV has 177 states and
+ledger rows (14 columns); GIF and MP4 each decode to 177 frames at 10 fps.
+Catalog selector `:8821` returns the updated CSV/GIF/MP4 with HTTP 200.

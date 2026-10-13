@@ -93,7 +93,7 @@ fn write_frame(out: &mut BufWriter<File>, scene: &Scene, step: usize) -> std::io
     let ledger = scene.boundary_removals();
     writeln!(
         out,
-        "L,{step},{},{},{},{},{},{},{},{},{},{},{}",
+        "L,{step},{},{},{},{},{},{},{},{},{},{},{},{}",
         scene.voxels.len(),
         ledger.voxel_count,
         ledger.mass_kg,
@@ -104,7 +104,8 @@ fn write_frame(out: &mut BufWriter<File>, scene: &Scene, step: usize) -> std::io
         ledger.momentum_kg_m_s[1],
         ledger.momentum_kg_m_s[2],
         scene.cluster_count,
-        ledger.elastic_bond_energy_j
+        ledger.elastic_bond_energy_j,
+        ledger.stored_plastic_bond_energy_j
     )?;
     out.flush()
 }
@@ -118,7 +119,10 @@ fn total_energy_j(scene: &Scene) -> f64 {
                 + 0.5 * voxel.mass as f64 * voxel.velocity.length_squared() as f64
         })
         .sum();
-    voxel_energy + scene.elastic_bond_energy_j() + scene.energy.pending_release
+    voxel_energy
+        + scene.elastic_bond_energy_j()
+        + scene.stored_plastic_bond_energy_j()
+        + scene.energy.pending_release
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -224,13 +228,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         - ledger.internal_energy_j
         - ledger.kinetic_energy_j
         - ledger.elastic_bond_energy_j
+        - ledger.stored_plastic_bond_energy_j
         - ledger.pending_bond_energy_j)
         .abs();
     let energy_tolerance = (initial_energy - initial_thermal_energy).abs().max(1e-9) * 1e-3;
-    eprintln!("world_bounds complete probes={} frames={FRAMES} steps={STEPS} simulated_s={:.3} remaining={} removed={} ledger_mass={:.9e} kg ledger_internal_energy={:.9e} J ledger_kinetic_energy={:.9e} J elastic_bond_energy={:.9e} J pending_bond_energy={:.9e} J ledger_momentum=[{:.9e},{:.9e},{:.9e}] kg m/s mass_balance_error={:.3e} kg total_energy_balance_error={:.3e} J energy_tolerance={:.3e} J wall={:.2}s",
+    eprintln!("world_bounds complete probes={} frames={FRAMES} steps={STEPS} simulated_s={:.3} remaining={} removed={} ledger_mass={:.9e} kg ledger_internal_energy={:.9e} J ledger_kinetic_energy={:.9e} J elastic_bond_energy={:.9e} J stored_plastic_bond_energy={:.9e} J pending_bond_energy={:.9e} J ledger_momentum=[{:.9e},{:.9e},{:.9e}] kg m/s mass_balance_error={:.3e} kg total_energy_balance_error={:.3e} J energy_tolerance={:.3e} J wall={:.2}s",
         PROBES.len(), STEPS as f64 * DT as f64, scene.voxels.len(), ledger.voxel_count,
         ledger.mass_kg, ledger.internal_energy_j, ledger.kinetic_energy_j,
-        ledger.elastic_bond_energy_j, ledger.pending_bond_energy_j, ledger.momentum_kg_m_s[0],
+        ledger.elastic_bond_energy_j, ledger.stored_plastic_bond_energy_j,
+        ledger.pending_bond_energy_j, ledger.momentum_kg_m_s[0],
         ledger.momentum_kg_m_s[1], ledger.momentum_kg_m_s[2], mass_error,
         energy_error, energy_tolerance, started.elapsed().as_secs_f64());
     if ledger.voxel_count != PROBES.len() as u64

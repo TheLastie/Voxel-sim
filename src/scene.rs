@@ -75,6 +75,8 @@ pub struct BoundaryRemovalLedger {
     pub kinetic_energy_j: f64,
     /// Elastic strain energy in intact bonds removed with the escaping REV.
     pub elastic_bond_energy_j: f64,
+    /// Plastic work still stored in removed bond states (joules).
+    pub stored_plastic_bond_energy_j: f64,
     /// Energy already queued for delayed bond release when an endpoint leaves.
     pub pending_bond_energy_j: f64,
     pub momentum_kg_m_s: [f64; 3],
@@ -878,6 +880,16 @@ impl Scene {
         energy_j
     }
 
+    /// Current plastic work retained as stored energy in bond history (joules).
+    pub fn stored_plastic_bond_energy_j(&self) -> f64 {
+        let retained_fraction = 1.0 - self.config.fracture.plastic_heat_fraction as f64;
+        self.bonds
+            .iter()
+            .flatten()
+            .map(|bond| bond.plastic_work.max(0.0) as f64 * retained_fraction)
+            .sum()
+    }
+
     /// Fix or release a REV through the engine API. A transition clears its
     /// velocity to avoid injecting a positional impulse into the solver.
     pub fn set_voxel_kinematic(&mut self, voxel: usize, fixed: bool) -> Result<(), &'static str> {
@@ -1293,14 +1305,22 @@ impl Scene {
         for axis in 0..3 {
             for i in 0..old_count {
                 let bond = self.bonds[axis][i];
-                if bond.neighbor == EMPTY {
+                let intact_neighbor = bond.neighbor;
+                let rest_neighbor = self.workspace[axis][i].rest_neighbor;
+                let removed_with_bond = !keep[i]
+                    || (intact_neighbor != EMPTY && !keep[intact_neighbor as usize])
+                    || (rest_neighbor != EMPTY && !keep[rest_neighbor as usize]);
+                if !removed_with_bond {
                     continue;
                 }
-                let j = bond.neighbor as usize;
-                if !keep[i] || !keep[j] {
+                if intact_neighbor != EMPTY {
+                    let j = intact_neighbor as usize;
                     self.boundary_removals.elastic_bond_energy_j +=
                         crate::solver::bond_stored_elastic_energy_j(self, i, j, axis);
                 }
+                let retained_fraction = 1.0 - self.config.fracture.plastic_heat_fraction as f64;
+                self.boundary_removals.stored_plastic_bond_energy_j +=
+                    bond.plastic_work.max(0.0) as f64 * retained_fraction;
             }
         }
 
@@ -1771,6 +1791,8 @@ mod world_bounds_tests {
         scene.positions[2].x += 0.002;
         scene.bonds[0][0].damage = 0.25;
         scene.bonds[0][1].damage = 0.25;
+        scene.bonds[0][0].plastic_work = 1.25;
+        scene.bonds[0][1].plastic_work = 2.5;
         let k = crate::solver::stiffness_matrix(&scene, 0, 1, glam::Mat3::IDENTITY);
         let strain_a = glam::Vec3::X * (scene.positions[1].x - scene.positions[0].x - CELL);
         let strain_b = glam::Vec3::X * (scene.positions[2].x - scene.positions[1].x - CELL);
@@ -1779,6 +1801,9 @@ mod world_bounds_tests {
                 as f64;
         assert!(expected_energy > 0.0);
         assert!((scene.elastic_bond_energy_j() - expected_energy).abs() < expected_energy * 1e-5);
+        let expected_stored_plastic =
+            3.75 * (1.0 - scene.config.fracture.plastic_heat_fraction as f64);
+        assert!((scene.stored_plastic_bond_energy_j() - expected_stored_plastic).abs() < 1e-12);
 
         assert_eq!(
             scene.set_world_bounds(Vec3::new(0.02, 0.0, 0.0), Vec3::splat(1.0)),
@@ -1794,6 +1819,36 @@ mod world_bounds_tests {
             scene.boundary_removals().elastic_bond_energy_j
         );
         assert_eq!(scene.elastic_bond_energy_j(), 0.0);
+        assert_eq!(scene.stored_plastic_bond_energy_j(), 0.0);
+        assert!(
+            (scene.boundary_removals().stored_plastic_bond_energy_j - expected_stored_plastic)
+                .abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn boundary_removal_transfers_stored_plastic_work_from_broken_bond() {
+        let iron = Material::component_id("iron").unwrap();
+        let mut scene = SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], iron))
+            .add_voxel(VoxelSpawn::at_cell([1, 0, 0], iron))
+            .build()
+            .unwrap();
+        scene.bonds[0][0].neighbor = EMPTY;
+        scene.bonds[0][0].damage = 1.0;
+        scene.bonds[0][0].plastic_work = 2.0;
+        assert!((scene.stored_plastic_bond_energy_j() - 0.2).abs() < 1e-7);
+
+        assert_eq!(
+            scene.set_world_bounds(Vec3::new(0.01, 0.0, 0.0), Vec3::splat(1.0)),
+            Ok(1)
+        );
+
+        assert_eq!(scene.boundary_removals().elastic_bond_energy_j, 0.0);
+        assert!((scene.boundary_removals().stored_plastic_bond_energy_j - 0.2).abs() < 1e-7);
+        assert_eq!(scene.stored_plastic_bond_energy_j(), 0.0);
     }
 
     #[test]

@@ -97,8 +97,9 @@ for frame_number, (step, frame) in enumerate(sorted(frames.items())):
     remaining, removed = int(ledger[2]), int(ledger[3])
     mass, internal, kinetic, pending = map(float, ledger[4:8])
     elastic = float(ledger[12]) if len(ledger) > 12 else 0.0
+    stored_plastic = float(ledger[13]) if len(ledger) > 13 else 0.0
     momentum = tuple(float(value) for value in ledger[8:11])
-    panel = (748, 112, 1090, 590)
+    panel = (748, 112, 1090, 638)
     draw.rounded_rectangle(panel, radius=14, fill=(12, 27, 43), outline=(49, 72, 96), width=2)
     draw.text((770, 132), "ГРАНИ / удалено", font=font(18), fill=white)
     for n, (face, title) in enumerate(zip(event_counts, ("X−", "X+", "Y−", "Y+", "Z−", "Z+"))):
@@ -107,7 +108,9 @@ for frame_number, (step, frame) in enumerate(sorted(frames.items())):
     draw.line((770, 370, 1068, 370), fill=(49, 72, 96), width=1)
     stats = [f"осталось REV: {remaining}", f"удалено REV: {removed}", f"масса: {mass:.4e} кг",
              f"U ledger: {internal:.4e} Дж", f"K ledger: {kinetic:.4e} Дж",
-             f"elastic bond: {elastic:.2e} Дж", f"pending release: {pending:.2e} Дж",
+             f"elastic bond: {elastic:.2e} Дж",
+             f"stored plastic: {stored_plastic:.2e} Дж",
+             f"pending release: {pending:.2e} Дж",
              f"p ledger: [{momentum[0]:.2e},",
              f"           {momentum[1]:.2e}, {momentum[2]:.2e}] кг·м/с"]
     for n, text in enumerate(stats):
