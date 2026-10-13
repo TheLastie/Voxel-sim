@@ -1,0 +1,133 @@
+{
+  "frames": 21,
+  "dt": 0.001,
+  "seconds": 0.02,
+  "stats": [
+    {
+      "frame": 0,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41999998
+    },
+    {
+      "frame": 1,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41999384
+    },
+    {
+      "frame": 2,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.4199779
+    },
+    {
+      "frame": 3,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41995214999999997
+    },
+    {
+      "frame": 4,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.4199166
+    },
+    {
+      "frame": 5,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41987124
+    },
+    {
+      "frame": 6,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41981604
+    },
+    {
+      "frame": 7,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41975107
+    },
+    {
+      "frame": 8,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41967627
+    },
+    {
+      "frame": 9,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41959166
+    },
+    {
+      "frame": 10,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41949725
+    },
+    {
+      "frame": 11,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41939303
+    },
+    {
+      "frame": 12,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41927897
+    },
+    {
+      "frame": 13,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41915512
+    },
+    {
+      "frame": 14,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41902145
+    },
+    {
+      "frame": 15,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41887798
+    },
+    {
+      "frame": 16,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41872468
+    },
+    {
+      "frame": 17,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.4185616
+    },
+    {
+      "frame": 18,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.4183887
+    },
+    {
+      "frame": 19,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41820597
+    },
+    {
+      "frame": 20,
+      "broken": 0,
+      "drift_m": 0.0,
+      "probe_bottom_m": 0.41801345
+    }
+  ]
+}
