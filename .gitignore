@@ -6,6 +6,7 @@
 /video_work/
 /validation/__pycache__/
 /validation/*_frames*/
+/validation/*-frames/
 /validation/.library_upload_helpers_current/
 /validation/*.csv
 /validation/*.mp4
@@ -14,6 +15,9 @@
 !/validation/knife-cut-demo.mp4
 !/validation/knife-cut-demo.gif
 !/validation/live-support.gif
+!/validation/live-support.mp4
+!/validation/thermal-gradient.gif
+!/validation/thermal-gradient.mp4
 !/validation/knife-cut-final-frame.png
 /voxel-physics-lab.zip
 /*.mp4

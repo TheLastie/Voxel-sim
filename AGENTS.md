@@ -24,6 +24,7 @@ The long-term performance targets are 30 FPS for the intended CPU workload and 6
 
 - Before starting a model run, confirm filesystem access and start or verify the live viewer. Stream the run's CSV to `http://127.0.0.1:8765` so the user can see it while it runs.
 - Save a GIF for every physical capture and expose it from the viewer. Keep the CSV and MP4 where useful for diagnostics and seeking. The browser page should show the GIF and the live solver frame during a run.
+- Maintain one reproducible physical experiment and recording for each engine mechanic in [`MECHANICS_EXPERIMENTS.md`](MECHANICS_EXPERIMENTS.md). Use at least 176 real saved states and a 17.6-second GIF at 10 FPS, twice the earlier 88-frame / 8.8-second recording. Extend the actual physical run to obtain more states; never duplicate or interpolate frames to meet the duration.
 - Keep the run's actual physics results in the recording. Do not synthesize trajectories or hide unstable behavior in a rendered result; report breakage, drift, and other failures beside the visual.
 - If the user gives a delivery deadline, check local time (`Asia/Yekaterinburg`) during the work and prioritize a runnable, inspectable result before that time. Do not imply a target has been achieved without a measurement.
 - For each actual physical model run, make the live stream available to the user and retain a GIF recording that can be opened in the site. Check that the viewer serves the current run before describing it as visible.

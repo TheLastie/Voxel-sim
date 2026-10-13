@@ -43,24 +43,26 @@ const $=s=>document.querySelector(s), setText=(id,text)=>$('#'+id).textContent=t
 const animation=$('#animation');
 animation.addEventListener('error',()=>{$('#gif-error').style.display='block';animation.hidden=true});
 const canvas=$('#live-scene'),ctx=canvas.getContext('2d');
-const live={offset:0,carry:'',dt:0,steps:0,floor:[],cells:[],frames:new Map(),latest:null,gifMtime:0};
+const live={offset:0,carry:'',dt:0,steps:0,mode:'mechanical',floor:[],cells:[],frames:new Map(),latest:null,gifMtime:0};
 const fmt=(v,d=3)=>Number.isFinite(v)?v.toFixed(d):'—';
-function liveReset(){live.offset=0;live.carry='';live.floor=[];live.cells=[];live.frames.clear();live.latest=null}
+function liveReset(){live.offset=0;live.carry='';live.floor=[];live.cells=[];live.frames.clear();live.latest=null;live.mode='mechanical'}
 function getFrame(n){if(!live.frames.has(n))live.frames.set(n,{n,tool:[],voxels:[]});return live.frames.get(n)}
-function parseLine(line){if(!line)return;const r=line.split(',');if(r[0]==='H'){live.dt=+r[1];live.steps=+r[2]}else if(r[0]==='P')live.floor.push(r.slice(1,4).map(Number));else if(r[0]==='T')live.cells.push(r.slice(1,4).map(Number));else if(r[0]==='F'){const f=getFrame(+r[1]);f.tool=r.slice(2).map(Number);live.latest=f}else if(r[0]==='V'){getFrame(+r[1]).voxels.push({i:+r[2],p:r.slice(3,6).map(Number),damage:+r[6],lost:+r[7]})}}
+function parseLine(line){if(!line)return;const r=line.split(',');if(r[0]==='H'){live.dt=+r[1];live.steps=+r[2];live.mode=r[4]||'mechanical'}else if(r[0]==='P')live.floor.push(r.slice(1,4).map(Number));else if(r[0]==='T')live.cells.push(r.slice(1,4).map(Number));else if(r[0]==='S')live.latest=getFrame(+r[1]);else if(r[0]==='Q'){const f=getFrame(+r[1]);f.voxels.push({i:+r[2],p:r.slice(3,6).map(Number),temp:+r[6]});live.latest=f}else if(r[0]==='F'){const f=getFrame(+r[1]);f.tool=r.slice(2).map(Number);live.latest=f}else if(r[0]==='V'){getFrame(+r[1]).voxels.push({i:+r[2],p:r.slice(3,6).map(Number),damage:+r[6],lost:+r[7]})}}
 function project(p,w,h,s){return[w*.5+(p[0]+p[1])*.70710678*s,h*.72+((p[0]-p[1])*.40824829-p[2]*.81649658)*s]}
 function rotate(q,p){const[x,y,z,w]=q,[a,b,c]=p,tx=2*(y*c-z*b),ty=2*(z*a-x*c),tz=2*(x*b-y*a);return[a+w*tx+y*tz-z*ty,b+w*ty+z*tx-x*tz,c+w*tz+x*ty-y*tx]}
-function paintLive(){const w=canvas.clientWidth,h=canvas.clientHeight,dpr=devicePixelRatio||1;if(!w||!h)return;if(canvas.width!==Math.round(w*dpr)||canvas.height!==Math.round(h*dpr)){canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr)}ctx.setTransform(dpr,0,0,dpr,0,0);ctx.fillStyle='#07101c';ctx.fillRect(0,0,w,h);const f=live.latest;if(!f||!f.tool.length){ctx.fillStyle='#9aabc0';ctx.fillText('Ожидание первого сохранённого состояния…',20,32);return}const s=Math.min(w/1.45,h/1.05),items=[];if(live.floor.length){const xs=live.floor.map(p=>p[0]),ys=live.floor.map(p=>p[1]),x0=Math.min(...xs),x1=Math.max(...xs),y0=Math.min(...ys),y1=Math.max(...ys),poly=[[x0,y0,0],[x1,y0,0],[x1,y1,0],[x0,y1,0]].map(p=>project(p,w,h,s));ctx.beginPath();poly.forEach((p,i)=>i?ctx.lineTo(...p):ctx.moveTo(...p));ctx.closePath();ctx.fillStyle='#202f40';ctx.fill();ctx.strokeStyle='#71869c';ctx.stroke()}for(const v of f.voxels){const color=v.i>=4320?'#50b5f8':v.lost>=2?'#d94a3a':v.lost?'#f08e44':v.damage>0?'#d99a54':'#985f3b';items.push({p:v.p,c:color,z:v.p[0]-v.p[1]+v.p[2],r:v.i>=4320?4:2.6})}const q=f.tool.slice(3,7),pos=f.tool.slice(0,3);if(q.length===4)for(const cell of live.cells){const r=rotate(q,cell),p=pos.map((v,i)=>v+r[i]);items.push({p,c:'#c9d4df',z:p[0]-p[1]+p[2],r:3})}items.sort((a,b)=>a.z-b.z);for(const v of items){const[x,y]=project(v.p,w,h,s);ctx.fillStyle=v.c;ctx.fillRect(x-v.r/2,y-v.r/2,v.r,v.r)}ctx.fillStyle='#e8eef7';ctx.font='14px system-ui';ctx.fillText(`t = ${fmt(f.n*live.dt,3)} s · кадр ${f.n}/${live.steps}`,16,22);$('#live-caption').textContent=`Живой кадр решателя · разорвано связей: ${fmt(f.tool[9],0)} · скорость инструмента: ${fmt(f.tool[7])} м/с`}
+function heatColor(temp){const t=Math.max(0,Math.min(1,(temp-300)/150)),stops=[[38,112,218],[250,202,71],[225,54,48]],x=t*2,i=Math.min(1,Math.floor(x)),a=x-i;return `rgb(${stops[i].map((v,c)=>Math.round(v*(1-a)+stops[i+1][c]*a)).join(',')})`}
+function paintThermal(f,w,h){if(!f||!f.voxels.length){ctx.fillStyle='#9aabc0';ctx.fillText('Ожидание теплового состояния…',20,32);return}const cells=f.voxels.slice().sort((a,b)=>a.i-b.i),left=24,right=w-24,cellW=(right-left)/cells.length;ctx.font='12px system-ui';ctx.fillStyle='#e8eef7';ctx.fillText(`t = ${fmt(f.n*live.dt,0)} s · кадр ${f.n}/${live.steps}`,16,22);const y=h*.47,height=Math.min(82,h*.22);cells.forEach((v,i)=>{const x=left+i*cellW;ctx.fillStyle=heatColor(v.temp);ctx.fillRect(x+1,y,Math.max(2,cellW-2),height);ctx.strokeStyle='#d3deeb';ctx.strokeRect(x+1,y,Math.max(2,cellW-2),height);if(i%4===0){ctx.fillStyle='#e8eef7';ctx.fillText(`${v.temp.toFixed(0)} K`,x,y+height+18)}});const gy=y+height+58;ctx.fillStyle='#9aabc0';ctx.fillText('300 K',left,gy);ctx.fillText('450 K',right-40,gy);ctx.fillText('горячая половина',left,y-12);ctx.fillText('холодная половина',left+cellW*cells.length/2,y-12);$('#live-caption').textContent=`Тепловой профиль · min ${Math.min(...cells.map(v=>v.temp)).toFixed(2)} K · max ${Math.max(...cells.map(v=>v.temp)).toFixed(2)} K`}
+function paintLive(){const w=canvas.clientWidth,h=canvas.clientHeight,dpr=devicePixelRatio||1;if(!w||!h)return;if(canvas.width!==Math.round(w*dpr)||canvas.height!==Math.round(h*dpr)){canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr)}ctx.setTransform(dpr,0,0,dpr,0,0);ctx.fillStyle='#07101c';ctx.fillRect(0,0,w,h);const f=live.latest;if(live.mode==='thermal'){paintThermal(f,w,h);return}if(!f||!f.tool.length){ctx.fillStyle='#9aabc0';ctx.fillText('Ожидание первого сохранённого состояния…',20,32);return}const s=Math.min(w/1.45,h/1.05),items=[];if(live.floor.length){const xs=live.floor.map(p=>p[0]),ys=live.floor.map(p=>p[1]),x0=Math.min(...xs),x1=Math.max(...xs),y0=Math.min(...ys),y1=Math.max(...ys),poly=[[x0,y0,0],[x1,y0,0],[x1,y1,0],[x0,y1,0]].map(p=>project(p,w,h,s));ctx.beginPath();poly.forEach((p,i)=>i?ctx.lineTo(...p):ctx.moveTo(...p));ctx.closePath();ctx.fillStyle='#202f40';ctx.fill();ctx.strokeStyle='#71869c';ctx.stroke()}for(const v of f.voxels){const color=v.i>=4320?'#50b5f8':v.lost>=2?'#d94a3a':v.lost?'#f08e44':v.damage>0?'#d99a54':'#985f3b';items.push({p:v.p,c:color,z:v.p[0]-v.p[1]+v.p[2],r:v.i>=4320?4:2.6})}const q=f.tool.slice(3,7),pos=f.tool.slice(0,3);if(q.length===4)for(const cell of live.cells){const r=rotate(q,cell),p=pos.map((v,i)=>v+r[i]);items.push({p,c:'#c9d4df',z:p[0]-p[1]+p[2],r:3})}items.sort((a,b)=>a.z-b.z);for(const v of items){const[x,y]=project(v.p,w,h,s);ctx.fillStyle=v.c;ctx.fillRect(x-v.r/2,y-v.r/2,v.r,v.r)}ctx.fillStyle='#e8eef7';ctx.font='14px system-ui';ctx.fillText(`t = ${fmt(f.n*live.dt,3)} s · кадр ${f.n}/${live.steps}`,16,22);$('#live-caption').textContent=`Живой кадр решателя · разорвано связей: ${fmt(f.tool[9],0)} · скорость инструмента: ${fmt(f.tool[7])} м/с`}
 async function pollLive(){try{const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());if(s.bytes<live.offset)liveReset();const chunk=await fetch('/capture?offset='+live.offset,{cache:'no-store'}).then(r=>r.text());live.offset+=new TextEncoder().encode(chunk).length;const parts=(live.carry+chunk).split('\n');live.carry=parts.pop()||'';parts.forEach(parseLine);paintLive();if(s.gif&&s.gif_mtime!==live.gifMtime){live.gifMtime=s.gif_mtime;const u='/gif?v='+encodeURIComponent(s.gif_mtime);animation.src=u;$('#gif-link').href=u}}catch(_){$('#live-caption').textContent='Нет соединения с CSV-потоком'}}
 async function init(){
  const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());
  setText('title',s.label);setText('source',`${s.file} · CSV: ${Number(s.bytes).toLocaleString('ru-RU')} байт`);
  $('#badge').textContent=s.gif?'GIF готова':'GIF не найдена';$('#badge').style.color=s.gif?'#8de0b0':'#f2c17e';
- $('#description').textContent=s.mode==='csv'?'Зацикленная визуализация последней сохранённой записи физического расчёта.':'Зацикленная GIF-анимация физического прогона.';
+ $('#description').textContent=s.mode==='thermal'?'Живой тепловой профиль рассчитанных состояний REV.':'Зацикленная визуализация последней сохранённой записи физического расчёта.';
  if(s.gif){const url='/gif?v='+encodeURIComponent(s.gif_mtime||s.gif_bytes||Date.now());animation.src=url;$('#gif-link').href=url}
  else{$('#gif-error').style.display='block';animation.hidden=true}
  if(s.video)$('#recording').style.display='block';
- if(s.mode==='csv'){$('#live-preview').hidden=false;window.addEventListener('resize',paintLive);await pollLive();setInterval(pollLive,500)}
+ if(s.mode==='csv'||s.mode==='thermal'){$('#live-preview').hidden=false;live.mode=s.mode==='thermal'?'thermal':'mechanical';window.addEventListener('resize',paintLive);await pollLive();setInterval(pollLive,500)}
 }
 init().catch(()=>{$('#badge').textContent='Ошибка подключения';setText('source','Не удалось загрузить состояние просмотрщика')});
 </script></body></html>"""
@@ -111,7 +113,7 @@ class Handler(BaseHTTPRequestHandler):
             }, ensure_ascii=False).encode("utf-8")
             self.send_bytes(200, "application/json; charset=utf-8", payload)
             return
-        if route.path == "/capture" and self.mode == "csv":
+        if route.path == "/capture" and self.mode in ("csv", "thermal"):
             try:
                 offset = max(0, int(parse_qs(route.query).get("offset", ["0"])[0]))
                 with self.source_path.open("rb") as source:
@@ -183,15 +185,16 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--video", type=Path, default=DEFAULT_VIDEO)
-    source.add_argument("--csv", type=Path, help="Append-only live solver capture CSV")
+    source.add_argument("--csv", type=Path, help="Append-only mechanical solver capture CSV")
+    source.add_argument("--thermal-csv", type=Path, help="Append-only thermal transport capture CSV")
     parser.add_argument("--label", default="Демонстрация физического расчёта")
     args = parser.parse_args()
-    Handler.mode = "csv" if args.csv else "video"
-    Handler.source_path = (args.csv or args.video).resolve()
+    Handler.mode = "thermal" if args.thermal_csv else "csv" if args.csv else "video"
+    Handler.source_path = (args.thermal_csv or args.csv or args.video).resolve()
     Handler.label = args.label
     if Handler.mode == "video" and not Handler.source_path.is_file():
         parser.error(f"video file does not exist: {Handler.source_path}")
-    if Handler.mode == "csv" and not Handler.source_path.parent.is_dir():
+    if Handler.mode in ("csv", "thermal") and not Handler.source_path.parent.is_dir():
         parser.error(f"CSV parent directory does not exist: {Handler.source_path.parent}")
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Viewer listening on http://127.0.0.1:{args.port} ({Handler.mode})", flush=True)
