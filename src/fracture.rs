@@ -163,6 +163,8 @@ pub struct EnergyLedger {
     pub damage_heat: f64,
     /// Kinetic energy converted to internal energy by REV contact friction (J).
     pub contact_friction_heat: f64,
+    /// Normal impact energy dissipated by the coefficient of restitution (J).
+    pub contact_restitution_heat: f64,
     pub pending_release: f64,
     pub kinetic_release: f64,
 }
@@ -434,6 +436,65 @@ mod tests {
             fatigue(&mut b, -0.8, &c);
         }
         assert_eq!(b.fatigue_damage, 1.);
+    }
+    #[test]
+    fn cyclic_subcritical_stress_breaks_bond_through_constitutive_update() {
+        let m = &Material::table()[2];
+        let limits = pair_limits(m, m, [1.; 2], [0.; 2]);
+        let mut b = Bond {
+            neighbor: 1,
+            ..Default::default()
+        };
+        let mut c = config();
+        c.fatigue_cycles = 2.;
+        c.fatigue_exponent = 1.;
+        c.fatigue_threshold = 0.1;
+
+        // Repeatedly holding 40% of the static strength must not consume fatigue life.
+        let amplitude = 0.4 * m.tensile_strength / m.young * CELL;
+        for _ in 0..100 {
+            let result = update(&mut b, Vec3::X * amplitude, k(m), limits, 0.001, &c);
+            assert_eq!(b.neighbor, 1);
+            assert_eq!(b.fatigue_damage, 0.0);
+            assert_eq!(result.total(), 0.0);
+        }
+
+        // The same stress magnitude, reversed each half-cycle, eventually fails the bond.
+        let mut dissipated = 0.0;
+        let mut failure_dissipation = None;
+        for _ in 0..20 {
+            for sign in [-1.0, 1.0] {
+                let result = update(
+                    &mut b,
+                    Vec3::X * (sign * amplitude),
+                    k(m),
+                    limits,
+                    0.001,
+                    &c,
+                );
+                dissipated += result.total();
+                if b.neighbor == EMPTY {
+                    failure_dissipation = Some(result);
+                    break;
+                }
+            }
+            if b.neighbor == EMPTY {
+                break;
+            }
+        }
+        assert_eq!(b.neighbor, EMPTY, "cyclic load did not break the bond");
+        assert_eq!(b.damage, 1.0);
+        assert_eq!(b.fatigue_damage, 1.0);
+        assert!(dissipated > 0.0);
+        let failure_dissipation = failure_dissipation.expect("failure step has no energy record");
+        let released_elastic_energy = energy(Vec3::X * amplitude, k(m), 0.0);
+        assert!(
+            (failure_dissipation.total() - released_elastic_energy).abs()
+                <= released_elastic_energy * 1e-6,
+            "fatigue failure dissipation {} != available elastic energy {}",
+            failure_dissipation.total(),
+            released_elastic_energy
+        );
     }
     #[test]
     fn wood_has_tension_and_compression_anisotropy() {

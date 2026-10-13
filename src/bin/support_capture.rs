@@ -138,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert!(scene.positions.iter().all(|p| p.is_finite()));
         writeln!(
             out,
-            "F,{frame},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "F,{frame},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             t.position.x,
             t.position.y,
             t.position.z,
@@ -151,7 +151,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             scene.broken,
             scene.cluster_count,
             drift,
-            scene.energy.contact_friction_heat
+            scene.energy.contact_friction_heat,
+            scene.energy.contact_restitution_heat
         )?;
         let damage = scene.incident_bond_damage();
         for i in 0..probe_end {

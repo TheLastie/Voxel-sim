@@ -652,7 +652,7 @@ pub fn capture_knife(
         }
         writeln!(
             out,
-            "F,{frame},{tx},{ty},{tz},{vx},{vy},{vz},{ax},{ay},{az},{broken},{clusters},{vmax},{wood_ke},{tool_ke},{kinetic_release},{pending_release},{surface_work},{damage_heat},{plastic_heat},{stored_plastic},{max_stress_ratio},{stress_x},{stress_y},{stress_z},{tension_limit},{compression_limit},{shear_limit},{contact_friction_heat}",
+            "F,{frame},{tx},{ty},{tz},{vx},{vy},{vz},{ax},{ay},{az},{broken},{clusters},{vmax},{wood_ke},{tool_ke},{kinetic_release},{pending_release},{surface_work},{damage_heat},{plastic_heat},{stored_plastic},{max_stress_ratio},{stress_x},{stress_y},{stress_z},{tension_limit},{compression_limit},{shear_limit},{contact_friction_heat},{contact_restitution_heat}",
             tx = t.position.x,
             ty = t.position.y,
             tz = t.position.z,
@@ -679,7 +679,8 @@ pub fn capture_knife(
             tension_limit = peak_limits[0],
             compression_limit = peak_limits[1],
             shear_limit = peak_limits[2],
-            contact_friction_heat = scene.energy.contact_friction_heat
+            contact_friction_heat = scene.energy.contact_friction_heat,
+            contact_restitution_heat = scene.energy.contact_restitution_heat
         )?;
         for i in 0..scene.positions.len() {
             let mut d = 0.0f32;

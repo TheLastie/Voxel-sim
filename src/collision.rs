@@ -136,6 +136,22 @@ pub fn resolve_velocities(scene: &mut Scene, contacts: &[Contact], targets: &[[O
                 normal_impulse = -(1.0 + restitution) * closing / denom;
                 scene.voxels[c.i].velocity -= c.normal * (normal_impulse * wi);
                 scene.voxels[c.j].velocity += c.normal * (normal_impulse * wj);
+                let restitution_heat = (normal_impulse as f64 * -(closing as f64)
+                    - 0.5 * (normal_impulse as f64).powi(2) * denom as f64)
+                    .max(0.0);
+                if restitution_heat > 0.0 {
+                    let i_free = wi > 0.0;
+                    let j_free = wj > 0.0;
+                    let receivers = i_free as u8 + j_free as u8;
+                    let heat_per_voxel = restitution_heat / receivers as f64;
+                    if i_free {
+                        scene.voxels[c.i].add_internal_energy_j(heat_per_voxel);
+                    }
+                    if j_free {
+                        scene.voxels[c.j].add_internal_energy_j(heat_per_voxel);
+                    }
+                    scene.energy.contact_restitution_heat += restitution_heat;
+                }
                 changed = true;
             }
 
@@ -197,12 +213,12 @@ pub fn resolve_velocities(scene: &mut Scene, contacts: &[Contact], targets: &[[O
                             let j_free = !scene.voxels[c.j].kinematic;
                             let receivers = i_free as u8 + j_free as u8;
                             if receivers > 0 {
-                                let heat_per_voxel = (friction_heat / receivers as f64) as f32;
+                                let heat_per_voxel = friction_heat / receivers as f64;
                                 if i_free {
-                                    scene.voxels[c.i].internal_energy += heat_per_voxel;
+                                    scene.voxels[c.i].add_internal_energy_j(heat_per_voxel);
                                 }
                                 if j_free {
-                                    scene.voxels[c.j].internal_energy += heat_per_voxel;
+                                    scene.voxels[c.j].add_internal_energy_j(heat_per_voxel);
                                 }
                                 scene.energy.contact_friction_heat += friction_heat;
                             }
@@ -589,23 +605,86 @@ mod tests {
 
         let mass = scene.voxels[0].mass as f64;
         let tangent_ke_before = 0.5 * mass * (scene.voxels[0].velocity.y as f64).powi(2);
-        let internal_before = scene.voxels[0].internal_energy as f64;
+        let internal_before = scene.voxels[0].total_internal_energy_j();
         resolve_velocities(&mut scene, &contacts, &targets);
 
         let tangent_ke_after = 0.5 * mass * (scene.voxels[0].velocity.y as f64).powi(2);
         let dissipated = tangent_ke_before - tangent_ke_after;
-        let internal_gain = scene.voxels[0].internal_energy as f64 - internal_before;
-        let internal_storage_tolerance = f32::EPSILON as f64 * internal_before.max(1.0);
+        let internal_gain = scene.voxels[0].total_internal_energy_j() - internal_before;
+        let total_contact_heat =
+            scene.energy.contact_friction_heat + scene.energy.contact_restitution_heat;
+        let internal_storage_tolerance = 1e-12;
         assert!(scene.voxels[0].velocity.y.abs() < 2.0);
         assert_eq!(scene.voxels[0].velocity.z, 5.0);
         assert!(dissipated > 0.0);
         assert!((dissipated - scene.energy.contact_friction_heat).abs() < 1e-7);
         assert!(
-            (internal_gain - scene.energy.contact_friction_heat).abs()
-                <= internal_storage_tolerance,
-            "internal gain={internal_gain:.12e}, friction heat={:.12e}, initial internal={internal_before:.12e}, f32 tolerance={internal_storage_tolerance:.12e}",
-            scene.energy.contact_friction_heat
+            (internal_gain - total_contact_heat).abs() <= internal_storage_tolerance,
+            "internal gain={internal_gain:.12e}, contact heat={total_contact_heat:.12e}, initial internal={internal_before:.12e}, tolerance={internal_storage_tolerance:.12e}"
         );
+    }
+
+    #[test]
+    fn normal_restitution_loss_is_converted_to_voxel_heat() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [2, 1, 1];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        config.gravity = [0.0; 3];
+        config.fracture.friction = 0.0;
+        config.fracture.restitution = 0.25;
+        let mut scene = Scene::new(config);
+        scene.bonds[0][0].neighbor = EMPTY;
+        scene.workspace[0][0].rest_neighbor = EMPTY;
+        scene.voxels[0].velocity = Vec3::X;
+        scene.voxels[1].velocity = -Vec3::X;
+        let initial_momentum = scene.voxels[0].mass * scene.voxels[0].velocity
+            + scene.voxels[1].mass * scene.voxels[1].velocity;
+        let initial_kinetic = scene
+            .voxels
+            .iter()
+            .map(|voxel| 0.5 * voxel.mass as f64 * voxel.velocity.length_squared() as f64)
+            .sum::<f64>();
+        let initial_internal = scene
+            .voxels
+            .iter()
+            .map(|voxel| voxel.total_internal_energy_j())
+            .sum::<f64>();
+        let contact = Contact {
+            i: 0,
+            j: 1,
+            normal: Vec3::X,
+            new_impact: true,
+        };
+
+        resolve_velocities(&mut scene, &[contact], &[]);
+
+        let final_momentum = scene.voxels[0].mass * scene.voxels[0].velocity
+            + scene.voxels[1].mass * scene.voxels[1].velocity;
+        let final_kinetic = scene
+            .voxels
+            .iter()
+            .map(|voxel| 0.5 * voxel.mass as f64 * voxel.velocity.length_squared() as f64)
+            .sum::<f64>();
+        let internal_gain = scene
+            .voxels
+            .iter()
+            .map(|voxel| voxel.total_internal_energy_j())
+            .sum::<f64>()
+            - initial_internal;
+        let dissipated = initial_kinetic - final_kinetic;
+
+        assert!((final_momentum - initial_momentum).length() < 1e-6);
+        assert!((scene.voxels[1].velocity.x - scene.voxels[0].velocity.x - 0.5).abs() < 1e-6);
+        assert!(dissipated > 0.0);
+        assert!((dissipated - scene.energy.contact_restitution_heat).abs() < 1e-8);
+        let storage_tolerance = 1e-12;
+        assert!(
+            (internal_gain - scene.energy.contact_restitution_heat).abs() <= storage_tolerance,
+            "internal gain={internal_gain:.12e}, restitution heat={:.12e}, tolerance={storage_tolerance:.12e}",
+            scene.energy.contact_restitution_heat
+        );
+        assert_eq!(scene.energy.contact_friction_heat, 0.0);
     }
 
     #[test]

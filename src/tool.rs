@@ -370,7 +370,7 @@ impl Tool {
                                                 * (friction_magnitude as f64).powi(2)
                                                 * tangent_denom as f64)
                                             .max(0.0);
-                                        scene.voxels[i].internal_energy += friction_heat as f32;
+                                        scene.voxels[i].add_internal_energy_j(friction_heat);
                                         scene.energy.contact_friction_heat += friction_heat;
                                     }
                                 }

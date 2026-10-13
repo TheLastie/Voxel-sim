@@ -10,6 +10,22 @@
       "video": "live-support.mp4"
     },
     {
+      "id": "fatigue-cycles",
+      "label": "Усталость железа · циклическая нагрузка · 2 REV",
+      "mode": "csv",
+      "csv": "fatigue-cycles.csv",
+      "gif": "fatigue-cycles.gif",
+      "video": "fatigue-cycles.mp4"
+    },
+    {
+      "id": "contact-energy",
+      "label": "Удар железных REV · restitution heat · 293 K",
+      "mode": "csv",
+      "csv": "contact-energy.csv",
+      "gif": "contact-energy.gif",
+      "video": "contact-energy.mp4"
+    },
+    {
       "id": "thermal-gradient",
       "label": "Теплопроводность железа · 24 REV",
       "mode": "thermal",

@@ -447,6 +447,7 @@ impl Material {
 #[cfg(test)]
 mod tests {
     use super::Material;
+    use crate::voxel::Composition;
 
     #[test]
     fn starter_material_names_resolve_to_physical_entries() {
@@ -458,5 +459,34 @@ mod tests {
             assert!(material.density > 0.0);
             assert!(material.heat_capacity > 0.0);
         }
+    }
+
+    #[test]
+    fn mass_fraction_mixture_preserves_specific_volume_and_heat_capacity() {
+        let table = Material::table();
+        let iron = Material::component_id("iron").unwrap();
+        let copper = Material::component_id("copper").unwrap();
+        let composition = Composition {
+            components: smallvec::smallvec![(iron, 0.25), (copper, 0.75)],
+        };
+        let mixture = Material::mixed(&composition, &table);
+        let iron_material = &table[iron as usize];
+        let copper_material = &table[copper as usize];
+
+        let expected_density =
+            1.0 / (0.25 / iron_material.density + 0.75 / copper_material.density);
+        let expected_heat_capacity =
+            0.25 * iron_material.heat_capacity + 0.75 * copper_material.heat_capacity;
+        assert!((mixture.density - expected_density).abs() <= expected_density * 1e-6);
+        assert!((mixture.heat_capacity - expected_heat_capacity).abs() <= 1e-5);
+
+        let mass_kg = 0.02;
+        let temperature_k = 300.0;
+        let energy_j = mixture.energy_at_temperature(mass_kg, temperature_k);
+        let phase = mixture.phase_state(mass_kg, energy_j);
+        assert!((phase.temperature_kelvin - temperature_k).abs() < 1e-4);
+        assert_eq!(phase.solid_fraction, 1.0);
+        assert_eq!(phase.liquid_fraction, 0.0);
+        assert_eq!(phase.gas_fraction, 0.0);
     }
 }

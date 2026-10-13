@@ -12,11 +12,38 @@ pub struct Voxel {
     pub kinematic: bool,
     pub composition: Composition,
     pub internal_energy: f32,
+    /// Signed sub-ULP correction that preserves small heat transfers which
+    /// cannot be represented by the f32 display/solver cache above.
+    #[serde(default)]
+    pub internal_energy_remainder_j: f64,
     pub velocity: Vec3,
     pub microstructure: Microstructure,
 }
 
 impl Voxel {
+    /// Exact conserved thermal energy represented by the f32 value and its
+    /// compensated residual.
+    pub fn total_internal_energy_j(&self) -> f64 {
+        (self.internal_energy as f64 + self.internal_energy_remainder_j).max(0.0)
+    }
+
+    /// Add heat without discarding increments smaller than one f32 ULP.
+    pub fn add_internal_energy_j(&mut self, joules: f64) {
+        if !joules.is_finite() {
+            return;
+        }
+        let total = (self.total_internal_energy_j() + joules).max(0.0);
+        let rounded = total.min(f32::MAX as f64) as f32;
+        self.internal_energy = rounded;
+        self.internal_energy_remainder_j = total - rounded as f64;
+    }
+
+    /// f32 thermal energy passed to the material EOS. The residual is kept
+    /// until enough transfers accumulate to change this representable value.
+    pub fn thermal_energy_f32(&self) -> f32 {
+        self.total_internal_energy_j().min(f32::MAX as f64) as f32
+    }
+
     /// Whether this REV is fixed in world space by the scene constraints.
     pub fn is_kinematic(&self) -> bool {
         self.kinematic

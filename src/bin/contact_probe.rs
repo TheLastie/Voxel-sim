@@ -97,13 +97,14 @@ fn run(bonded: bool, fractures: bool) {
         solver::step(&mut s, &mut t);
         if frame % 5 == 0 {
             println!(
-                "{label} frame={frame} KE={:.6} J elastic={:.6} J released={:.6} J surface={:.6} J pending={:.6} J friction_heat={:.6} J broken={} residual={:.3e} vmax={:.3} m/s",
+                "{label} frame={frame} KE={:.6} J elastic={:.6} J released={:.6} J surface={:.6} J pending={:.6} J friction_heat={:.6} J restitution_heat={:.6} J broken={} residual={:.3e} vmax={:.3} m/s",
                 total_ke(&s, t.as_ref().unwrap()),
                 elastic_energy(&s),
                 s.energy.kinetic_release,
                 s.energy.surface_work,
                 s.energy.pending_release,
                 s.energy.contact_friction_heat,
+                s.energy.contact_restitution_heat,
                 s.broken,
                 s.solver_residual,
                 s.voxels.iter().filter(|v|!v.kinematic).map(|v|v.velocity.length()).fold(0.,f32::max)

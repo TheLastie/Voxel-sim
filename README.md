@@ -260,7 +260,9 @@ The desktop default is now `scenes/mounted_axe.ron`: 4,320 wood REVs,
 The floor surface is Z=0; support uses contacts with actual floor voxels.
 Voxel contacts use the configured Coulomb friction coefficient for tangential
 sliding resistance; its kinetic-energy loss is converted to REV internal energy
-and reported in `EnergyLedger::contact_friction_heat`.
+and reported in `EnergyLedger::contact_friction_heat`. Normal impact losses from
+the configured coefficient of restitution are also converted to internal energy
+and tracked separately in `EnergyLedger::contact_restitution_heat`.
 The lowest wood REV layer is fixed through the scene's kinematic API, so the
 trunk stays rooted while the axe loads it. A separate falling coupon is placed
 over the interior of the finite floor to measure vertical support without
