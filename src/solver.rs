@@ -1,7 +1,7 @@
 use crate::{
     bond::EMPTY,
     collision,
-    scene::{Scene, AREA, CELL},
+    scene::{CpuPreconditioner, Scene, AREA, CELL},
     tool::Tool,
 };
 use glam::{Mat3, Quat, Vec3};
@@ -13,6 +13,17 @@ use std::time::{Duration, Instant};
 // The intended 4k-REV CPU workload must use Rayon; keeping this at 32k made
 // its PCG reductions and vector updates serial on the target scene.
 const PARALLEL_MIN_VOXELS: usize = 2_048;
+
+fn parallel_enabled_for(voxel_count: usize) -> bool {
+    static THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let threshold = THRESHOLD.get_or_init(|| {
+        std::env::var("VOXEL_PARALLEL_MIN_VOXELS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(PARALLEL_MIN_VOXELS)
+    });
+    voxel_count >= *threshold
+}
 
 fn basis(axis: usize, rotation: Quat) -> Mat3 {
     let axes = [Vec3::X, Vec3::Y, Vec3::Z];
@@ -334,7 +345,7 @@ fn fit_rotations(scene: &mut Scene, scratch: &mut SolverScratch) -> f32 {
         }
         2.0 * previous.dot(*q).abs().clamp(0.0, 1.0).acos()
     };
-    if n < PARALLEL_MIN_VOXELS {
+    if !parallel_enabled_for(n) {
         scene
             .rotations
             .iter_mut()
@@ -1111,6 +1122,14 @@ fn build_ic0(scene: &Scene, scratch: &mut SolverScratch) {
     }
 }
 
+fn build_block_jacobi(scratch: &mut SolverScratch) {
+    let n = scratch.diagonal.len();
+    scratch.factor_diagonal.resize(n, Mat3::IDENTITY);
+    for row in 0..n {
+        scratch.factor_diagonal[row] = cholesky_lower(scratch.diagonal[row]);
+    }
+}
+
 fn apply_ic0(
     constraints: &[Constraint],
     incidence: &[[u32; 6]],
@@ -1151,6 +1170,47 @@ fn apply_ic0(
             }
         }
         out[slot] = solve_lower_transpose(factor_diagonal[i], value);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_preconditioner(
+    kind: CpuPreconditioner,
+    constraints: &[Constraint],
+    incidence: &[[u32; 6]],
+    incidence_len: &[u8],
+    factor_diagonal: &[Mat3],
+    factor_edges: &[Mat3],
+    active: &[usize],
+    active_index: &[u32],
+    rhs: &[Vec3],
+    work: &mut [Vec3],
+    out: &mut [Vec3],
+) {
+    match kind {
+        CpuPreconditioner::IncompleteCholesky0 => apply_ic0(
+            constraints,
+            incidence,
+            incidence_len,
+            factor_diagonal,
+            factor_edges,
+            active,
+            active_index,
+            rhs,
+            work,
+            out,
+        ),
+        CpuPreconditioner::BlockJacobi => {
+            let apply_one = |(slot, output): (usize, &mut Vec3)| {
+                let diagonal = factor_diagonal[active[slot]];
+                *output = solve_lower_transpose(diagonal, solve_lower(diagonal, rhs[slot]));
+            };
+            if !parallel_enabled_for(active.len()) {
+                out.iter_mut().enumerate().for_each(apply_one);
+            } else {
+                out.par_iter_mut().enumerate().for_each(apply_one);
+            }
+        }
     }
 }
 
@@ -1255,7 +1315,10 @@ fn solve_coupled(
     let assembly_time = assembly_start.elapsed();
     let factor_start = Instant::now();
     if !reuse_preconditioner {
-        build_ic0(scene, scratch);
+        match scene.config.cpu_preconditioner {
+            CpuPreconditioner::IncompleteCholesky0 => build_ic0(scene, scratch),
+            CpuPreconditioner::BlockJacobi => build_block_jacobi(scratch),
+        }
     }
     let factor_time = factor_start.elapsed();
     let free = &scratch.free;
@@ -1297,7 +1360,7 @@ fn solve_coupled(
             }
             *out = value * free[i];
         };
-        if active.len() < PARALLEL_MIN_VOXELS {
+        if !parallel_enabled_for(active.len()) {
             out.iter_mut()
                 .enumerate()
                 .for_each(|(slot, out)| apply_one((slot, out)));
@@ -1308,7 +1371,7 @@ fn solve_coupled(
         }
     };
     let dot = |a: &[Vec3], b: &[Vec3]| -> f64 {
-        if a.len() < PARALLEL_MIN_VOXELS {
+        if !parallel_enabled_for(a.len()) {
             a.iter().zip(b).map(|(x, y)| x.dot(*y) as f64).sum()
         } else {
             a.par_iter()
@@ -1448,7 +1511,8 @@ fn solve_coupled(
         );
     }
     let cpu_pcg_start = Instant::now();
-    apply_ic0(
+    apply_preconditioner(
+        scene.config.cpu_preconditioner,
         constraints,
         incidence,
         incidence_len,
@@ -1481,7 +1545,7 @@ fn solve_coupled(
             break;
         }
         let alpha = (rz / denom) as f32;
-        if active_count < PARALLEL_MIN_VOXELS {
+        if !parallel_enabled_for(active_count) {
             for i in 0..active_count {
                 dx[i] += alpha * p[i];
                 r[i] -= alpha * ap[i];
@@ -1499,7 +1563,8 @@ fn solve_coupled(
         if scene.solver_residual < scene.config.solver_relative_tolerance {
             break;
         }
-        apply_ic0(
+        apply_preconditioner(
+            scene.config.cpu_preconditioner,
             constraints,
             incidence,
             incidence_len,
@@ -1513,7 +1578,7 @@ fn solve_coupled(
         );
         let next = dot(&r, &z);
         let beta = (next / rz) as f32;
-        if active_count < PARALLEL_MIN_VOXELS {
+        if !parallel_enabled_for(active_count) {
             for i in 0..active_count {
                 p[i] = z[i] + beta * p[i];
             }
@@ -1525,6 +1590,14 @@ fn solve_coupled(
         rz = next;
     }
     let pcg_time = cpu_pcg_start.elapsed();
+    if std::env::var_os("VOXEL_PROFILE_PCG_SOLVE").is_some() {
+        eprintln!(
+            "CPU PCG solve: active={active_count} preconditioner={:?} iterations={iterations} residual={:.3e} elapsed={:.2}ms",
+            scene.config.cpu_preconditioner,
+            scene.solver_residual,
+            pcg_time.as_secs_f64() * 1_000.0,
+        );
+    }
     for (slot, &i) in active.iter().enumerate() {
         scene.positions[i] += dx[slot];
     }

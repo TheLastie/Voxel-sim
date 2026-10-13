@@ -23,7 +23,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if steps == 0 || saved_frames < 2 || saved_frames > steps + 1 {
         return Err("steps must be positive and saved_frames must be in 2..=steps+1".into());
     }
-    let mut cfg = SceneConfig::load("scenes/mounted_axe.ron")?;
+    let scene_config =
+        std::env::var("VOXEL_SCENE_CONFIG").unwrap_or_else(|_| "scenes/mounted_axe.ron".into());
+    let mut cfg = SceneConfig::load(&scene_config)?;
     if let Ok(raw) = std::env::var("VOXEL_CAPTURE_SUBSTEPS") {
         let substeps: usize = raw.parse()?;
         if substeps == 0 {
@@ -50,9 +52,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     for i in probe_start..probe_end {
-        // Keep the coupon in the platform interior for its full fall; with the
-        // previous Y offset it rolled past the finite floor edge before impact.
-        scene.positions[i] += Vec3::new(-0.25, 0.0, 0.22);
+        // Keep the coupon over the platform interior and clear of the axe's
+        // swept volume; the previous y=0 offset made it overlap the tool.
+        scene.positions[i] += Vec3::new(-0.25, 0.25, 0.22);
         scene.previous[i] = scene.positions[i];
         scene.rest_positions[i] = scene.positions[i];
     }

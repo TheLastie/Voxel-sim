@@ -235,8 +235,12 @@ their remaining bonds. Pair conductance uses material conductivity in W/(m·K)
 and the bond's undamaged fraction. Equal and opposite pair fluxes update internal
 energy; the explicit update selects stable substeps automatically. Normal solver
 steps call this for each mechanical substep. Thermal work buffers are retained
-between calls. This first implementation has passed release compilation, but its
-energy balance and physical behavior still need a recorded thermal scenario.
+between calls. The recorded `thermal_capture` uses a 24-REV iron rod with hot and
+cold halves, and shows their mean temperatures converge from 450/300 K to
+375.093/374.907 K over 1,680 one-second steps. Total internal energy changes by
+`4.52×10⁻⁷` relative; the 176-state CSV, 3D GIF and MP4 are in `validation/`.
+The capture checks thermal transport for this solid iron scenario; it does not
+validate phase-change heat flow or temperature-dependent mechanical strength.
 
 ## Limits
 

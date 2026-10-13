@@ -10,6 +10,19 @@ use std::{collections::HashMap, fs};
 pub const CELL: f32 = 0.01;
 pub const AREA: f32 = CELL * CELL;
 
+/// CPU preconditioner used by the coupled elastic PCG solver.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuPreconditioner {
+    /// Block incomplete Cholesky with zero fill; reduces iterations but has
+    /// sequential triangular application passes.
+    #[default]
+    IncompleteCholesky0,
+    /// Independent per-REV 3×3 diagonal blocks; parallel application can be
+    /// faster on multicore CPUs at the cost of potentially more PCG iterations.
+    BlockJacobi,
+}
+
 /// Inclusive world-space bounds for REV centres (metres).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WorldBounds {
@@ -155,6 +168,12 @@ impl SceneBuilder {
         self
     }
 
+    /// Choose the CPU PCG preconditioner for the scene.
+    pub fn with_cpu_preconditioner(mut self, preconditioner: CpuPreconditioner) -> Self {
+        self.config.cpu_preconditioner = preconditioner;
+        self
+    }
+
     pub fn build(self) -> Result<Scene, String> {
         Scene::from_voxels(self.config, self.voxels)
     }
@@ -176,6 +195,9 @@ pub struct SceneConfig {
     /// Maximum CUDA PCG iterations; CPU PCG keeps `iterations` as its cap.
     #[serde(default = "default_cuda_iterations")]
     pub cuda_iterations: usize,
+    /// CPU PCG preconditioner; GPU currently uses its block-Jacobi kernel.
+    #[serde(default)]
+    pub cpu_preconditioner: CpuPreconditioner,
     pub solver_relative_tolerance: f32,
     pub corotation_tolerance: f32,
     pub corotation_iterations: usize,
@@ -199,6 +221,7 @@ impl Default for SceneConfig {
             substeps: 4,
             iterations: 80,
             cuda_iterations: default_cuda_iterations(),
+            cpu_preconditioner: CpuPreconditioner::default(),
             solver_relative_tolerance: 1e-5,
             corotation_tolerance: 1e-5,
             corotation_iterations: 2,
@@ -1039,5 +1062,45 @@ mod world_bounds_tests {
         assert!((ledger.kinetic_energy_j - expected_kinetic).abs() < 1e-12);
         assert_eq!(ledger.momentum_kg_m_s, expected_momentum);
         assert_eq!(ledger.pending_bond_energy_j, 0.25);
+    }
+}
+
+#[cfg(test)]
+mod thermal_transport_tests {
+    use super::*;
+
+    #[test]
+    fn connected_hot_and_cold_revs_exchange_heat_conservatively() {
+        let iron = Material::component_id("iron").unwrap();
+        let mut scene = SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], iron).at_temperature(450.0))
+            .add_voxel(VoxelSpawn::at_cell([1, 0, 0], iron).at_temperature(300.0))
+            .build()
+            .unwrap();
+        assert_eq!(scene.bonds[0][0].neighbor, 1);
+
+        let initial_energy: f64 = scene
+            .voxels
+            .iter()
+            .map(|voxel| voxel.internal_energy as f64)
+            .sum();
+        let initial_hot = scene.temperature_kelvin(0).unwrap();
+        let initial_cold = scene.temperature_kelvin(1).unwrap();
+
+        let thermal_substeps = scene.conduct_heat(1.0).unwrap();
+
+        let final_hot = scene.temperature_kelvin(0).unwrap();
+        let final_cold = scene.temperature_kelvin(1).unwrap();
+        let final_energy: f64 = scene
+            .voxels
+            .iter()
+            .map(|voxel| voxel.internal_energy as f64)
+            .sum();
+        assert!(thermal_substeps > 0);
+        assert!(final_hot < initial_hot);
+        assert!(final_cold > initial_cold);
+        assert!(final_hot >= initial_cold && final_cold <= initial_hot);
+        assert!((final_energy - initial_energy).abs() < 1e-3);
     }
 }
