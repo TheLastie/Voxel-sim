@@ -100,6 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     scene.positions[1].x += 0.005;
     scene.previous[1] = scene.positions[1];
     scene.release_voxels(&[0, 1])?;
+    scene.voxels[0].velocity = Vec3::X * INITIAL_SPEED;
     scene.set_material_thermal_expansion("iron", 12.0e-6)?;
     let mut heater_input_j = 0.0f64;
     for i in 0..scene.voxels.len() {
@@ -127,16 +128,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for step in 1..=STEPS {
         scene.tick();
         let relative_speed = (scene.voxels[1].velocity - scene.voxels[0].velocity).length();
-        if (49..=53).contains(&step) {
-            eprintln!("approach step={step} separation={:.9} relative_speed={relative_speed:.6e} velocities={:?}", (scene.positions[1] - scene.positions[0]).length(), scene.voxels.iter().map(|v| v.velocity).collect::<Vec<_>>());
-        }
         if formed_step.is_none()
             && (scene.positions[1] - scene.positions[0]).length() <= 0.01001
             && relative_speed <= 1e-5
         {
             let before_internal = internal(&scene);
             let before_momentum = momentum(&scene);
-            eprintln!("contact step={step} pre_connect velocities={:?} momentum={before_momentum:?}", scene.voxels.iter().map(|v| v.velocity).collect::<Vec<_>>());
             scene.connect_adjacent_voxels(0, 1)?;
             let energy_jump = internal(&scene) - before_internal;
             let momentum_jump = (momentum(&scene) - before_momentum).length();

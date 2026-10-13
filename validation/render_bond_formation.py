@@ -53,9 +53,6 @@ for number, (step, frame) in enumerate(sorted(frames.items()), 1):
     elems.append('<text x="40" y="42" fill="#ebf2fa" font-size="24" font-family="sans-serif">HOT CONTACT · BOND FORMATION · ENGINE SOLVER</text>')
     elems.append(f'<text x="42" y="75" fill="#99aec6" font-size="16" font-family="sans-serif">t = {step*dt:.2f} s · шаг {step}/{steps} · состояние {number}/{len(frames)}</text>')
     elems.append('<line x1="250" y1="430" x2="870" y2="430" stroke="#556779" stroke-width="3"/>')
-    if frame["bond"] and len(cx) == 2:
-        elems.append(f'<line x1="{cx[0]:.1f}" y1="330" x2="{cx[1]:.1f}" y2="330" stroke="#42d6c4" stroke-width="12"/>')
-        elems.append(f'<text x="{(cx[0]+cx[1])/2-42:.1f}" y="300" fill="#42d6c4" font-size="16" font-family="sans-serif">bond</text>')
     for i, voxel in sorted(voxels.items()):
         x = cx[i]
         t = max(0.0, min(1.0, (voxel.get("temp", 293.15)-293.15)/500.0))
@@ -68,6 +65,9 @@ for number, (step, frame) in enumerate(sorted(frames.items()), 1):
         elems.append(f'<polygon points="{top}" fill="{color}" stroke="#f0f5fa"/>')
         elems.append(f'<text x="{x-20:.1f}" y="455" fill="#ebf2fa" font-size="16" font-family="sans-serif">REV {i}</text>')
         elems.append(f'<text x="{x-33:.1f}" y="270" fill="#ebf2fa" font-size="15" font-family="sans-serif">{voxel.get("temp",293.15):.1f} K</text>')
+    if frame["bond"] and len(cx) == 2:
+        elems.append(f'<line x1="{cx[0]:.1f}" y1="350" x2="{cx[1]:.1f}" y2="350" stroke="#42d6c4" stroke-width="7"/>')
+        elems.append(f'<text x="{(cx[0]+cx[1])/2-42:.1f}" y="285" fill="#42d6c4" font-size="16" font-family="sans-serif">bond</text>')
     state = f"образована на шаге {formed_step}" if frame["bond"] and step >= formed_step else "раздельные REVs · сближение" if step < formed_step else "контакт"
     elems.append('<rect x="55" y="510" width="1010" height="145" rx="16" fill="#111d2c" stroke="#3d5267" stroke-width="2"/>')
     elems.append(f'<text x="82" y="546" fill="#42d6c4" font-size="20" font-family="sans-serif">Связь: {esc(state)} · расстояние центров {distance*1000:.4f} mm</text>')

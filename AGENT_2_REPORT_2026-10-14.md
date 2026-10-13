@@ -581,21 +581,27 @@ Heater input is 464.1000 J. GIF/MP4 contain 177 frames at 1120×700 and 10 fps /
 experiment and its CSV/GIF/MP4 with HTTP 200. The test suite and formatting /
 renderer / manifest checks listed above pass after this addition.
 
-#### Runtime bond topology API
+#### Hot-contact bond formation
 
-Added `Scene::connect_adjacent_voxels(a, b)` as a public engine primitive for
-adhesion/welding/healing systems. It validates indices, original lattice
-adjacency and matching kinematic constraints; initializes a fresh bond, adds it
-to solver coloring, resets dependent workspaces, and rebuilds cluster labels.
-It rejects a pair with queued fracture release and requires the current center
-displacement to match the thermal/fiber-dependent stress-free vector within
-10 µm, avoiding an instantaneous elastic energy jump. Four focused regressions
-cover topology, heat transport, pending events and a heated stress-free pair.
-Automatic material criteria, merge/composition transfer and a physical bonding
-capture remain open.
+Extended `Bond` with a local formation offset and included it in the shared
+solver rest displacement, constitutive stress, and fracture calculations.
+`Scene::connect_adjacent_voxels` now requires face contact within 10 µm and
+rejects pairs with pending fracture release. It records a stress-free local
+formation shape from the current pose, so connecting hot or previously
+deformed material does not add an instantaneous spring impulse or energy jump.
 
-After the runtime bond-topology API addition, the full CPU suite passed 70/70
-tests (`VOXEL_SOLVER_BACKEND=cpu cargo test --no-default-features`). The focused
-regression also confirms the newly formed bond carries heat through the normal
-engine thermal transport path. `rustfmt --check src/scene.rs` and `git diff
---check` pass.
+`bond_formation_capture` runs two iron REVs at 363.15 K from 15 mm centre
+separation at velocities ±0.01 m/s. With zero restitution, real solver contact
+stops relative motion at step 25; the capture then calls the public Scene API.
+The run continues for 1,760 steps (`dt=10 ms`, two substeps) and records 177
+unique states over 17.6 s. Heater input is 495.810058594 J; total mass is
+0.01573999785 kg; momentum error is 0; contact restitution heat is
+7.87e-7 J; total energy error is 0 J. The new bond remains intact, with one
+cluster. GIF/MP4 contain 177 frames at 1120×700, 10 fps/17.7 s. Live viewer
+`:8797` serves CSV/GIF/MP4 with HTTP 200; catalog selector `:8800` also
+serves this experiment; existing `:8765` was left running.
+
+Full CPU suite: 70/70 tests. The renderer, capture binary and formatting checks
+pass. This controlled capture validates contact-time topology formation and
+energy neutrality of the bond operation; automatic welding criteria, material
+adhesion, REV fusion/composition transfer and healing rules remain incomplete.

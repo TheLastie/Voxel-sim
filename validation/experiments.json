@@ -34,6 +34,14 @@
       "video": "fatigue-fragment-collision.mp4"
     },
     {
+      "id": "hot-contact-bond-formation",
+      "label": "Образование связи при горячем контакте · 2 железных REV",
+      "mode": "csv",
+      "csv": "bond-formation.csv",
+      "gif": "bond-formation.gif",
+      "video": "bond-formation.mp4"
+    },
+    {
       "id": "thermal-strength",
       "label": "Температурное размягчение стеклянной связи · 2 REV",
       "mode": "thermal",
