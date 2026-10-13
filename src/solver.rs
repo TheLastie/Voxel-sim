@@ -24,12 +24,16 @@ fn basis(axis: usize, rotation: Quat) -> Mat3 {
 /// Transverse shear remains finite. This is not a full orthotropic continuum law.
 fn tensor_compliance(scene: &Scene, n: usize, frame: Mat3) -> Mat3 {
     let material = &scene.properties[n];
+    let solid = material
+        .phase_state(scene.voxels[n].mass, scene.voxels[n].internal_energy)
+        .solid_fraction
+        .clamp(1e-4, 1.0);
     let micro = scene.voxels[n].microstructure;
     let fiber = frame.transpose() * (scene.rotations[n] * micro.fibers());
     let transverse = material.young + micro.anisotropy * (material.young_perp - material.young);
     // Directional axial modulus plus coupled anisotropic tangential response.
     let normal = transverse + (material.young - transverse) * fiber.x * fiber.x;
-    let diagonal = Vec3::new(normal, material.shear, material.shear);
+    let diagonal = Vec3::new(normal, material.shear, material.shear) * solid;
     if !diagonal.is_finite() || diagonal.min_element() <= 0.0 {
         return Mat3::ZERO;
     }
@@ -58,7 +62,7 @@ pub fn stiffness_matrix(scene: &Scene, i: usize, j: usize, frame: Mat3) -> Mat3 
 pub fn bond_limits(scene: &Scene, i: usize, j: usize, direction: Vec3) -> crate::fracture::Limits {
     let alignment =
         [i, j].map(|n| direction.dot(scene.rotations[n] * scene.voxels[n].microstructure.fibers()));
-    crate::fracture::pair_limits(
+    let mut limits = crate::fracture::pair_limits(
         &scene.properties[i],
         &scene.properties[j],
         alignment,
@@ -66,7 +70,24 @@ pub fn bond_limits(scene: &Scene, i: usize, j: usize, direction: Vec3) -> crate:
             scene.voxels[i].microstructure.anisotropy,
             scene.voxels[j].microstructure.anisotropy,
         ],
-    )
+    );
+    let solid = [i, j]
+        .map(|n| {
+            scene.properties[n]
+                .phase_state(scene.voxels[n].mass, scene.voxels[n].internal_energy)
+                .solid_fraction
+                .clamp(0.0, 1.0)
+        })
+        .into_iter()
+        .fold(1.0f32, f32::min);
+    let strength_scale = solid * solid;
+    limits.tension *= strength_scale;
+    limits.compression *= strength_scale;
+    limits.shear *= strength_scale;
+    limits.yield_stress *= strength_scale;
+    limits.hardening *= strength_scale;
+    limits.fracture_energy *= strength_scale;
+    limits
 }
 pub fn fracture_strength(scene: &Scene, i: usize, j: usize, direction: Vec3) -> f32 {
     bond_limits(scene, i, j, direction).tension
@@ -386,7 +407,7 @@ pub fn step_with_axis_targets_and_loads(
         .collect();
     let h = scene.config.fixed_dt / scene.config.substeps as f32;
     let gravity = Vec3::from_array(scene.config.gravity);
-    let mut topology_changed = false;
+    let mut topology_changed = break_fully_melted_bonds(scene);
     let profile_step = std::env::var_os("VOXEL_PROFILE_STEP").is_some();
     let mut stage_time = [Duration::ZERO; 5];
     let mut total_pcg_iterations = 0usize;
@@ -571,6 +592,66 @@ pub fn step_with_axis_targets_and_loads(
         );
     }
 }
+
+/// Convert stored bond energy to heat and remove bonds that cannot exist in a
+/// fully liquid REV. Called at the fixed-step boundary so all solver workspaces
+/// see one consistent topology for the whole step.
+fn break_fully_melted_bonds(scene: &mut Scene) -> bool {
+    let melted: Vec<bool> = scene
+        .voxels
+        .iter()
+        .zip(&scene.properties)
+        .map(|(voxel, material)| {
+            material.phase_state(voxel.mass, voxel.internal_energy).solid_fraction <= 0.0
+        })
+        .collect();
+    if !melted.iter().any(|&value| value) {
+        return false;
+    }
+
+    let mut topology_changed = false;
+    for axis in 0..3 {
+        for i in 0..scene.voxels.len() {
+            let bond = scene.bonds[axis][i];
+            if bond.neighbor == EMPTY {
+                continue;
+            }
+            let j = bond.neighbor as usize;
+            if !melted[i] && !melted[j] {
+                continue;
+            }
+
+            let frame = basis(axis, scene.rotations[i]);
+            let displacement = frame.transpose() * (scene.positions[j] - scene.positions[i])
+                - Vec3::X * CELL
+                - Vec3::from_array(bond.plastic_strain) * CELL;
+            let stored = 0.5
+                * (frame.transpose() * scene.workspace[axis][i].last_force)
+                    .dot(displacement)
+                    .max(0.0);
+            let pending: f64 = scene
+                .releases
+                .iter()
+                .filter(|release| release.i == i && release.j == j)
+                .map(|release| release.energy)
+                .sum();
+            scene.releases.retain(|release| release.i != i || release.j != j);
+            scene.energy.pending_release = (scene.energy.pending_release - pending).max(0.0);
+            scene.energy.damage_heat += stored as f64 + pending;
+            let heat = (stored as f64 + pending) as f32 * 0.5;
+            scene.voxels[i].internal_energy += heat;
+            scene.voxels[j].internal_energy += heat;
+
+            scene.bonds[axis][i] = Default::default();
+            scene.workspace[axis][i].lambda = Vec3::ZERO;
+            scene.workspace[axis][i].last_force = Vec3::ZERO;
+            scene.broken += 1;
+            topology_changed = true;
+        }
+    }
+    topology_changed
+}
+
 pub fn rebuild_clusters(scene: &mut Scene) {
     let n = scene.voxels.len();
     let mut parent: Vec<usize> = (0..n).collect();

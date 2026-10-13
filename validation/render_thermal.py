@@ -1,79 +1,91 @@
 #!/usr/bin/env python3
-"""Render actual thermal_capture CSV states to 1600x1000 PNG frames."""
+"""Render physical thermal or melting CSV snapshots as an isometric 3D scene."""
 import csv
 import sys
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-source = Path(sys.argv[1])
-output = Path(sys.argv[2])
+source, output = Path(sys.argv[1]), Path(sys.argv[2])
 output.mkdir(parents=True, exist_ok=True)
-dt = 1.0
-steps = 0
+dt, steps = 1.0, 0
 frames = {}
 for row in csv.reader(source.open()):
+    if not row:
+        continue
     if row[0] == "H":
         dt, steps = float(row[1]), int(row[2])
     elif row[0] == "S":
-        frames[int(row[1])] = []
+        frames[int(row[1])] = {"cells": [], "bonds": []}
     elif row[0] == "Q":
-        frames[int(row[1])].append((int(row[2]), float(row[3]), float(row[4]), float(row[5]), float(row[6])))
+        frames[int(row[1])]["cells"].append(
+            (int(row[2]), float(row[3]), float(row[4]), float(row[5]), float(row[6]), float(row[7]) if len(row) > 7 else 0.0)
+        )
+    elif row[0] == "B":
+        frames[int(row[1])]["bonds"].append((int(row[2]), int(row[3])))
 
-if not frames or any(len(values) != 24 for values in frames.values()):
-    raise SystemExit("expected complete 24-REV thermal snapshots")
+if not frames or len({len(frame["cells"]) for frame in frames.values()}) != 1:
+    raise SystemExit("expected complete, consistently sized physical snapshots")
 
+all_cells = [cell for frame in frames.values() for cell in frame["cells"]]
+min_temp = min(cell[4] for cell in all_cells)
+max_temp = max(cell[4] for cell in all_cells)
+if max_temp - min_temp < 1:
+    max_temp = min_temp + 1
+coords = [(cell[1], cell[2], cell[3]) for cell in all_cells]
+lo = [min(p[i] for p in coords) - 0.006 for i in range(3)]
+hi = [max(p[i] for p in coords) + 0.006 for i in range(3)]
+center = [(lo[i] + hi[i]) / 2 for i in range(3)]
+extent = [(hi[i] - lo[i]) / 2 for i in range(3)]
 font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 font = lambda size: ImageFont.truetype(font_path, size)
 white, muted = (235, 242, 250), (153, 174, 198)
 
+def project(p):
+    x, y, z = [p[i] - center[i] for i in range(3)]
+    return (800 + (x + y) * .70710678 * scale, 555 + ((x - y) * .40824829 - z * .81649658) * scale)
+
 def heat_color(temp):
-    amount = max(0.0, min(1.0, (temp - 300.0) / 150.0))
+    amount = max(0.0, min(1.0, (temp - min_temp) / (max_temp - min_temp)))
     stops = ((38, 112, 218), (250, 202, 71), (225, 54, 48))
     scaled = amount * 2
     index = min(1, int(scaled))
     fraction = scaled - index
     return tuple(round(stops[index][c] * (1 - fraction) + stops[index + 1][c] * fraction) for c in range(3))
 
-for frame_index, (step, cells) in enumerate(sorted(frames.items())):
-    temperatures = [cell[4] for cell in cells]
-    image = Image.new("RGB", (1600, 1000), (11, 18, 29))
+padding_x, padding_y = 680, 430
+screen_x = (extent[0] + extent[1]) * .70710678
+screen_y = (extent[0] + extent[1]) * .40824829 + extent[2] * .81649658
+scale = .78 * min(padding_x / max(screen_x, .005), padding_y / max(screen_y, .005))
+cube = .0097
+corners = [(-1,-1,-1),(1,-1,-1),(1,1,-1),(-1,1,-1),(-1,-1,1),(1,-1,1),(1,1,1),(-1,1,1)]
+faces = [((0,1,5,4),.62),((1,2,6,5),.78),((4,5,6,7),1.16)]
+
+for frame_index, (step, frame) in enumerate(sorted(frames.items())):
+    cells = sorted(frame["cells"])
+    by_id = {cell[0]: cell for cell in cells}
+    image = Image.new("RGB", (1600, 1000), (7, 16, 28))
     draw = ImageDraw.Draw(image)
-    draw.text((54, 32), "ТЕПЛОПРОВОДНОСТЬ · ЖЕЛЕЗНЫЙ СТЕРЖЕНЬ · 24 REV", font=font(30), fill=white)
-    draw.text((56, 82), "Физические состояния движка · 1 REV = 1 см³ · цвет показывает температуру", font=font(20), fill=muted)
-    draw.rounded_rectangle((36, 136, 1564, 940), 24, fill=(16, 26, 40), outline=(43, 61, 79), width=2)
-    draw.text((76, 164), f"Время расчёта: {step * dt:.0f} с    Кадр: {frame_index + 1}/{len(frames)}", font=font(24), fill=white)
-
-    graph = (120, 255, 1470, 515)
-    draw.rounded_rectangle(graph, 12, fill=(9, 16, 28), outline=(55, 75, 96), width=2)
-    for temp in (300, 350, 400, 450):
-        y = graph[3] - (temp - 300) / 150 * (graph[3] - graph[1])
-        draw.line((graph[0], y, graph[2], y), fill=(42, 57, 75), width=1)
-        draw.text((graph[0] - 64, y - 12), str(temp), font=font(16), fill=muted)
-    points = []
-    for index, temp in enumerate(temperatures):
-        x = graph[0] + index * (graph[2] - graph[0]) / (len(temperatures) - 1)
-        y = graph[3] - (temp - 300) / 150 * (graph[3] - graph[1])
-        points.append((x, y))
-    draw.line(points, fill=(248, 190, 74), width=5)
-    for x, y in points:
-        draw.ellipse((x - 5, y - 5, x + 5, y + 5), fill=(255, 226, 147))
-    draw.text((122, 526), "Профиль вдоль стержня · K", font=font(18), fill=muted)
-
-    start_x, base_y, cell_w, gap, height = 86, 746, 55, 7, 120
-    for index, (_, _, _, _, temp) in enumerate(cells):
-        x = start_x + index * (cell_w + gap)
-        y_top = base_y - height
+    draw.text((48, 28), "ФИЗИЧЕСКОЕ СОСТОЯНИЕ · 3D REV", font=font(30), fill=white)
+    liquid = max(cell[5] for cell in cells)
+    draw.text((50, 76), f"Время: {step * dt:.3f} с · кадр {frame_index + 1}/{len(frames)} · связи: {len(frame['bonds'])} · жидкая доля: {liquid:.2f}", font=font(20), fill=muted)
+    draw.rounded_rectangle((28, 124, 1572, 950), 20, fill=(11, 24, 39), outline=(43, 61, 79), width=2)
+    # Draw the actual intact topology before the REV cubes.
+    for i, j in frame["bonds"]:
+        if i in by_id and j in by_id:
+            a, b = project(by_id[i][1:4]), project(by_id[j][1:4])
+            draw.line((a, b), fill=(151, 177, 201), width=7)
+    ordered = sorted(cells, key=lambda cell: cell[1] - cell[2] + cell[3])
+    for cell in ordered:
+        _, x, y, z, temp, liquid = cell
+        points = [project((x + dx*cube/2, y + dy*cube/2, z + dz*cube/2)) for dx,dy,dz in corners]
         color = heat_color(temp)
-        top = tuple(min(255, round(c * 1.2)) for c in color)
-        side = tuple(round(c * 0.68) for c in color)
-        draw.polygon(((x, y_top), (x + 14, y_top - 14), (x + cell_w + 14, y_top - 14), (x + cell_w, y_top)), fill=top, outline=(205, 215, 226))
-        draw.polygon(((x + cell_w, y_top), (x + cell_w + 14, y_top - 14), (x + cell_w + 14, base_y - 14), (x + cell_w, base_y)), fill=side, outline=(205, 215, 226))
-        draw.rectangle((x, y_top, x + cell_w, base_y), fill=color, outline=(205, 215, 226), width=2)
-        if index % 3 == 0:
-            draw.text((x + 2, base_y + 12), f"{temp:.0f} K", font=font(14), fill=white)
-    draw.text((84, 866), "Слева — начальная горячая половина (450 K); справа — холодная (300 K). Кубики остаются на решётке.", font=font(18), fill=muted)
+        for indices, shade in faces:
+            poly = [points[i] for i in indices]
+            face_color = tuple(round(value * shade) for value in color)
+            draw.polygon(poly, fill=face_color, outline=(12, 25, 39))
+    draw.text((52, 910), f"Температура: {min_temp:.0f}–{max_temp:.0f} K · жидкая фаза и целые связи взяты из состояния движка", font=font(18), fill=muted)
     image.save(output / f"{frame_index:05}.png")
     if frame_index % 32 == 0:
         print(f"render {frame_index + 1}/{len(frames)}", flush=True)
-print(f"rendered {len(frames)} physical states, duration={steps * dt:g} s", flush=True)
+print(f"rendered {len(frames)} physical 3D states, duration={steps * dt:g} s", flush=True)

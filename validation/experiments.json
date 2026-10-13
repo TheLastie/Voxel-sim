@@ -1,0 +1,29 @@
+{
+  "default": "thermal-gradient",
+  "experiments": [
+    {
+      "id": "support",
+      "label": "Гравитация, опора и контакт · 1 680 шагов",
+      "mode": "csv",
+      "csv": "live-support.csv",
+      "gif": "live-support.gif",
+      "video": "live-support.mp4"
+    },
+    {
+      "id": "thermal-gradient",
+      "label": "Теплопроводность железа · 24 REV",
+      "mode": "thermal",
+      "csv": "thermal-gradient.csv",
+      "gif": "thermal-gradient.gif",
+      "video": "thermal-gradient.mp4"
+    },
+    {
+      "id": "melting",
+      "label": "Плавление железа · разрыв связей · 8 REV",
+      "mode": "thermal",
+      "csv": "melting.csv",
+      "gif": "melting.gif",
+      "video": "melting.mp4"
+    }
+  ]
+}
