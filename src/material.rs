@@ -37,7 +37,19 @@ pub struct Material {
     pub hardness: f32,
     pub heat_capacity: f32,
     pub thermal_cond: f32,
+    /// Electrical conductivity, siemens per metre (S/m).
+    pub electrical_conductivity: f32,
+    /// Relative dielectric permittivity (dimensionless, vacuum = 1).
+    pub relative_permittivity: f32,
+    /// Linear thermal expansion parallel to the material fiber axis (1/K).
+    pub thermal_expansion_parallel: f32,
+    /// Linear thermal expansion perpendicular to the material fiber axis (1/K).
+    pub thermal_expansion_perpendicular: f32,
     pub melt_temp: f32,
+    /// Fraction of the melting temperature where progressive strength loss starts.
+    /// A value of 1.0 disables pre-melt softening. Illustrative built-in values
+    /// are not calibrated material data.
+    pub strength_softening_start_ratio: f32,
     pub boil_temp: f32,
     pub latent_fusion: f32,
     pub latent_vaporization: f32,
@@ -262,20 +274,61 @@ impl Material {
             ),
         ];
         table[1].fracture_mode = FractureMode::Mixed;
+        table[1].electrical_conductivity = 1.0e-4;
+        table[1].relative_permittivity = 3.0;
+        table[1].thermal_expansion_parallel = 3.0e-6;
+        table[1].thermal_expansion_perpendicular = 30.0e-6;
         table[1].compressive_strength_perp = 2e6;
         table[1].shear_strength_perp = 3e6;
         table[1].hardening_modulus = 2e9;
         table[1].failure_plastic_strain = 0.04;
         table[2].fracture_mode = FractureMode::Ductile;
+        table[2].electrical_conductivity = 1.0e7;
+        table[2].relative_permittivity = 1.0;
+        table[2].thermal_expansion_parallel = 12.0e-6;
+        table[2].thermal_expansion_perpendicular = 12.0e-6;
+        table[2].strength_softening_start_ratio = 0.7;
         table[2].hardening_modulus = 1e9;
         table[2].failure_plastic_strain = 0.15;
         table[5].fracture_mode = FractureMode::Ductile;
+        table[5].electrical_conductivity = 3.5e7;
+        table[5].relative_permittivity = 1.0;
+        table[5].thermal_expansion_parallel = 23.0e-6;
+        table[5].thermal_expansion_perpendicular = 23.0e-6;
+        table[5].strength_softening_start_ratio = 0.7;
         table[5].hardening_modulus = 0.7e9;
         table[5].failure_plastic_strain = 0.18;
         table[6].fracture_mode = FractureMode::Ductile;
+        table[6].electrical_conductivity = 5.96e7;
+        table[6].relative_permittivity = 1.0;
+        table[6].thermal_expansion_parallel = 16.5e-6;
+        table[6].thermal_expansion_perpendicular = 16.5e-6;
+        table[6].strength_softening_start_ratio = 0.7;
         table[6].hardening_modulus = 0.45e9;
         table[6].failure_plastic_strain = 0.30;
+        table[7].strength_softening_start_ratio = 0.7;
+        table[8].strength_softening_start_ratio = 0.7;
+        table[3].electrical_conductivity = 1.0e-10;
+        table[3].relative_permittivity = 5.0;
+        table[3].thermal_expansion_parallel = 8.0e-6;
+        table[3].thermal_expansion_perpendicular = 8.0e-6;
+        table[4].electrical_conductivity = 5.0e-2;
+        table[4].relative_permittivity = 80.0;
+        table[4].thermal_expansion_parallel = 69.0e-6;
+        table[4].thermal_expansion_perpendicular = 69.0e-6;
+        table[7].electrical_conductivity = 1.0e-12;
+        table[7].relative_permittivity = 7.0;
+        table[7].thermal_expansion_parallel = 9.0e-6;
+        table[7].thermal_expansion_perpendicular = 9.0e-6;
+        table[8].electrical_conductivity = 1.0e-4;
+        table[8].relative_permittivity = 5.0;
+        table[8].thermal_expansion_parallel = 10.0e-6;
+        table[8].thermal_expansion_perpendicular = 10.0e-6;
         table[9].fracture_mode = FractureMode::Ductile;
+        table[9].electrical_conductivity = 1.0e-13;
+        table[9].relative_permittivity = 2.5;
+        table[9].thermal_expansion_parallel = 100.0e-6;
+        table[9].thermal_expansion_perpendicular = 100.0e-6;
         table[9].hardening_modulus = 20e6;
         table[9].failure_plastic_strain = 1.0;
         table
@@ -321,7 +374,12 @@ impl Material {
             hardness: yield_strength,
             heat_capacity,
             thermal_cond,
+            electrical_conductivity: 1.0e-14,
+            relative_permittivity: 1.0,
+            thermal_expansion_parallel: 0.0,
+            thermal_expansion_perpendicular: 0.0,
             melt_temp,
+            strength_softening_start_ratio: 1.0,
             boil_temp,
             latent_fusion,
             latent_vaporization,
@@ -335,11 +393,12 @@ impl Material {
         // add linearly: v_mix = Σ(w_i / ρ_i), ρ_mix = 1 / v_mix.
         // An arithmetic density average would violate the mass/volume meaning
         // of the composition and give every mixed REV the wrong physical mass.
-        result.density = 1.0
-            / c.components
-                .iter()
-                .map(|&(id, fraction)| fraction / table[id as usize].density)
-                .sum::<f32>();
+        let specific_volume = c
+            .components
+            .iter()
+            .map(|&(id, fraction)| fraction / table[id as usize].density)
+            .sum::<f32>();
+        result.density = 1.0 / specific_volume;
         macro_rules! mix { ($($field:ident),*) => { $(result.$field = c.components.iter()
             .map(|&(id, f)| table[id as usize].$field * f).sum();)* }; }
         mix!(
@@ -359,13 +418,44 @@ impl Material {
             hardness,
             heat_capacity,
             thermal_cond,
+            thermal_expansion_parallel,
+            thermal_expansion_perpendicular,
             melt_temp,
+            strength_softening_start_ratio,
             boil_temp,
             latent_fusion,
             latent_vaporization,
             fracture_energy,
             fracture_energy_perp
         );
+        // Series-mixture (lower-bound) rule: component resistivities add by
+        // volume fraction, keeping composition and geometry explicit.
+        let contains_insulator = c
+            .components
+            .iter()
+            .any(|&(id, _)| table[id as usize].electrical_conductivity == 0.0);
+        result.electrical_conductivity = if contains_insulator {
+            0.0
+        } else {
+            specific_volume
+                / c.components
+                    .iter()
+                    .map(|&(id, mass_fraction)| {
+                        let material = &table[id as usize];
+                        mass_fraction / material.density / material.electrical_conductivity
+                    })
+                    .sum::<f32>()
+        };
+        // The same series orientation gives a volume-weighted harmonic
+        // permittivity bound for layered component mixtures.
+        result.relative_permittivity = specific_volume
+            / c.components
+                .iter()
+                .map(|&(id, mass_fraction)| {
+                    let material = &table[id as usize];
+                    mass_fraction / material.density / material.relative_permittivity
+                })
+                .sum::<f32>();
         if c.components
             .iter()
             .any(|&(id, _)| table[id as usize].fracture_mode != result.fracture_mode)
@@ -373,6 +463,27 @@ impl Material {
             result.fracture_mode = FractureMode::Mixed;
         }
         result
+    }
+
+    /// Return the pre-melt factor applied to bond strength and fracture energy.
+    /// Temperature and melting point are in kelvin. Values outside the useful
+    /// ratio range disable this optional softening instead of producing NaNs.
+    pub fn thermal_strength_scale(&self, temperature_kelvin: f32) -> f32 {
+        let onset_ratio = self.strength_softening_start_ratio;
+        if !temperature_kelvin.is_finite()
+            || !self.melt_temp.is_finite()
+            || self.melt_temp <= 0.0
+            || !onset_ratio.is_finite()
+            || !(0.0..1.0).contains(&onset_ratio)
+        {
+            return 1.0;
+        }
+        let onset = self.melt_temp * onset_ratio;
+        if temperature_kelvin <= onset {
+            1.0
+        } else {
+            ((self.melt_temp - temperature_kelvin) / (self.melt_temp - onset)).clamp(0.0, 1.0)
+        }
     }
 
     /// Enthalpy relative to 0 K for the compact constant-heat-capacity EOS.
@@ -462,6 +573,20 @@ mod tests {
     }
 
     #[test]
+    fn material_strength_softens_linearly_before_melting() {
+        let iron_id = Material::component_id("iron").unwrap();
+        let iron = &Material::table()[iron_id as usize];
+        let onset = iron.melt_temp * iron.strength_softening_start_ratio;
+        assert_eq!(iron.thermal_strength_scale(onset - 1.0), 1.0);
+        assert!((iron.thermal_strength_scale((onset + iron.melt_temp) * 0.5) - 0.5).abs() < 1e-6);
+        assert_eq!(iron.thermal_strength_scale(iron.melt_temp), 0.0);
+
+        let wood_id = Material::component_id("wood").unwrap();
+        let wood = &Material::table()[wood_id as usize];
+        assert_eq!(wood.thermal_strength_scale(2000.0), 1.0);
+    }
+
+    #[test]
     fn mass_fraction_mixture_preserves_specific_volume_and_heat_capacity() {
         let table = Material::table();
         let iron = Material::component_id("iron").unwrap();
@@ -477,8 +602,33 @@ mod tests {
             1.0 / (0.25 / iron_material.density + 0.75 / copper_material.density);
         let expected_heat_capacity =
             0.25 * iron_material.heat_capacity + 0.75 * copper_material.heat_capacity;
+        let expected_expansion_parallel = 0.25 * iron_material.thermal_expansion_parallel
+            + 0.75 * copper_material.thermal_expansion_parallel;
+        let expected_expansion_perpendicular = 0.25 * iron_material.thermal_expansion_perpendicular
+            + 0.75 * copper_material.thermal_expansion_perpendicular;
+        let iron_volume = 0.25 / iron_material.density;
+        let copper_volume = 0.75 / copper_material.density;
+        let expected_conductivity = (iron_volume + copper_volume)
+            / (iron_volume / iron_material.electrical_conductivity
+                + copper_volume / copper_material.electrical_conductivity);
+        let expected_permittivity = (iron_volume + copper_volume)
+            / (iron_volume / iron_material.relative_permittivity
+                + copper_volume / copper_material.relative_permittivity);
         assert!((mixture.density - expected_density).abs() <= expected_density * 1e-6);
         assert!((mixture.heat_capacity - expected_heat_capacity).abs() <= 1e-5);
+        assert!((mixture.thermal_expansion_parallel - expected_expansion_parallel).abs() <= 1e-10);
+        assert!(
+            (mixture.thermal_expansion_perpendicular - expected_expansion_perpendicular).abs()
+                <= 1e-10
+        );
+        assert!(
+            (mixture.electrical_conductivity - expected_conductivity).abs()
+                <= expected_conductivity * 1e-6
+        );
+        assert!(
+            (mixture.relative_permittivity - expected_permittivity).abs()
+                <= expected_permittivity * 1e-6
+        );
 
         let mass_kg = 0.02;
         let temperature_k = 300.0;

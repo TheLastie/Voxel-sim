@@ -1,6 +1,7 @@
 pub mod bond;
 pub mod collision;
 mod cuda_solver;
+pub mod electrical;
 pub mod fracture;
 pub mod material;
 pub mod scene;

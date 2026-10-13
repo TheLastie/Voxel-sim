@@ -3,6 +3,8 @@ pub const EMPTY: u32 = u32::MAX;
 #[derive(Clone, Copy, Debug)]
 pub struct Bond {
     pub neighbor: u32,
+    /// Local-frame stress-free offset established when an adhesive bond forms (m).
+    pub formation_offset: [f32; 3],
     pub plastic_strain: [f32; 3],
     pub damage: f32,
     pub equivalent_plastic_strain: f32,
@@ -16,6 +18,7 @@ impl Default for Bond {
     fn default() -> Self {
         Self {
             neighbor: EMPTY,
+            formation_offset: [0.0; 3],
             plastic_strain: [0.0; 3],
             damage: 0.0,
             equivalent_plastic_strain: 0.0,

@@ -59,7 +59,7 @@ struct CudaSolver {
     driver: Driver,
     context: Handle,
     module: Handle,
-    kernels: [Handle; 8],
+    kernels: [Handle; 9],
     buffers: HashMap<&'static str, (DevicePtr, usize)>,
 }
 
@@ -121,7 +121,7 @@ impl CudaSolver {
                     "cuModuleLoadData(PCG PTX) failed with CUDA status {status}"
                 ));
             }
-            let mut kernels = [0; 8];
+            let mut kernels = [0; 9];
             for (slot, name) in [
                 b"block_sparse_matvec\0".as_slice(),
                 b"block_jacobi\0".as_slice(),
@@ -131,6 +131,7 @@ impl CudaSolver {
                 b"dot_reduce\0".as_slice(),
                 b"dot_reduce_ratio\0".as_slice(),
                 b"scalar_ratio\0".as_slice(),
+                b"pcg_update_precondition\0".as_slice(),
             ]
             .into_iter()
             .enumerate()
@@ -271,6 +272,23 @@ impl CudaSolver {
             (&mut partial_count_arg as *mut u32).cast(),
         ];
         self.launch(6, 1, &mut reduce_params)
+    }
+
+    fn launch_ratio(
+        &self,
+        numerator: DevicePtr,
+        denominator: DevicePtr,
+        output: DevicePtr,
+    ) -> Result<(), String> {
+        let mut numerator = numerator;
+        let mut denominator = denominator;
+        let mut output = output;
+        let mut params = [
+            (&mut numerator as *mut DevicePtr).cast(),
+            (&mut denominator as *mut DevicePtr).cast(),
+            (&mut output as *mut DevicePtr).cast(),
+        ];
+        self.launch(7, 1, &mut params)
     }
 }
 
@@ -419,33 +437,29 @@ pub(crate) fn solve_pcg(
         ];
         cuda.launch(0, grid, &mut matvec_params)?;
         cuda.launch_dot_ratio(p, ap, count, rho, alpha)?;
+        let mut inverse = inverse_ptr;
         let mut dx_arg = dx;
-        let mut r_arg = r;
+        let mut residual = r;
         let mut p_arg = p;
         let mut ap_arg = ap;
         let mut alpha_arg = alpha;
+        let mut preconditioned = z;
         let mut count_arg = count;
-        let mut update_params = [
+        let mut update_precondition_params = [
+            (&mut inverse as *mut DevicePtr).cast(),
             (&mut dx_arg as *mut DevicePtr).cast(),
-            (&mut r_arg as *mut DevicePtr).cast(),
+            (&mut residual as *mut DevicePtr).cast(),
             (&mut p_arg as *mut DevicePtr).cast(),
             (&mut ap_arg as *mut DevicePtr).cast(),
             (&mut alpha_arg as *mut DevicePtr).cast(),
-            (&mut count_arg as *mut u32).cast(),
-        ];
-        cuda.launch(2, vector_grid, &mut update_params)?;
-        let mut inverse = inverse_ptr;
-        let mut residual = r;
-        let mut preconditioned = z;
-        let mut count_arg = count;
-        let mut precondition_params = [
-            (&mut inverse as *mut DevicePtr).cast(),
-            (&mut residual as *mut DevicePtr).cast(),
             (&mut preconditioned as *mut DevicePtr).cast(),
             (&mut count_arg as *mut u32).cast(),
         ];
-        cuda.launch(1, grid, &mut precondition_params)?;
-        cuda.launch_dot_ratio(r, z, count, rho, beta)?;
+        cuda.launch(8, grid, &mut update_precondition_params)?;
+        // rho_new = r·M⁻¹r and beta = rho_new/rho. Keep rho_new in its
+        // alternating device buffer before swapping the recurrence scalars.
+        cuda.launch_dot(r, z, count, rho_next)?;
+        cuda.launch_ratio(rho_next, rho, beta)?;
         let mut p_arg = p;
         let mut z_arg = z;
         let mut beta_arg = beta;

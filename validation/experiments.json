@@ -34,6 +34,54 @@
       "video": "fatigue-fragment-collision.mp4"
     },
     {
+      "id": "thermal-strength",
+      "label": "Температурное размягчение стеклянной связи · 2 REV",
+      "mode": "thermal",
+      "csv": "thermal-strength.csv",
+      "gif": "thermal-strength.gif",
+      "video": "thermal-strength.mp4"
+    },
+    {
+      "id": "thermal-strength-iron-diagnostic",
+      "label": "Диагностика пластического размягчения железа · без разрыва",
+      "mode": "thermal",
+      "csv": "thermal-strength-iron-diagnostic.csv",
+      "gif": "thermal-strength-iron-diagnostic.gif",
+      "video": "thermal-strength-iron-diagnostic.mp4"
+    },
+    {
+      "id": "thermal-expansion",
+      "label": "Терморасширение закреплённого железного стержня · 3 REV",
+      "mode": "thermal",
+      "csv": "thermal-expansion.csv",
+      "gif": "thermal-expansion.gif",
+      "video": "thermal-expansion.mp4"
+    },
+    {
+      "id": "thermal-expansion-anisotropy",
+      "label": "Тепловое расширение дерева вдоль и поперёк волокон · 6 REV",
+      "mode": "thermal",
+      "csv": "thermal-expansion-anisotropy.csv",
+      "gif": "thermal-expansion-anisotropy.gif",
+      "video": "thermal-expansion-anisotropy.mp4"
+    },
+    {
+      "id": "electrical-conduction",
+      "label": "Проводимость меди · ток и джоулево тепло · 3 REV",
+      "mode": "thermal",
+      "csv": "electrical-conduction.csv",
+      "gif": "electrical-conduction.gif",
+      "video": "electrical-conduction.mp4"
+    },
+    {
+      "id": "dielectric-capacitance",
+      "label": "Ёмкостный отклик стекла · заряд и полевая энергия · 3 REV",
+      "mode": "csv",
+      "csv": "dielectric-capacitance.csv",
+      "gif": "dielectric-capacitance.gif",
+      "video": "dielectric-capacitance.mp4"
+    },
+    {
       "id": "thermal-gradient",
       "label": "Теплопроводность железа · 24 REV",
       "mode": "thermal",
@@ -72,6 +120,38 @@
       "csv": "solver-cuda.csv",
       "gif": "solver-cuda.gif",
       "video": "solver-cuda.mp4"
+    },
+    {
+      "id": "pcg-cuda-clean",
+      "label": "Решатель CUDA · исправленная PCG-рекурсия · 4 203 REV",
+      "mode": "csv",
+      "csv": "cuda-fused-update-clean.csv",
+      "gif": "cuda-fused-update-clean.gif",
+      "video": "cuda-fused-update-clean.mp4"
+    },
+    {
+      "id": "pcg-cpu-clean",
+      "label": "Решатель CPU IC(0) · matched A/B · 4 203 REV",
+      "mode": "csv",
+      "csv": "cpu-fused-update-clean.csv",
+      "gif": "cpu-fused-update-clean.gif",
+      "video": "cpu-fused-update-clean.mp4"
+    },
+    {
+      "id": "pcg-cpu-block-jacobi",
+      "label": "Решатель CPU Block-Jacobi · matched A/B · 4 203 REV",
+      "mode": "csv",
+      "csv": "cpu-block-jacobi-clean.csv",
+      "gif": "cpu-block-jacobi-clean.gif",
+      "video": "cpu-block-jacobi-clean.mp4"
+    },
+    {
+      "id": "pcg-scale-36k-partial",
+      "label": "Масштаб решателя · 35 712 активных REV · частичная запись",
+      "mode": "csv",
+      "csv": "solver-scale-36k.csv",
+      "gif": "solver-scale-36k.gif",
+      "video": "solver-scale-36k.mp4"
     }
   ]
 }

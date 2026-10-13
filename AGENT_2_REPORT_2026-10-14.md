@@ -442,3 +442,160 @@ The momentum check starts after the applied launch impulse and is for the full
 three-REV assembly; per-cluster mass/momentum ledgers remain open.
 
 — Агент 1
+
+### Agent 2: temperature-dependent bond strength
+
+Added `Material::thermal_strength_scale` and the public scene API
+`Scene::set_material_strength_softening(name, onset_ratio)`. Solver bond limits
+now include the minimum thermal factor of the two adjacent REV, multiplied by
+the existing solid-fraction factor. Built-in iron, aluminum, copper, glass and
+concrete use an illustrative linear ramp from 70% of melting temperature to
+melting; caller-specified ratios are validated and derived REV properties are
+refreshed. The 70% onset is not calibrated data.
+
+`thermal_strength_capture` used two glass REV, zero gravity, `dt=1 ms`, one
+substep and prescribed tension at 0.8 of the ambient limit. The temperature was
+raised from 300 K to 1445 K over 600 steps, below glass melting at 1700 K. The
+bond broke at step 520, 1292.34 K, when the strength factor reached 0.7993 and
+the measured load/current-limit ratio reached 1.0008. The final state remained
+solid (liquid fraction 0); heater input was 4837.7617 J. The CSV has 17,600
+solver steps and 177 actual states over 17.6 s. GIF/MP4 contain 177 frames at
+1600×1000, 10 fps and 17.7 s; full MP4 decode passed. Selector `:8777` serves
+both this run and its CSV/GIF/MP4 with HTTP 200. Existing viewer `:8765` remained
+on the fracture-fragment capture and was not stopped.
+
+An initial full-length iron run is retained as
+`validation/thermal-strength-iron-diagnostic.csv` with corresponding GIF/MP4.
+At thermal factor 0.5, the ductile iron bond stayed connected because plastic
+flow relaxed the elastic stress and accumulated strain did not reach its
+plastic-failure limit. This negative physical result motivated using brittle
+glass for the threshold demonstration; it is not hidden from the experiment
+catalog.
+
+Verification on the combined current worktree: `VOXEL_SOLVER_BACKEND=cpu cargo
+test --no-default-features` passed 58 tests (42 library, 5 smoke, 1 contact
+energy, 1 CPU preconditioner, 3 fatigue topology, 6 supports). The dedicated
+material, scene API and solver tests pass. `cargo check --no-default-features
+--bin thermal_strength_capture`, `cargo fmt --check` and `git diff --check` pass.
+`src/solver.rs` also contains Agent 1's in-progress fused CPU PCG change; I did
+not stage or commit shared solver edits while that A/B work was active.
+
+### Agent 2: reusable DC conduction and Joule heating
+
+Added `Material::electrical_conductivity` in S/m (illustrative built-ins and a
+volume-fraction series mixture rule) plus `electrical::solve_and_heat`. The API
+solves a steady resistor network over intact REV bonds with Dirichlet voltage
+boundaries, returns node potentials/boundary currents/source energy and adds
+bond Joule loss to adjacent voxels through the compensated internal-energy API.
+A three-node conjugate-gradient regression checks the midpoint voltage, current,
+source-vs-heat budget and total internal-energy change; an open-bond test checks
+zero current.
+
+Physical capture `electrical_conduction_capture`: three copper REV, 1 mV,
+`dt=10 ms`, 1,760 electrical steps / 177 real states / 17.6 s. Measured current
+`298.000019 A`, resistance `3.355704e-6 Ω`, power `0.298000 W`. Source work and
+Joule heat both equal `5.244800337 J`; total internal-energy error is
+`-2.2e-11 J`. Temperature of REV 0 rises from 293.15 K to 293.5301 K. GIF/MP4
+have 177 frames, 1600×1000, 10 fps / 17.7 s; MP4 decodes fully. Selector `:8777`
+serves status, CSV, GIF and MP4 with HTTP 200. The implementation is steady DC
+on intact mechanical bond edges; dielectric response, charge storage and
+unbonded-contact conduction are still absent. Built-in σ values and mixture
+rule are illustrative, not experimentally calibrated.
+
+On the electrical-conduction change, the latest full test run passed 62 tests:
+46 library, 5 smoke, 1 contact energy, 1 preconditioner, 3 topology and 6
+support tests, including input-overflow rejection before thermal mutation. All Agent 2 Rust files pass standalone rustfmt checking and
+`git diff --check`. Whole-worktree `cargo fmt --check` currently reports one
+formatting difference in the parallel Agent 1 `src/solver.rs` fused-PCG edit;
+I left that shared file untouched.
+
+### Agent 2: dielectric permittivity and stored field energy
+
+Added dimensionless `Material::relative_permittivity` (illustrative built-ins)
+and `electrical::solve_dielectric_state`, reusing the weighted graph-Laplace
+solver from DC conduction with bond capacitance `ε0 εr A/L`. It returns each
+REV's potential and charge, electrode charge, stored field energy and iteration
+count without modifying thermal state. Material mixtures use a volume-fraction
+harmonic permittivity estimate for serial layers.
+
+A regression on three glass REV checks the analytical midpoint potential,
+positive/negative electrode charge, zero free charge at the middle REV, and
+`U=QΔV/2`. The physical quasi-static voltage-sweep capture ramps 0→1 V over
+1,760 steps (`dt=10 ms`, 17.6 s) and saves 177 actual states. At εr=7 it measures
+`C=0.3098965725 pF`, `Q=0.3098965725 pC`, field energy and integrated source
+work both `1.549482863e-13 J`, with `1.01e-28 J` discrepancy. GIF/MP4 have 177
+frames at 1600×1000 and 10 fps / 17.7 s; selector `:8777` serves status, CSV,
+GIF and MP4 with HTTP 200. This is a quasi-static network model over intact
+mechanical bonds; dynamic displacement current, dielectric relaxation, frequency
+dependence, electrical forces, leakage and contact conduction remain unmodeled.
+
+#### Повторная проверка world-bounds артефактов — 14 октября 2026
+
+Проверил текущие файлы, не меняя `solver.rs`: CSV содержит 177 уникальных
+состояний на шагах 0…1760 (`dt=0.01 s`), все шесть выходов зарегистрированы
+по одному, итоговый ledger равен 6 удалённым / 0 оставшимся REV. Regression
+`VOXEL_SOLVER_BACKEND=cpu cargo test --no-default-features --lib
+world_bounds_tests` прошёл 1/1. GIF — 1120×700, 177 кадров, 100 ms на кадр,
+17.7 s; MP4 — 1120×700, 177 кадров, 10 fps, 17.7 s. Каталог на `:8766`
+сейчас отдаёт world-bounds CSV/GIF/MP4 с HTTP 200. Основной `:8765` оставлен
+работать с более поздней записью усталостного разрушения; его не перезапускал.
+`git diff --check` и проверка JSON каталога прошли.
+
+### Agent 2: thermal expansion and fiber-axis anisotropy
+
+Added illustrative parallel/perpendicular thermal expansion values in 1/K, a
+mass-fraction mixture rule, public isotropic and anisotropic Scene setters, and
+per-REV stress-free temperatures captured at scene creation. Topology removal
+compacts the reference-temperature array with every other REV array. The solver
+uses temperature-derived linear thermal strain as part of each bond's target
+length and stress/fracture displacement.
+
+`thermal_expansion_capture` heats a three-REV iron bar from 293.15 K to 363.15 K
+in 0.6 s, holds both ends fixed, then continues the actual physical run to 17.6 s
+(1,760 steps at `dt=10 ms`, one substep, 177 saved states). With
+`α=12e-6 1/K`, the calculated free span is 20.016799 mm while the fixed span
+stays at 20.000000 mm. The engine reports 167.992 MPa compression, no broken
+bonds and one cluster; heater input is 743.7151 J. GIF and MP4 contain 177 actual
+states at 1120×700, 10 fps and 17.7 s. Live viewer `:8790` showed the run; selector `:8791` serves status/CSV/GIF/MP4
+with HTTP 200. The existing `:8765` capture was left running.
+
+Verification: full `VOXEL_SOLVER_BACKEND=cpu cargo test --no-default-features`
+passed 66 tests (50 library, 5 smoke, 1 contact energy, 1 preconditioner, 3
+fatigue topology, 6 supports). Rust formatting checks for edited Rust files,
+renderer `py_compile`, manifest JSON parsing and `git diff --check` pass. The coefficient data is illustrative and two-way transfer between thermal and
+elastic energy remains unimplemented, so this is not a complete thermodynamic
+model.
+
+
+#### Fiber-axis anisotropy capture
+
+`thermal_expansion_anisotropy_capture` compares fixed-end three-REV wood bars
+parallel (Z) and transverse (X) to the REV fiber axis. All six voxels are heated
+from 293.15 K to 363.15 K in 0.6 s and the CPU run continues for 17.6 s total
+(1,760 steps, 177 actual saved states). With illustrative `α‖=3e-6 1/K` and
+`α⊥=30e-6 1/K`, free spans are 20.004200 mm and 20.041998 mm; measured fixed
+spans stay 20.000000 mm. Reaction stresses are 2.127 MPa parallel and 1.260 MPa
+transverse, no bonds break, and the two disconnected bars remain two clusters.
+Heater input is 464.1000 J. GIF/MP4 contain 177 frames at 1120×700 and 10 fps /
+17.7 s. Live viewer `:8793` showed the run; selector `:8796` serves the
+experiment and its CSV/GIF/MP4 with HTTP 200. The test suite and formatting /
+renderer / manifest checks listed above pass after this addition.
+
+#### Runtime bond topology API
+
+Added `Scene::connect_adjacent_voxels(a, b)` as a public engine primitive for
+adhesion/welding/healing systems. It validates indices, original lattice
+adjacency and matching kinematic constraints; initializes a fresh bond, adds it
+to solver coloring, resets dependent workspaces, and rebuilds cluster labels.
+It rejects a pair with queued fracture release and requires the current center
+displacement to match the thermal/fiber-dependent stress-free vector within
+10 µm, avoiding an instantaneous elastic energy jump. Four focused regressions
+cover topology, heat transport, pending events and a heated stress-free pair.
+Automatic material criteria, merge/composition transfer and a physical bonding
+capture remain open.
+
+After the runtime bond-topology API addition, the full CPU suite passed 70/70
+tests (`VOXEL_SOLVER_BACKEND=cpu cargo test --no-default-features`). The focused
+regression also confirms the newly formed bond carries heat through the normal
+engine thermal transport path. `rustfmt --check src/scene.rs` and `git diff
+--check` pass.
