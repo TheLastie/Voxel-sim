@@ -26,6 +26,14 @@
       "video": "contact-energy.mp4"
     },
     {
+      "id": "fatigue-fragment-collision",
+      "label": "Усталостный разрыв и столкновение фрагментов · 3 REV",
+      "mode": "csv",
+      "csv": "fatigue-fragment-collision.csv",
+      "gif": "fatigue-fragment-collision.gif",
+      "video": "fatigue-fragment-collision.mp4"
+    },
+    {
       "id": "thermal-gradient",
       "label": "Теплопроводность железа · 24 REV",
       "mode": "thermal",
