@@ -863,9 +863,31 @@ fusion/end. Restitution heat is `5.181831960e-4 J`; friction, plastic and damage
 heat are zero; fusion heat is `2.094925452e-7 J`. GIF and MP4 each contain 177
 real frames at 1120x700 and 10 fps. CPU suite passes 86/86.
 
+#### World-bound elastic-energy ledger follow-up
+
+Closed the audit gap for intact bonds destroyed by boundary compaction. The
+engine measures constitutive strain energy with the bond's damage-adjusted
+stiffness before deleting topology and records it in
+`BoundaryRemovalLedger::elastic_bond_energy_j`; a stored bond is counted once
+even if both endpoints leave. Added tests for ordinary fixed-step removal and a
+strained bonded pair. The release CPU capture `world-bounds-ledger` ran 1,760
+steps and saved 177 real states over 17.6 s. Six free probes crossed all six
+faces, and an additional bonded pair crossed X+; all 8 REV were removed. The
+capture recorded elastic bond energy `8.673616492e-8 J`, pending release 0,
+mass error 0 and thermal-energy error 0. GIF/MP4 each have 177 frames at
+1120×700 and 10 fps; viewer `:8820` served the current run. This covers one
+bonded pair; broader multi-bond accounting remains open.
+
 #### World-bound fixed-step regression
 
 Added and ran `fixed_step_removes_crossing_voxel_and_records_boundary_ledger`:
 a moving REV crosses configured bounds during `Scene::tick`, is removed at the
 fixed-step boundary, and its mass, internal/kinetic energy, and momentum are
-recorded. Targeted test and full CPU suite pass; 87/87 total tests.
+recorded. Targeted test and full CPU suite pass; 88/88 total tests.
+
+
+Final validation after the tighter ledger regression tolerance (`1e-5` relative):
+full CPU suite 88/88, release all-target check, fmt, renderer `py_compile`, JSON
+parse and `git diff --check` pass. The capture and media use 177 saved physical
+states; `world-bounds-ledger.gif` and `.mp4` decode to 177 frames each. Live
+viewer `:8820` and catalog selector `:8821` were checked by Agent 2.

@@ -109,6 +109,18 @@ fn bond_elastic_displacement(scene: &Scene, i: usize, j: usize, axis: usize, fra
         - Vec3::from_array(scene.bonds[axis][i].formation_offset)
 }
 
+/// Recover the current stored elastic energy of an intact bond (joules).
+/// This is also used when a topology operation removes the bond before its
+/// strain energy can be dissipated through fracture or melting.
+pub(crate) fn bond_stored_elastic_energy_j(scene: &Scene, i: usize, j: usize, axis: usize) -> f64 {
+    let bond = scene.bonds[axis][i];
+    let frame = basis(axis, scene.rotations[i].slerp(scene.rotations[j], 0.5));
+    let displacement = bond_elastic_displacement(scene, i, j, axis, frame)
+        - Vec3::from_array(bond.plastic_strain) * CELL;
+    let stiffness = stiffness_matrix(scene, i, j, frame);
+    (0.5 * (1.0 - bond.damage) * displacement.dot(stiffness * displacement)).max(0.0) as f64
+}
+
 pub fn bond_limits(scene: &Scene, i: usize, j: usize, direction: Vec3) -> crate::fracture::Limits {
     let alignment =
         [i, j].map(|n| direction.dot(scene.rotations[n] * scene.voxels[n].microstructure.fibers()));

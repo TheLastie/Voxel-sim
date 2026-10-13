@@ -73,6 +73,9 @@ pub struct BoundaryRemovalLedger {
     pub mass_kg: f64,
     pub internal_energy_j: f64,
     pub kinetic_energy_j: f64,
+    /// Elastic strain energy in intact bonds removed with the escaping REV.
+    pub elastic_bond_energy_j: f64,
+    /// Energy already queued for delayed bond release when an endpoint leaves.
     pub pending_bond_energy_j: f64,
     pub momentum_kg_m_s: [f64; 3],
 }
@@ -1267,6 +1270,22 @@ impl Scene {
                 voxel.mass as f64 * voxel.velocity.z as f64;
         }
 
+        // Bond strain energy belongs to the topology being removed. Count each
+        // stored directed bond once, even when both endpoints leave together.
+        for axis in 0..3 {
+            for i in 0..old_count {
+                let bond = self.bonds[axis][i];
+                if bond.neighbor == EMPTY {
+                    continue;
+                }
+                let j = bond.neighbor as usize;
+                if !keep[i] || !keep[j] {
+                    self.boundary_removals.elastic_bond_energy_j +=
+                        crate::solver::bond_stored_elastic_energy_j(self, i, j, axis);
+                }
+            }
+        }
+
         let mut kept_releases = Vec::with_capacity(self.releases.len());
         for mut release in self.releases.drain(..) {
             if keep[release.i] && keep[release.j] {
@@ -1718,6 +1737,36 @@ mod world_bounds_tests {
         assert!((ledger.internal_energy_j - expected_internal).abs() < 1e-9);
         assert!((ledger.kinetic_energy_j - expected_kinetic).abs() < 1e-12);
         assert_eq!(ledger.momentum_kg_m_s, expected_momentum);
+    }
+
+    #[test]
+    fn boundary_removal_transfers_intact_bond_strain_energy_once() {
+        let iron = Material::component_id("iron").unwrap();
+        let mut scene = SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], iron))
+            .add_voxel(VoxelSpawn::at_cell([1, 0, 0], iron))
+            .build()
+            .unwrap();
+        scene.positions[1].x += 0.001;
+        scene.bonds[0][0].damage = 0.25;
+        let k = crate::solver::stiffness_matrix(&scene, 0, 1, glam::Mat3::IDENTITY);
+        let strain = glam::Vec3::X * 0.001;
+        let expected_energy = (0.5 * 0.75 * strain.dot(k * strain)).max(0.0) as f64;
+        assert!(expected_energy > 0.0);
+
+        assert_eq!(
+            scene.set_world_bounds(Vec3::new(0.02, 0.0, 0.0), Vec3::splat(1.0)),
+            Ok(2)
+        );
+
+        assert_eq!(scene.boundary_removals().voxel_count, 2);
+        assert!(
+            (scene.boundary_removals().elastic_bond_energy_j - expected_energy).abs()
+                < expected_energy * 1.0e-5,
+            "ledger={} expected={expected_energy}",
+            scene.boundary_removals().elastic_bond_energy_j
+        );
     }
 
     #[test]
