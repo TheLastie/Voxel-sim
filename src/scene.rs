@@ -149,6 +149,12 @@ impl SceneBuilder {
         self
     }
 
+    /// Set the CUDA PCG iteration cap independently of the CPU solver cap.
+    pub fn with_cuda_solver_iterations(mut self, iterations: usize) -> Self {
+        self.config.cuda_iterations = iterations;
+        self
+    }
+
     pub fn build(self) -> Result<Scene, String> {
         Scene::from_voxels(self.config, self.voxels)
     }
@@ -167,6 +173,9 @@ pub struct SceneConfig {
     pub fixed_dt: f32,
     pub substeps: usize,
     pub iterations: usize,
+    /// Maximum CUDA PCG iterations; CPU PCG keeps `iterations` as its cap.
+    #[serde(default = "default_cuda_iterations")]
+    pub cuda_iterations: usize,
     pub solver_relative_tolerance: f32,
     pub corotation_tolerance: f32,
     pub corotation_iterations: usize,
@@ -189,6 +198,7 @@ impl Default for SceneConfig {
             fixed_dt: 0.001,
             substeps: 4,
             iterations: 80,
+            cuda_iterations: default_cuda_iterations(),
             solver_relative_tolerance: 1e-5,
             corotation_tolerance: 1e-5,
             corotation_iterations: 2,
@@ -221,6 +231,7 @@ impl SceneConfig {
             || result.fixed_dt <= 0.0
             || result.substeps == 0
             || result.iterations == 0
+            || result.cuda_iterations == 0
             || result.corotation_iterations == 0
             || !result.solver_relative_tolerance.is_finite()
             || result.solver_relative_tolerance <= 0.0
@@ -233,6 +244,10 @@ impl SceneConfig {
         }
         Ok(())
     }
+}
+
+fn default_cuda_iterations() -> usize {
+    160
 }
 /// Positions are separate arrays; material identity exists only in composition.
 pub struct Scene {
