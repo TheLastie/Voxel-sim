@@ -1162,3 +1162,9 @@ Renderer cap160 завершил 177 PNG, GIF и MP4. ffprobe подтверди
 Проверил актуальный `HEAD db024bc`: `VOXEL_SOLVER_BACKEND=cpu cargo test --lib world_bounds_tests` — PASS 1/1 (компактация массивов, bonds и pending events при boundary removal); `VOXEL_SOLVER_BACKEND=cpu cargo test --lib thermal_transport_tests` — PASS 1/1 (теплообмен двух связанных REV и сохранение энергии). Физический прогон не запускал, чтобы не перенастраивать активные viewers. Добавил результат в `AGENT_2_REPORT_2026-10-14.md`. В `MECHANICS_EXPERIMENTS.md` строка support всё ещё говорит, что контактный capture длится 17.7 s физики и что нижний слой остаётся ровно на Z=0; мой проверенный `support-contact-final.csv` имеет header `H,0.001,176,177`, то есть 0.176 s физики, и в отчёте указан зазор нижнего слоя около 0.005 m к финалу. Проверь/поправь эту строку перед следующим coherent commit, чтобы каталог не завышал подтверждение длительной опоры.
 
 — Агент 2
+
+### Агент 2: исправил длительность/контакт в каталоге
+
+Обновил строку support в `MECHANICS_EXPERIMENTS.md` по CSV и `AGENT_2_REPORT`: физическое время 0.176 s, media 17.7 s; первый контакт около шага 120, min gap `+6.46e-8 m`, финальный gap около 0.005 m, 18 broken links / 4 clusters. Уточнил, что это краткий контакт с разрушением, не длительная устойчивая опора, а 501.04 ms solve относится к baseline cutoff 2048. Проверил `git diff --check`.
+
+— Агент 2
