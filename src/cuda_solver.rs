@@ -61,9 +61,8 @@ struct CudaSolver {
     driver: Driver,
     context: Handle,
     module: Handle,
-    kernels: [Handle; 5],
+    kernels: [Handle; 7],
     buffers: HashMap<&'static str, (DevicePtr, usize)>,
-    dot_partials: Vec<f64>,
 }
 
 static CUDA: OnceLock<Result<Mutex<CudaSolver>, String>> = OnceLock::new();
@@ -125,13 +124,15 @@ impl CudaSolver {
                     "cuModuleLoadData(PCG PTX) failed with CUDA status {status}"
                 ));
             }
-            let mut kernels = [0; 5];
+            let mut kernels = [0; 7];
             for (slot, name) in [
                 b"block_sparse_matvec\0".as_slice(),
                 b"block_jacobi\0".as_slice(),
                 b"pcg_update\0".as_slice(),
                 b"pcg_update_direction\0".as_slice(),
                 b"dot_product\0".as_slice(),
+                b"dot_reduce\0".as_slice(),
+                b"scalar_ratio\0".as_slice(),
             ]
             .into_iter()
             .enumerate()
@@ -153,7 +154,6 @@ impl CudaSolver {
                 module,
                 kernels,
                 buffers: HashMap::new(),
-                dot_partials: Vec::new(),
             })
         }
     }
@@ -212,31 +212,51 @@ impl CudaSolver {
         )
     }
 
-    fn dot(&mut self, a: DevicePtr, b: DevicePtr, count: u32) -> Result<f64, String> {
-        let result = self.buffer("dot_partial", count as usize * 8)?;
+    fn launch_dot(
+        &mut self,
+        a: DevicePtr,
+        b: DevicePtr,
+        count: u32,
+        output: DevicePtr,
+    ) -> Result<(), String> {
+        let partial_count = count.div_ceil(256) as usize;
+        let partials = self.buffer("dot_partials", partial_count * 8)?;
         let mut a = a;
         let mut b = b;
-        let mut result = result;
+        let mut partials_arg = partials;
         let mut count = count;
         let mut params = [
             (&mut a as *mut DevicePtr).cast(),
             (&mut b as *mut DevicePtr).cast(),
-            (&mut result as *mut DevicePtr).cast(),
+            (&mut partials_arg as *mut DevicePtr).cast(),
             (&mut count as *mut u32).cast(),
         ];
         self.launch(4, count.div_ceil(256), &mut params)?;
-        self.dot_partials.resize(count as usize, 0.0);
-        check(
-            unsafe {
-                (self.driver.copy_dtoh)(
-                    self.dot_partials.as_mut_ptr().cast(),
-                    result,
-                    self.dot_partials.len() * 8,
-                )
-            },
-            "cuMemcpyDtoH(dot partials)",
-        )?;
-        Ok(self.dot_partials.iter().sum())
+        let mut output = output;
+        let mut partial_count_arg = partial_count as u32;
+        let mut reduce_params = [
+            (&mut partials_arg as *mut DevicePtr).cast(),
+            (&mut output as *mut DevicePtr).cast(),
+            (&mut partial_count_arg as *mut u32).cast(),
+        ];
+        self.launch(5, 1, &mut reduce_params)
+    }
+
+    fn launch_ratio(
+        &self,
+        numerator: DevicePtr,
+        denominator: DevicePtr,
+        output: DevicePtr,
+    ) -> Result<(), String> {
+        let mut numerator = numerator;
+        let mut denominator = denominator;
+        let mut output = output;
+        let mut params = [
+            (&mut numerator as *mut DevicePtr).cast(),
+            (&mut denominator as *mut DevicePtr).cast(),
+            (&mut output as *mut DevicePtr).cast(),
+        ];
+        self.launch(6, 1, &mut params)
     }
 }
 
@@ -273,6 +293,22 @@ pub(crate) fn solve_pcg(
     max_iterations: usize,
     tolerance: f32,
 ) -> Result<(Vec<Vec3>, usize, f32), String> {
+    let n = rhs.len();
+    if n == 0 {
+        return Ok((Vec::new(), 0, 0.0));
+    }
+    let count = u32::try_from(n)
+        .map_err(|_| "CUDA PCG supports at most u32::MAX active REV".to_string())?;
+    let flat_rhs: Vec<f32> = rhs.iter().flat_map(|v| [v.x, v.y, v.z]).collect();
+    let initial_squared = flat_rhs
+        .iter()
+        .map(|x| (*x as f64) * (*x as f64))
+        .sum::<f64>();
+    let initial = initial_squared.sqrt();
+    if initial <= 1e-12 {
+        return Ok((vec![Vec3::ZERO; n], 0, 0.0));
+    }
+
     let store = CUDA.get_or_init(|| CudaSolver::initialize().map(Mutex::new));
     let mut cuda = match store {
         Ok(cuda) => cuda
@@ -284,13 +320,6 @@ pub(crate) fn solve_pcg(
         unsafe { (cuda.driver.context_set_current)(cuda.context) },
         "cuCtxSetCurrent",
     )?;
-    let n = rhs.len();
-    if n == 0 {
-        return Ok((Vec::new(), 0, 0.0));
-    }
-    let count = u32::try_from(n)
-        .map_err(|_| "CUDA PCG supports at most u32::MAX active REV".to_string())?;
-    let flat_rhs: Vec<f32> = rhs.iter().flat_map(|v| [v.x, v.y, v.z]).collect();
     let neighbor_ptr = cuda.upload("neighbors", neighbors)?;
     let diagonal_ptr = cuda.upload("diagonal", diagonal)?;
     let block_ptr = cuda.upload("blocks", blocks)?;
@@ -300,6 +329,17 @@ pub(crate) fn solve_pcg(
     let z = cuda.buffer("z", flat_rhs.len() * 4)?;
     let p = cuda.buffer("p", flat_rhs.len() * 4)?;
     let ap = cuda.buffer("ap", flat_rhs.len() * 4)?;
+    let rho_a = cuda.buffer("rho_a", 8)?;
+    let rho_b = cuda.buffer("rho_b", 8)?;
+    let denominator = cuda.buffer("denominator", 8)?;
+    let residual_squared = cuda.buffer("residual_squared", 8)?;
+    let alpha = cuda.buffer("alpha", 4)?;
+    let beta = cuda.buffer("beta", 4)?;
+    let beta_zero = cuda.buffer("beta_zero", 4)?;
+    check(
+        unsafe { (cuda.driver.copy_htod)(beta_zero, (&0.0f32 as *const f32).cast(), 4) },
+        "initialize zero beta",
+    )?;
     let zeroes = vec![0.0f32; flat_rhs.len()];
     check(
         unsafe { (cuda.driver.copy_htod)(dx, zeroes.as_ptr().cast(), zeroes.len() * 4) },
@@ -326,45 +366,26 @@ pub(crate) fn solve_pcg(
         (&mut n_arg as *mut u32).cast(),
     ];
     cuda.launch(1, grid, &mut params)?;
+    cuda.launch_dot(r, z, count, rho_a)?;
     check(
         unsafe { (cuda.driver.copy_htod)(p, zeroes.as_ptr().cast(), zeroes.len() * 4) },
         "initialize direction",
     )?;
-    let zero = 0.0f32;
-    let mut beta_arg = zero;
     let mut p_arg = p;
     let mut z_arg = z;
+    let mut beta_arg = beta_zero;
     let mut count_arg = count;
     let mut init_params = [
         (&mut p_arg as *mut DevicePtr).cast(),
         (&mut z_arg as *mut DevicePtr).cast(),
-        (&mut beta_arg as *mut f32).cast(),
+        (&mut beta_arg as *mut DevicePtr).cast(),
         (&mut count_arg as *mut u32).cast(),
     ];
     cuda.launch(3, vector_grid, &mut init_params)?;
-    let mut p_host = vec![0.0f32; flat_rhs.len()];
-    check(
-        unsafe { (cuda.driver.copy_dtoh)(p_host.as_mut_ptr().cast(), p, p_host.len() * 4) },
-        "read initial direction",
-    )?;
-    let r_host = &flat_rhs;
-    let mut rz: f64 = r_host
-        .iter()
-        .zip(&p_host)
-        .map(|(a, b)| *a as f64 * *b as f64)
-        .sum();
-    let initial = r_host
-        .iter()
-        .map(|x| (*x as f64) * (*x as f64))
-        .sum::<f64>()
-        .sqrt();
-    if initial <= 1e-12 {
-        return Ok((vec![Vec3::ZERO; n], 0, 0.0));
-    }
-    // Replace the initial direction with the Jacobi-preconditioned residual;
-    // the first direction update above uses beta=0 and performs that copy.
-    let mut residual_norm = initial;
-    let mut relative = 1.0f32;
+    // All reductions and scalar updates stay on the device. The host submits a
+    // fixed PCG iteration sequence and synchronizes only to read the final state.
+    let mut rho = rho_a;
+    let mut rho_next = rho_b;
     let mut iterations = 0;
     for _ in 0..max_iterations {
         let mut x_arg = p;
@@ -382,11 +403,8 @@ pub(crate) fn solve_pcg(
             (&mut count_arg as *mut u32).cast(),
         ];
         cuda.launch(0, grid, &mut matvec_params)?;
-        let denom = cuda.dot(p, ap, count)?;
-        if denom <= 1e-30 {
-            break;
-        }
-        let alpha = (rz / denom) as f32;
+        cuda.launch_dot(p, ap, count, denominator)?;
+        cuda.launch_ratio(rho, denominator, alpha)?;
         let mut dx_arg = dx;
         let mut r_arg = r;
         let mut p_arg = p;
@@ -398,17 +416,10 @@ pub(crate) fn solve_pcg(
             (&mut r_arg as *mut DevicePtr).cast(),
             (&mut p_arg as *mut DevicePtr).cast(),
             (&mut ap_arg as *mut DevicePtr).cast(),
-            (&mut alpha_arg as *mut f32).cast(),
+            (&mut alpha_arg as *mut DevicePtr).cast(),
             (&mut count_arg as *mut u32).cast(),
         ];
         cuda.launch(2, vector_grid, &mut update_params)?;
-        let rr = cuda.dot(r, r, count)?;
-        iterations += 1;
-        residual_norm = rr.sqrt();
-        relative = (residual_norm / initial) as f32;
-        if relative < tolerance {
-            break;
-        }
         let mut inverse = inverse_ptr;
         let mut residual = r;
         let mut preconditioned = z;
@@ -420,8 +431,8 @@ pub(crate) fn solve_pcg(
             (&mut count_arg as *mut u32).cast(),
         ];
         cuda.launch(1, grid, &mut precondition_params)?;
-        let next_rz = cuda.dot(r, z, count)?;
-        let beta = (next_rz / rz) as f32;
+        cuda.launch_dot(r, z, count, rho_next)?;
+        cuda.launch_ratio(rho_next, rho, beta)?;
         let mut p_arg = p;
         let mut z_arg = z;
         let mut beta_arg = beta;
@@ -429,25 +440,49 @@ pub(crate) fn solve_pcg(
         let mut direction_params = [
             (&mut p_arg as *mut DevicePtr).cast(),
             (&mut z_arg as *mut DevicePtr).cast(),
-            (&mut beta_arg as *mut f32).cast(),
+            (&mut beta_arg as *mut DevicePtr).cast(),
             (&mut count_arg as *mut u32).cast(),
         ];
         cuda.launch(3, vector_grid, &mut direction_params)?;
-        rz = next_rz;
+        std::mem::swap(&mut rho, &mut rho_next);
+        iterations += 1;
     }
+    cuda.launch_dot(r, r, count, residual_squared)?;
     let mut output = vec![0.0f32; flat_rhs.len()];
     check(
         unsafe { (cuda.driver.copy_dtoh)(output.as_mut_ptr().cast(), dx, output.len() * 4) },
         "read PCG correction",
     )?;
+    let mut residual_squared_host = 0.0f64;
+    check(
+        unsafe {
+            (cuda.driver.copy_dtoh)(
+                (&mut residual_squared_host as *mut f64).cast(),
+                residual_squared,
+                8,
+            )
+        },
+        "read PCG residual norm",
+    )?;
     check(
         unsafe { (cuda.driver.context_synchronize)() },
         "cuCtxSynchronize",
     )?;
+    if !residual_squared_host.is_finite() || residual_squared_host < 0.0 {
+        return Err("CUDA PCG produced a non-finite residual norm".into());
+    }
+    let relative = (residual_squared_host.sqrt() / initial) as f32;
+    if !relative.is_finite() || relative > tolerance {
+        return Err(format!(
+            "CUDA PCG did not converge: iterations={iterations}, relative residual={relative:.3e}, tolerance={tolerance:.3e}"
+        ));
+    }
+    if output.iter().any(|value| !value.is_finite()) {
+        return Err("CUDA PCG produced a non-finite correction".into());
+    }
     let correction = output
         .chunks_exact(3)
         .map(|v| Vec3::new(v[0], v[1], v[2]))
         .collect();
-    let _ = residual_norm;
     Ok((correction, iterations, relative))
 }

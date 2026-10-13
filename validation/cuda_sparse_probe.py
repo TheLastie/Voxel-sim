@@ -3,6 +3,7 @@
 
 from array import array
 import ctypes
+import sys
 import time
 from pathlib import Path
 
@@ -31,10 +32,11 @@ PTX = (Path(__file__).resolve().parents[1] / "src/cuda/pcg.ptx").read_bytes()
 
 
 def main():
-    nx, ny, nz = 20, 25, 20
+    nx, ny, nz = (map(int, sys.argv[1:]) if len(sys.argv) == 4 else (20, 25, 20))
     count = nx * ny * nz
     invalid = 0xFFFFFFFF
-    mass = array("f", [2.5] * count)
+    diagonal_block = (2.5, 0.1, -0.05, 0.1, 3.0, 0.08, -0.05, 0.08, 4.0)
+    diagonal = array("f", diagonal_block) * count
     x = array("f", (((i % 19) - 9) * 0.03125 for i in range(count * 3)))
     neighbors = array("I", [invalid]) * (count * 6)
     block = (700.0, 31.0, -12.0, 31.0, 520.0, 8.0, -12.0, 8.0, 430.0)
@@ -54,15 +56,20 @@ def main():
 
     for i in range(count):
         vx, vy, vz = x[i * 3 : i * 3 + 3]
-        out = [mass[i] * vx, mass[i] * vy, mass[i] * vz]
+        out = [
+            diagonal_block[row * 3] * vx
+            + diagonal_block[row * 3 + 1] * vy
+            + diagonal_block[row * 3 + 2] * vz
+            for row in range(3)
+        ]
         for edge in range(6):
             j = neighbors[i * 6 + edge]
             if j == invalid:
                 continue
-            delta = [vx - x[j * 3], vy - x[j * 3 + 1], vz - x[j * 3 + 2]]
+            neighbor_x = [x[j * 3], x[j * 3 + 1], x[j * 3 + 2]]
             base = (i * 6 + edge) * 9
             for row in range(3):
-                out[row] += sum(blocks[base + row * 3 + col] * delta[col] for col in range(3))
+                out[row] += sum(blocks[base + row * 3 + col] * neighbor_x[col] for col in range(3))
         cpu[i * 3 : i * 3 + 3] = array("f", out)
 
     check(api("cuInit", INT, U32)(0), "cuInit")
@@ -83,7 +90,7 @@ def main():
     kernel = PTR()
     check(api("cuModuleGetFunction", INT, ctypes.POINTER(PTR), PTR, ctypes.c_char_p)(ctypes.byref(kernel), module, b"block_sparse_matvec"), "cuModuleGetFunction")
 
-    arrays = (mass, x, neighbors, blocks, gpu)
+    arrays = (diagonal, x, neighbors, blocks, gpu)
     device_ptrs = [U64() for _ in arrays]
     allocate = api("cuMemAlloc_v2", INT, ctypes.POINTER(U64), SIZE)
     release = api("cuMemFree_v2", INT, U64)
@@ -112,6 +119,213 @@ def main():
         raise RuntimeError(f"sparse matvec mismatch: max absolute error {max_error}")
     print(f"CUDA block sparse matvec: nodes={count}, max_abs_error={max_error:.3e}")
 
+    jacobi_kernel = PTR()
+    check(api("cuModuleGetFunction", INT, ctypes.POINTER(PTR), PTR, ctypes.c_char_p)(ctypes.byref(jacobi_kernel), module, b"block_jacobi"), "cuModuleGetFunction(block_jacobi)")
+    jacobi_parameters = (PTR * 4)(
+        ctypes.cast(ctypes.byref(device_ptrs[0]), PTR),
+        ctypes.cast(ctypes.byref(device_ptrs[1]), PTR),
+        ctypes.cast(ctypes.byref(device_ptrs[4]), PTR),
+        ctypes.cast(ctypes.byref(n), PTR),
+    )
+    check(launch(jacobi_kernel, grid_x, 1, 1, 256, 1, 1, 0, None, jacobi_parameters, None), "block Jacobi launch")
+    check(synchronize(), "block Jacobi synchronize")
+    check(copy_to_host(PTR(gpu.buffer_info()[0]), device_ptrs[4], len(gpu) * gpu.itemsize), "copy Jacobi output")
+    jacobi_reference = array("f")
+    for i in range(count):
+        values = x[i * 3 : i * 3 + 3]
+        jacobi_reference.extend(
+            sum(diagonal_block[row * 3 + col] * values[col] for col in range(3))
+            for row in range(3)
+        )
+    jacobi_error = max(abs(a - b) for a, b in zip(jacobi_reference, gpu))
+    if jacobi_error > 2e-3:
+        raise RuntimeError(f"block Jacobi mismatch: max absolute error {jacobi_error}")
+    print(f"CUDA block Jacobi: nodes={count}, max_abs_error={jacobi_error:.3e}")
+
+    direction_kernel = PTR()
+    check(api("cuModuleGetFunction", INT, ctypes.POINTER(PTR), PTR, ctypes.c_char_p)(ctypes.byref(direction_kernel), module, b"pcg_update_direction"), "cuModuleGetFunction(pcg_update_direction)")
+    zeros = array("f", [0.0]) * len(gpu)
+    check(copy_to_device(device_ptrs[4], PTR(zeros.buffer_info()[0]), len(zeros) * zeros.itemsize), "initialize direction output")
+    beta = array("f", [0.0])
+    beta_device = U64()
+    check(allocate(ctypes.byref(beta_device), beta.itemsize), "beta allocation")
+    check(copy_to_device(beta_device, PTR(beta.buffer_info()[0]), beta.itemsize), "copy beta")
+    vector_grid = (count * 3 + 255) // 256
+    direction_parameters = (PTR * 4)(
+        ctypes.cast(ctypes.byref(device_ptrs[4]), PTR),
+        ctypes.cast(ctypes.byref(device_ptrs[1]), PTR),
+        ctypes.cast(ctypes.byref(beta_device), PTR),
+        ctypes.cast(ctypes.byref(n), PTR),
+    )
+    check(launch(direction_kernel, vector_grid, 1, 1, 256, 1, 1, 0, None, direction_parameters, None), "PCG direction launch")
+    check(synchronize(), "PCG direction synchronize")
+    check(copy_to_host(PTR(gpu.buffer_info()[0]), device_ptrs[4], len(gpu) * gpu.itemsize), "copy direction output")
+    direction_error = max(abs(a - b) for a, b in zip(x, gpu))
+    if direction_error > 1e-6:
+        raise RuntimeError(f"PCG direction mismatch: max absolute error {direction_error}")
+    print(f"CUDA PCG direction update: nodes={count}, max_abs_error={direction_error:.3e}")
+    check(release(beta_device), "beta free")
+
+    dot_kernel = PTR()
+    check(api("cuModuleGetFunction", INT, ctypes.POINTER(PTR), PTR, ctypes.c_char_p)(ctypes.byref(dot_kernel), module, b"dot_product"), "dot product kernel")
+    partial_count = (count + 255) // 256
+    partials = array("d", [0.0]) * partial_count
+    partial_device = U64()
+    check(allocate(ctypes.byref(partial_device), len(partials) * partials.itemsize), "dot partial allocation")
+    dot_count = U32(count)
+    dot_parameters = (PTR * 4)(
+        ctypes.cast(ctypes.byref(device_ptrs[1]), PTR),
+        ctypes.cast(ctypes.byref(device_ptrs[1]), PTR),
+        ctypes.cast(ctypes.byref(partial_device), PTR),
+        ctypes.cast(ctypes.byref(dot_count), PTR),
+    )
+    check(launch(dot_kernel, partial_count, 1, 1, 256, 1, 1, 0, None, dot_parameters, None), "dot product launch")
+    check(synchronize(), "dot product synchronize")
+    check(copy_to_host(PTR(partials.buffer_info()[0]), partial_device, len(partials) * partials.itemsize), "copy dot partials")
+    actual_dot = sum(partials)
+    expected_dot = sum(value * value for value in x)
+    relative_error = abs(actual_dot - expected_dot) / max(abs(expected_dot), 1e-30)
+    if relative_error > 1e-12:
+        raise RuntimeError(f"CUDA dot product mismatch: relative error {relative_error:.3e}")
+    print(f"CUDA block-reduced dot: nodes={count}, blocks={partial_count}, relative_error={relative_error:.3e}")
+
+    ratio_kernel = PTR()
+    check(api("cuModuleGetFunction", INT, ctypes.POINTER(PTR), PTR, ctypes.c_char_p)(ctypes.byref(ratio_kernel), module, b"scalar_ratio"), "scalar ratio kernel")
+    scalar_inputs = array("d", [4.5, 1.5])
+    check(copy_to_device(partial_device, PTR(scalar_inputs.buffer_info()[0]), len(scalar_inputs) * scalar_inputs.itemsize), "copy scalar inputs")
+    scalar_output = array("f", [0.0])
+    scalar_output_device = U64()
+    check(allocate(ctypes.byref(scalar_output_device), scalar_output.itemsize), "scalar output allocation")
+    numerator_ptr = U64(partial_device.value)
+    denominator_ptr = U64(partial_device.value + scalar_inputs.itemsize)
+    ratio_parameters = (PTR * 3)(
+        ctypes.cast(ctypes.byref(numerator_ptr), PTR),
+        ctypes.cast(ctypes.byref(denominator_ptr), PTR),
+        ctypes.cast(ctypes.byref(scalar_output_device), PTR),
+    )
+    check(launch(ratio_kernel, 1, 1, 1, 256, 1, 1, 0, None, ratio_parameters, None), "scalar ratio launch")
+    check(synchronize(), "scalar ratio synchronize")
+    check(copy_to_host(PTR(scalar_output.buffer_info()[0]), scalar_output_device, scalar_output.itemsize), "copy scalar result")
+    if abs(scalar_output[0] - 3.0) > 1e-6:
+        raise RuntimeError(f"CUDA scalar ratio mismatch: got {scalar_output[0]}")
+    print(f"CUDA scalar ratio: {scalar_inputs[0]} / {scalar_inputs[1]} = {scalar_output[0]}")
+
+    # Exercise the same asynchronous device-side PCG sequence as the engine on
+    # a 2-node SPD block system with an analytic solution.
+    functions = {}
+    for name in (b"block_jacobi", b"pcg_update", b"pcg_update_direction", b"dot_reduce"):
+        function = PTR()
+        check(api("cuModuleGetFunction", INT, ctypes.POINTER(PTR), PTR, ctypes.c_char_p)(ctypes.byref(function), module, name), f"{name.decode()} kernel")
+        functions[name] = function
+
+    def device_buffer(host):
+        pointer = U64()
+        check(allocate(ctypes.byref(pointer), len(host) * host.itemsize), "PCG buffer allocation")
+        if len(host):
+            check(copy_to_device(pointer, PTR(host.buffer_info()[0]), len(host) * host.itemsize), "PCG buffer upload")
+        return pointer
+
+    def launch_args(function, *values):
+        params = (PTR * len(values))(*[ctypes.cast(ctypes.byref(value), PTR) for value in values])
+        check(launch(function, 1, 1, 1, 256, 1, 1, 0, None, params, None), "PCG kernel launch")
+
+    # Production captures at 4,203 active REV use 17 first-stage dot partials.
+    # Check a nonzero residual explicitly; an exactly solved 2-node system can
+    # hide a duplicated-partial multiplier behind its near-zero residual.
+    reduction_input = array("d", range(1, 18))
+    reduction_output = array("d", [0.0])
+    reduction_input_d = device_buffer(reduction_input)
+    reduction_output_d = device_buffer(reduction_output)
+    reduction_count = U32(len(reduction_input))
+    launch_args(functions[b"dot_reduce"], reduction_input_d, reduction_output_d, reduction_count)
+    check(synchronize(), "17-partial reduction synchronize")
+    check(copy_to_host(PTR(reduction_output.buffer_info()[0]), reduction_output_d, reduction_output.itemsize), "17-partial reduction download")
+    if abs(reduction_output[0] - sum(reduction_input)) > 1e-12:
+        raise RuntimeError(f"CUDA 17-partial reduction mismatch: got {reduction_output[0]}, expected {sum(reduction_input)}")
+    print(f"CUDA dot reduction: partials=17, sum={reduction_output[0]:.1f}")
+
+    rhs_host = array("f", [1.0, 2.0, 3.0, 4.0, -1.0, 0.5])
+    zero_host = array("f", [0.0]) * 6
+    diagonal_host = array("f", [2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0] * 2)
+    inverse_host = array("f", [0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5] * 2)
+    invalid = 0xFFFFFFFF
+    neighbors_host = array("I", [1, invalid, invalid, invalid, invalid, invalid,
+                                  invalid, 0, invalid, invalid, invalid, invalid])
+    blocks_host = array("f", [0.0]) * 108
+    for node, edge in ((0, 0), (1, 1)):
+        base = node * 54 + edge * 9
+        for axis in range(3):
+            blocks_host[base + axis * 3 + axis] = -0.2
+
+    diagonal_d = device_buffer(diagonal_host)
+    inverse_d = device_buffer(inverse_host)
+    neighbors_d = device_buffer(neighbors_host)
+    blocks_d = device_buffer(blocks_host)
+    rhs_d = device_buffer(rhs_host)
+    dx_d = device_buffer(zero_host)
+    p_d = device_buffer(zero_host)
+    ap_d = device_buffer(zero_host)
+    z_d = device_buffer(zero_host)
+    dot_partials_d = device_buffer(array("d", [0.0]))
+    rho_a_d = device_buffer(array("d", [0.0]))
+    rho_b_d = device_buffer(array("d", [0.0]))
+    denominator_d = device_buffer(array("d", [0.0]))
+    residual_d = device_buffer(array("d", [0.0]))
+    alpha_d = device_buffer(array("f", [0.0]))
+    beta_d = device_buffer(array("f", [0.0]))
+    beta_zero_d = device_buffer(array("f", [0.0]))
+    n_arg = U32(2)
+
+    launch_args(functions[b"block_jacobi"], inverse_d, rhs_d, z_d, n_arg)
+
+    def pcg_dot(left, right, target):
+        launch_args(dot_kernel, left, right, dot_partials_d, n_arg)
+        one_block = U32(1)
+        launch_args(functions[b"dot_reduce"], dot_partials_d, target, one_block)
+
+    def ratio(numerator, denominator, target):
+        launch_args(ratio_kernel, numerator, denominator, target)
+
+    pcg_dot(rhs_d, z_d, rho_a_d)
+    launch_args(functions[b"pcg_update_direction"], p_d, z_d, beta_zero_d, n_arg)
+    rho_d, rho_next_d = rho_a_d, rho_b_d
+    # Match the engine's fixed configured PCG budget. The analytic system
+    # converges in two iterations; the remaining iterations must not corrupt
+    # an already-converged correction.
+    for _ in range(80):
+        launch_args(kernel, diagonal_d, p_d, neighbors_d, blocks_d, ap_d, n_arg)
+        pcg_dot(p_d, ap_d, denominator_d)
+        ratio(rho_d, denominator_d, alpha_d)
+        launch_args(functions[b"pcg_update"], dx_d, rhs_d, p_d, ap_d, alpha_d, n_arg)
+        launch_args(functions[b"block_jacobi"], inverse_d, rhs_d, z_d, n_arg)
+        pcg_dot(rhs_d, z_d, rho_next_d)
+        ratio(rho_next_d, rho_d, beta_d)
+        launch_args(functions[b"pcg_update_direction"], p_d, z_d, beta_d, n_arg)
+        rho_d, rho_next_d = rho_next_d, rho_d
+    pcg_dot(rhs_d, rhs_d, residual_d)
+    check(synchronize(), "PCG sequence synchronize")
+
+    correction_host = array("f", [0.0]) * 6
+    residual_host = array("d", [0.0])
+    check(copy_to_host(PTR(correction_host.buffer_info()[0]), dx_d, len(correction_host) * correction_host.itemsize), "PCG result download")
+    check(copy_to_host(PTR(residual_host.buffer_info()[0]), residual_d, residual_host.itemsize), "PCG residual download")
+    expected = [0.0] * 6
+    for component in range(3):
+        b0, b1 = rhs_host[component], rhs_host[3 + component]
+        expected[component] = (2.0 * b0 + 0.2 * b1) / 3.96
+        expected[3 + component] = (0.2 * b0 + 2.0 * b1) / 3.96
+    max_correction_error = max(abs(a - b) for a, b in zip(correction_host, expected))
+    initial_norm = sum(value * value for value in rhs_host) ** 0.5
+    relative_residual = residual_host[0] ** 0.5 / initial_norm
+    if relative_residual > 1e-5 or max_correction_error > 1e-5:
+        raise RuntimeError(f"CUDA PCG mismatch: relative residual={relative_residual:.3e}, max correction error={max_correction_error:.3e}")
+    print(f"CUDA device-resident PCG: nodes=2, iterations=80, relative_residual={relative_residual:.3e}, max_correction_error={max_correction_error:.3e}")
+
+    for pointer in (diagonal_d, inverse_d, neighbors_d, blocks_d, rhs_d, dx_d, p_d, ap_d, z_d,
+                    dot_partials_d, rho_a_d, rho_b_d, denominator_d, residual_d,
+                    alpha_d, beta_d, beta_zero_d):
+        check(release(pointer), "PCG buffer free")
+
     iterations = 100
     start = time.perf_counter()
     for _ in range(iterations):
@@ -122,6 +336,8 @@ def main():
 
     for pointer in device_ptrs:
         check(release(pointer), "cuMemFree")
+    check(release(partial_device), "dot partial free")
+    check(release(scalar_output_device), "scalar output free")
     check(api("cuModuleUnload", INT, PTR)(module), "cuModuleUnload")
     check(api("cuCtxDestroy_v2", INT, PTR)(context), "cuCtxDestroy")
 

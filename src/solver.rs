@@ -973,6 +973,7 @@ pub(crate) struct SolverScratch {
     rhs: Vec<Vec3>,
     constraints: Vec<Constraint>,
     pcg_rows: Vec<PcgRow>,
+    cuda_neighbors: Vec<[u32; 6]>,
     cuda_blocks: Vec<[f32; 54]>,
     cuda_diagonal: Vec<[f32; 9]>,
     cuda_inverse: Vec<[f32; 9]>,
@@ -1326,11 +1327,13 @@ fn solve_coupled(
         _ => active_count >= 2_048,
     };
     if try_cuda {
+        scratch.cuda_neighbors.resize(active_count, [u32::MAX; 6]);
         scratch.cuda_blocks.resize(active_count, [0.0; 54]);
         scratch.cuda_blocks.fill([0.0; 54]);
         scratch.cuda_diagonal.resize(active_count, [0.0; 9]);
         scratch.cuda_inverse.resize(active_count, [0.0; 9]);
         for (slot, &i) in active.iter().enumerate() {
+            scratch.cuda_neighbors[slot] = scratch.pcg_rows[slot].neighbors;
             let row_projection = Mat3::from_diagonal(scratch.free[i]);
             for (edge_slot, &edge) in incidence[i][..incidence_len[i] as usize].iter().enumerate() {
                 let neighbor = pcg_rows[slot].neighbors[edge_slot];
@@ -1380,11 +1383,7 @@ fn solve_coupled(
         }
         match crate::cuda_solver::solve_pcg(
             &scratch.r,
-            &scratch
-                .pcg_rows
-                .iter()
-                .map(|row| row.neighbors)
-                .collect::<Vec<_>>(),
+            &scratch.cuda_neighbors,
             &scratch.cuda_diagonal,
             &scratch.cuda_blocks,
             &scratch.cuda_inverse,

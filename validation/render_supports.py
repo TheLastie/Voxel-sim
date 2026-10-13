@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Render real support_capture states; no scripted motion or interpolation."""
-import csv, math, json, sys
+import csv, math, json, sys, subprocess
 from pathlib import Path
 from PIL import Image,ImageDraw,ImageFont
 src=Path(sys.argv[1]); out=Path(sys.argv[2]);out.mkdir(exist_ok=True)
@@ -131,4 +131,10 @@ for index,n in enumerate(ordered):
  stats.append({'frame':n,'broken':int(f['f'][9]),'drift_m':f['f'][11],'probe_bottom_m':bottom})
  if index%30==0:print('render',index,'/',len(ordered),flush=True)
 Path(str(src)+'.render.json').write_text(json.dumps({'frames':len(ordered),'dt':dt,'seconds':steps*dt,'stats':stats},indent=2))
-print('done',len(ordered))
+gif=src.with_suffix('.gif');video=src.with_suffix('.mp4')
+sequence=str(out/'%05d.png')
+subprocess.run(['ffmpeg','-y','-hide_banner','-loglevel','error','-framerate','10','-i',sequence,
+ '-filter_complex','[0:v]split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer',str(gif)],check=True)
+subprocess.run(['ffmpeg','-y','-hide_banner','-loglevel','error','-framerate','10','-i',sequence,
+ '-c:v','libx264','-pix_fmt','yuv420p','-crf','18','-movflags','+faststart',str(video)],check=True)
+print('done',len(ordered),'GIF',gif,'MP4',video)

@@ -122,8 +122,14 @@ by the CUDA Driver API. In WSL, wgpu currently sees llvmpipe while CUDA can
 access the host RTX 5060. `python3 validation/cuda_probe.py` JIT-compiles a PTX
 vector kernel and checks its output. `python3 validation/cuda_sparse_probe.py`
 checks the block sparse matrix-vector operator used by PCG on CUDA against a
-CPU reference. This is still a standalone synthetic probe: the physics solver
-and its preconditioner continue to run on CPU.
+CPU reference. The engine can run its assembled PCG solve on CUDA: set
+`VOXEL_SOLVER_BACKEND=cuda`, or leave it as `auto` to try CUDA for systems with
+at least 2,048 active REV. Matrix assembly remains on the CPU; matvec, block
+Jacobi preconditioning, vector updates and reductions run on CUDA. If the
+device is unavailable or the requested residual tolerance is not reached, the
+solver falls back to its CPU path. The sparse probe is synthetic and does not
+measure full simulation speed; verified 30 FPS CPU and 60 FPS GPU targets have
+not yet been reached.
 
 ```sh
 cargo test --no-default-features --lib

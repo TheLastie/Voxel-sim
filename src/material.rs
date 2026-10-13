@@ -331,10 +331,18 @@ impl Material {
     }
     pub fn mixed(c: &Composition, table: &[Self]) -> Self {
         let mut result = table[c.components[0].0 as usize].clone();
+        // Composition fractions are mass fractions. Specific volumes therefore
+        // add linearly: v_mix = Σ(w_i / ρ_i), ρ_mix = 1 / v_mix.
+        // An arithmetic density average would violate the mass/volume meaning
+        // of the composition and give every mixed REV the wrong physical mass.
+        result.density = 1.0
+            / c.components
+                .iter()
+                .map(|&(id, fraction)| fraction / table[id as usize].density)
+                .sum::<f32>();
         macro_rules! mix { ($($field:ident),*) => { $(result.$field = c.components.iter()
             .map(|&(id, f)| table[id as usize].$field * f).sum();)* }; }
         mix!(
-            density,
             young,
             young_perp,
             shear,

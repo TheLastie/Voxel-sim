@@ -67,8 +67,8 @@ LOOP:
     ld.global.f32 %f15, [%rd13+4];
     ld.global.f32 %f16, [%rd13+8];
 
-    mul.lo.u32 %r10, %r7, 36;
-    // Each packed 3x3 edge block contains 36 f32 values (144 bytes).
+    mul.lo.u32 %r10, %r7, 9;
+    // Each packed 3x3 edge block contains 9 f32 values (36 bytes).
     mul.wide.u32 %rd14, %r10, 4;
     add.u64 %rd15, %rd4, %rd14;
     ld.global.f32 %f17, [%rd15];
@@ -158,18 +158,19 @@ J_DONE:
     .param .u64 r_ptr,
     .param .u64 p_ptr,
     .param .u64 ap_ptr,
-    .param .f32 alpha,
+    .param .u64 alpha_ptr,
     .param .u32 count
 ) {
     .reg .pred %p<2>;
     .reg .b32 %r<7>;
-    .reg .b64 %rd<9>;
+    .reg .b64 %rd<10>;
     .reg .f32 %f<6>;
     ld.param.u64 %rd1, [dx_ptr];
     ld.param.u64 %rd2, [r_ptr];
     ld.param.u64 %rd3, [p_ptr];
     ld.param.u64 %rd4, [ap_ptr];
-    ld.param.f32 %f1, [alpha];
+    ld.param.u64 %rd9, [alpha_ptr];
+    ld.global.f32 %f1, [%rd9];
     ld.param.u32 %r1, [count];
     mov.u32 %r2, %ctaid.x;
     mov.u32 %r3, %ntid.x;
@@ -198,7 +199,7 @@ U_DONE:
 .visible .entry pcg_update_direction(
     .param .u64 p_ptr,
     .param .u64 z_ptr,
-    .param .f32 beta,
+    .param .u64 beta_ptr,
     .param .u32 count
 ) {
     .reg .pred %p<2>;
@@ -207,7 +208,8 @@ U_DONE:
     .reg .f32 %f<4>;
     ld.param.u64 %rd1, [p_ptr];
     ld.param.u64 %rd2, [z_ptr];
-    ld.param.f32 %f1, [beta];
+    ld.param.u64 %rd5, [beta_ptr];
+    ld.global.f32 %f1, [%rd5];
     ld.param.u32 %r1, [count];
     mov.u32 %r2, %ctaid.x;
     mov.u32 %r3, %ntid.x;
@@ -233,10 +235,11 @@ D_DONE:
     .param .u32 count
 ) {
     .reg .pred %p<2>;
-    .reg .b32 %r<6>;
-    .reg .b64 %rd<8>;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<10>;
     .reg .f32 %f<7>;
     .reg .f64 %fd<4>;
+    .shared .align 8 .b8 dot_shared[2048];
     ld.param.u64 %rd1, [left_ptr];
     ld.param.u64 %rd2, [right_ptr];
     ld.param.u64 %rd3, [output_ptr];
@@ -246,7 +249,7 @@ D_DONE:
     mov.u32 %r4, %tid.x;
     mad.lo.u32 %r5, %r2, %r3, %r4;
     setp.ge.u32 %p1, %r5, %r1;
-    @%p1 bra DOT_DONE;
+    @%p1 bra DOT_ZERO;
     mul.wide.u32 %rd4, %r5, 12;
     add.u64 %rd5, %rd1, %rd4;
     add.u64 %rd4, %rd2, %rd4;
@@ -266,8 +269,129 @@ D_DONE:
     cvt.f64.f32 %fd2, %f6;
     fma.rn.f64 %fd3, %fd1, %fd2, %fd3;
     mul.wide.u32 %rd6, %r5, 8;
-    add.u64 %rd7, %rd3, %rd6;
-    st.global.f64 [%rd7], %fd3;
+    bra DOT_STORE;
+DOT_ZERO:
+    mov.f64 %fd3, 0d0000000000000000;
+DOT_STORE:
+    mul.wide.u32 %rd8, %r4, 8;
+    mov.u64 %rd9, dot_shared;
+    add.u64 %rd9, %rd9, %rd8;
+    st.shared.f64 [%rd9], %fd3;
+    bar.sync 0;
+    mov.u32 %r6, 128;
+DOT_REDUCE:
+    setp.ge.u32 %p1, %r4, %r6;
+    @%p1 bra DOT_SKIP_ADD;
+    mul.wide.u32 %rd8, %r4, 8;
+    mov.u64 %rd9, dot_shared;
+    add.u64 %rd9, %rd9, %rd8;
+    mul.wide.u32 %rd7, %r6, 8;
+    add.u64 %rd7, %rd7, %rd9;
+    ld.shared.f64 %fd1, [%rd9];
+    ld.shared.f64 %fd2, [%rd7];
+    add.f64 %fd3, %fd1, %fd2;
+    st.shared.f64 [%rd9], %fd3;
+DOT_SKIP_ADD:
+    bar.sync 0;
+    shr.u32 %r6, %r6, 1;
+    setp.ne.u32 %p1, %r6, 0;
+    @%p1 bra DOT_REDUCE;
+    setp.ne.u32 %p1, %r4, 0;
+    @%p1 bra DOT_DONE;
+    mov.u64 %rd9, dot_shared;
+    ld.shared.f64 %fd3, [%rd9];
+    mul.wide.u32 %rd8, %r2, 8;
+    add.u64 %rd9, %rd3, %rd8;
+    st.global.f64 [%rd9], %fd3;
 DOT_DONE:
+    ret;
+}
+.visible .entry dot_reduce(
+    .param .u64 partial_ptr,
+    .param .u64 output_ptr,
+    .param .u32 count
+) {
+    .reg .pred %p<3>;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<10>;
+    .reg .f64 %fd<5>;
+    .shared .align 8 .b8 reduce_shared[2048];
+    ld.param.u64 %rd1, [partial_ptr];
+    ld.param.u64 %rd2, [output_ptr];
+    ld.param.u32 %r1, [count];
+    mov.u32 %r2, %tid.x;
+    // Each lane starts at its own partial; starting every lane at zero
+    // multiplies the final reduction by the block width (256).
+    mov.u32 %r3, %r2;
+    mov.f64 %fd1, 0d0000000000000000;
+REDUCE_LOAD:
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra REDUCE_STORE;
+    mul.wide.u32 %rd3, %r3, 8;
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.f64 %fd2, [%rd4];
+    add.f64 %fd1, %fd1, %fd2;
+    add.u32 %r3, %r3, 256;
+    bra REDUCE_LOAD;
+REDUCE_STORE:
+    mul.wide.u32 %rd3, %r2, 8;
+    mov.u64 %rd4, reduce_shared;
+    add.u64 %rd4, %rd4, %rd3;
+    st.shared.f64 [%rd4], %fd1;
+    bar.sync 0;
+    mov.u32 %r4, 128;
+REDUCE_TREE:
+    setp.ge.u32 %p2, %r2, %r4;
+    @%p2 bra REDUCE_SKIP_ADD;
+    mul.wide.u32 %rd3, %r2, 8;
+    mov.u64 %rd4, reduce_shared;
+    add.u64 %rd4, %rd4, %rd3;
+    mul.wide.u32 %rd5, %r4, 8;
+    add.u64 %rd5, %rd5, %rd4;
+    ld.shared.f64 %fd2, [%rd4];
+    ld.shared.f64 %fd3, [%rd5];
+    add.f64 %fd2, %fd2, %fd3;
+    st.shared.f64 [%rd4], %fd2;
+REDUCE_SKIP_ADD:
+    bar.sync 0;
+    shr.u32 %r4, %r4, 1;
+    setp.ne.u32 %p2, %r4, 0;
+    @%p2 bra REDUCE_TREE;
+    setp.ne.u32 %p2, %r2, 0;
+    @%p2 bra REDUCE_DONE;
+    mov.u64 %rd4, reduce_shared;
+    ld.shared.f64 %fd1, [%rd4];
+    st.global.f64 [%rd2], %fd1;
+REDUCE_DONE:
+    ret;
+}
+.visible .entry scalar_ratio(
+    .param .u64 numerator_ptr,
+    .param .u64 denominator_ptr,
+    .param .u64 output_ptr
+) {
+    .reg .pred %p<3>;
+    .reg .b32 %r<2>;
+    .reg .b64 %rd<5>;
+    .reg .f32 %f<2>;
+    .reg .f64 %fd<4>;
+    ld.param.u64 %rd1, [numerator_ptr];
+    ld.param.u64 %rd2, [denominator_ptr];
+    ld.param.u64 %rd3, [output_ptr];
+    mov.u32 %r1, %tid.x;
+    setp.ne.u32 %p2, %r1, 0;
+    @%p2 bra RATIO_DONE;
+    ld.global.f64 %fd1, [%rd1];
+    ld.global.f64 %fd2, [%rd2];
+    setp.gt.f64 %p1, %fd2, 1.0e-30;
+    @!%p1 bra RATIO_ZERO;
+    div.rn.f64 %fd3, %fd1, %fd2;
+    cvt.rn.f32.f64 %f1, %fd3;
+    bra RATIO_STORE;
+RATIO_ZERO:
+    mov.f32 %f1, 0f00000000;
+RATIO_STORE:
+    st.global.f32 [%rd3], %f1;
+RATIO_DONE:
     ret;
 }
