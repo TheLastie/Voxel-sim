@@ -857,6 +857,20 @@ struct Constraint {
     k: Mat3,
     rest: Vec3,
 }
+
+#[derive(Clone, Copy)]
+struct PcgRow {
+    neighbors: [u32; 6],
+}
+
+impl Default for PcgRow {
+    fn default() -> Self {
+        Self {
+            neighbors: [u32::MAX; 6],
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct SolverScratch {
     free: Vec<Vec3>,
@@ -872,6 +886,7 @@ pub(crate) struct SolverScratch {
     preconditioner_work: Vec<Vec3>,
     rhs: Vec<Vec3>,
     constraints: Vec<Constraint>,
+    pcg_rows: Vec<PcgRow>,
     dx: Vec<Vec3>,
     ap: Vec<Vec3>,
     r: Vec<Vec3>,
@@ -1151,20 +1166,35 @@ fn solve_coupled(
     let incidence = &scratch.incidence;
     let incidence_len = &scratch.incidence_len;
     let constraints = &scratch.constraints;
+    scratch.pcg_rows.resize(active.len(), PcgRow::default());
+    for (slot, &i) in active.iter().enumerate() {
+        let row = &mut scratch.pcg_rows[slot];
+        for (edge_slot, &edge) in incidence[i][..incidence_len[i] as usize].iter().enumerate() {
+            let constraint = &constraints[edge as usize];
+            let neighbor = if constraint.i == i {
+                constraint.j
+            } else {
+                constraint.i
+            };
+            row.neighbors[edge_slot] = active_index[neighbor];
+        }
+    }
+    let pcg_rows = &scratch.pcg_rows;
     let apply = |v: &[Vec3], out: &mut [Vec3]| {
         let apply_one = |(slot, out): (usize, &mut Vec3)| {
             let i = active[slot];
             let vi = v[slot];
             let mut value = vi * masses[i];
-            for &edge in &incidence[i][..incidence_len[i] as usize] {
-                let c = &constraints[edge as usize];
-                let j = if c.i == i { c.j } else { c.i };
-                let vj = if active_index[j] == u32::MAX {
+            for (edge_slot, &edge_id) in
+                incidence[i][..incidence_len[i] as usize].iter().enumerate()
+            {
+                let neighbor = pcg_rows[slot].neighbors[edge_slot];
+                let vj = if neighbor == u32::MAX {
                     Vec3::ZERO
                 } else {
-                    v[active_index[j] as usize]
+                    v[neighbor as usize]
                 };
-                value += c.k * (vi - vj);
+                value += constraints[edge_id as usize].k * (vi - vj);
             }
             *out = value * free[i];
         };
