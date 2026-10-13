@@ -414,6 +414,11 @@ pub fn step_with_axis_targets_and_loads(
     let mut solve_detail_time = [Duration::ZERO; 3];
     // Reuse large solver buffers across substeps and corotation corrections.
     let mut solver_scratch = std::mem::take(&mut scene.solver_scratch);
+    // A failed device solve is unlikely to recover on another corotation
+    // iteration/substep of this same fixed step (same device and scene state).
+    // Fall back once, then avoid repeating the costly CUDA setup until the next
+    // fixed step, where the matrix and residual have changed.
+    let mut cuda_enabled_for_step = true;
     for _ in 0..scene.config.substeps {
         let mut phase_start = Instant::now();
         scene.previous.clone_from(&scene.positions);
@@ -473,6 +478,7 @@ pub fn step_with_axis_targets_and_loads(
                 &predicted,
                 &mut solver_scratch,
                 iteration > 0,
+                &mut cuda_enabled_for_step,
             );
             total_pcg_iterations += iterations;
             for index in 0..solve_detail_time.len() {
@@ -1157,6 +1163,7 @@ fn solve_coupled(
     predicted: &[Vec3],
     scratch: &mut SolverScratch,
     reuse_preconditioner: bool,
+    cuda_enabled_for_step: &mut bool,
 ) -> (usize, [Duration; 3]) {
     let assembly_start = Instant::now();
     let n = scene.voxels.len();
@@ -1321,11 +1328,12 @@ fn solve_coupled(
     let pcg_start = Instant::now();
     let backend = std::env::var("VOXEL_SOLVER_BACKEND").unwrap_or_else(|_| "auto".into());
     let mut cuda_solution = None;
-    let try_cuda = match backend.as_str() {
-        "cpu" => false,
-        "cuda" => true,
-        _ => active_count >= 2_048,
-    };
+    let try_cuda = *cuda_enabled_for_step
+        && match backend.as_str() {
+            "cpu" => false,
+            "cuda" => true,
+            _ => active_count >= 2_048,
+        };
     if try_cuda {
         scratch.cuda_neighbors.resize(active_count, [u32::MAX; 6]);
         scratch.cuda_blocks.resize(active_count, [0.0; 54]);
@@ -1396,6 +1404,7 @@ fn solve_coupled(
                 cuda_solution = Some(iterations);
             }
             Err(error) => {
+                *cuda_enabled_for_step = false;
                 static REPORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
                 REPORTED.get_or_init(|| eprintln!("CUDA PCG unavailable; using CPU PCG: {error}"));
             }
