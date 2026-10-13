@@ -126,7 +126,18 @@ pub fn resolve_velocities(
     contacts: &[Contact],
     targets: &[[Option<f32>; 3]],
 ) -> Vec<f32> {
+    let pre_contact_velocities: Vec<_> = scene.voxels.iter().map(|voxel| voxel.velocity).collect();
+    resolve_velocities_with_precontact(scene, contacts, targets, &pre_contact_velocities)
+}
+
+pub(crate) fn resolve_velocities_with_precontact(
+    scene: &mut Scene,
+    contacts: &[Contact],
+    targets: &[[Option<f32>; 3]],
+    pre_contact_velocities: &[Vec3],
+) -> Vec<f32> {
     let mut normal_impulses = vec![0.0; contacts.len()];
+    let mut physical_velocities = pre_contact_velocities.to_vec();
     for iteration in 0..4 {
         let mut changed = false;
         for (contact_index, c) in contacts.iter().enumerate() {
@@ -149,11 +160,33 @@ pub fn resolve_velocities(
                 };
                 normal_impulse = -(1.0 + restitution) * closing / denom;
                 normal_impulses[contact_index] += normal_impulse;
+                let physical_closing =
+                    (physical_velocities[c.j] - physical_velocities[c.i]).dot(c.normal);
+                let physical_impulse = if c.new_impact {
+                    normal_impulse
+                } else if physical_closing < -1e-6 {
+                    (-physical_closing / denom).min(normal_impulse)
+                } else {
+                    0.0
+                };
                 scene.voxels[c.i].velocity -= c.normal * (normal_impulse * wi);
                 scene.voxels[c.j].velocity += c.normal * (normal_impulse * wj);
-                let restitution_heat = (normal_impulse as f64 * -(closing as f64)
-                    - 0.5 * (normal_impulse as f64).powi(2) * denom as f64)
-                    .max(0.0);
+                // A persistent manifold can receive a solver impulse solely
+                // to balance this substep's applied load. Track only the
+                // incoming kinetic component that existed before that solve.
+                let heat_closing = if c.new_impact {
+                    closing
+                } else {
+                    physical_closing
+                };
+                let heat_impulse = physical_impulse;
+                let restitution_heat = if heat_closing < -1e-6 && heat_impulse > 0.0 {
+                    (heat_impulse as f64 * -(heat_closing as f64)
+                        - 0.5 * (heat_impulse as f64).powi(2) * denom as f64)
+                        .max(0.0)
+                } else {
+                    0.0
+                };
                 if restitution_heat > 0.0 {
                     let i_free = wi > 0.0;
                     let j_free = wj > 0.0;
@@ -167,6 +200,8 @@ pub fn resolve_velocities(
                     }
                     scene.energy.contact_restitution_heat += restitution_heat;
                 }
+                physical_velocities[c.i] -= c.normal * (physical_impulse * wi);
+                physical_velocities[c.j] += c.normal * (physical_impulse * wj);
                 changed = true;
             }
 
@@ -749,6 +784,33 @@ mod tests {
             (internal_gain - total_contact_heat).abs() <= internal_storage_tolerance,
             "internal gain={internal_gain:.12e}, contact heat={total_contact_heat:.12e}, initial internal={internal_before:.12e}, tolerance={internal_storage_tolerance:.12e}"
         );
+    }
+
+    #[test]
+    fn resting_contact_under_compression_does_not_accumulate_impact_heat() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [2, 1, 1];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        config.gravity = [0.0; 3];
+        config.fixed_dt = 0.01;
+        config.substeps = 2;
+        config.iterations = 1;
+        config.corotation_iterations = 1;
+        config.fracture.friction = 0.0;
+        config.fracture.restitution = 0.0;
+        let mut scene = Scene::new(config);
+        scene.bonds[0][0].neighbor = EMPTY;
+        scene.voxels[0].velocity = Vec3::ZERO;
+        scene.voxels[1].velocity = Vec3::ZERO;
+        scene.workspace[0][0].rest_neighbor = EMPTY;
+        solver::set_force(&mut scene, 0, Vec3::X * 0.1).unwrap();
+        solver::set_force(&mut scene, 1, Vec3::NEG_X * 0.1).unwrap();
+        for _ in 0..20 {
+            solver::step(&mut scene, &mut None);
+        }
+        assert!((scene.positions[1] - scene.positions[0]).length() <= CELL + 2e-6);
+        assert_eq!(scene.energy.contact_restitution_heat, 0.0);
     }
 
     #[test]

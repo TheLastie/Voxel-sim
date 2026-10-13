@@ -811,7 +811,7 @@ pending fusion), plus an external-work ledger check. Full CPU test suite passes
 1120×700, 10 fps and 17.7 s.
 
 
-The follow-up diagnostic request is included in each saved `L` row: cumulative
+Before the contact heat correction, the follow-up diagnostic request was included in each saved `L` row; those measurements are historical and are superseded by the correction below. It recorded: cumulative
 contact restitution heat, contact friction heat, plastic heat, damage heat,
 fusion heat, and engine external work. Final channels are respectively
 `1.114864458e-3 J`, `0`, `0`, `0`, `2.094925452e-7 J`, and
@@ -820,3 +820,45 @@ is `4.947903454e-4 J`, and contact restitution heat is `9.955282255e-4 J`;
 these values point toward the contact/integration path as where the energy
 discrepancy appears, but do not isolate a single faulty operation. The new
 frame renderer shows the channels and residual.
+
+
+##### Contact impulse heat correction
+
+The diagnostic localized most of the earlier energy residual to normal impulses
+repeated on the persistent compressed contact: those impulses had been counted
+as impact heat each substep even though the incoming velocity was produced only
+by the current force/contact correction. `resolve_velocities_with_precontact`
+now tracks a separate physical velocity component that begins from the drift/tool
+velocity before the coupled load solve. Persistent-contact impulses remove
+heat only from that incoming component; new impacts still use the full resolved
+impact impulse, and pressure/dwell continues to use the complete normal impulse.
+A solver regression checks 20 loaded resting-contact steps with no accumulated
+impact heat, and the fracture-generated fragment collision regression still
+passes.
+
+Repeated release CPU capture: automatic fusion remains at step 12, with 177
+actual states over 17.6 s. Contact restitution heat is `5.181831960e-4 J`;
+friction/plastic/damage heat are zero; fusion heat is `2.094925452e-7 J`; engine
+external work is `4.998999292e-4 J`; residual is `+1.744532031e-5 J`, 3.49%
+of measured work and 35.2 times smaller than the earlier residual. The residual
+remains visible and is not called closed. GIF/MP4 were regenerated with these
+per-frame channels. Full CPU suite: 86/86.
+
+#### External-work quadrature follow-up
+
+The per-step D rows showed that the earlier mismatch began before fusion.
+Updated the engine ledger to follow the integrator: free/new-impact substeps use
+midpoint velocity from the start and load-integrated state before contact
+impulse; a persistent contact uses its constrained displacement. The free-body
+constant-load regression verifies external work against kinetic-energy change.
+The capture now gates `abs(energy_residual) / abs(external_work) <= 1e-5`.
+
+Final release CPU capture: 1,760 physical steps, 177 actual states over 17.6 s,
+automatic fusion at step 12, mass `0.016829997 kg`, Fe/Cu fractions
+`0.46761733/0.53238267`, momentum error `3.601e-8 kg*m/s`, external work
+`5.173444941e-4 J`, energy residual `7.553650965e-10 J` (`1.460e-6` of work),
+so the strict gate passes with about 6.8x margin. D rows show `1.88e-10 J` at
+step 1, a maximum about `7.86e-10 J` at step 4, then `7.55e-10 J` through
+fusion/end. Restitution heat is `5.181831960e-4 J`; friction, plastic and damage
+heat are zero; fusion heat is `2.094925452e-7 J`. GIF and MP4 each contain 177
+real frames at 1120x700 and 10 fps. CPU suite passes 86/86.

@@ -475,9 +475,14 @@ pub fn step_with_axis_targets_and_loads(
     // fixed step, where the matrix and residual have changed.
     let mut cuda_enabled_for_step = true;
     let mut substep_start_positions = Vec::with_capacity(scene.positions.len());
+    let mut substep_start_velocities = Vec::with_capacity(scene.voxels.len());
+    let mut load_integrated_velocities = vec![Vec3::ZERO; scene.voxels.len()];
+    let mut contact_work_mode = vec![0u8; scene.voxels.len()];
     for _ in 0..scene.config.substeps {
         let mut phase_start = Instant::now();
         substep_start_positions.clone_from(&scene.positions);
+        substep_start_velocities.clear();
+        substep_start_velocities.extend(scene.voxels.iter().map(|voxel| voxel.velocity));
         scene.previous.clone_from(&scene.positions);
         let mut drift_velocity = vec![Vec3::ZERO; scene.voxels.len()];
         for (i, (p, v)) in scene
@@ -558,7 +563,18 @@ pub fn step_with_axis_targets_and_loads(
         // subtracting two large f32 positions every step otherwise accumulates
         // measurable kinetic error in simple free fall.
         let solved_positions = scene.positions.clone();
+        let pre_contact_velocities: Vec<_> = drift_velocity
+            .iter()
+            .zip(&contact_velocity)
+            .map(|(&drift, &contact)| drift + contact)
+            .collect();
         let contacts = collision::project(scene, targets);
+        contact_work_mode.fill(0);
+        for contact in &contacts {
+            let mode = if contact.new_impact { 2 } else { 1 };
+            contact_work_mode[contact.i] = contact_work_mode[contact.i].max(mode);
+            contact_work_mode[contact.j] = contact_work_mode[contact.j].max(mode);
+        }
         let impact_energies_j: Vec<f64> = contacts
             .iter()
             .map(|contact| {
@@ -651,8 +667,14 @@ pub fn step_with_axis_targets_and_loads(
                     }
                 }
             }
+            load_integrated_velocities[i] = scene.voxels[i].velocity;
         }
-        let normal_impulses_ns = collision::resolve_velocities(scene, &contacts, targets);
+        let normal_impulses_ns = collision::resolve_velocities_with_precontact(
+            scene,
+            &contacts,
+            targets,
+            &pre_contact_velocities,
+        );
         collision::resolve_liquid_viscosity(scene, &contacts, targets, h);
         let formed_bonds =
             scene.form_thermal_bonds(&contacts, &impact_energies_j, &normal_impulses_ns, h);
@@ -677,8 +699,17 @@ pub fn step_with_axis_targets_and_loads(
         for i in 0..scene.voxels.len() {
             if !scene.voxels[i].kinematic {
                 let applied_force = applied_loads[i] + gravity * scene.voxels[i].mass;
-                scene.energy.external_work +=
-                    applied_force.dot(scene.positions[i] - substep_start_positions[i]) as f64;
+                let work = match contact_work_mode[i] {
+                    // Use the velocity quadrature of the force/integration
+                    // phase before an impact impulse is applied.
+                    0 | 2 => applied_force.dot(
+                        (substep_start_velocities[i] + load_integrated_velocities[i]) * (0.5 * h),
+                    ),
+                    // A persistent contact constrains the actual projected
+                    // displacement, so don't count its trial velocity as work.
+                    _ => applied_force.dot(scene.positions[i] - substep_start_positions[i]),
+                };
+                scene.energy.external_work += work as f64;
             }
         }
         scene.substep_index += 1;
@@ -863,16 +894,22 @@ mod tests {
     fn persistent_force_and_acceleration_use_voxel_mass() {
         let mut s = free_voxel();
         let mass = s.voxels[0].mass;
-        let initial_position = s.positions[0];
+        let initial_velocity = s.voxels[0].velocity;
         set_force(&mut s, 0, Vec3::X * (3.0 * mass)).unwrap();
         set_acceleration(&mut s, 0, Vec3::Y * 2.0).unwrap();
         let mut tool = None;
         step(&mut s, &mut tool);
         assert!((s.voxels[0].velocity.x - 0.03).abs() < 1e-5);
         assert!((s.voxels[0].velocity.y - 0.02).abs() < 1e-5);
-        let expected_work = (Vec3::X * (3.0 * mass) + Vec3::Y * (2.0 * mass))
-            .dot(s.positions[0] - initial_position) as f64;
+        let total_force = Vec3::X * (3.0 * mass) + Vec3::Y * (2.0 * mass);
+        let expected_work = total_force
+            .dot((initial_velocity + s.voxels[0].velocity) * (0.5 * s.config.fixed_dt))
+            as f64;
         assert!((s.energy.external_work - expected_work).abs() < 1e-10);
+        let kinetic_change = 0.5
+            * mass as f64
+            * (s.voxels[0].velocity.length_squared() - initial_velocity.length_squared()) as f64;
+        assert!((s.energy.external_work - kinetic_change).abs() < 1e-10);
         step(&mut s, &mut tool);
         assert!((s.voxels[0].velocity.x - 0.06).abs() < 1e-5);
         assert!((s.voxels[0].velocity.y - 0.04).abs() < 1e-5);
@@ -907,6 +944,18 @@ mod tests {
         set_force(&mut s, 0, Vec3::X * 0.1).unwrap();
         set_force(&mut s, 1, Vec3::NEG_X * 0.1).unwrap();
         s.set_thermal_fusion_rule(350.0, 900.0, 0.1).unwrap();
+        let total_energy = |scene: &Scene| {
+            scene
+                .voxels
+                .iter()
+                .map(|voxel| {
+                    voxel.total_internal_energy_j()
+                        + 0.5 * voxel.mass as f64 * voxel.velocity.length_squared() as f64
+                })
+                .sum::<f64>()
+        };
+        let initial_energy = total_energy(&s);
+        let initial_external_work = s.energy.external_work;
         let mut tool = None;
         for _ in 0..20 {
             step(&mut s, &mut tool);
@@ -918,6 +967,12 @@ mod tests {
         assert!(s.energy.fusion_heat > 0.0);
         assert!(s.energy.external_work > 0.0);
         assert_eq!(s.cluster_count, 1);
+        let residual =
+            total_energy(&s) - initial_energy - (s.energy.external_work - initial_external_work);
+        assert!(
+            residual.abs() < 1e-7,
+            "automatic fusion energy residual={residual:.12e} J"
+        );
     }
     #[test]
     fn velocity_and_impulse_are_mass_consistent() {

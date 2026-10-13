@@ -22,6 +22,7 @@ const COMPRESSION_FORCE_N: f32 = 0.1;
 const FUSION_TEMPERATURE_K: f32 = 350.0;
 const FUSION_PRESSURE_PA: f32 = 900.0;
 const FUSION_DWELL_S: f32 = 0.1;
+const ENERGY_RESIDUAL_FRACTION_OF_WORK: f64 = 1.0e-5;
 
 fn kinetic(scene: &Scene) -> f64 {
     scene
@@ -130,8 +131,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     writeln!(out, "R,compression_force,{COMPRESSION_FORCE_N}")?;
     writeln!(
         out,
-        "R,external_work,applied_loads_plus_gravity_dot_substep_displacement"
+        "R,external_work,midpoint_velocity_free_or_new_impact;projected_displacement_persistent_contact"
     )?;
+    writeln!(out, "R,fixed_step_diagnostics,U,K,work,Q_restitution,Q_friction,Q_plastic,Q_damage,Q_fusion,residual")?;
     let mut fused_at = None;
     let initial_external_work_j = scene.energy.external_work;
     let start = Instant::now();
@@ -140,6 +142,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for step in 1..=STEPS {
         scene.tick();
         let external_work_j = scene.energy.external_work - initial_external_work_j;
+        let step_internal = internal(&scene);
+        let step_kinetic = kinetic(&scene);
+        let residual =
+            step_internal + step_kinetic - initial_internal - initial_kinetic - external_work_j;
+        writeln!(out, "D,{step},{step_internal:.12e},{step_kinetic:.12e},{external_work_j:.12e},{:.12e},{:.12e},{:.12e},{:.12e},{:.12e},{residual:.12e}",
+            scene.energy.contact_restitution_heat,
+            scene.energy.contact_friction_heat,
+            scene.energy.plastic_heat,
+            scene.energy.damage_heat,
+            scene.energy.fusion_heat)?;
         if fused_at.is_none() && scene.voxels.len() == 1 {
             fused_at = Some(step);
             writeln!(out, "E,{step},fusion,iron_copper")?;
@@ -148,10 +160,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if step % STRIDE == 0 {
             write_frame(&mut out, &scene, step)?;
-            let residual = internal(&scene) + kinetic(&scene)
-                - initial_internal
-                - initial_kinetic
-                - external_work_j;
             writeln!(out, "W,{step},{external_work_j:.12e},{residual:.12e}")?;
         }
     }
@@ -159,6 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let external_work_j = scene.energy.external_work - initial_external_work_j;
     let energy_error =
         internal(&scene) + kinetic(&scene) - initial_internal - initial_kinetic - external_work_j;
+    let energy_tolerance_j = external_work_j.abs() * ENERGY_RESIDUAL_FRACTION_OF_WORK;
     let momentum_error = (momentum(&scene) - initial_momentum).length();
     let composition_ok = scene.voxels.len() == 1
         && scene.voxels[0].composition.components.len() == 2
@@ -183,8 +192,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || (scene.total_mass_kg() - initial_mass).abs() > 1e-9
         || momentum_error > 1e-7
         || scene.energy.fusion_heat <= 0.0
+        || energy_error.abs() > energy_tolerance_j
     {
-        return Err("fusion capture failed its topology, mass, or momentum checks".into());
+        return Err(format!(
+            "fusion capture failed: topology/mass/momentum/heat or energy residual {:.3e} J exceeds {:.3e} J",
+            energy_error.abs(), energy_tolerance_j
+        ).into());
     }
     Ok(())
 }
