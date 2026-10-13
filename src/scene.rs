@@ -43,14 +43,6 @@ pub struct ThermalBondingRule {
     pub minimum_dwell_seconds: f32,
 }
 
-/// Automatic fusion criterion evaluated from real contact impulses and dwell.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ThermalFusionRule {
-    pub minimum_temperature_kelvin: f32,
-    pub minimum_contact_pressure_pa: f32,
-    pub minimum_dwell_seconds: f32,
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct BondingContactState {
     dwell_seconds: f32,
@@ -339,9 +331,6 @@ pub struct Scene {
     world_bounds: Option<WorldBounds>,
     thermal_bonding_rule: Option<ThermalBondingRule>,
     bonding_contacts: HashMap<(usize, usize), BondingContactState>,
-    thermal_fusion_rule: Option<ThermalFusionRule>,
-    fusion_contacts: HashMap<(usize, usize), BondingContactState>,
-    pending_fusion: Option<(usize, usize)>,
     boundary_removals: BoundaryRemovalLedger,
 }
 impl Scene {
@@ -470,9 +459,6 @@ impl Scene {
             world_bounds: None,
             thermal_bonding_rule: None,
             bonding_contacts: HashMap::new(),
-            thermal_fusion_rule: None,
-            fusion_contacts: HashMap::new(),
-            pending_fusion: None,
             boundary_removals: BoundaryRemovalLedger::default(),
         };
         let mut occupancy = HashMap::with_capacity(spawns.len());
