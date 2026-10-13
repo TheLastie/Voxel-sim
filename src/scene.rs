@@ -430,19 +430,44 @@ impl Scene {
     /// Fix or release a REV through the engine API. A transition clears its
     /// velocity to avoid injecting a positional impulse into the solver.
     pub fn set_voxel_kinematic(&mut self, voxel: usize, fixed: bool) -> Result<(), &'static str> {
-        let state = self
-            .voxels
-            .get_mut(voxel)
-            .ok_or("voxel index out of range")?;
-        if state.kinematic != fixed {
-            state.kinematic = fixed;
-            state.velocity = Vec3::ZERO;
-            self.previous[voxel] = self.positions[voxel];
-            self.solver_scratch = Default::default();
-            self.collision_scratch = Default::default();
-            crate::solver::rebuild_clusters(self);
+        self.set_voxels_kinematic(&[voxel], fixed)
+    }
+
+    /// Fix or release several REVs as one scene mutation. Validates every
+    /// index before changing state, then invalidates dependent caches once.
+    pub fn set_voxels_kinematic(
+        &mut self,
+        voxels: &[usize],
+        fixed: bool,
+    ) -> Result<(), &'static str> {
+        if voxels.iter().any(|&voxel| voxel >= self.voxels.len()) {
+            return Err("voxel index out of range");
         }
+        let changed: Vec<_> = voxels
+            .iter()
+            .copied()
+            .filter(|&voxel| self.voxels[voxel].kinematic != fixed)
+            .collect();
+        if changed.is_empty() {
+            return Ok(());
+        }
+        for voxel in changed {
+            self.voxels[voxel].kinematic = fixed;
+            self.voxels[voxel].velocity = Vec3::ZERO;
+            self.previous[voxel] = self.positions[voxel];
+        }
+        self.solver_scratch = Default::default();
+        self.collision_scratch = Default::default();
+        crate::solver::rebuild_clusters(self);
         Ok(())
+    }
+
+    pub fn fix_voxels(&mut self, voxels: &[usize]) -> Result<(), &'static str> {
+        self.set_voxels_kinematic(voxels, true)
+    }
+
+    pub fn release_voxels(&mut self, voxels: &[usize]) -> Result<(), &'static str> {
+        self.set_voxels_kinematic(voxels, false)
     }
 
     pub fn fix_voxel(&mut self, voxel: usize) -> Result<(), &'static str> {

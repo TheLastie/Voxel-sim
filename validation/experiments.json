@@ -1,5 +1,5 @@
 {
-  "default": "thermal-gradient",
+  "default": "pcg-cpu",
   "experiments": [
     {
       "id": "support",
@@ -24,6 +24,30 @@
       "csv": "melting.csv",
       "gif": "melting.gif",
       "video": "melting.mp4"
+    },
+    {
+      "id": "world-bounds",
+      "label": "Мировые границы · ledger · 6 REV",
+      "mode": "thermal",
+      "csv": "world-bounds.csv",
+      "gif": "world-bounds.gif",
+      "video": "world-bounds.mp4"
+    },
+    {
+      "id": "pcg-cpu",
+      "label": "Решатель CPU · 4 347 активных REV · опыт контакта",
+      "mode": "csv",
+      "csv": "solver-cpu.csv",
+      "gif": "solver-cpu.gif",
+      "video": "solver-cpu.mp4"
+    },
+    {
+      "id": "pcg-cuda",
+      "label": "Решатель CUDA · RTX 5060 · 4 347 активных REV",
+      "mode": "csv",
+      "csv": "solver-cuda.csv",
+      "gif": "solver-cuda.gif",
+      "video": "solver-cuda.mp4"
     }
   ]
 }

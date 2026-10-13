@@ -20,8 +20,14 @@ fn write_frame(out: &mut BufWriter<File>, scene: &Scene, step: usize) -> std::io
     writeln!(out, "S,{step}")?;
     for (i, position) in scene.positions.iter().enumerate() {
         let temperature = scene.temperature_kelvin(i).unwrap_or(f32::NAN);
-        let liquid = scene.phase_state(i).map_or(0.0, |phase| phase.liquid_fraction);
-        writeln!(out, "Q,{step},{i},{},{},{},{temperature},{liquid}", position.x, position.y, position.z)?;
+        let liquid = scene
+            .phase_state(i)
+            .map_or(0.0, |phase| phase.liquid_fraction);
+        writeln!(
+            out,
+            "Q,{step},{i},{},{},{},{temperature},{liquid}",
+            position.x, position.y, position.z
+        )?;
     }
     for axis in 0..3 {
         for (i, bond) in scene.bonds[axis].iter().enumerate() {
@@ -71,7 +77,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("missing initial phase state")?
         .liquid_fraction;
     if initial_bonds != 12 || molten < 1.0 {
-        return Err(format!("invalid melt scene: bonds={initial_bonds}, liquid_fraction={molten}").into());
+        return Err(
+            format!("invalid melt scene: bonds={initial_bonds}, liquid_fraction={molten}").into(),
+        );
     }
 
     let mut out = BufWriter::new(File::create(path)?);

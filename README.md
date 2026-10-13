@@ -96,6 +96,10 @@ recorded in `PROGRESS_2026-10-12.md`.
 
 ### General scene and engine APIs
 
+The built-in component names, SI units and current limits of their illustrative
+parameters are listed in [MATERIALS.md](MATERIALS.md). The starter table covers
+air, wood, iron, stone, water, aluminum, copper, glass, concrete and rubber.
+
 `SceneBuilder::standard()` creates an empty custom scene. Add REV states with
 `VoxelSpawn`, resolve built-in components by name, and use engine methods to fix
 or release voxels and configure world bounds. REV outside those bounds are
@@ -244,6 +248,13 @@ can propagate damage too broadly. See
 The desktop default is now `scenes/mounted_axe.ron`: 4,320 wood REVs,
 6,400 fixed floor REVs, gravity `(0, 0, -9.81)` m/s² and a 1 m/s axe.
 The floor surface is Z=0; support uses contacts with actual floor voxels.
+Voxel contacts use the configured Coulomb friction coefficient for tangential
+sliding resistance; its kinetic-energy loss is converted to REV internal energy
+and reported in `EnergyLedger::contact_friction_heat`.
+The lowest wood REV layer is fixed through the scene's kinematic API, so the
+trunk stays rooted while the axe loads it. A separate falling coupon is placed
+over the interior of the finite floor to measure vertical support without
+leaving the platform.
 `--scene scenes/wood_chop.ron` selects the previous larger scene.
 The axe (key 1 / wedge) is mounted on a fixed-orientation linear guide through
 its rear base. It can move along the selected strike direction but cannot move

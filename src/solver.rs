@@ -602,7 +602,10 @@ fn break_fully_melted_bonds(scene: &mut Scene) -> bool {
         .iter()
         .zip(&scene.properties)
         .map(|(voxel, material)| {
-            material.phase_state(voxel.mass, voxel.internal_energy).solid_fraction <= 0.0
+            material
+                .phase_state(voxel.mass, voxel.internal_energy)
+                .solid_fraction
+                <= 0.0
         })
         .collect();
     if !melted.iter().any(|&value| value) {
@@ -635,7 +638,9 @@ fn break_fully_melted_bonds(scene: &mut Scene) -> bool {
                 .filter(|release| release.i == i && release.j == j)
                 .map(|release| release.energy)
                 .sum();
-            scene.releases.retain(|release| release.i != i || release.j != j);
+            scene
+                .releases
+                .retain(|release| release.i != i || release.j != j);
             scene.energy.pending_release = (scene.energy.pending_release - pending).max(0.0);
             scene.energy.damage_heat += stored as f64 + pending;
             let heat = (stored as f64 + pending) as f32 * 0.5;
@@ -968,6 +973,9 @@ pub(crate) struct SolverScratch {
     rhs: Vec<Vec3>,
     constraints: Vec<Constraint>,
     pcg_rows: Vec<PcgRow>,
+    cuda_blocks: Vec<[f32; 54]>,
+    cuda_diagonal: Vec<[f32; 9]>,
+    cuda_inverse: Vec<[f32; 9]>,
     dx: Vec<Vec3>,
     ap: Vec<Vec3>,
     r: Vec<Vec3>,
@@ -1289,8 +1297,16 @@ fn solve_coupled(
                 .for_each(|(slot, out)| apply_one((slot, out)));
         }
     };
-    let dot =
-        |a: &[Vec3], b: &[Vec3]| -> f64 { a.iter().zip(b).map(|(x, y)| x.dot(*y) as f64).sum() };
+    let dot = |a: &[Vec3], b: &[Vec3]| -> f64 {
+        if a.len() < PARALLEL_MIN_VOXELS {
+            a.iter().zip(b).map(|(x, y)| x.dot(*y) as f64).sum()
+        } else {
+            a.par_iter()
+                .zip(b.par_iter())
+                .map(|(x, y)| x.dot(*y) as f64)
+                .sum()
+        }
+    };
     let active_count = active.len();
     scratch.dx.resize(active_count, Vec3::ZERO);
     scratch.dx.fill(Vec3::ZERO);
@@ -1302,6 +1318,114 @@ fn solve_coupled(
     scratch.z.resize(active_count, Vec3::ZERO);
     scratch.preconditioner_work.resize(active_count, Vec3::ZERO);
     let pcg_start = Instant::now();
+    let backend = std::env::var("VOXEL_SOLVER_BACKEND").unwrap_or_else(|_| "auto".into());
+    let mut cuda_solution = None;
+    let try_cuda = match backend.as_str() {
+        "cpu" => false,
+        "cuda" => true,
+        _ => active_count >= 2_048,
+    };
+    if try_cuda {
+        scratch.cuda_blocks.resize(active_count, [0.0; 54]);
+        scratch.cuda_blocks.fill([0.0; 54]);
+        scratch.cuda_diagonal.resize(active_count, [0.0; 9]);
+        scratch.cuda_inverse.resize(active_count, [0.0; 9]);
+        for (slot, &i) in active.iter().enumerate() {
+            let row_projection = Mat3::from_diagonal(scratch.free[i]);
+            for (edge_slot, &edge) in incidence[i][..incidence_len[i] as usize].iter().enumerate() {
+                let neighbor = pcg_rows[slot].neighbors[edge_slot];
+                let column_projection = if neighbor == u32::MAX {
+                    Mat3::ZERO
+                } else {
+                    Mat3::from_diagonal(scratch.free[active[neighbor as usize]])
+                };
+                let matrix = -row_projection * constraints[edge as usize].k * column_projection;
+                let packed = &mut scratch.cuda_blocks[slot][edge_slot * 9..edge_slot * 9 + 9];
+                packed.copy_from_slice(&[
+                    matrix.x_axis.x,
+                    matrix.y_axis.x,
+                    matrix.z_axis.x,
+                    matrix.x_axis.y,
+                    matrix.y_axis.y,
+                    matrix.z_axis.y,
+                    matrix.x_axis.z,
+                    matrix.y_axis.z,
+                    matrix.z_axis.z,
+                ]);
+            }
+            let diagonal = scratch.diagonal[i];
+            scratch.cuda_diagonal[slot] = [
+                diagonal.x_axis.x,
+                diagonal.y_axis.x,
+                diagonal.z_axis.x,
+                diagonal.x_axis.y,
+                diagonal.y_axis.y,
+                diagonal.z_axis.y,
+                diagonal.x_axis.z,
+                diagonal.y_axis.z,
+                diagonal.z_axis.z,
+            ];
+            let inverse = scratch.diagonal[i].inverse();
+            scratch.cuda_inverse[slot] = [
+                inverse.x_axis.x,
+                inverse.y_axis.x,
+                inverse.z_axis.x,
+                inverse.x_axis.y,
+                inverse.y_axis.y,
+                inverse.z_axis.y,
+                inverse.x_axis.z,
+                inverse.y_axis.z,
+                inverse.z_axis.z,
+            ];
+        }
+        match crate::cuda_solver::solve_pcg(
+            &scratch.r,
+            &scratch
+                .pcg_rows
+                .iter()
+                .map(|row| row.neighbors)
+                .collect::<Vec<_>>(),
+            &scratch.cuda_diagonal,
+            &scratch.cuda_blocks,
+            &scratch.cuda_inverse,
+            scene.config.iterations,
+            scene.config.solver_relative_tolerance,
+        ) {
+            Ok((correction, iterations, residual)) => {
+                scratch.dx = correction;
+                scene.solver_residual = residual;
+                cuda_solution = Some(iterations);
+            }
+            Err(error) => {
+                static REPORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                REPORTED.get_or_init(|| eprintln!("CUDA PCG unavailable; using CPU PCG: {error}"));
+            }
+        }
+    }
+    let cuda_time = cuda_solution.map(|_| pcg_start.elapsed());
+    if let Some(iterations) = cuda_solution {
+        if std::env::var_os("VOXEL_PROFILE_STEP").is_some() {
+            eprintln!(
+                "CUDA PCG: active={} iterations={} residual={:.3e} elapsed={:.2} ms",
+                active_count,
+                iterations,
+                scene.solver_residual,
+                cuda_time.unwrap_or_default().as_secs_f64() * 1_000.0,
+            );
+        }
+        for (slot, &i) in active.iter().enumerate() {
+            scene.positions[i] += scratch.dx[slot];
+        }
+        for c in &scratch.constraints {
+            let force = c.k * (scene.positions[c.j] - scene.positions[c.i] - c.rest);
+            scene.workspace[c.axis][c.i].lambda = -c.frame.transpose() * force * (h * h);
+        }
+        return (
+            iterations,
+            [assembly_time, factor_time, cuda_time.unwrap_or_default()],
+        );
+    }
+    let cpu_pcg_start = Instant::now();
     apply_ic0(
         constraints,
         incidence,
@@ -1335,9 +1459,19 @@ fn solve_coupled(
             break;
         }
         let alpha = (rz / denom) as f32;
-        for i in 0..active_count {
-            dx[i] += alpha * p[i];
-            r[i] -= alpha * ap[i];
+        if active_count < PARALLEL_MIN_VOXELS {
+            for i in 0..active_count {
+                dx[i] += alpha * p[i];
+                r[i] -= alpha * ap[i];
+            }
+        } else {
+            dx.par_iter_mut()
+                .zip(r.par_iter_mut())
+                .zip(p.par_iter().zip(ap.par_iter()))
+                .for_each(|((dx, r), (p, ap))| {
+                    *dx += alpha * *p;
+                    *r -= alpha * *ap;
+                });
         }
         scene.solver_residual = (dot(&r, &r).sqrt() / initial) as f32;
         if scene.solver_residual < scene.config.solver_relative_tolerance {
@@ -1357,12 +1491,18 @@ fn solve_coupled(
         );
         let next = dot(&r, &z);
         let beta = (next / rz) as f32;
-        for i in 0..active_count {
-            p[i] = z[i] + beta * p[i];
+        if active_count < PARALLEL_MIN_VOXELS {
+            for i in 0..active_count {
+                p[i] = z[i] + beta * p[i];
+            }
+        } else {
+            p.par_iter_mut()
+                .zip(z.par_iter())
+                .for_each(|(p, z)| *p = *z + beta * *p);
         }
         rz = next;
     }
-    let pcg_time = pcg_start.elapsed();
+    let pcg_time = cpu_pcg_start.elapsed();
     for (slot, &i) in active.iter().enumerate() {
         scene.positions[i] += dx[slot];
     }

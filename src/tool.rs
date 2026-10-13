@@ -299,7 +299,23 @@ impl Tool {
                                     // energy as the active normal changes. Use an inelastic
                                     // normal solve here; friction and fracture dissipate it.
                                     let normal_impulse = closing / denom.max(1e-9);
-                                    let tangent = rel - closing * n;
+                                    let normal_vector = normal_impulse * n;
+                                    let normal_voxel_delta =
+                                        normal_vector * free / scene.voxels[i].mass;
+                                    scene.voxels[i].velocity += normal_voxel_delta;
+                                    contact_velocity[i] += normal_voxel_delta;
+                                    self.velocity -= self.linear_response(normal_vector);
+                                    self.angular_velocity -=
+                                        self.angular_response(arm.cross(normal_vector));
+
+                                    // Recompute relative motion after the normal impulse. This
+                                    // includes normal-to-tangent coupling from an off-centre hit.
+                                    let relative_after_normal = self.velocity
+                                        + self.angular_velocity.cross(arm)
+                                        - scene.voxels[i].velocity;
+                                    let tangent =
+                                        relative_after_normal - relative_after_normal.dot(n) * n;
+                                    let tangent_speed = tangent.length();
                                     let tangent_dir = tangent.try_normalize().unwrap_or(Vec3::ZERO);
                                     let tangent_free = Vec3::new(
                                         if !scene.voxels[i].kinematic
@@ -336,16 +352,27 @@ impl Tool {
                                             self.angular_response(arm.cross(tangent_dir))
                                                 .cross(arm),
                                         );
-                                    let friction = tangent_dir
-                                        * (tangent.length() / tangent_denom.max(1e-9))
+                                    if tangent_speed > 1e-6 && tangent_denom > 1e-9 {
+                                        let friction_magnitude = (tangent_speed / tangent_denom)
                                             .min(scene.config.fracture.friction * normal_impulse);
-                                    let impulse = normal_impulse * n + friction;
-                                    let voxel_delta_v = impulse * free / scene.voxels[i].mass;
-                                    scene.voxels[i].velocity += voxel_delta_v;
-                                    contact_velocity[i] += voxel_delta_v;
-                                    self.velocity -= self.linear_response(impulse);
-                                    self.angular_velocity -=
-                                        self.angular_response(arm.cross(impulse));
+                                        let friction = tangent_dir * friction_magnitude;
+                                        let friction_voxel_delta =
+                                            friction * free / scene.voxels[i].mass;
+                                        scene.voxels[i].velocity += friction_voxel_delta;
+                                        contact_velocity[i] += friction_voxel_delta;
+                                        self.velocity -= self.linear_response(friction);
+                                        self.angular_velocity -=
+                                            self.angular_response(arm.cross(friction));
+
+                                        let friction_heat = (friction_magnitude as f64
+                                            * tangent_speed as f64
+                                            - 0.5
+                                                * (friction_magnitude as f64).powi(2)
+                                                * tangent_denom as f64)
+                                            .max(0.0);
+                                        scene.voxels[i].internal_energy += friction_heat as f32;
+                                        scene.energy.contact_friction_heat += friction_heat;
+                                    }
                                 }
                                 // Split positional correction from velocity. It enforces
                                 // non-penetration without turning depenetration into energy.
@@ -557,6 +584,42 @@ mod tests {
         assert!((after.1 + orbital - before.1).length() < 1e-8);
         assert!(scene.voxels[0].velocity.length() > 0.0);
         assert!(kinetic_energy(&scene, &tool) <= e0 * (1.0 + 1e-5));
+    }
+
+    #[test]
+    fn tool_friction_converts_contact_energy_to_voxel_heat() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [1; 3];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        config.gravity = [0.0; 3];
+        config.tool_dimensions = [2; 3];
+        config.fracture.friction = 0.35;
+        let mut scene = Scene::new(config);
+        let mut tool = Tool::new(
+            Shape::Blade,
+            &scene,
+            Vec3::new(0.0199, 0.006, 0.005),
+            -Vec3::X,
+            0.1,
+        );
+        tool.angular_velocity = Vec3::Z * 10.0;
+        let energy_before = kinetic_energy(&scene, &tool);
+        let internal_before = scene.voxels[0].internal_energy as f64;
+        tool.advance(&mut scene, 0.0, &[]);
+
+        let friction_heat = scene.energy.contact_friction_heat;
+        let internal_gain = scene.voxels[0].internal_energy as f64 - internal_before;
+        let thermal_rounding = f32::EPSILON as f64 * internal_before.max(1.0);
+        assert!(
+            friction_heat > 0.0,
+            "off-center sliding generated no friction"
+        );
+        assert!(kinetic_energy(&scene, &tool) <= energy_before * (1.0 + 1e-5));
+        assert!(
+            (internal_gain - friction_heat).abs() <= thermal_rounding,
+            "internal gain={internal_gain:.12e}, friction heat={friction_heat:.12e}, tolerance={thermal_rounding:.12e}"
+        );
     }
 
     #[test]

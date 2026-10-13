@@ -161,6 +161,8 @@ pub struct EnergyLedger {
     pub stored_plastic: f64,
     pub surface_work: f64,
     pub damage_heat: f64,
+    /// Kinetic energy converted to internal energy by REV contact friction (J).
+    pub contact_friction_heat: f64,
     pub pending_release: f64,
     pub kinetic_release: f64,
 }

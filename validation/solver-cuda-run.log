@@ -1,0 +1,1577 @@
+frame=0/175 wall=0.0s substeps=4 broken=0 drift=0.000e0 tool_x=-0.26250
+CUDA PCG: active=4347 iterations=58 residual=8.078e-6 elapsed=948.17 ms
+CUDA PCG: active=4347 iterations=80 residual=6.516e-5 elapsed=33.48 ms
+CUDA PCG: active=4347 iterations=80 residual=1.889e-4 elapsed=34.00 ms
+CUDA PCG: active=4347 iterations=80 residual=5.522e-5 elapsed=32.45 ms
+CUDA PCG: active=4347 iterations=80 residual=2.800e-4 elapsed=32.12 ms
+CUDA PCG: active=4347 iterations=80 residual=3.991e-5 elapsed=32.44 ms
+CUDA PCG: active=4347 iterations=80 residual=9.970e-5 elapsed=36.16 ms
+profile step ms: predict/tool=18.59 solve=1184.48 [assemble=23.87 factor=5.69 pcg=1148.82] collision=8.48 fracture=4.86 finish=15.84 pcg_iters=538 residual=9.970e-5
+CUDA PCG: active=4347 iterations=80 residual=4.338e-5 elapsed=36.18 ms
+CUDA PCG: active=4347 iterations=80 residual=1.972e-4 elapsed=31.71 ms
+CUDA PCG: active=4347 iterations=80 residual=4.797e-5 elapsed=33.28 ms
+CUDA PCG: active=4347 iterations=80 residual=6.059e-4 elapsed=36.31 ms
+CUDA PCG: active=4347 iterations=80 residual=4.696e-5 elapsed=36.64 ms
+CUDA PCG: active=4347 iterations=80 residual=2.288e-4 elapsed=31.78 ms
+CUDA PCG: active=4347 iterations=80 residual=4.204e-5 elapsed=33.59 ms
+CUDA PCG: active=4347 iterations=80 residual=2.738e-4 elapsed=32.40 ms
+profile step ms: predict/tool=17.11 solve=319.05 [assemble=37.02 factor=3.57 pcg=271.89] collision=6.37 fracture=5.61 finish=15.19 pcg_iters=640 residual=2.738e-4
+CUDA PCG: active=4347 iterations=80 residual=5.262e-5 elapsed=36.47 ms
+CUDA PCG: active=4347 iterations=80 residual=2.057e-3 elapsed=32.12 ms
+CUDA PCG: active=4347 iterations=80 residual=4.256e-5 elapsed=37.32 ms
+CUDA PCG: active=4347 iterations=80 residual=3.008e-3 elapsed=31.47 ms
+CUDA PCG: active=4347 iterations=80 residual=4.764e-5 elapsed=35.05 ms
+CUDA PCG: active=4347 iterations=80 residual=1.754e-3 elapsed=37.19 ms
+CUDA PCG: active=4347 iterations=80 residual=4.328e-5 elapsed=35.35 ms
+CUDA PCG: active=4347 iterations=80 residual=2.717e-3 elapsed=32.03 ms
+profile step ms: predict/tool=16.56 solve=328.36 [assemble=41.30 factor=3.55 pcg=277.01] collision=6.43 fracture=5.90 finish=15.13 pcg_iters=640 residual=2.717e-3
+CUDA PCG: active=4347 iterations=80 residual=4.512e-5 elapsed=34.48 ms
+CUDA PCG: active=4347 iterations=80 residual=1.910e-3 elapsed=33.24 ms
+CUDA PCG: active=4347 iterations=80 residual=4.141e-5 elapsed=32.22 ms
+CUDA PCG: active=4347 iterations=80 residual=1.065e-3 elapsed=36.42 ms
+CUDA PCG: active=4347 iterations=80 residual=4.481e-5 elapsed=38.02 ms
+CUDA PCG: active=4347 iterations=80 residual=9.105e-4 elapsed=37.04 ms
+CUDA PCG: active=4347 iterations=80 residual=3.789e-5 elapsed=35.85 ms
+CUDA PCG: active=4347 iterations=80 residual=8.855e-4 elapsed=39.66 ms
+profile step ms: predict/tool=16.86 solve=338.76 [assemble=41.55 factor=3.63 pcg=286.93] collision=6.58 fracture=5.98 finish=15.40 pcg_iters=640 residual=8.855e-4
+CUDA PCG: active=4347 iterations=80 residual=4.332e-5 elapsed=39.39 ms
+CUDA PCG: active=4347 iterations=80 residual=1.456e-3 elapsed=38.98 ms
+CUDA PCG: active=4347 iterations=80 residual=3.950e-5 elapsed=38.95 ms
+CUDA PCG: active=4347 iterations=80 residual=7.335e-4 elapsed=37.34 ms
+CUDA PCG: active=4347 iterations=80 residual=3.788e-5 elapsed=38.44 ms
+CUDA PCG: active=4347 iterations=80 residual=6.336e-4 elapsed=37.30 ms
+CUDA PCG: active=4347 iterations=80 residual=4.829e-5 elapsed=39.55 ms
+CUDA PCG: active=4347 iterations=80 residual=1.685e-3 elapsed=38.56 ms
+profile step ms: predict/tool=17.85 solve=360.39 [assemble=41.61 factor=3.62 pcg=308.51] collision=6.49 fracture=5.94 finish=16.41 pcg_iters=640 residual=1.685e-3
+CUDA PCG: active=4347 iterations=80 residual=3.908e-5 elapsed=41.42 ms
+CUDA PCG: active=4347 iterations=80 residual=1.914e-4 elapsed=39.73 ms
+CUDA PCG: active=4347 iterations=80 residual=4.567e-5 elapsed=39.05 ms
+CUDA PCG: active=4347 iterations=80 residual=9.806e-4 elapsed=32.31 ms
+CUDA PCG: active=4347 iterations=80 residual=3.901e-5 elapsed=32.87 ms
+CUDA PCG: active=4347 iterations=80 residual=2.958e-4 elapsed=31.86 ms
+CUDA PCG: active=4347 iterations=80 residual=4.119e-5 elapsed=33.39 ms
+CUDA PCG: active=4347 iterations=80 residual=4.094e-4 elapsed=31.95 ms
+profile step ms: predict/tool=16.78 solve=335.46 [assemble=42.45 factor=4.03 pcg=282.57] collision=6.47 fracture=5.96 finish=15.15 pcg_iters=640 residual=4.094e-4
+CUDA PCG: active=4347 iterations=80 residual=4.762e-5 elapsed=36.53 ms
+CUDA PCG: active=4347 iterations=80 residual=8.535e-4 elapsed=32.54 ms
+CUDA PCG: active=4347 iterations=80 residual=4.002e-5 elapsed=36.49 ms
+CUDA PCG: active=4347 iterations=80 residual=5.229e-4 elapsed=33.18 ms
+CUDA PCG: active=4347 iterations=80 residual=4.481e-5 elapsed=34.28 ms
+CUDA PCG: active=4347 iterations=80 residual=9.931e-4 elapsed=31.45 ms
+CUDA PCG: active=4347 iterations=80 residual=4.165e-5 elapsed=33.01 ms
+CUDA PCG: active=4347 iterations=80 residual=1.494e-3 elapsed=32.69 ms
+profile step ms: predict/tool=16.67 solve=323.38 [assemble=43.18 factor=3.60 pcg=270.17] collision=6.45 fracture=5.74 finish=15.20 pcg_iters=640 residual=1.494e-3
+CUDA PCG: active=4347 iterations=80 residual=4.712e-5 elapsed=34.61 ms
+CUDA PCG: active=4347 iterations=80 residual=3.869e-3 elapsed=31.60 ms
+CUDA PCG: active=4347 iterations=80 residual=5.219e-5 elapsed=31.80 ms
+CUDA PCG: active=4347 iterations=80 residual=3.923e-3 elapsed=34.56 ms
+CUDA PCG: active=4347 iterations=80 residual=4.839e-5 elapsed=32.43 ms
+CUDA PCG: active=4347 iterations=80 residual=4.081e-3 elapsed=35.82 ms
+CUDA PCG: active=4347 iterations=80 residual=5.318e-5 elapsed=35.10 ms
+CUDA PCG: active=4347 iterations=80 residual=4.007e-3 elapsed=35.91 ms
+profile step ms: predict/tool=16.59 solve=325.53 [assemble=43.63 factor=3.56 pcg=271.83] collision=6.35 fracture=5.64 finish=15.19 pcg_iters=640 residual=4.007e-3
+CUDA PCG: active=4347 iterations=80 residual=4.956e-5 elapsed=33.31 ms
+CUDA PCG: active=4347 iterations=80 residual=2.650e-3 elapsed=32.84 ms
+CUDA PCG: active=4347 iterations=80 residual=4.179e-5 elapsed=34.92 ms
+CUDA PCG: active=4347 iterations=80 residual=1.366e-3 elapsed=32.25 ms
+CUDA PCG: active=4347 iterations=80 residual=4.807e-5 elapsed=33.71 ms
+CUDA PCG: active=4347 iterations=80 residual=7.488e-4 elapsed=35.48 ms
+CUDA PCG: active=4347 iterations=80 residual=4.193e-5 elapsed=33.22 ms
+CUDA PCG: active=4347 iterations=80 residual=1.063e-3 elapsed=35.85 ms
+profile step ms: predict/tool=16.71 solve=326.44 [assemble=45.09 factor=3.56 pcg=271.58] collision=7.11 fracture=6.59 finish=15.85 pcg_iters=640 residual=1.063e-3
+CUDA PCG: active=4347 iterations=80 residual=4.846e-5 elapsed=32.17 ms
+CUDA PCG: active=4347 iterations=80 residual=6.210e-4 elapsed=36.53 ms
+CUDA PCG: active=4347 iterations=80 residual=4.045e-5 elapsed=32.82 ms
+CUDA PCG: active=4347 iterations=80 residual=1.335e-3 elapsed=32.90 ms
+CUDA PCG: active=4347 iterations=80 residual=6.150e-5 elapsed=33.15 ms
+CUDA PCG: active=4347 iterations=80 residual=1.609e-3 elapsed=33.47 ms
+CUDA PCG: active=4347 iterations=80 residual=4.399e-5 elapsed=33.91 ms
+CUDA PCG: active=4347 iterations=80 residual=8.913e-4 elapsed=37.77 ms
+profile step ms: predict/tool=16.65 solve=326.23 [assemble=43.63 factor=3.55 pcg=272.73] collision=6.36 fracture=5.69 finish=15.12 pcg_iters=640 residual=8.913e-4
+CUDA PCG: active=4347 iterations=80 residual=5.058e-5 elapsed=39.02 ms
+CUDA PCG: active=4347 iterations=80 residual=8.210e-4 elapsed=50.76 ms
+CUDA PCG: active=4347 iterations=80 residual=4.247e-5 elapsed=31.65 ms
+CUDA PCG: active=4347 iterations=80 residual=5.335e-4 elapsed=33.19 ms
+CUDA PCG: active=4347 iterations=80 residual=4.137e-5 elapsed=32.45 ms
+CUDA PCG: active=4347 iterations=80 residual=5.149e-4 elapsed=33.21 ms
+CUDA PCG: active=4347 iterations=80 residual=4.131e-5 elapsed=31.80 ms
+CUDA PCG: active=4347 iterations=80 residual=4.498e-4 elapsed=32.23 ms
+profile step ms: predict/tool=16.61 solve=337.82 [assemble=43.34 factor=3.58 pcg=284.31] collision=6.33 fracture=5.70 finish=15.18 pcg_iters=640 residual=4.498e-4
+CUDA PCG: active=4347 iterations=80 residual=4.453e-5 elapsed=32.29 ms
+CUDA PCG: active=4347 iterations=80 residual=1.641e-3 elapsed=31.70 ms
+CUDA PCG: active=4347 iterations=80 residual=4.692e-5 elapsed=37.59 ms
+CUDA PCG: active=4347 iterations=80 residual=3.032e-3 elapsed=50.08 ms
+CUDA PCG: active=4347 iterations=80 residual=4.575e-5 elapsed=33.32 ms
+CUDA PCG: active=4347 iterations=80 residual=1.579e-3 elapsed=33.34 ms
+CUDA PCG: active=4347 iterations=80 residual=3.850e-5 elapsed=34.49 ms
+CUDA PCG: active=4347 iterations=80 residual=6.017e-4 elapsed=32.46 ms
+profile step ms: predict/tool=16.64 solve=338.61 [assemble=43.26 factor=3.61 pcg=285.27] collision=6.51 fracture=5.82 finish=15.35 pcg_iters=640 residual=6.017e-4
+CUDA PCG: active=4347 iterations=80 residual=4.614e-5 elapsed=38.87 ms
+CUDA PCG: active=4347 iterations=80 residual=1.080e-3 elapsed=33.92 ms
+CUDA PCG: active=4347 iterations=80 residual=3.922e-5 elapsed=32.77 ms
+CUDA PCG: active=4347 iterations=80 residual=5.537e-4 elapsed=33.83 ms
+CUDA PCG: active=4347 iterations=80 residual=4.824e-5 elapsed=33.90 ms
+CUDA PCG: active=4347 iterations=80 residual=1.506e-3 elapsed=34.69 ms
+CUDA PCG: active=4347 iterations=80 residual=3.798e-5 elapsed=32.92 ms
+CUDA PCG: active=4347 iterations=80 residual=1.037e-3 elapsed=33.61 ms
+profile step ms: predict/tool=16.95 solve=329.97 [assemble=45.09 factor=3.77 pcg=274.50] collision=6.51 fracture=5.75 finish=15.24 pcg_iters=640 residual=1.037e-3
+CUDA PCG: active=4347 iterations=80 residual=4.764e-5 elapsed=33.22 ms
+CUDA PCG: active=4347 iterations=80 residual=1.228e-3 elapsed=33.36 ms
+CUDA PCG: active=4347 iterations=80 residual=3.979e-5 elapsed=32.08 ms
+CUDA PCG: active=4347 iterations=80 residual=1.188e-3 elapsed=32.03 ms
+CUDA PCG: active=4347 iterations=80 residual=4.211e-5 elapsed=33.55 ms
+CUDA PCG: active=4347 iterations=80 residual=1.206e-3 elapsed=33.98 ms
+CUDA PCG: active=4347 iterations=80 residual=4.315e-5 elapsed=35.04 ms
+CUDA PCG: active=4347 iterations=80 residual=1.795e-3 elapsed=34.09 ms
+profile step ms: predict/tool=16.96 solve=322.35 [assemble=45.04 factor=3.58 pcg=267.34] collision=6.49 fracture=5.83 finish=15.39 pcg_iters=640 residual=1.795e-3
+CUDA PCG: active=4347 iterations=80 residual=4.207e-5 elapsed=34.77 ms
+CUDA PCG: active=4347 iterations=80 residual=1.685e-3 elapsed=32.49 ms
+CUDA PCG: active=4347 iterations=80 residual=4.419e-5 elapsed=35.02 ms
+CUDA PCG: active=4347 iterations=80 residual=2.029e-3 elapsed=32.05 ms
+CUDA PCG: active=4347 iterations=80 residual=4.632e-5 elapsed=36.36 ms
+CUDA PCG: active=4347 iterations=80 residual=2.992e-3 elapsed=41.17 ms
+CUDA PCG: active=4347 iterations=80 residual=4.388e-5 elapsed=35.04 ms
+CUDA PCG: active=4347 iterations=80 residual=3.131e-3 elapsed=31.64 ms
+profile step ms: predict/tool=17.31 solve=334.83 [assemble=45.56 factor=3.88 pcg=278.54] collision=6.58 fracture=5.88 finish=15.32 pcg_iters=640 residual=3.131e-3
+CUDA PCG: active=4347 iterations=80 residual=4.704e-5 elapsed=34.47 ms
+CUDA PCG: active=4347 iterations=80 residual=2.210e-3 elapsed=37.58 ms
+CUDA PCG: active=4347 iterations=80 residual=4.210e-5 elapsed=35.60 ms
+CUDA PCG: active=4347 iterations=80 residual=5.824e-4 elapsed=33.50 ms
+CUDA PCG: active=4347 iterations=80 residual=4.260e-5 elapsed=32.74 ms
+CUDA PCG: active=4347 iterations=80 residual=1.541e-3 elapsed=39.82 ms
+CUDA PCG: active=4347 iterations=80 residual=4.726e-5 elapsed=43.62 ms
+CUDA PCG: active=4347 iterations=80 residual=2.628e-3 elapsed=43.16 ms
+profile step ms: predict/tool=17.08 solve=356.48 [assemble=45.41 factor=3.62 pcg=300.49] collision=6.58 fracture=6.16 finish=15.46 pcg_iters=640 residual=2.628e-3
+CUDA PCG: active=4347 iterations=80 residual=4.696e-5 elapsed=48.29 ms
+CUDA PCG: active=4347 iterations=80 residual=1.256e-3 elapsed=44.38 ms
+CUDA PCG: active=4347 iterations=80 residual=3.942e-5 elapsed=49.04 ms
+CUDA PCG: active=4347 iterations=80 residual=7.319e-4 elapsed=47.39 ms
+CUDA PCG: active=4347 iterations=80 residual=4.359e-5 elapsed=45.96 ms
+CUDA PCG: active=4347 iterations=80 residual=1.419e-3 elapsed=50.93 ms
+CUDA PCG: active=4347 iterations=80 residual=4.538e-5 elapsed=39.97 ms
+CUDA PCG: active=4347 iterations=80 residual=1.672e-3 elapsed=40.35 ms
+profile step ms: predict/tool=19.93 solve=426.49 [assemble=49.59 factor=3.83 pcg=366.31] collision=9.06 fracture=6.71 finish=17.93 pcg_iters=640 residual=1.672e-3
+CUDA PCG: active=4347 iterations=80 residual=4.359e-5 elapsed=40.04 ms
+CUDA PCG: active=4347 iterations=80 residual=6.891e-4 elapsed=42.00 ms
+CUDA PCG: active=4347 iterations=80 residual=4.588e-5 elapsed=34.10 ms
+CUDA PCG: active=4347 iterations=80 residual=1.120e-3 elapsed=37.60 ms
+CUDA PCG: active=4347 iterations=80 residual=4.447e-5 elapsed=33.25 ms
+CUDA PCG: active=4347 iterations=80 residual=7.581e-4 elapsed=33.54 ms
+CUDA PCG: active=4347 iterations=80 residual=4.817e-5 elapsed=35.04 ms
+CUDA PCG: active=4347 iterations=80 residual=1.898e-3 elapsed=35.48 ms
+profile step ms: predict/tool=17.87 solve=350.36 [assemble=48.43 factor=4.12 pcg=291.05] collision=7.04 fracture=6.30 finish=16.22 pcg_iters=640 residual=1.898e-3
+CUDA PCG: active=4347 iterations=80 residual=4.452e-5 elapsed=34.63 ms
+CUDA PCG: active=4347 iterations=80 residual=1.133e-3 elapsed=32.99 ms
+CUDA PCG: active=4347 iterations=80 residual=4.250e-5 elapsed=33.23 ms
+CUDA PCG: active=4347 iterations=80 residual=9.898e-4 elapsed=32.47 ms
+CUDA PCG: active=4347 iterations=80 residual=4.241e-5 elapsed=38.22 ms
+CUDA PCG: active=4347 iterations=80 residual=1.016e-3 elapsed=42.33 ms
+CUDA PCG: active=4347 iterations=80 residual=4.580e-5 elapsed=48.30 ms
+CUDA PCG: active=4347 iterations=80 residual=1.649e-3 elapsed=44.83 ms
+profile step ms: predict/tool=16.37 solve=362.78 [assemble=45.78 factor=3.51 pcg=307.01] collision=6.52 fracture=5.65 finish=15.35 pcg_iters=640 residual=1.649e-3
+CUDA PCG: active=4347 iterations=80 residual=4.142e-5 elapsed=42.13 ms
+CUDA PCG: active=4347 iterations=80 residual=1.039e-3 elapsed=40.33 ms
+CUDA PCG: active=4347 iterations=80 residual=3.978e-5 elapsed=36.82 ms
+CUDA PCG: active=4347 iterations=80 residual=6.521e-4 elapsed=36.28 ms
+CUDA PCG: active=4347 iterations=80 residual=3.988e-5 elapsed=39.74 ms
+CUDA PCG: active=4347 iterations=80 residual=4.600e-4 elapsed=52.57 ms
+CUDA PCG: active=4347 iterations=80 residual=4.266e-5 elapsed=46.95 ms
+CUDA PCG: active=4347 iterations=80 residual=6.951e-4 elapsed=50.11 ms
+profile step ms: predict/tool=16.79 solve=402.00 [assemble=47.05 factor=3.51 pcg=344.93] collision=6.38 fracture=5.75 finish=16.71 pcg_iters=640 residual=6.951e-4
+CUDA PCG: active=4347 iterations=80 residual=4.022e-5 elapsed=42.74 ms
+CUDA PCG: active=4347 iterations=80 residual=2.971e-4 elapsed=42.04 ms
+CUDA PCG: active=4347 iterations=80 residual=3.714e-5 elapsed=45.06 ms
+CUDA PCG: active=4347 iterations=80 residual=2.515e-4 elapsed=52.54 ms
+CUDA PCG: active=4347 iterations=80 residual=4.948e-5 elapsed=52.30 ms
+CUDA PCG: active=4347 iterations=80 residual=1.173e-3 elapsed=47.99 ms
+CUDA PCG: active=4347 iterations=80 residual=4.155e-5 elapsed=40.98 ms
+CUDA PCG: active=4347 iterations=80 residual=8.183e-4 elapsed=51.82 ms
+profile step ms: predict/tool=17.45 solve=431.82 [assemble=46.06 factor=3.75 pcg=375.47] collision=7.05 fracture=5.88 finish=15.47 pcg_iters=640 residual=8.183e-4
+CUDA PCG: active=4347 iterations=80 residual=5.680e-5 elapsed=45.56 ms
+CUDA PCG: active=4347 iterations=80 residual=2.116e-3 elapsed=38.20 ms
+CUDA PCG: active=4347 iterations=80 residual=4.313e-5 elapsed=35.45 ms
+CUDA PCG: active=4347 iterations=80 residual=7.526e-4 elapsed=36.17 ms
+CUDA PCG: active=4347 iterations=80 residual=4.220e-5 elapsed=36.33 ms
+CUDA PCG: active=4347 iterations=80 residual=1.459e-3 elapsed=35.83 ms
+CUDA PCG: active=4347 iterations=80 residual=4.557e-5 elapsed=35.69 ms
+CUDA PCG: active=4347 iterations=80 residual=2.102e-3 elapsed=35.78 ms
+profile step ms: predict/tool=17.30 solve=355.77 [assemble=46.30 factor=3.69 pcg=299.00] collision=6.39 fracture=5.76 finish=15.36 pcg_iters=640 residual=2.102e-3
+CUDA PCG: active=4347 iterations=80 residual=4.313e-5 elapsed=37.53 ms
+CUDA PCG: active=4347 iterations=80 residual=2.132e-3 elapsed=38.07 ms
+CUDA PCG: active=4347 iterations=80 residual=4.281e-5 elapsed=38.12 ms
+CUDA PCG: active=4347 iterations=80 residual=1.913e-3 elapsed=36.56 ms
+CUDA PCG: active=4347 iterations=80 residual=4.204e-5 elapsed=38.64 ms
+CUDA PCG: active=4347 iterations=80 residual=8.393e-4 elapsed=39.08 ms
+CUDA PCG: active=4347 iterations=80 residual=4.882e-5 elapsed=33.47 ms
+CUDA PCG: active=4347 iterations=80 residual=1.493e-3 elapsed=35.42 ms
+profile step ms: predict/tool=16.51 solve=352.93 [assemble=45.88 factor=3.59 pcg=296.88] collision=6.52 fracture=5.71 finish=15.05 pcg_iters=640 residual=1.493e-3
+CUDA PCG: active=4347 iterations=80 residual=4.134e-5 elapsed=32.83 ms
+CUDA PCG: active=4347 iterations=80 residual=6.192e-4 elapsed=33.14 ms
+CUDA PCG: active=4347 iterations=80 residual=4.211e-5 elapsed=34.05 ms
+CUDA PCG: active=4347 iterations=80 residual=8.144e-4 elapsed=34.18 ms
+CUDA PCG: active=4347 iterations=80 residual=4.205e-5 elapsed=32.84 ms
+CUDA PCG: active=4347 iterations=80 residual=8.805e-4 elapsed=33.46 ms
+CUDA PCG: active=4347 iterations=80 residual=4.181e-5 elapsed=33.07 ms
+CUDA PCG: active=4347 iterations=80 residual=1.385e-3 elapsed=33.76 ms
+profile step ms: predict/tool=16.31 solve=321.57 [assemble=44.40 factor=3.46 pcg=267.34] collision=6.36 fracture=5.51 finish=14.93 pcg_iters=640 residual=1.385e-3
+CUDA PCG: active=4347 iterations=80 residual=4.395e-5 elapsed=40.65 ms
+CUDA PCG: active=4347 iterations=80 residual=9.003e-4 elapsed=50.49 ms
+CUDA PCG: active=4347 iterations=80 residual=4.322e-5 elapsed=45.62 ms
+CUDA PCG: active=4347 iterations=80 residual=1.352e-3 elapsed=41.37 ms
+CUDA PCG: active=4347 iterations=80 residual=4.213e-5 elapsed=32.92 ms
+CUDA PCG: active=4347 iterations=80 residual=8.315e-4 elapsed=32.87 ms
+CUDA PCG: active=4347 iterations=80 residual=4.374e-5 elapsed=33.20 ms
+CUDA PCG: active=4347 iterations=80 residual=1.822e-3 elapsed=37.47 ms
+profile step ms: predict/tool=20.15 solve=371.48 [assemble=46.96 factor=3.54 pcg=314.59] collision=8.21 fracture=6.54 finish=18.67 pcg_iters=640 residual=1.822e-3
+CUDA PCG: active=4347 iterations=80 residual=4.329e-5 elapsed=46.64 ms
+CUDA PCG: active=4347 iterations=80 residual=1.404e-3 elapsed=39.22 ms
+CUDA PCG: active=4347 iterations=80 residual=4.531e-5 elapsed=45.60 ms
+CUDA PCG: active=4347 iterations=80 residual=1.413e-3 elapsed=33.86 ms
+CUDA PCG: active=4347 iterations=80 residual=4.026e-5 elapsed=32.48 ms
+CUDA PCG: active=4347 iterations=80 residual=7.919e-4 elapsed=33.76 ms
+CUDA PCG: active=4347 iterations=80 residual=4.179e-5 elapsed=32.68 ms
+CUDA PCG: active=4347 iterations=80 residual=1.610e-3 elapsed=33.95 ms
+profile step ms: predict/tool=16.73 solve=353.26 [assemble=45.20 factor=3.63 pcg=298.18] collision=6.37 fracture=5.55 finish=15.24 pcg_iters=640 residual=1.610e-3
+CUDA PCG: active=4347 iterations=80 residual=4.532e-5 elapsed=34.43 ms
+CUDA PCG: active=4347 iterations=80 residual=1.075e-3 elapsed=34.11 ms
+CUDA PCG: active=4347 iterations=80 residual=4.323e-5 elapsed=35.81 ms
+CUDA PCG: active=4347 iterations=80 residual=1.178e-3 elapsed=33.79 ms
+CUDA PCG: active=4347 iterations=80 residual=4.454e-5 elapsed=35.07 ms
+CUDA PCG: active=4347 iterations=80 residual=1.183e-3 elapsed=42.04 ms
+CUDA PCG: active=4347 iterations=80 residual=4.189e-5 elapsed=40.09 ms
+CUDA PCG: active=4347 iterations=80 residual=7.836e-4 elapsed=36.12 ms
+profile step ms: predict/tool=16.66 solve=346.70 [assemble=45.13 factor=3.60 pcg=291.46] collision=6.50 fracture=5.46 finish=15.47 pcg_iters=640 residual=7.836e-4
+CUDA PCG: active=4347 iterations=80 residual=4.838e-5 elapsed=33.03 ms
+CUDA PCG: active=4347 iterations=80 residual=1.293e-3 elapsed=32.10 ms
+CUDA PCG: active=4347 iterations=80 residual=4.625e-5 elapsed=31.95 ms
+CUDA PCG: active=4347 iterations=80 residual=1.667e-3 elapsed=32.54 ms
+CUDA PCG: active=4347 iterations=80 residual=4.657e-5 elapsed=34.64 ms
+CUDA PCG: active=4347 iterations=80 residual=9.248e-4 elapsed=38.87 ms
+CUDA PCG: active=4347 iterations=80 residual=4.765e-5 elapsed=32.52 ms
+CUDA PCG: active=4347 iterations=80 residual=2.468e-3 elapsed=34.88 ms
+profile step ms: predict/tool=16.39 solve=325.63 [assemble=45.17 factor=3.54 pcg=270.54] collision=6.38 fracture=5.65 finish=15.08 pcg_iters=640 residual=2.468e-3
+CUDA PCG: active=4347 iterations=80 residual=4.995e-5 elapsed=37.94 ms
+CUDA PCG: active=4347 iterations=80 residual=2.621e-3 elapsed=38.21 ms
+CUDA PCG: active=4347 iterations=80 residual=4.870e-5 elapsed=39.70 ms
+CUDA PCG: active=4347 iterations=80 residual=3.341e-3 elapsed=42.16 ms
+CUDA PCG: active=4347 iterations=80 residual=5.080e-5 elapsed=40.09 ms
+CUDA PCG: active=4347 iterations=80 residual=3.619e-3 elapsed=39.36 ms
+CUDA PCG: active=4347 iterations=80 residual=4.467e-5 elapsed=45.15 ms
+CUDA PCG: active=4347 iterations=80 residual=2.760e-3 elapsed=46.61 ms
+profile step ms: predict/tool=16.42 solve=386.16 [assemble=47.01 factor=3.49 pcg=329.23] collision=6.40 fracture=5.72 finish=15.04 pcg_iters=640 residual=2.760e-3
+CUDA PCG: active=4347 iterations=80 residual=4.558e-5 elapsed=44.08 ms
+CUDA PCG: active=4347 iterations=80 residual=2.365e-3 elapsed=45.19 ms
+CUDA PCG: active=4347 iterations=80 residual=4.088e-5 elapsed=43.29 ms
+CUDA PCG: active=4347 iterations=80 residual=1.585e-3 elapsed=41.53 ms
+CUDA PCG: active=4347 iterations=80 residual=4.464e-5 elapsed=41.59 ms
+CUDA PCG: active=4347 iterations=80 residual=2.429e-3 elapsed=45.76 ms
+CUDA PCG: active=4347 iterations=80 residual=4.580e-5 elapsed=47.94 ms
+CUDA PCG: active=4347 iterations=80 residual=3.387e-3 elapsed=44.12 ms
+profile step ms: predict/tool=16.39 solve=409.85 [assemble=46.61 factor=3.48 pcg=353.50] collision=6.22 fracture=5.56 finish=14.97 pcg_iters=640 residual=3.387e-3
+CUDA PCG: active=4347 iterations=80 residual=4.675e-5 elapsed=45.90 ms
+CUDA PCG: active=4347 iterations=80 residual=2.310e-3 elapsed=45.20 ms
+CUDA PCG: active=4347 iterations=80 residual=4.486e-5 elapsed=42.58 ms
+CUDA PCG: active=4347 iterations=80 residual=1.963e-3 elapsed=35.63 ms
+CUDA PCG: active=4347 iterations=80 residual=4.296e-5 elapsed=35.38 ms
+CUDA PCG: active=4347 iterations=80 residual=1.566e-3 elapsed=32.28 ms
+CUDA PCG: active=4347 iterations=80 residual=4.512e-5 elapsed=37.09 ms
+CUDA PCG: active=4347 iterations=80 residual=1.029e-3 elapsed=39.72 ms
+profile step ms: predict/tool=16.58 solve=371.19 [assemble=47.86 factor=3.46 pcg=313.79] collision=7.15 fracture=5.47 finish=15.06 pcg_iters=640 residual=1.029e-3
+CUDA PCG: active=4347 iterations=80 residual=4.428e-5 elapsed=39.67 ms
+CUDA PCG: active=4347 iterations=80 residual=1.568e-3 elapsed=42.44 ms
+CUDA PCG: active=4347 iterations=80 residual=4.505e-5 elapsed=41.27 ms
+CUDA PCG: active=4347 iterations=80 residual=1.142e-3 elapsed=43.46 ms
+CUDA PCG: active=4347 iterations=80 residual=4.225e-5 elapsed=42.95 ms
+CUDA PCG: active=4347 iterations=80 residual=1.085e-3 elapsed=45.94 ms
+CUDA PCG: active=4347 iterations=80 residual=4.325e-5 elapsed=32.43 ms
+CUDA PCG: active=4347 iterations=80 residual=1.043e-3 elapsed=34.63 ms
+profile step ms: predict/tool=16.34 solve=378.81 [assemble=46.11 factor=3.52 pcg=322.80] collision=8.44 fracture=5.43 finish=15.08 pcg_iters=640 residual=1.043e-3
+CUDA PCG: active=4347 iterations=80 residual=4.382e-5 elapsed=39.40 ms
+CUDA PCG: active=4347 iterations=80 residual=1.194e-3 elapsed=33.68 ms
+CUDA PCG: active=4347 iterations=80 residual=4.319e-5 elapsed=42.23 ms
+CUDA PCG: active=4347 iterations=80 residual=9.960e-4 elapsed=41.08 ms
+CUDA PCG: active=4347 iterations=80 residual=4.422e-5 elapsed=42.07 ms
+CUDA PCG: active=4347 iterations=80 residual=6.701e-4 elapsed=44.09 ms
+CUDA PCG: active=4347 iterations=80 residual=4.253e-5 elapsed=35.10 ms
+CUDA PCG: active=4347 iterations=80 residual=9.755e-4 elapsed=34.66 ms
+profile step ms: predict/tool=16.45 solve=366.79 [assemble=44.83 factor=3.42 pcg=312.30] collision=7.39 fracture=5.36 finish=15.09 pcg_iters=640 residual=9.755e-4
+CUDA PCG: active=4347 iterations=80 residual=4.228e-5 elapsed=32.73 ms
+CUDA PCG: active=4347 iterations=80 residual=9.089e-4 elapsed=43.07 ms
+CUDA PCG: active=4347 iterations=80 residual=3.948e-5 elapsed=45.85 ms
+CUDA PCG: active=4347 iterations=80 residual=6.716e-4 elapsed=40.43 ms
+CUDA PCG: active=4347 iterations=80 residual=4.312e-5 elapsed=49.57 ms
+CUDA PCG: active=4347 iterations=80 residual=1.245e-3 elapsed=49.34 ms
+CUDA PCG: active=4347 iterations=80 residual=4.203e-5 elapsed=42.34 ms
+CUDA PCG: active=4347 iterations=80 residual=1.381e-3 elapsed=38.90 ms
+profile step ms: predict/tool=16.85 solve=397.42 [assemble=45.01 factor=3.63 pcg=342.23] collision=6.47 fracture=5.47 finish=15.49 pcg_iters=640 residual=1.381e-3
+CUDA PCG: active=4347 iterations=80 residual=4.497e-5 elapsed=32.22 ms
+CUDA PCG: active=4347 iterations=80 residual=1.285e-3 elapsed=31.18 ms
+CUDA PCG: active=4347 iterations=80 residual=4.253e-5 elapsed=53.34 ms
+CUDA PCG: active=4347 iterations=80 residual=8.832e-4 elapsed=36.02 ms
+CUDA PCG: active=4347 iterations=80 residual=4.068e-5 elapsed=45.96 ms
+CUDA PCG: active=4347 iterations=80 residual=1.114e-3 elapsed=46.75 ms
+CUDA PCG: active=4347 iterations=80 residual=4.802e-5 elapsed=235.10 ms
+CUDA PCG: active=4347 iterations=80 residual=2.421e-3 elapsed=43.11 ms
+profile step ms: predict/tool=17.33 solve=580.21 [assemble=46.41 factor=3.74 pcg=523.68] collision=6.54 fracture=5.66 finish=15.28 pcg_iters=640 residual=2.421e-3
+CUDA PCG: active=4347 iterations=80 residual=4.492e-5 elapsed=45.84 ms
+CUDA PCG: active=4347 iterations=80 residual=1.075e-3 elapsed=39.95 ms
+CUDA PCG: active=4347 iterations=80 residual=3.888e-5 elapsed=41.82 ms
+CUDA PCG: active=4347 iterations=80 residual=7.154e-4 elapsed=41.38 ms
+CUDA PCG: active=4347 iterations=80 residual=4.655e-5 elapsed=42.12 ms
+CUDA PCG: active=4347 iterations=80 residual=1.367e-3 elapsed=43.26 ms
+CUDA PCG: active=4347 iterations=80 residual=4.620e-5 elapsed=41.45 ms
+CUDA PCG: active=4347 iterations=80 residual=1.796e-3 elapsed=45.86 ms
+profile step ms: predict/tool=16.69 solve=399.38 [assemble=47.64 factor=3.58 pcg=341.68] collision=6.75 fracture=6.13 finish=15.72 pcg_iters=640 residual=1.796e-3
+CUDA PCG: active=4347 iterations=80 residual=4.422e-5 elapsed=45.84 ms
+CUDA PCG: active=4347 iterations=80 residual=1.747e-3 elapsed=48.73 ms
+CUDA PCG: active=4347 iterations=80 residual=4.776e-5 elapsed=42.79 ms
+CUDA PCG: active=4347 iterations=80 residual=2.544e-3 elapsed=47.58 ms
+CUDA PCG: active=4347 iterations=80 residual=4.314e-5 elapsed=39.52 ms
+CUDA PCG: active=4347 iterations=80 residual=9.753e-4 elapsed=41.42 ms
+CUDA PCG: active=4347 iterations=80 residual=4.370e-5 elapsed=37.59 ms
+CUDA PCG: active=4347 iterations=80 residual=6.247e-4 elapsed=35.63 ms
+profile step ms: predict/tool=17.47 solve=398.05 [assemble=48.48 factor=3.75 pcg=339.10] collision=7.15 fracture=5.73 finish=15.58 pcg_iters=640 residual=6.247e-4
+CUDA PCG: active=4347 iterations=80 residual=4.391e-5 elapsed=43.38 ms
+CUDA PCG: active=4347 iterations=80 residual=1.075e-3 elapsed=43.29 ms
+CUDA PCG: active=4347 iterations=80 residual=4.312e-5 elapsed=53.20 ms
+CUDA PCG: active=4347 iterations=80 residual=1.576e-3 elapsed=48.58 ms
+CUDA PCG: active=4347 iterations=80 residual=4.343e-5 elapsed=64.81 ms
+CUDA PCG: active=4347 iterations=80 residual=8.618e-4 elapsed=58.05 ms
+CUDA PCG: active=4347 iterations=80 residual=4.063e-5 elapsed=38.30 ms
+CUDA PCG: active=4347 iterations=80 residual=5.466e-4 elapsed=36.14 ms
+profile step ms: predict/tool=16.88 solve=443.52 [assemble=47.41 factor=3.57 pcg=385.75] collision=7.41 fracture=5.50 finish=15.40 pcg_iters=640 residual=5.466e-4
+CUDA PCG: active=4347 iterations=80 residual=4.517e-5 elapsed=37.88 ms
+CUDA PCG: active=4347 iterations=80 residual=1.015e-3 elapsed=38.95 ms
+CUDA PCG: active=4347 iterations=80 residual=4.210e-5 elapsed=53.90 ms
+CUDA PCG: active=4347 iterations=80 residual=8.929e-4 elapsed=46.62 ms
+CUDA PCG: active=4347 iterations=80 residual=4.405e-5 elapsed=44.76 ms
+CUDA PCG: active=4347 iterations=80 residual=1.127e-3 elapsed=35.68 ms
+CUDA PCG: active=4347 iterations=80 residual=4.146e-5 elapsed=35.96 ms
+CUDA PCG: active=4347 iterations=80 residual=1.035e-3 elapsed=34.78 ms
+profile step ms: predict/tool=16.80 solve=385.21 [assemble=46.65 factor=3.58 pcg=328.53] collision=6.83 fracture=5.71 finish=15.48 pcg_iters=640 residual=1.035e-3
+CUDA PCG: active=4347 iterations=80 residual=4.138e-5 elapsed=40.02 ms
+CUDA PCG: active=4347 iterations=80 residual=7.646e-4 elapsed=44.39 ms
+CUDA PCG: active=4347 iterations=80 residual=3.857e-5 elapsed=53.18 ms
+CUDA PCG: active=4347 iterations=80 residual=8.539e-4 elapsed=42.68 ms
+CUDA PCG: active=4347 iterations=80 residual=4.373e-5 elapsed=36.30 ms
+CUDA PCG: active=4347 iterations=80 residual=1.730e-3 elapsed=34.00 ms
+CUDA PCG: active=4347 iterations=80 residual=4.875e-5 elapsed=42.17 ms
+CUDA PCG: active=4347 iterations=80 residual=2.100e-3 elapsed=56.73 ms
+profile step ms: predict/tool=17.04 solve=408.24 [assemble=48.61 factor=3.56 pcg=349.47] collision=6.56 fracture=5.88 finish=15.62 pcg_iters=640 residual=2.100e-3
+CUDA PCG: active=4347 iterations=80 residual=4.278e-5 elapsed=49.84 ms
+CUDA PCG: active=4347 iterations=80 residual=2.886e-3 elapsed=56.78 ms
+CUDA PCG: active=4347 iterations=80 residual=4.463e-5 elapsed=41.64 ms
+CUDA PCG: active=4347 iterations=80 residual=2.625e-3 elapsed=35.76 ms
+CUDA PCG: active=4347 iterations=80 residual=4.663e-5 elapsed=33.51 ms
+CUDA PCG: active=4347 iterations=80 residual=2.547e-3 elapsed=34.43 ms
+CUDA PCG: active=4347 iterations=80 residual=4.468e-5 elapsed=42.06 ms
+CUDA PCG: active=4347 iterations=80 residual=2.092e-3 elapsed=40.20 ms
+profile step ms: predict/tool=17.08 solve=391.41 [assemble=46.97 factor=3.63 pcg=334.22] collision=6.84 fracture=5.75 finish=15.28 pcg_iters=640 residual=2.092e-3
+CUDA PCG: active=4347 iterations=80 residual=4.403e-5 elapsed=46.25 ms
+CUDA PCG: active=4347 iterations=80 residual=2.135e-3 elapsed=39.62 ms
+CUDA PCG: active=4347 iterations=80 residual=4.710e-5 elapsed=40.88 ms
+CUDA PCG: active=4347 iterations=80 residual=2.769e-3 elapsed=35.26 ms
+CUDA PCG: active=4347 iterations=80 residual=4.236e-5 elapsed=39.07 ms
+CUDA PCG: active=4347 iterations=80 residual=7.581e-4 elapsed=38.80 ms
+CUDA PCG: active=4347 iterations=80 residual=4.236e-5 elapsed=46.77 ms
+CUDA PCG: active=4347 iterations=80 residual=1.007e-3 elapsed=41.77 ms
+profile step ms: predict/tool=16.75 solve=385.28 [assemble=46.64 factor=3.56 pcg=328.40] collision=7.75 fracture=5.47 finish=15.21 pcg_iters=640 residual=1.007e-3
+CUDA PCG: active=4347 iterations=80 residual=4.598e-5 elapsed=47.18 ms
+CUDA PCG: active=4347 iterations=80 residual=9.205e-4 elapsed=33.48 ms
+CUDA PCG: active=4347 iterations=80 residual=4.369e-5 elapsed=35.97 ms
+CUDA PCG: active=4347 iterations=80 residual=1.063e-3 elapsed=33.50 ms
+CUDA PCG: active=4347 iterations=80 residual=4.341e-5 elapsed=44.78 ms
+CUDA PCG: active=4347 iterations=80 residual=1.650e-3 elapsed=44.44 ms
+CUDA PCG: active=4347 iterations=80 residual=4.601e-5 elapsed=44.03 ms
+CUDA PCG: active=4347 iterations=80 residual=2.253e-3 elapsed=50.23 ms
+profile step ms: predict/tool=16.77 solve=389.75 [assemble=46.06 factor=3.66 pcg=333.61] collision=8.95 fracture=5.41 finish=15.91 pcg_iters=640 residual=2.253e-3
+CUDA PCG: active=4347 iterations=80 residual=4.580e-5 elapsed=36.36 ms
+CUDA PCG: active=4347 iterations=80 residual=1.541e-3 elapsed=38.83 ms
+CUDA PCG: active=4347 iterations=80 residual=4.359e-5 elapsed=33.53 ms
+CUDA PCG: active=4347 iterations=80 residual=1.746e-3 elapsed=38.34 ms
+CUDA PCG: active=4347 iterations=80 residual=4.667e-5 elapsed=42.54 ms
+CUDA PCG: active=4347 iterations=80 residual=2.252e-3 elapsed=34.32 ms
+CUDA PCG: active=4347 iterations=80 residual=4.488e-5 elapsed=37.76 ms
+CUDA PCG: active=4347 iterations=80 residual=1.126e-3 elapsed=37.66 ms
+profile step ms: predict/tool=17.94 solve=356.63 [assemble=46.95 factor=3.65 pcg=299.34] collision=8.13 fracture=5.53 finish=15.60 pcg_iters=640 residual=1.126e-3
+CUDA PCG: active=4347 iterations=80 residual=3.921e-5 elapsed=34.02 ms
+CUDA PCG: active=4347 iterations=80 residual=6.634e-4 elapsed=35.34 ms
+CUDA PCG: active=4347 iterations=80 residual=4.248e-5 elapsed=35.82 ms
+CUDA PCG: active=4347 iterations=80 residual=4.961e-4 elapsed=33.56 ms
+CUDA PCG: active=4347 iterations=80 residual=3.994e-5 elapsed=34.23 ms
+CUDA PCG: active=4347 iterations=80 residual=2.439e-4 elapsed=33.96 ms
+CUDA PCG: active=4347 iterations=80 residual=4.179e-5 elapsed=52.36 ms
+CUDA PCG: active=4347 iterations=80 residual=6.462e-4 elapsed=41.18 ms
+profile step ms: predict/tool=16.81 solve=356.87 [assemble=46.53 factor=3.48 pcg=300.48] collision=7.87 fracture=5.75 finish=15.47 pcg_iters=640 residual=6.462e-4
+CUDA PCG: active=4347 iterations=80 residual=4.243e-5 elapsed=45.82 ms
+CUDA PCG: active=4347 iterations=80 residual=9.361e-4 elapsed=40.46 ms
+CUDA PCG: active=4347 iterations=80 residual=4.210e-5 elapsed=46.11 ms
+CUDA PCG: active=4347 iterations=80 residual=8.619e-4 elapsed=35.08 ms
+CUDA PCG: active=4347 iterations=80 residual=4.130e-5 elapsed=38.02 ms
+CUDA PCG: active=4347 iterations=80 residual=3.871e-4 elapsed=37.14 ms
+CUDA PCG: active=4347 iterations=80 residual=4.063e-5 elapsed=42.70 ms
+CUDA PCG: active=4347 iterations=80 residual=4.608e-4 elapsed=49.39 ms
+profile step ms: predict/tool=16.86 solve=391.59 [assemble=46.78 factor=3.64 pcg=334.71] collision=6.65 fracture=5.87 finish=15.68 pcg_iters=640 residual=4.608e-4
+CUDA PCG: active=4347 iterations=80 residual=3.781e-5 elapsed=45.08 ms
+CUDA PCG: active=4347 iterations=80 residual=2.712e-4 elapsed=45.30 ms
+CUDA PCG: active=4347 iterations=80 residual=4.216e-5 elapsed=35.90 ms
+CUDA PCG: active=4347 iterations=80 residual=1.050e-3 elapsed=38.01 ms
+CUDA PCG: active=4347 iterations=80 residual=4.247e-5 elapsed=34.54 ms
+CUDA PCG: active=4347 iterations=80 residual=5.605e-4 elapsed=39.50 ms
+CUDA PCG: active=4347 iterations=80 residual=4.255e-5 elapsed=42.93 ms
+CUDA PCG: active=4347 iterations=80 residual=6.888e-4 elapsed=44.56 ms
+profile step ms: predict/tool=17.06 solve=383.54 [assemble=47.24 factor=3.76 pcg=325.81] collision=6.73 fracture=5.87 finish=15.71 pcg_iters=640 residual=6.888e-4
+CUDA PCG: active=4347 iterations=80 residual=4.297e-5 elapsed=44.68 ms
+CUDA PCG: active=4347 iterations=80 residual=9.109e-4 elapsed=34.67 ms
+CUDA PCG: active=4347 iterations=80 residual=4.204e-5 elapsed=35.06 ms
+CUDA PCG: active=4347 iterations=80 residual=1.276e-3 elapsed=33.78 ms
+CUDA PCG: active=4347 iterations=80 residual=4.492e-5 elapsed=38.58 ms
+CUDA PCG: active=4347 iterations=80 residual=6.585e-4 elapsed=39.53 ms
+CUDA PCG: active=4347 iterations=80 residual=4.049e-5 elapsed=48.07 ms
+CUDA PCG: active=4347 iterations=80 residual=5.527e-4 elapsed=39.91 ms
+profile step ms: predict/tool=17.22 solve=369.88 [assemble=45.68 factor=3.55 pcg=314.27] collision=7.16 fracture=5.32 finish=15.38 pcg_iters=640 residual=5.527e-4
+CUDA PCG: active=4347 iterations=80 residual=4.436e-5 elapsed=37.27 ms
+CUDA PCG: active=4347 iterations=80 residual=1.230e-3 elapsed=37.71 ms
+CUDA PCG: active=4347 iterations=80 residual=4.365e-5 elapsed=38.64 ms
+CUDA PCG: active=4347 iterations=80 residual=1.417e-3 elapsed=37.65 ms
+CUDA PCG: active=4347 iterations=80 residual=4.441e-5 elapsed=43.59 ms
+CUDA PCG: active=4347 iterations=80 residual=1.935e-3 elapsed=40.61 ms
+CUDA PCG: active=4347 iterations=80 residual=4.728e-5 elapsed=41.69 ms
+CUDA PCG: active=4347 iterations=80 residual=2.396e-3 elapsed=41.04 ms
+profile step ms: predict/tool=17.07 solve=374.05 [assemble=45.83 factor=3.70 pcg=318.20] collision=7.50 fracture=5.38 finish=15.54 pcg_iters=640 residual=2.396e-3
+CUDA PCG: active=4347 iterations=80 residual=4.226e-5 elapsed=35.05 ms
+CUDA PCG: active=4347 iterations=80 residual=1.119e-3 elapsed=35.18 ms
+CUDA PCG: active=4347 iterations=80 residual=4.195e-5 elapsed=56.07 ms
+CUDA PCG: active=4347 iterations=80 residual=1.240e-3 elapsed=54.20 ms
+CUDA PCG: active=4347 iterations=80 residual=4.416e-5 elapsed=43.40 ms
+CUDA PCG: active=4347 iterations=80 residual=1.046e-3 elapsed=42.75 ms
+CUDA PCG: active=4347 iterations=80 residual=3.952e-5 elapsed=39.69 ms
+CUDA PCG: active=4347 iterations=80 residual=6.624e-4 elapsed=36.01 ms
+profile step ms: predict/tool=16.88 solve=397.30 [assemble=44.79 factor=3.56 pcg=342.34] collision=6.94 fracture=5.46 finish=15.24 pcg_iters=640 residual=6.624e-4
+CUDA PCG: active=4347 iterations=80 residual=4.495e-5 elapsed=36.11 ms
+CUDA PCG: active=4347 iterations=80 residual=4.639e-4 elapsed=33.46 ms
+CUDA PCG: active=4347 iterations=80 residual=3.774e-5 elapsed=41.17 ms
+CUDA PCG: active=4347 iterations=80 residual=3.688e-4 elapsed=46.41 ms
+CUDA PCG: active=4347 iterations=80 residual=4.388e-5 elapsed=52.52 ms
+CUDA PCG: active=4347 iterations=80 residual=3.690e-4 elapsed=43.40 ms
+CUDA PCG: active=4347 iterations=80 residual=4.142e-5 elapsed=34.18 ms
+CUDA PCG: active=4347 iterations=80 residual=5.842e-4 elapsed=36.10 ms
+profile step ms: predict/tool=16.94 solve=379.16 [assemble=45.77 factor=3.52 pcg=323.34] collision=6.56 fracture=5.75 finish=15.42 pcg_iters=640 residual=5.842e-4
+CUDA PCG: active=4347 iterations=80 residual=4.191e-5 elapsed=35.88 ms
+CUDA PCG: active=4347 iterations=80 residual=5.934e-4 elapsed=37.83 ms
+CUDA PCG: active=4347 iterations=80 residual=4.088e-5 elapsed=45.35 ms
+CUDA PCG: active=4347 iterations=80 residual=1.337e-3 elapsed=39.84 ms
+CUDA PCG: active=4347 iterations=80 residual=4.721e-5 elapsed=50.48 ms
+CUDA PCG: active=4347 iterations=80 residual=2.500e-3 elapsed=34.92 ms
+CUDA PCG: active=4347 iterations=80 residual=4.616e-5 elapsed=35.27 ms
+CUDA PCG: active=4347 iterations=80 residual=2.419e-3 elapsed=32.91 ms
+profile step ms: predict/tool=17.19 solve=370.83 [assemble=47.19 factor=4.66 pcg=312.48] collision=6.61 fracture=5.73 finish=15.34 pcg_iters=640 residual=2.419e-3
+CUDA PCG: active=4347 iterations=80 residual=4.359e-5 elapsed=36.69 ms
+CUDA PCG: active=4347 iterations=80 residual=1.517e-3 elapsed=47.89 ms
+CUDA PCG: active=4347 iterations=80 residual=4.291e-5 elapsed=41.92 ms
+CUDA PCG: active=4347 iterations=80 residual=1.423e-3 elapsed=46.18 ms
+CUDA PCG: active=4347 iterations=80 residual=4.416e-5 elapsed=37.71 ms
+CUDA PCG: active=4347 iterations=80 residual=9.716e-4 elapsed=40.14 ms
+CUDA PCG: active=4347 iterations=80 residual=4.269e-5 elapsed=38.85 ms
+CUDA PCG: active=4347 iterations=80 residual=2.168e-3 elapsed=35.33 ms
+profile step ms: predict/tool=16.93 solve=379.88 [assemble=45.11 factor=3.61 pcg=324.70] collision=7.19 fracture=5.38 finish=15.39 pcg_iters=640 residual=2.168e-3
+CUDA PCG: active=4347 iterations=80 residual=4.544e-5 elapsed=47.98 ms
+CUDA PCG: active=4347 iterations=80 residual=7.410e-4 elapsed=40.95 ms
+CUDA PCG: active=4347 iterations=80 residual=4.079e-5 elapsed=38.89 ms
+CUDA PCG: active=4347 iterations=80 residual=7.941e-4 elapsed=45.48 ms
+CUDA PCG: active=4347 iterations=80 residual=4.646e-5 elapsed=37.69 ms
+CUDA PCG: active=4347 iterations=80 residual=2.295e-3 elapsed=39.95 ms
+CUDA PCG: active=4347 iterations=80 residual=4.528e-5 elapsed=39.89 ms
+CUDA PCG: active=4347 iterations=80 residual=2.626e-3 elapsed=32.95 ms
+profile step ms: predict/tool=17.72 solve=380.43 [assemble=46.46 factor=3.60 pcg=323.78] collision=7.64 fracture=5.29 finish=15.36 pcg_iters=640 residual=2.626e-3
+CUDA PCG: active=4347 iterations=80 residual=4.838e-5 elapsed=36.62 ms
+CUDA PCG: active=4347 iterations=80 residual=3.886e-3 elapsed=37.75 ms
+CUDA PCG: active=4347 iterations=80 residual=4.778e-5 elapsed=34.11 ms
+CUDA PCG: active=4347 iterations=80 residual=4.463e-3 elapsed=37.98 ms
+CUDA PCG: active=4347 iterations=80 residual=4.337e-5 elapsed=36.51 ms
+CUDA PCG: active=4347 iterations=80 residual=2.491e-3 elapsed=38.50 ms
+CUDA PCG: active=4347 iterations=80 residual=4.633e-5 elapsed=38.19 ms
+CUDA PCG: active=4347 iterations=80 residual=2.123e-3 elapsed=47.46 ms
+profile step ms: predict/tool=17.01 solve=364.47 [assemble=46.96 factor=3.80 pcg=307.13] collision=7.40 fracture=5.54 finish=15.57 pcg_iters=640 residual=2.123e-3
+CUDA PCG: active=4347 iterations=80 residual=4.237e-5 elapsed=41.66 ms
+CUDA PCG: active=4347 iterations=80 residual=1.441e-3 elapsed=35.04 ms
+CUDA PCG: active=4347 iterations=80 residual=4.433e-5 elapsed=34.18 ms
+CUDA PCG: active=4347 iterations=80 residual=1.621e-3 elapsed=32.79 ms
+CUDA PCG: active=4347 iterations=80 residual=4.064e-5 elapsed=34.30 ms
+CUDA PCG: active=4347 iterations=80 residual=9.956e-4 elapsed=36.25 ms
+CUDA PCG: active=4347 iterations=80 residual=4.058e-5 elapsed=33.38 ms
+CUDA PCG: active=4347 iterations=80 residual=8.988e-4 elapsed=35.76 ms
+profile step ms: predict/tool=16.69 solve=339.31 [assemble=45.90 factor=3.64 pcg=283.36] collision=6.74 fracture=5.56 finish=15.24 pcg_iters=640 residual=8.988e-4
+CUDA PCG: active=4347 iterations=80 residual=4.616e-5 elapsed=35.18 ms
+CUDA PCG: active=4347 iterations=80 residual=1.600e-3 elapsed=52.26 ms
+CUDA PCG: active=4347 iterations=80 residual=4.304e-5 elapsed=33.95 ms
+CUDA PCG: active=4347 iterations=80 residual=1.493e-3 elapsed=40.22 ms
+CUDA PCG: active=4347 iterations=80 residual=4.623e-5 elapsed=35.85 ms
+CUDA PCG: active=4347 iterations=80 residual=1.234e-3 elapsed=33.66 ms
+CUDA PCG: active=4347 iterations=80 residual=4.186e-5 elapsed=36.59 ms
+CUDA PCG: active=4347 iterations=80 residual=1.457e-3 elapsed=33.89 ms
+profile step ms: predict/tool=16.75 solve=360.74 [assemble=49.13 factor=3.52 pcg=301.60] collision=6.51 fracture=5.92 finish=15.48 pcg_iters=640 residual=1.457e-3
+CUDA PCG: active=4347 iterations=80 residual=4.769e-5 elapsed=42.04 ms
+CUDA PCG: active=4347 iterations=80 residual=1.315e-3 elapsed=37.97 ms
+CUDA PCG: active=4347 iterations=80 residual=4.118e-5 elapsed=40.53 ms
+CUDA PCG: active=4347 iterations=80 residual=5.062e-4 elapsed=35.94 ms
+CUDA PCG: active=4347 iterations=80 residual=3.970e-5 elapsed=41.21 ms
+CUDA PCG: active=4347 iterations=80 residual=6.404e-4 elapsed=38.27 ms
+CUDA PCG: active=4347 iterations=80 residual=4.620e-5 elapsed=37.66 ms
+CUDA PCG: active=4347 iterations=80 residual=9.643e-4 elapsed=38.05 ms
+profile step ms: predict/tool=17.15 solve=372.91 [assemble=50.78 factor=3.64 pcg=311.67] collision=6.80 fracture=6.10 finish=15.69 pcg_iters=640 residual=9.643e-4
+CUDA PCG: active=4347 iterations=80 residual=3.984e-5 elapsed=39.86 ms
+CUDA PCG: active=4347 iterations=80 residual=2.320e-4 elapsed=35.22 ms
+CUDA PCG: active=4347 iterations=80 residual=4.175e-5 elapsed=35.89 ms
+CUDA PCG: active=4347 iterations=80 residual=3.732e-4 elapsed=36.20 ms
+CUDA PCG: active=4347 iterations=80 residual=4.188e-5 elapsed=36.67 ms
+CUDA PCG: active=4347 iterations=80 residual=6.746e-4 elapsed=53.21 ms
+CUDA PCG: active=4347 iterations=80 residual=4.623e-5 elapsed=44.81 ms
+CUDA PCG: active=4347 iterations=80 residual=1.004e-3 elapsed=47.65 ms
+profile step ms: predict/tool=17.05 solve=387.50 [assemble=47.91 factor=3.62 pcg=329.50] collision=6.65 fracture=5.67 finish=15.51 pcg_iters=640 residual=1.004e-3
+CUDA PCG: active=4347 iterations=80 residual=4.072e-5 elapsed=34.59 ms
+CUDA PCG: active=4347 iterations=80 residual=4.532e-4 elapsed=34.23 ms
+CUDA PCG: active=4347 iterations=80 residual=4.308e-5 elapsed=34.74 ms
+CUDA PCG: active=4347 iterations=80 residual=5.528e-4 elapsed=32.70 ms
+CUDA PCG: active=4347 iterations=80 residual=4.476e-5 elapsed=42.79 ms
+CUDA PCG: active=4347 iterations=80 residual=1.755e-3 elapsed=43.10 ms
+CUDA PCG: active=4347 iterations=80 residual=4.740e-5 elapsed=41.75 ms
+CUDA PCG: active=4347 iterations=80 residual=1.269e-3 elapsed=43.27 ms
+profile step ms: predict/tool=16.73 solve=364.02 [assemble=46.94 factor=3.58 pcg=307.16] collision=6.58 fracture=5.70 finish=15.33 pcg_iters=640 residual=1.269e-3
+CUDA PCG: active=4347 iterations=80 residual=4.050e-5 elapsed=34.43 ms
+CUDA PCG: active=4347 iterations=80 residual=7.495e-4 elapsed=34.56 ms
+CUDA PCG: active=4347 iterations=80 residual=4.029e-5 elapsed=33.01 ms
+CUDA PCG: active=4347 iterations=80 residual=4.136e-4 elapsed=35.64 ms
+CUDA PCG: active=4347 iterations=80 residual=4.536e-5 elapsed=43.60 ms
+CUDA PCG: active=4347 iterations=80 residual=9.080e-4 elapsed=42.04 ms
+CUDA PCG: active=4347 iterations=80 residual=4.344e-5 elapsed=48.58 ms
+CUDA PCG: active=4347 iterations=80 residual=8.783e-4 elapsed=35.59 ms
+profile step ms: predict/tool=16.68 solve=366.95 [assemble=49.29 factor=3.84 pcg=307.46] collision=6.60 fracture=5.70 finish=15.29 pcg_iters=640 residual=8.783e-4
+CUDA PCG: active=4347 iterations=80 residual=4.201e-5 elapsed=33.28 ms
+CUDA PCG: active=4347 iterations=80 residual=1.073e-3 elapsed=36.52 ms
+CUDA PCG: active=4347 iterations=80 residual=4.158e-5 elapsed=38.36 ms
+CUDA PCG: active=4347 iterations=80 residual=5.918e-4 elapsed=32.97 ms
+CUDA PCG: active=4347 iterations=80 residual=4.086e-5 elapsed=33.40 ms
+CUDA PCG: active=4347 iterations=80 residual=5.180e-4 elapsed=34.66 ms
+CUDA PCG: active=4347 iterations=80 residual=4.467e-5 elapsed=57.06 ms
+CUDA PCG: active=4347 iterations=80 residual=1.277e-3 elapsed=39.32 ms
+profile step ms: predict/tool=16.89 solve=362.41 [assemble=46.72 factor=3.65 pcg=305.58] collision=7.06 fracture=5.61 finish=15.49 pcg_iters=640 residual=1.277e-3
+CUDA PCG: active=4347 iterations=80 residual=4.234e-5 elapsed=48.62 ms
+CUDA PCG: active=4347 iterations=80 residual=7.055e-4 elapsed=41.94 ms
+CUDA PCG: active=4347 iterations=80 residual=4.005e-5 elapsed=38.28 ms
+CUDA PCG: active=4347 iterations=80 residual=2.558e-4 elapsed=37.61 ms
+CUDA PCG: active=4347 iterations=80 residual=4.014e-5 elapsed=39.24 ms
+CUDA PCG: active=4347 iterations=80 residual=7.030e-4 elapsed=44.47 ms
+CUDA PCG: active=4347 iterations=80 residual=4.272e-5 elapsed=51.59 ms
+CUDA PCG: active=4347 iterations=80 residual=6.849e-4 elapsed=42.48 ms
+profile step ms: predict/tool=17.09 solve=405.61 [assemble=49.76 factor=4.34 pcg=344.23] collision=7.19 fracture=5.62 finish=15.85 pcg_iters=640 residual=6.849e-4
+CUDA PCG: active=4347 iterations=80 residual=4.036e-5 elapsed=51.18 ms
+CUDA PCG: active=4347 iterations=80 residual=4.449e-4 elapsed=48.35 ms
+CUDA PCG: active=4347 iterations=80 residual=4.183e-5 elapsed=37.25 ms
+CUDA PCG: active=4347 iterations=80 residual=8.560e-4 elapsed=35.91 ms
+CUDA PCG: active=4347 iterations=80 residual=4.220e-5 elapsed=37.36 ms
+CUDA PCG: active=4347 iterations=80 residual=1.153e-3 elapsed=36.05 ms
+CUDA PCG: active=4347 iterations=80 residual=4.395e-5 elapsed=36.83 ms
+CUDA PCG: active=4347 iterations=80 residual=1.905e-3 elapsed=36.63 ms
+profile step ms: predict/tool=17.16 solve=377.90 [assemble=47.64 factor=3.83 pcg=319.57] collision=6.62 fracture=5.73 finish=15.56 pcg_iters=640 residual=1.905e-3
+CUDA PCG: active=4347 iterations=80 residual=4.343e-5 elapsed=33.81 ms
+CUDA PCG: active=4347 iterations=80 residual=1.785e-3 elapsed=34.50 ms
+CUDA PCG: active=4347 iterations=80 residual=4.686e-5 elapsed=33.75 ms
+CUDA PCG: active=4347 iterations=80 residual=1.151e-3 elapsed=34.91 ms
+CUDA PCG: active=4347 iterations=80 residual=4.263e-5 elapsed=34.29 ms
+CUDA PCG: active=4347 iterations=80 residual=1.336e-3 elapsed=37.29 ms
+CUDA PCG: active=4347 iterations=80 residual=3.953e-5 elapsed=40.45 ms
+CUDA PCG: active=4347 iterations=80 residual=9.967e-4 elapsed=42.91 ms
+profile step ms: predict/tool=16.63 solve=350.82 [assemble=48.25 factor=3.64 pcg=291.91] collision=6.69 fracture=5.74 finish=15.38 pcg_iters=640 residual=9.967e-4
+CUDA PCG: active=4347 iterations=80 residual=4.811e-5 elapsed=37.64 ms
+CUDA PCG: active=4347 iterations=80 residual=1.665e-3 elapsed=38.70 ms
+CUDA PCG: active=4347 iterations=80 residual=3.902e-5 elapsed=40.99 ms
+CUDA PCG: active=4347 iterations=80 residual=6.048e-4 elapsed=41.09 ms
+CUDA PCG: active=4347 iterations=80 residual=4.148e-5 elapsed=36.35 ms
+CUDA PCG: active=4347 iterations=80 residual=8.640e-4 elapsed=35.74 ms
+CUDA PCG: active=4347 iterations=80 residual=4.053e-5 elapsed=36.95 ms
+CUDA PCG: active=4347 iterations=80 residual=4.900e-4 elapsed=38.58 ms
+profile step ms: predict/tool=17.32 solve=365.41 [assemble=48.67 factor=4.12 pcg=306.04] collision=6.76 fracture=5.79 finish=15.51 pcg_iters=640 residual=4.900e-4
+CUDA PCG: active=4347 iterations=80 residual=4.351e-5 elapsed=39.95 ms
+CUDA PCG: active=4347 iterations=80 residual=1.144e-3 elapsed=40.58 ms
+CUDA PCG: active=4347 iterations=80 residual=4.405e-5 elapsed=39.76 ms
+CUDA PCG: active=4347 iterations=80 residual=1.305e-3 elapsed=40.67 ms
+CUDA PCG: active=4347 iterations=80 residual=4.205e-5 elapsed=42.63 ms
+CUDA PCG: active=4347 iterations=80 residual=1.027e-3 elapsed=33.67 ms
+CUDA PCG: active=4347 iterations=80 residual=4.416e-5 elapsed=35.65 ms
+CUDA PCG: active=4347 iterations=80 residual=1.477e-3 elapsed=36.11 ms
+profile step ms: predict/tool=17.16 solve=366.91 [assemble=47.30 factor=3.82 pcg=309.03] collision=6.73 fracture=5.60 finish=15.59 pcg_iters=640 residual=1.477e-3
+CUDA PCG: active=4347 iterations=80 residual=4.182e-5 elapsed=35.98 ms
+CUDA PCG: active=4347 iterations=80 residual=1.087e-3 elapsed=33.06 ms
+CUDA PCG: active=4347 iterations=80 residual=4.083e-5 elapsed=34.66 ms
+CUDA PCG: active=4347 iterations=80 residual=4.074e-4 elapsed=32.79 ms
+CUDA PCG: active=4347 iterations=80 residual=3.866e-5 elapsed=36.86 ms
+CUDA PCG: active=4347 iterations=80 residual=6.309e-4 elapsed=33.75 ms
+CUDA PCG: active=4347 iterations=80 residual=4.171e-5 elapsed=49.54 ms
+CUDA PCG: active=4347 iterations=80 residual=1.166e-3 elapsed=52.01 ms
+profile step ms: predict/tool=16.84 solve=367.97 [assemble=48.86 factor=3.63 pcg=308.65] collision=6.87 fracture=5.82 finish=16.06 pcg_iters=640 residual=1.166e-3
+CUDA PCG: active=4347 iterations=80 residual=4.115e-5 elapsed=53.15 ms
+CUDA PCG: active=4347 iterations=80 residual=9.545e-4 elapsed=48.56 ms
+CUDA PCG: active=4347 iterations=80 residual=4.080e-5 elapsed=48.77 ms
+CUDA PCG: active=4347 iterations=80 residual=1.111e-3 elapsed=46.84 ms
+CUDA PCG: active=4347 iterations=80 residual=4.202e-5 elapsed=46.26 ms
+CUDA PCG: active=4347 iterations=80 residual=1.678e-3 elapsed=37.74 ms
+CUDA PCG: active=4347 iterations=80 residual=4.940e-5 elapsed=41.01 ms
+CUDA PCG: active=4347 iterations=80 residual=2.952e-3 elapsed=36.14 ms
+profile step ms: predict/tool=17.64 solve=421.46 [assemble=52.03 factor=4.48 pcg=358.47] collision=6.93 fracture=6.02 finish=15.96 pcg_iters=640 residual=2.952e-3
+CUDA PCG: active=4347 iterations=80 residual=4.414e-5 elapsed=39.28 ms
+CUDA PCG: active=4347 iterations=80 residual=1.645e-3 elapsed=42.16 ms
+CUDA PCG: active=4347 iterations=80 residual=3.961e-5 elapsed=47.81 ms
+CUDA PCG: active=4347 iterations=80 residual=9.181e-4 elapsed=41.72 ms
+CUDA PCG: active=4347 iterations=80 residual=4.342e-5 elapsed=41.01 ms
+CUDA PCG: active=4347 iterations=80 residual=1.771e-3 elapsed=43.89 ms
+CUDA PCG: active=4347 iterations=80 residual=4.497e-5 elapsed=41.94 ms
+CUDA PCG: active=4347 iterations=80 residual=1.705e-3 elapsed=40.09 ms
+profile step ms: predict/tool=17.14 solve=396.82 [assemble=48.30 factor=3.67 pcg=337.92] collision=6.94 fracture=5.70 finish=16.23 pcg_iters=640 residual=1.705e-3
+CUDA PCG: active=4347 iterations=80 residual=4.355e-5 elapsed=39.40 ms
+CUDA PCG: active=4347 iterations=80 residual=1.218e-3 elapsed=39.60 ms
+CUDA PCG: active=4347 iterations=80 residual=4.324e-5 elapsed=37.36 ms
+CUDA PCG: active=4347 iterations=80 residual=9.320e-4 elapsed=35.99 ms
+CUDA PCG: active=4347 iterations=80 residual=4.589e-5 elapsed=38.43 ms
+CUDA PCG: active=4347 iterations=80 residual=1.250e-3 elapsed=38.60 ms
+CUDA PCG: active=4347 iterations=80 residual=4.289e-5 elapsed=38.93 ms
+CUDA PCG: active=4347 iterations=80 residual=1.505e-3 elapsed=43.10 ms
+profile step ms: predict/tool=17.53 solve=369.38 [assemble=47.85 factor=3.70 pcg=311.41] collision=6.76 fracture=5.78 finish=15.55 pcg_iters=640 residual=1.505e-3
+CUDA PCG: active=4347 iterations=80 residual=4.124e-5 elapsed=41.83 ms
+CUDA PCG: active=4347 iterations=80 residual=9.077e-4 elapsed=36.93 ms
+CUDA PCG: active=4347 iterations=80 residual=4.348e-5 elapsed=39.85 ms
+CUDA PCG: active=4347 iterations=80 residual=1.599e-3 elapsed=37.14 ms
+CUDA PCG: active=4347 iterations=80 residual=4.103e-5 elapsed=34.03 ms
+CUDA PCG: active=4347 iterations=80 residual=3.175e-4 elapsed=36.33 ms
+CUDA PCG: active=4347 iterations=80 residual=4.193e-5 elapsed=37.99 ms
+CUDA PCG: active=4347 iterations=80 residual=9.910e-4 elapsed=33.44 ms
+profile step ms: predict/tool=16.68 solve=355.72 [assemble=47.93 factor=3.65 pcg=297.54] collision=6.62 fracture=5.77 finish=15.40 pcg_iters=640 residual=9.910e-4
+CUDA PCG: active=4347 iterations=80 residual=4.513e-5 elapsed=35.53 ms
+CUDA PCG: active=4347 iterations=80 residual=1.404e-3 elapsed=37.48 ms
+CUDA PCG: active=4347 iterations=80 residual=4.892e-5 elapsed=34.56 ms
+CUDA PCG: active=4347 iterations=80 residual=1.134e-3 elapsed=35.97 ms
+CUDA PCG: active=4347 iterations=80 residual=4.053e-5 elapsed=39.81 ms
+CUDA PCG: active=4347 iterations=80 residual=1.101e-3 elapsed=36.24 ms
+CUDA PCG: active=4347 iterations=80 residual=5.043e-5 elapsed=35.31 ms
+CUDA PCG: active=4347 iterations=80 residual=2.372e-3 elapsed=34.95 ms
+profile step ms: predict/tool=16.60 solve=349.54 [assemble=49.80 factor=3.56 pcg=289.86] collision=6.59 fracture=5.70 finish=15.32 pcg_iters=640 residual=2.372e-3
+CUDA PCG: active=4347 iterations=80 residual=4.559e-5 elapsed=36.89 ms
+CUDA PCG: active=4347 iterations=80 residual=1.726e-3 elapsed=32.60 ms
+CUDA PCG: active=4347 iterations=80 residual=4.080e-5 elapsed=33.30 ms
+CUDA PCG: active=4347 iterations=80 residual=4.015e-4 elapsed=31.53 ms
+CUDA PCG: active=4347 iterations=80 residual=5.294e-5 elapsed=33.20 ms
+CUDA PCG: active=4347 iterations=80 residual=1.127e-3 elapsed=34.93 ms
+CUDA PCG: active=4347 iterations=80 residual=3.953e-5 elapsed=37.04 ms
+CUDA PCG: active=4347 iterations=80 residual=5.578e-4 elapsed=37.59 ms
+profile step ms: predict/tool=17.45 solve=336.85 [assemble=49.95 factor=3.54 pcg=277.08] collision=6.55 fracture=5.77 finish=15.11 pcg_iters=640 residual=5.578e-4
+CUDA PCG: active=4347 iterations=80 residual=4.587e-5 elapsed=38.69 ms
+CUDA PCG: active=4347 iterations=80 residual=1.788e-3 elapsed=36.53 ms
+CUDA PCG: active=4347 iterations=80 residual=4.279e-5 elapsed=37.24 ms
+CUDA PCG: active=4347 iterations=80 residual=6.589e-4 elapsed=35.74 ms
+CUDA PCG: active=4347 iterations=80 residual=4.183e-5 elapsed=34.07 ms
+CUDA PCG: active=4347 iterations=80 residual=5.827e-4 elapsed=32.80 ms
+CUDA PCG: active=4347 iterations=80 residual=3.950e-5 elapsed=35.23 ms
+CUDA PCG: active=4347 iterations=80 residual=5.251e-4 elapsed=32.57 ms
+profile step ms: predict/tool=16.82 solve=342.57 [assemble=49.52 factor=3.57 pcg=282.86] collision=6.51 fracture=5.66 finish=15.24 pcg_iters=640 residual=5.251e-4
+CUDA PCG: active=4347 iterations=80 residual=4.521e-5 elapsed=34.41 ms
+CUDA PCG: active=4347 iterations=80 residual=9.433e-4 elapsed=38.87 ms
+CUDA PCG: active=4347 iterations=80 residual=4.113e-5 elapsed=51.13 ms
+CUDA PCG: active=4347 iterations=80 residual=6.324e-4 elapsed=48.29 ms
+CUDA PCG: active=4347 iterations=80 residual=4.332e-5 elapsed=42.31 ms
+CUDA PCG: active=4347 iterations=80 residual=7.504e-4 elapsed=39.07 ms
+CUDA PCG: active=4347 iterations=80 residual=4.263e-5 elapsed=40.85 ms
+CUDA PCG: active=4347 iterations=80 residual=5.807e-4 elapsed=38.16 ms
+profile step ms: predict/tool=16.81 solve=389.83 [assemble=46.84 factor=3.56 pcg=333.08] collision=6.64 fracture=5.70 finish=15.20 pcg_iters=640 residual=5.807e-4
+CUDA PCG: active=4347 iterations=80 residual=3.814e-5 elapsed=46.14 ms
+CUDA PCG: active=4347 iterations=80 residual=3.226e-4 elapsed=42.13 ms
+CUDA PCG: active=4347 iterations=80 residual=4.393e-5 elapsed=43.90 ms
+CUDA PCG: active=4347 iterations=80 residual=7.166e-4 elapsed=41.98 ms
+CUDA PCG: active=4347 iterations=80 residual=4.095e-5 elapsed=38.26 ms
+CUDA PCG: active=4347 iterations=80 residual=6.106e-4 elapsed=36.33 ms
+CUDA PCG: active=4347 iterations=80 residual=4.224e-5 elapsed=40.65 ms
+CUDA PCG: active=4347 iterations=80 residual=8.800e-4 elapsed=43.83 ms
+profile step ms: predict/tool=16.62 solve=390.70 [assemble=47.39 factor=3.66 pcg=333.21] collision=6.86 fracture=5.68 finish=15.24 pcg_iters=640 residual=8.800e-4
+CUDA PCG: active=4347 iterations=80 residual=4.122e-5 elapsed=45.27 ms
+CUDA PCG: active=4347 iterations=80 residual=6.844e-4 elapsed=47.52 ms
+CUDA PCG: active=4347 iterations=80 residual=3.924e-5 elapsed=38.95 ms
+CUDA PCG: active=4347 iterations=80 residual=5.037e-4 elapsed=34.07 ms
+CUDA PCG: active=4347 iterations=80 residual=4.421e-5 elapsed=33.72 ms
+CUDA PCG: active=4347 iterations=80 residual=9.617e-4 elapsed=36.04 ms
+CUDA PCG: active=4347 iterations=80 residual=4.004e-5 elapsed=33.90 ms
+CUDA PCG: active=4347 iterations=80 residual=1.713e-3 elapsed=36.25 ms
+profile step ms: predict/tool=16.46 solve=364.15 [assemble=48.54 factor=3.50 pcg=305.71] collision=6.83 fracture=5.66 finish=15.16 pcg_iters=640 residual=1.713e-3
+CUDA PCG: active=4347 iterations=80 residual=4.885e-5 elapsed=37.19 ms
+CUDA PCG: active=4347 iterations=80 residual=3.298e-3 elapsed=33.72 ms
+CUDA PCG: active=4347 iterations=80 residual=4.543e-5 elapsed=40.32 ms
+CUDA PCG: active=4347 iterations=80 residual=3.648e-3 elapsed=35.61 ms
+CUDA PCG: active=4347 iterations=80 residual=4.450e-5 elapsed=36.98 ms
+CUDA PCG: active=4347 iterations=80 residual=3.294e-3 elapsed=35.67 ms
+CUDA PCG: active=4347 iterations=80 residual=4.308e-5 elapsed=33.48 ms
+CUDA PCG: active=4347 iterations=80 residual=1.035e-3 elapsed=36.62 ms
+profile step ms: predict/tool=16.56 solve=349.30 [assemble=49.81 factor=3.53 pcg=289.59] collision=7.09 fracture=5.78 finish=15.40 pcg_iters=640 residual=1.035e-3
+CUDA PCG: active=4347 iterations=80 residual=4.118e-5 elapsed=35.80 ms
+CUDA PCG: active=4347 iterations=80 residual=4.664e-4 elapsed=35.25 ms
+CUDA PCG: active=4347 iterations=80 residual=4.280e-5 elapsed=34.94 ms
+CUDA PCG: active=4347 iterations=80 residual=7.361e-4 elapsed=37.23 ms
+CUDA PCG: active=4347 iterations=80 residual=4.223e-5 elapsed=40.34 ms
+CUDA PCG: active=4347 iterations=80 residual=1.208e-3 elapsed=34.94 ms
+CUDA PCG: active=4347 iterations=80 residual=4.098e-5 elapsed=40.47 ms
+CUDA PCG: active=4347 iterations=80 residual=7.904e-4 elapsed=40.34 ms
+profile step ms: predict/tool=17.17 solve=357.85 [assemble=48.20 factor=3.81 pcg=299.30] collision=6.54 fracture=5.97 finish=15.58 pcg_iters=640 residual=7.904e-4
+CUDA PCG: active=4347 iterations=80 residual=3.989e-5 elapsed=38.65 ms
+CUDA PCG: active=4347 iterations=80 residual=9.166e-4 elapsed=38.11 ms
+CUDA PCG: active=4347 iterations=80 residual=4.439e-5 elapsed=36.53 ms
+CUDA PCG: active=4347 iterations=80 residual=1.346e-3 elapsed=35.08 ms
+CUDA PCG: active=4347 iterations=80 residual=4.181e-5 elapsed=39.56 ms
+CUDA PCG: active=4347 iterations=80 residual=7.194e-4 elapsed=42.98 ms
+CUDA PCG: active=4347 iterations=80 residual=4.041e-5 elapsed=49.27 ms
+CUDA PCG: active=4347 iterations=80 residual=7.141e-4 elapsed=44.76 ms
+profile step ms: predict/tool=17.52 solve=382.45 [assemble=47.40 factor=3.55 pcg=324.94] collision=6.88 fracture=5.74 finish=15.88 pcg_iters=640 residual=7.141e-4
+CUDA PCG: active=4347 iterations=80 residual=4.323e-5 elapsed=41.58 ms
+CUDA PCG: active=4347 iterations=80 residual=1.109e-3 elapsed=40.95 ms
+CUDA PCG: active=4347 iterations=80 residual=4.199e-5 elapsed=38.36 ms
+CUDA PCG: active=4347 iterations=80 residual=6.111e-4 elapsed=35.64 ms
+CUDA PCG: active=4347 iterations=80 residual=4.010e-5 elapsed=35.00 ms
+CUDA PCG: active=4347 iterations=80 residual=9.979e-4 elapsed=34.61 ms
+CUDA PCG: active=4347 iterations=80 residual=4.429e-5 elapsed=33.99 ms
+CUDA PCG: active=4347 iterations=80 residual=1.191e-3 elapsed=37.41 ms
+profile step ms: predict/tool=16.90 solve=354.73 [assemble=47.09 factor=3.64 pcg=297.54] collision=7.07 fracture=5.53 finish=15.58 pcg_iters=640 residual=1.191e-3
+CUDA PCG: active=4347 iterations=80 residual=4.202e-5 elapsed=35.12 ms
+CUDA PCG: active=4347 iterations=80 residual=1.993e-3 elapsed=36.85 ms
+CUDA PCG: active=4347 iterations=80 residual=4.626e-5 elapsed=33.77 ms
+CUDA PCG: active=4347 iterations=80 residual=2.470e-3 elapsed=36.49 ms
+CUDA PCG: active=4347 iterations=80 residual=4.691e-5 elapsed=32.92 ms
+CUDA PCG: active=4347 iterations=80 residual=1.592e-3 elapsed=33.09 ms
+CUDA PCG: active=4347 iterations=80 residual=4.114e-5 elapsed=33.38 ms
+CUDA PCG: active=4347 iterations=80 residual=1.093e-3 elapsed=32.57 ms
+profile step ms: predict/tool=17.17 solve=331.47 [assemble=47.25 factor=3.67 pcg=274.19] collision=7.18 fracture=5.51 finish=15.52 pcg_iters=640 residual=1.093e-3
+CUDA PCG: active=4347 iterations=80 residual=4.746e-5 elapsed=34.07 ms
+CUDA PCG: active=4347 iterations=80 residual=2.294e-3 elapsed=34.41 ms
+CUDA PCG: active=4347 iterations=80 residual=4.514e-5 elapsed=33.50 ms
+CUDA PCG: active=4347 iterations=80 residual=2.233e-3 elapsed=36.95 ms
+CUDA PCG: active=4347 iterations=80 residual=4.721e-5 elapsed=47.25 ms
+CUDA PCG: active=4347 iterations=80 residual=2.359e-3 elapsed=33.95 ms
+CUDA PCG: active=4347 iterations=80 residual=4.219e-5 elapsed=36.92 ms
+CUDA PCG: active=4347 iterations=80 residual=1.702e-3 elapsed=35.45 ms
+profile step ms: predict/tool=16.53 solve=348.33 [assemble=45.91 factor=3.57 pcg=292.50] collision=6.53 fracture=5.76 finish=15.22 pcg_iters=640 residual=1.702e-3
+CUDA PCG: active=4347 iterations=80 residual=4.665e-5 elapsed=37.97 ms
+CUDA PCG: active=4347 iterations=80 residual=1.743e-3 elapsed=33.18 ms
+CUDA PCG: active=4347 iterations=80 residual=4.098e-5 elapsed=33.88 ms
+CUDA PCG: active=4347 iterations=80 residual=8.765e-4 elapsed=35.03 ms
+CUDA PCG: active=4347 iterations=80 residual=5.251e-5 elapsed=34.91 ms
+CUDA PCG: active=4347 iterations=80 residual=2.412e-3 elapsed=34.09 ms
+CUDA PCG: active=4347 iterations=80 residual=4.532e-5 elapsed=35.97 ms
+CUDA PCG: active=4347 iterations=80 residual=1.802e-3 elapsed=34.05 ms
+profile step ms: predict/tool=16.82 solve=338.77 [assemble=49.64 factor=3.54 pcg=279.08] collision=6.79 fracture=5.82 finish=15.49 pcg_iters=640 residual=1.802e-3
+CUDA PCG: active=4347 iterations=80 residual=4.326e-5 elapsed=41.95 ms
+CUDA PCG: active=4347 iterations=80 residual=9.369e-4 elapsed=41.27 ms
+CUDA PCG: active=4347 iterations=80 residual=3.868e-5 elapsed=42.81 ms
+CUDA PCG: active=4347 iterations=80 residual=9.089e-4 elapsed=43.69 ms
+CUDA PCG: active=4347 iterations=80 residual=4.223e-5 elapsed=42.32 ms
+CUDA PCG: active=4347 iterations=80 residual=6.485e-4 elapsed=42.81 ms
+CUDA PCG: active=4347 iterations=80 residual=4.021e-5 elapsed=46.54 ms
+CUDA PCG: active=4347 iterations=80 residual=5.865e-4 elapsed=41.07 ms
+profile step ms: predict/tool=17.12 solve=400.09 [assemble=47.66 factor=3.59 pcg=342.46] collision=7.01 fracture=5.62 finish=15.76 pcg_iters=640 residual=5.865e-4
+CUDA PCG: active=4347 iterations=80 residual=4.184e-5 elapsed=41.94 ms
+CUDA PCG: active=4347 iterations=80 residual=8.936e-4 elapsed=39.13 ms
+CUDA PCG: active=4347 iterations=80 residual=4.179e-5 elapsed=46.44 ms
+CUDA PCG: active=4347 iterations=80 residual=1.051e-3 elapsed=39.80 ms
+CUDA PCG: active=4347 iterations=80 residual=4.200e-5 elapsed=41.26 ms
+CUDA PCG: active=4347 iterations=80 residual=8.534e-4 elapsed=44.76 ms
+CUDA PCG: active=4347 iterations=80 residual=4.270e-5 elapsed=34.78 ms
+CUDA PCG: active=4347 iterations=80 residual=1.438e-3 elapsed=35.60 ms
+profile step ms: predict/tool=16.89 solve=379.72 [assemble=46.15 factor=3.52 pcg=323.71] collision=7.12 fracture=5.33 finish=15.40 pcg_iters=640 residual=1.438e-3
+CUDA PCG: active=4347 iterations=80 residual=4.434e-5 elapsed=33.40 ms
+CUDA PCG: active=4347 iterations=80 residual=1.695e-3 elapsed=36.85 ms
+CUDA PCG: active=4347 iterations=80 residual=4.086e-5 elapsed=40.02 ms
+CUDA PCG: active=4347 iterations=80 residual=7.065e-4 elapsed=40.83 ms
+CUDA PCG: active=4347 iterations=80 residual=4.286e-5 elapsed=38.86 ms
+CUDA PCG: active=4347 iterations=80 residual=6.500e-4 elapsed=36.84 ms
+CUDA PCG: active=4347 iterations=80 residual=3.914e-5 elapsed=34.72 ms
+CUDA PCG: active=4347 iterations=80 residual=4.610e-4 elapsed=34.49 ms
+profile step ms: predict/tool=16.57 solve=352.48 [assemble=46.84 factor=3.49 pcg=296.02] collision=7.24 fracture=5.43 finish=15.27 pcg_iters=640 residual=4.610e-4
+CUDA PCG: active=4347 iterations=80 residual=4.298e-5 elapsed=34.34 ms
+CUDA PCG: active=4347 iterations=80 residual=1.122e-3 elapsed=41.30 ms
+CUDA PCG: active=4347 iterations=80 residual=4.335e-5 elapsed=40.10 ms
+CUDA PCG: active=4347 iterations=80 residual=1.149e-3 elapsed=43.88 ms
+CUDA PCG: active=4347 iterations=80 residual=4.094e-5 elapsed=39.85 ms
+CUDA PCG: active=4347 iterations=80 residual=5.352e-4 elapsed=34.80 ms
+CUDA PCG: active=4347 iterations=80 residual=3.986e-5 elapsed=33.33 ms
+CUDA PCG: active=4347 iterations=80 residual=3.432e-4 elapsed=33.29 ms
+profile step ms: predict/tool=16.74 solve=357.62 [assemble=46.67 factor=3.56 pcg=300.88] collision=7.09 fracture=5.54 finish=15.30 pcg_iters=640 residual=3.432e-4
+CUDA PCG: active=4347 iterations=80 residual=4.127e-5 elapsed=60.39 ms
+CUDA PCG: active=4347 iterations=80 residual=6.081e-4 elapsed=46.52 ms
+CUDA PCG: active=4347 iterations=80 residual=4.181e-5 elapsed=44.62 ms
+CUDA PCG: active=4347 iterations=80 residual=6.003e-4 elapsed=39.96 ms
+CUDA PCG: active=4347 iterations=80 residual=4.121e-5 elapsed=47.50 ms
+CUDA PCG: active=4347 iterations=80 residual=7.674e-4 elapsed=47.47 ms
+CUDA PCG: active=4347 iterations=80 residual=5.282e-5 elapsed=51.07 ms
+CUDA PCG: active=4347 iterations=80 residual=7.028e-4 elapsed=43.94 ms
+profile step ms: predict/tool=16.98 solve=439.88 [assemble=47.69 factor=3.87 pcg=381.46] collision=13.49 fracture=5.78 finish=15.84 pcg_iters=640 residual=7.028e-4
+CUDA PCG: active=4347 iterations=80 residual=5.898e-5 elapsed=44.98 ms
+CUDA PCG: active=4347 iterations=80 residual=5.485e-4 elapsed=42.86 ms
+CUDA PCG: active=4347 iterations=80 residual=6.384e-5 elapsed=34.72 ms
+CUDA PCG: active=4347 iterations=80 residual=4.205e-4 elapsed=34.45 ms
+CUDA PCG: active=4347 iterations=80 residual=6.290e-5 elapsed=34.00 ms
+CUDA PCG: active=4347 iterations=80 residual=4.056e-4 elapsed=38.83 ms
+CUDA PCG: active=4347 iterations=80 residual=5.817e-5 elapsed=40.47 ms
+CUDA PCG: active=4347 iterations=80 residual=4.310e-4 elapsed=38.11 ms
+profile step ms: predict/tool=42.73 solve=364.36 [assemble=45.29 factor=3.60 pcg=308.42] collision=36.68 fracture=4.60 finish=20.63 pcg_iters=640 residual=4.310e-4
+CUDA PCG: active=4347 iterations=80 residual=5.691e-5 elapsed=41.04 ms
+CUDA PCG: active=4347 iterations=80 residual=4.678e-4 elapsed=50.54 ms
+CUDA PCG: active=4347 iterations=80 residual=5.941e-5 elapsed=46.65 ms
+CUDA PCG: active=4347 iterations=80 residual=5.174e-4 elapsed=43.87 ms
+CUDA PCG: active=4347 iterations=80 residual=6.084e-5 elapsed=35.93 ms
+CUDA PCG: active=4347 iterations=80 residual=5.935e-4 elapsed=32.81 ms
+CUDA PCG: active=4347 iterations=80 residual=6.052e-5 elapsed=45.02 ms
+CUDA PCG: active=4347 iterations=80 residual=6.495e-4 elapsed=38.99 ms
+profile step ms: predict/tool=42.44 solve=390.62 [assemble=45.41 factor=3.53 pcg=334.84] collision=37.41 fracture=4.80 finish=20.59 pcg_iters=640 residual=6.495e-4
+CUDA PCG: active=4347 iterations=80 residual=5.904e-5 elapsed=42.64 ms
+CUDA PCG: active=4347 iterations=80 residual=6.876e-4 elapsed=41.77 ms
+CUDA PCG: active=4347 iterations=80 residual=5.871e-5 elapsed=35.53 ms
+CUDA PCG: active=4347 iterations=80 residual=6.956e-4 elapsed=37.84 ms
+CUDA PCG: active=4347 iterations=80 residual=5.841e-5 elapsed=43.02 ms
+CUDA PCG: active=4347 iterations=80 residual=7.128e-4 elapsed=41.88 ms
+CUDA PCG: active=4347 iterations=80 residual=5.749e-5 elapsed=47.91 ms
+CUDA PCG: active=4347 iterations=80 residual=7.203e-4 elapsed=37.07 ms
+profile step ms: predict/tool=42.94 solve=383.38 [assemble=45.39 factor=3.47 pcg=327.67] collision=36.18 fracture=4.94 finish=20.47 pcg_iters=640 residual=7.203e-4
+CUDA PCG: active=4347 iterations=80 residual=5.598e-5 elapsed=47.72 ms
+CUDA PCG: active=4347 iterations=80 residual=7.547e-4 elapsed=41.27 ms
+CUDA PCG: active=4347 iterations=80 residual=5.502e-5 elapsed=42.78 ms
+CUDA PCG: active=4347 iterations=80 residual=7.661e-4 elapsed=44.19 ms
+CUDA PCG: active=4347 iterations=80 residual=5.460e-5 elapsed=40.35 ms
+CUDA PCG: active=4347 iterations=80 residual=7.695e-4 elapsed=47.23 ms
+CUDA PCG: active=4347 iterations=80 residual=5.330e-5 elapsed=37.82 ms
+CUDA PCG: active=4347 iterations=80 residual=7.915e-4 elapsed=39.91 ms
+profile step ms: predict/tool=41.46 solve=395.07 [assemble=43.50 factor=3.40 pcg=341.26] collision=35.54 fracture=4.84 finish=20.43 pcg_iters=640 residual=7.915e-4
+CUDA PCG: active=4347 iterations=80 residual=5.292e-5 elapsed=43.67 ms
+CUDA PCG: active=4347 iterations=80 residual=8.332e-4 elapsed=46.68 ms
+CUDA PCG: active=4347 iterations=80 residual=5.197e-5 elapsed=45.76 ms
+CUDA PCG: active=4347 iterations=80 residual=8.326e-4 elapsed=38.18 ms
+CUDA PCG: active=4347 iterations=80 residual=5.174e-5 elapsed=36.91 ms
+CUDA PCG: active=4347 iterations=80 residual=8.684e-4 elapsed=37.44 ms
+CUDA PCG: active=4347 iterations=80 residual=5.111e-5 elapsed=36.28 ms
+CUDA PCG: active=4347 iterations=80 residual=8.937e-4 elapsed=35.51 ms
+profile step ms: predict/tool=41.93 solve=375.03 [assemble=44.10 factor=3.50 pcg=320.44] collision=35.75 fracture=4.73 finish=15.43 pcg_iters=640 residual=8.937e-4
+CUDA PCG: active=4347 iterations=80 residual=5.077e-5 elapsed=35.32 ms
+CUDA PCG: active=4347 iterations=80 residual=9.195e-4 elapsed=32.65 ms
+CUDA PCG: active=4347 iterations=80 residual=4.945e-5 elapsed=39.80 ms
+CUDA PCG: active=4347 iterations=80 residual=9.335e-4 elapsed=39.12 ms
+CUDA PCG: active=4347 iterations=80 residual=4.935e-5 elapsed=37.94 ms
+CUDA PCG: active=4347 iterations=80 residual=9.756e-4 elapsed=36.21 ms
+CUDA PCG: active=4347 iterations=80 residual=4.857e-5 elapsed=38.75 ms
+CUDA PCG: active=4347 iterations=80 residual=1.002e-3 elapsed=38.20 ms
+profile step ms: predict/tool=42.28 solve=353.00 [assemble=44.44 factor=3.52 pcg=298.00] collision=36.02 fracture=5.12 finish=15.61 pcg_iters=640 residual=1.002e-3
+CUDA PCG: active=4347 iterations=80 residual=4.803e-5 elapsed=39.55 ms
+CUDA PCG: active=4347 iterations=80 residual=1.037e-3 elapsed=37.40 ms
+CUDA PCG: active=4347 iterations=80 residual=4.784e-5 elapsed=37.64 ms
+CUDA PCG: active=4347 iterations=80 residual=1.077e-3 elapsed=32.55 ms
+CUDA PCG: active=4347 iterations=80 residual=4.758e-5 elapsed=42.48 ms
+CUDA PCG: active=4347 iterations=80 residual=1.088e-3 elapsed=35.60 ms
+CUDA PCG: active=4347 iterations=80 residual=4.684e-5 elapsed=34.19 ms
+CUDA PCG: active=4347 iterations=80 residual=1.125e-3 elapsed=33.16 ms
+profile step ms: predict/tool=41.45 solve=346.22 [assemble=43.54 factor=3.46 pcg=292.57] collision=34.54 fracture=4.69 finish=15.12 pcg_iters=640 residual=1.125e-3
+CUDA PCG: active=4347 iterations=80 residual=4.703e-5 elapsed=36.79 ms
+CUDA PCG: active=4347 iterations=80 residual=1.167e-3 elapsed=33.99 ms
+CUDA PCG: active=4347 iterations=80 residual=4.661e-5 elapsed=37.42 ms
+CUDA PCG: active=4347 iterations=80 residual=1.203e-3 elapsed=34.38 ms
+CUDA PCG: active=4347 iterations=80 residual=4.623e-5 elapsed=35.39 ms
+CUDA PCG: active=4347 iterations=80 residual=1.234e-3 elapsed=32.97 ms
+CUDA PCG: active=4347 iterations=80 residual=4.543e-5 elapsed=37.27 ms
+CUDA PCG: active=4347 iterations=80 residual=1.244e-3 elapsed=38.32 ms
+profile step ms: predict/tool=41.28 solve=340.74 [assemble=43.95 factor=3.41 pcg=286.53] collision=35.14 fracture=4.71 finish=15.73 pcg_iters=640 residual=1.244e-3
+CUDA PCG: active=4347 iterations=80 residual=4.555e-5 elapsed=40.66 ms
+CUDA PCG: active=4347 iterations=80 residual=1.298e-3 elapsed=41.71 ms
+CUDA PCG: active=4347 iterations=80 residual=4.491e-5 elapsed=44.08 ms
+CUDA PCG: active=4347 iterations=80 residual=1.329e-3 elapsed=49.29 ms
+CUDA PCG: active=4347 iterations=80 residual=4.480e-5 elapsed=33.12 ms
+CUDA PCG: active=4347 iterations=80 residual=1.365e-3 elapsed=31.85 ms
+CUDA PCG: active=4347 iterations=80 residual=4.429e-5 elapsed=33.81 ms
+CUDA PCG: active=4347 iterations=80 residual=1.386e-3 elapsed=33.33 ms
+profile step ms: predict/tool=41.47 solve=362.43 [assemble=44.36 factor=3.42 pcg=307.85] collision=36.08 fracture=5.10 finish=15.75 pcg_iters=640 residual=1.386e-3
+CUDA PCG: active=4347 iterations=80 residual=4.382e-5 elapsed=33.82 ms
+CUDA PCG: active=4347 iterations=80 residual=1.422e-3 elapsed=31.60 ms
+CUDA PCG: active=4347 iterations=80 residual=4.356e-5 elapsed=34.68 ms
+CUDA PCG: active=4347 iterations=80 residual=1.457e-3 elapsed=35.40 ms
+CUDA PCG: active=4347 iterations=80 residual=4.318e-5 elapsed=33.32 ms
+CUDA PCG: active=4347 iterations=80 residual=1.462e-3 elapsed=32.76 ms
+CUDA PCG: active=4347 iterations=80 residual=4.283e-5 elapsed=40.02 ms
+CUDA PCG: active=4347 iterations=80 residual=1.504e-3 elapsed=46.20 ms
+profile step ms: predict/tool=41.02 solve=341.47 [assemble=43.38 factor=3.46 pcg=287.81] collision=35.04 fracture=4.77 finish=15.13 pcg_iters=640 residual=1.504e-3
+frame=100/175 wall=43.1s substeps=4 broken=0 drift=0.000e0 tool_x=-0.17038
+CUDA PCG: active=4347 iterations=80 residual=4.194e-5 elapsed=42.72 ms
+CUDA PCG: active=4347 iterations=80 residual=1.510e-3 elapsed=39.52 ms
+CUDA PCG: active=4347 iterations=80 residual=4.169e-5 elapsed=39.49 ms
+CUDA PCG: active=4347 iterations=80 residual=1.530e-3 elapsed=45.32 ms
+CUDA PCG: active=4347 iterations=80 residual=4.171e-5 elapsed=34.19 ms
+CUDA PCG: active=4347 iterations=80 residual=1.559e-3 elapsed=33.67 ms
+CUDA PCG: active=4347 iterations=80 residual=4.097e-5 elapsed=39.37 ms
+CUDA PCG: active=4347 iterations=80 residual=1.585e-3 elapsed=38.78 ms
+profile step ms: predict/tool=41.62 solve=367.37 [assemble=43.86 factor=3.62 pcg=313.07] collision=35.16 fracture=4.84 finish=15.58 pcg_iters=640 residual=1.585e-3
+CUDA PCG: active=4347 iterations=80 residual=4.109e-5 elapsed=62.74 ms
+CUDA PCG: active=4347 iterations=80 residual=1.573e-3 elapsed=68.10 ms
+CUDA PCG: active=4347 iterations=80 residual=4.075e-5 elapsed=41.81 ms
+CUDA PCG: active=4347 iterations=80 residual=1.599e-3 elapsed=37.38 ms
+CUDA PCG: active=4347 iterations=80 residual=4.028e-5 elapsed=43.54 ms
+CUDA PCG: active=4347 iterations=80 residual=1.614e-3 elapsed=45.12 ms
+CUDA PCG: active=4347 iterations=80 residual=4.001e-5 elapsed=61.42 ms
+CUDA PCG: active=4347 iterations=80 residual=1.624e-3 elapsed=42.85 ms
+profile step ms: predict/tool=41.54 solve=458.85 [assemble=44.66 factor=4.05 pcg=402.95] collision=34.97 fracture=4.88 finish=15.39 pcg_iters=640 residual=1.624e-3
+CUDA PCG: active=4347 iterations=80 residual=3.978e-5 elapsed=38.20 ms
+CUDA PCG: active=4347 iterations=80 residual=1.646e-3 elapsed=32.63 ms
+CUDA PCG: active=4347 iterations=80 residual=3.945e-5 elapsed=35.97 ms
+CUDA PCG: active=4347 iterations=80 residual=1.662e-3 elapsed=34.00 ms
+CUDA PCG: active=4347 iterations=80 residual=3.932e-5 elapsed=35.35 ms
+CUDA PCG: active=4347 iterations=80 residual=1.676e-3 elapsed=29.99 ms
+CUDA PCG: active=4347 iterations=80 residual=3.913e-5 elapsed=33.72 ms
+CUDA PCG: active=4347 iterations=80 residual=1.693e-3 elapsed=30.09 ms
+profile step ms: predict/tool=40.89 solve=322.76 [assemble=42.92 factor=3.36 pcg=269.97] collision=34.76 fracture=4.73 finish=14.95 pcg_iters=640 residual=1.693e-3
+CUDA PCG: active=4347 iterations=80 residual=3.885e-5 elapsed=42.78 ms
+CUDA PCG: active=4347 iterations=80 residual=1.630e-3 elapsed=42.14 ms
+CUDA PCG: active=4347 iterations=80 residual=3.990e-5 elapsed=40.02 ms
+CUDA PCG: active=4347 iterations=80 residual=1.707e-3 elapsed=42.61 ms
+CUDA PCG: active=4347 iterations=80 residual=3.913e-5 elapsed=35.65 ms
+CUDA PCG: active=4347 iterations=80 residual=1.923e-3 elapsed=37.83 ms
+CUDA PCG: active=4347 iterations=80 residual=3.832e-5 elapsed=34.78 ms
+CUDA PCG: active=4347 iterations=80 residual=2.097e-3 elapsed=33.24 ms
+profile step ms: predict/tool=23.03 solve=362.98 [assemble=43.35 factor=3.50 pcg=309.04] collision=35.27 fracture=4.74 finish=15.21 pcg_iters=640 residual=2.097e-3
+CUDA PCG: active=4347 iterations=80 residual=3.899e-5 elapsed=33.44 ms
+CUDA PCG: active=4347 iterations=80 residual=2.122e-3 elapsed=38.06 ms
+CUDA PCG: active=4347 iterations=80 residual=3.867e-5 elapsed=34.95 ms
+CUDA PCG: active=4347 iterations=80 residual=2.078e-3 elapsed=34.52 ms
+CUDA PCG: active=4347 iterations=80 residual=3.976e-5 elapsed=31.80 ms
+CUDA PCG: active=4347 iterations=80 residual=2.149e-3 elapsed=34.80 ms
+CUDA PCG: active=4347 iterations=80 residual=4.023e-5 elapsed=32.55 ms
+CUDA PCG: active=4347 iterations=80 residual=2.277e-3 elapsed=31.79 ms
+profile step ms: predict/tool=16.94 solve=325.31 [assemble=43.28 factor=3.46 pcg=271.91] collision=35.05 fracture=4.75 finish=15.37 pcg_iters=640 residual=2.277e-3
+CUDA PCG: active=4347 iterations=80 residual=3.909e-5 elapsed=32.56 ms
+CUDA PCG: active=4347 iterations=80 residual=2.239e-3 elapsed=31.31 ms
+CUDA PCG: active=4347 iterations=80 residual=3.958e-5 elapsed=34.56 ms
+CUDA PCG: active=4347 iterations=80 residual=2.255e-3 elapsed=31.27 ms
+CUDA PCG: active=4347 iterations=80 residual=3.958e-5 elapsed=33.96 ms
+CUDA PCG: active=4347 iterations=80 residual=2.292e-3 elapsed=35.34 ms
+CUDA PCG: active=4347 iterations=80 residual=3.942e-5 elapsed=32.34 ms
+CUDA PCG: active=4347 iterations=80 residual=2.350e-3 elapsed=32.50 ms
+profile step ms: predict/tool=16.57 solve=316.33 [assemble=42.37 factor=3.47 pcg=263.82] collision=34.95 fracture=4.82 finish=15.11 pcg_iters=640 residual=2.350e-3
+CUDA PCG: active=4347 iterations=80 residual=3.949e-5 elapsed=33.79 ms
+CUDA PCG: active=4347 iterations=80 residual=2.391e-3 elapsed=34.86 ms
+CUDA PCG: active=4347 iterations=80 residual=3.957e-5 elapsed=37.11 ms
+CUDA PCG: active=4347 iterations=80 residual=2.448e-3 elapsed=36.01 ms
+CUDA PCG: active=4347 iterations=80 residual=4.004e-5 elapsed=40.18 ms
+CUDA PCG: active=4347 iterations=80 residual=2.497e-3 elapsed=47.44 ms
+CUDA PCG: active=4347 iterations=80 residual=4.016e-5 elapsed=47.21 ms
+CUDA PCG: active=4347 iterations=80 residual=2.539e-3 elapsed=56.29 ms
+profile step ms: predict/tool=18.57 solve=390.45 [assemble=46.51 factor=3.78 pcg=332.88] collision=38.47 fracture=5.47 finish=18.03 pcg_iters=640 residual=2.539e-3
+CUDA PCG: active=4347 iterations=80 residual=4.022e-5 elapsed=54.89 ms
+CUDA PCG: active=4347 iterations=80 residual=2.575e-3 elapsed=48.44 ms
+CUDA PCG: active=4347 iterations=80 residual=4.067e-5 elapsed=50.69 ms
+CUDA PCG: active=4347 iterations=80 residual=2.666e-3 elapsed=52.11 ms
+CUDA PCG: active=4347 iterations=80 residual=4.078e-5 elapsed=56.10 ms
+CUDA PCG: active=4347 iterations=80 residual=2.767e-3 elapsed=51.91 ms
+CUDA PCG: active=4347 iterations=80 residual=4.074e-5 elapsed=44.89 ms
+CUDA PCG: active=4347 iterations=80 residual=2.795e-3 elapsed=35.30 ms
+profile step ms: predict/tool=18.86 solve=454.18 [assemble=48.25 factor=4.11 pcg=394.32] collision=38.93 fracture=5.55 finish=16.87 pcg_iters=640 residual=2.795e-3
+CUDA PCG: active=4347 iterations=80 residual=4.104e-5 elapsed=43.79 ms
+CUDA PCG: active=4347 iterations=80 residual=2.869e-3 elapsed=39.41 ms
+CUDA PCG: active=4347 iterations=80 residual=4.105e-5 elapsed=41.70 ms
+CUDA PCG: active=4347 iterations=80 residual=2.962e-3 elapsed=43.79 ms
+CUDA PCG: active=4347 iterations=80 residual=4.134e-5 elapsed=45.98 ms
+CUDA PCG: active=4347 iterations=80 residual=3.002e-3 elapsed=43.94 ms
+CUDA PCG: active=4347 iterations=80 residual=4.139e-5 elapsed=37.79 ms
+CUDA PCG: active=4347 iterations=80 residual=3.081e-3 elapsed=37.70 ms
+profile step ms: predict/tool=18.60 solve=393.07 [assemble=47.42 factor=3.94 pcg=334.11] collision=38.23 fracture=5.41 finish=16.81 pcg_iters=640 residual=3.081e-3
+CUDA PCG: active=4347 iterations=80 residual=4.179e-5 elapsed=41.42 ms
+CUDA PCG: active=4347 iterations=80 residual=3.178e-3 elapsed=37.92 ms
+CUDA PCG: active=4347 iterations=80 residual=4.152e-5 elapsed=37.10 ms
+CUDA PCG: active=4347 iterations=80 residual=3.281e-3 elapsed=34.96 ms
+CUDA PCG: active=4347 iterations=80 residual=4.195e-5 elapsed=37.16 ms
+CUDA PCG: active=4347 iterations=80 residual=3.347e-3 elapsed=42.06 ms
+CUDA PCG: active=4347 iterations=80 residual=4.173e-5 elapsed=38.91 ms
+CUDA PCG: active=4347 iterations=80 residual=3.436e-3 elapsed=34.55 ms
+profile step ms: predict/tool=18.09 solve=361.56 [assemble=46.22 factor=3.79 pcg=304.10] collision=36.90 fracture=5.31 finish=16.16 pcg_iters=640 residual=3.436e-3
+CUDA PCG: active=4347 iterations=80 residual=4.191e-5 elapsed=37.51 ms
+CUDA PCG: active=4347 iterations=80 residual=3.513e-3 elapsed=34.87 ms
+CUDA PCG: active=4347 iterations=80 residual=4.125e-5 elapsed=41.22 ms
+CUDA PCG: active=4347 iterations=80 residual=3.732e-3 elapsed=40.46 ms
+CUDA PCG: active=4347 iterations=80 residual=4.258e-5 elapsed=42.10 ms
+CUDA PCG: active=4347 iterations=80 residual=3.736e-3 elapsed=44.16 ms
+CUDA PCG: active=4347 iterations=80 residual=4.267e-5 elapsed=40.83 ms
+CUDA PCG: active=4347 iterations=80 residual=3.924e-3 elapsed=43.24 ms
+profile step ms: predict/tool=17.61 solve=379.97 [assemble=44.60 factor=3.66 pcg=324.39] collision=36.05 fracture=5.11 finish=15.96 pcg_iters=640 residual=3.924e-3
+CUDA PCG: active=4347 iterations=80 residual=4.184e-5 elapsed=38.65 ms
+CUDA PCG: active=4347 iterations=80 residual=3.946e-3 elapsed=36.89 ms
+CUDA PCG: active=4347 iterations=80 residual=4.303e-5 elapsed=38.74 ms
+CUDA PCG: active=4347 iterations=80 residual=4.280e-3 elapsed=36.31 ms
+CUDA PCG: active=4347 iterations=80 residual=4.253e-5 elapsed=34.35 ms
+CUDA PCG: active=4347 iterations=80 residual=4.061e-3 elapsed=33.15 ms
+CUDA PCG: active=4347 iterations=80 residual=4.262e-5 elapsed=33.78 ms
+CUDA PCG: active=4347 iterations=80 residual=4.274e-3 elapsed=32.21 ms
+profile step ms: predict/tool=17.52 solve=339.19 [assemble=44.10 factor=4.05 pcg=284.09] collision=35.84 fracture=5.08 finish=15.93 pcg_iters=640 residual=4.274e-3
+CUDA PCG: active=4347 iterations=80 residual=4.267e-5 elapsed=38.26 ms
+CUDA PCG: active=4347 iterations=80 residual=4.347e-3 elapsed=36.98 ms
+CUDA PCG: active=4347 iterations=80 residual=4.250e-5 elapsed=39.46 ms
+CUDA PCG: active=4347 iterations=80 residual=4.813e-3 elapsed=34.24 ms
+CUDA PCG: active=4347 iterations=80 residual=4.184e-5 elapsed=34.39 ms
+CUDA PCG: active=4347 iterations=80 residual=4.588e-3 elapsed=32.99 ms
+CUDA PCG: active=4347 iterations=80 residual=4.157e-5 elapsed=34.83 ms
+CUDA PCG: active=4347 iterations=80 residual=4.641e-3 elapsed=36.24 ms
+profile step ms: predict/tool=17.82 solve=341.97 [assemble=43.88 factor=3.59 pcg=287.39] collision=36.14 fracture=5.24 finish=15.92 pcg_iters=640 residual=4.641e-3
+CUDA PCG: active=4347 iterations=80 residual=4.136e-5 elapsed=37.00 ms
+CUDA PCG: active=4347 iterations=80 residual=4.755e-3 elapsed=36.91 ms
+CUDA PCG: active=4347 iterations=80 residual=4.103e-5 elapsed=37.18 ms
+CUDA PCG: active=4347 iterations=80 residual=4.875e-3 elapsed=40.14 ms
+CUDA PCG: active=4347 iterations=80 residual=4.029e-5 elapsed=45.03 ms
+CUDA PCG: active=4347 iterations=80 residual=4.807e-3 elapsed=50.43 ms
+CUDA PCG: active=4347 iterations=80 residual=4.088e-5 elapsed=47.08 ms
+CUDA PCG: active=4347 iterations=80 residual=5.303e-3 elapsed=43.57 ms
+profile step ms: predict/tool=17.54 solve=392.42 [assemble=44.31 factor=3.61 pcg=337.34] collision=35.94 fracture=5.11 finish=15.94 pcg_iters=640 residual=5.303e-3
+CUDA PCG: active=4347 iterations=80 residual=4.036e-5 elapsed=36.22 ms
+CUDA PCG: active=4347 iterations=80 residual=5.091e-3 elapsed=37.34 ms
+CUDA PCG: active=4347 iterations=80 residual=4.087e-5 elapsed=36.96 ms
+CUDA PCG: active=4347 iterations=80 residual=5.375e-3 elapsed=35.86 ms
+CUDA PCG: active=4347 iterations=80 residual=3.939e-5 elapsed=36.21 ms
+CUDA PCG: active=4347 iterations=80 residual=5.101e-3 elapsed=35.37 ms
+CUDA PCG: active=4347 iterations=80 residual=4.007e-5 elapsed=33.37 ms
+CUDA PCG: active=4347 iterations=80 residual=5.557e-3 elapsed=34.62 ms
+profile step ms: predict/tool=17.55 solve=341.14 [assemble=44.54 factor=3.61 pcg=285.95] collision=36.16 fracture=5.23 finish=16.02 pcg_iters=640 residual=5.557e-3
+CUDA PCG: active=4347 iterations=80 residual=3.943e-5 elapsed=37.55 ms
+CUDA PCG: active=4347 iterations=80 residual=5.367e-3 elapsed=50.11 ms
+CUDA PCG: active=4347 iterations=80 residual=3.914e-5 elapsed=35.02 ms
+CUDA PCG: active=4347 iterations=80 residual=5.680e-3 elapsed=37.97 ms
+CUDA PCG: active=4347 iterations=80 residual=3.904e-5 elapsed=47.59 ms
+CUDA PCG: active=4347 iterations=80 residual=5.225e-3 elapsed=41.41 ms
+CUDA PCG: active=4347 iterations=80 residual=3.931e-5 elapsed=37.13 ms
+CUDA PCG: active=4347 iterations=80 residual=5.449e-3 elapsed=43.86 ms
+profile step ms: predict/tool=17.75 solve=387.00 [assemble=45.49 factor=3.64 pcg=330.65] collision=44.92 fracture=5.24 finish=15.81 pcg_iters=640 residual=5.449e-3
+CUDA PCG: active=4347 iterations=80 residual=3.880e-5 elapsed=37.73 ms
+CUDA PCG: active=4347 iterations=80 residual=5.561e-3 elapsed=34.90 ms
+CUDA PCG: active=4347 iterations=80 residual=3.904e-5 elapsed=36.39 ms
+CUDA PCG: active=4347 iterations=80 residual=5.580e-3 elapsed=33.35 ms
+CUDA PCG: active=4347 iterations=80 residual=3.871e-5 elapsed=34.59 ms
+CUDA PCG: active=4347 iterations=80 residual=5.631e-3 elapsed=32.85 ms
+CUDA PCG: active=4347 iterations=80 residual=3.879e-5 elapsed=39.41 ms
+CUDA PCG: active=4347 iterations=80 residual=5.881e-3 elapsed=31.68 ms
+profile step ms: predict/tool=17.47 solve=335.71 [assemble=44.34 factor=3.60 pcg=280.90] collision=36.06 fracture=5.38 finish=15.75 pcg_iters=640 residual=5.881e-3
+CUDA PCG: active=4347 iterations=80 residual=3.846e-5 elapsed=34.56 ms
+CUDA PCG: active=4347 iterations=80 residual=6.273e-3 elapsed=33.78 ms
+CUDA PCG: active=4347 iterations=80 residual=3.770e-5 elapsed=44.49 ms
+CUDA PCG: active=4347 iterations=80 residual=6.028e-3 elapsed=44.65 ms
+CUDA PCG: active=4347 iterations=80 residual=3.852e-5 elapsed=38.18 ms
+CUDA PCG: active=4347 iterations=80 residual=6.022e-3 elapsed=39.73 ms
+CUDA PCG: active=4347 iterations=80 residual=3.704e-5 elapsed=38.08 ms
+CUDA PCG: active=4347 iterations=80 residual=5.181e-3 elapsed=37.21 ms
+profile step ms: predict/tool=17.66 solve=365.83 [assemble=44.46 factor=3.64 pcg=310.68] collision=36.62 fracture=5.20 finish=16.12 pcg_iters=640 residual=5.181e-3
+CUDA PCG: active=4347 iterations=80 residual=3.749e-5 elapsed=37.70 ms
+CUDA PCG: active=4347 iterations=80 residual=5.899e-3 elapsed=37.58 ms
+CUDA PCG: active=4347 iterations=80 residual=3.799e-5 elapsed=35.74 ms
+CUDA PCG: active=4347 iterations=80 residual=5.932e-3 elapsed=36.22 ms
+CUDA PCG: active=4347 iterations=80 residual=3.745e-5 elapsed=37.80 ms
+CUDA PCG: active=4347 iterations=80 residual=5.563e-3 elapsed=34.16 ms
+CUDA PCG: active=4347 iterations=80 residual=3.784e-5 elapsed=37.16 ms
+CUDA PCG: active=4347 iterations=80 residual=6.186e-3 elapsed=45.61 ms
+profile step ms: predict/tool=17.44 solve=356.49 [assemble=43.89 factor=3.67 pcg=301.97] collision=36.75 fracture=5.20 finish=16.09 pcg_iters=640 residual=6.186e-3
+CUDA PCG: active=4347 iterations=80 residual=3.662e-5 elapsed=46.93 ms
+CUDA PCG: active=4347 iterations=80 residual=5.663e-3 elapsed=44.50 ms
+CUDA PCG: active=4347 iterations=80 residual=3.779e-5 elapsed=41.24 ms
+CUDA PCG: active=4347 iterations=80 residual=6.326e-3 elapsed=42.80 ms
+CUDA PCG: active=4347 iterations=80 residual=3.748e-5 elapsed=44.33 ms
+CUDA PCG: active=4347 iterations=80 residual=6.801e-3 elapsed=43.04 ms
+CUDA PCG: active=4347 iterations=80 residual=3.732e-5 elapsed=40.69 ms
+CUDA PCG: active=4347 iterations=80 residual=6.354e-3 elapsed=35.75 ms
+profile step ms: predict/tool=18.78 solve=397.48 [assemble=45.94 factor=4.12 pcg=339.28] collision=38.61 fracture=6.11 finish=16.35 pcg_iters=640 residual=6.354e-3
+CUDA PCG: active=4347 iterations=80 residual=3.648e-5 elapsed=35.48 ms
+CUDA PCG: active=4347 iterations=80 residual=6.528e-3 elapsed=35.77 ms
+CUDA PCG: active=4347 iterations=80 residual=3.649e-5 elapsed=43.57 ms
+CUDA PCG: active=4347 iterations=80 residual=7.101e-3 elapsed=46.05 ms
+CUDA PCG: active=4347 iterations=80 residual=3.747e-5 elapsed=51.95 ms
+CUDA PCG: active=4347 iterations=80 residual=7.311e-3 elapsed=41.77 ms
+CUDA PCG: active=4347 iterations=80 residual=3.634e-5 elapsed=35.32 ms
+CUDA PCG: active=4347 iterations=80 residual=6.259e-3 elapsed=36.04 ms
+profile step ms: predict/tool=18.42 solve=381.65 [assemble=44.54 factor=3.86 pcg=325.95] collision=36.57 fracture=5.23 finish=16.03 pcg_iters=640 residual=6.259e-3
+CUDA PCG: active=4347 iterations=80 residual=3.661e-5 elapsed=37.94 ms
+CUDA PCG: active=4347 iterations=80 residual=7.259e-3 elapsed=36.54 ms
+CUDA PCG: active=4347 iterations=80 residual=3.676e-5 elapsed=34.95 ms
+CUDA PCG: active=4347 iterations=80 residual=6.993e-3 elapsed=36.85 ms
+CUDA PCG: active=4347 iterations=80 residual=3.652e-5 elapsed=37.29 ms
+CUDA PCG: active=4347 iterations=80 residual=7.189e-3 elapsed=33.86 ms
+CUDA PCG: active=4347 iterations=80 residual=3.630e-5 elapsed=35.46 ms
+CUDA PCG: active=4347 iterations=80 residual=6.521e-3 elapsed=33.73 ms
+profile step ms: predict/tool=17.48 solve=341.58 [assemble=44.05 factor=3.72 pcg=286.63] collision=35.88 fracture=5.32 finish=15.92 pcg_iters=640 residual=6.521e-3
+CUDA PCG: active=4347 iterations=80 residual=3.670e-5 elapsed=35.23 ms
+CUDA PCG: active=4347 iterations=80 residual=7.568e-3 elapsed=33.00 ms
+CUDA PCG: active=4347 iterations=80 residual=3.682e-5 elapsed=35.11 ms
+CUDA PCG: active=4347 iterations=80 residual=7.539e-3 elapsed=33.79 ms
+CUDA PCG: active=4347 iterations=80 residual=3.620e-5 elapsed=34.32 ms
+CUDA PCG: active=4347 iterations=80 residual=6.993e-3 elapsed=34.59 ms
+CUDA PCG: active=4347 iterations=80 residual=3.659e-5 elapsed=34.60 ms
+CUDA PCG: active=4347 iterations=80 residual=7.836e-3 elapsed=34.39 ms
+profile step ms: predict/tool=17.27 solve=330.02 [assemble=44.30 factor=3.61 pcg=275.03] collision=35.66 fracture=5.31 finish=16.05 pcg_iters=640 residual=7.836e-3
+CUDA PCG: active=4347 iterations=80 residual=3.609e-5 elapsed=35.81 ms
+CUDA PCG: active=4347 iterations=80 residual=7.185e-3 elapsed=32.84 ms
+CUDA PCG: active=4347 iterations=80 residual=3.615e-5 elapsed=39.01 ms
+CUDA PCG: active=4347 iterations=80 residual=7.949e-3 elapsed=35.26 ms
+CUDA PCG: active=4347 iterations=80 residual=3.606e-5 elapsed=37.80 ms
+CUDA PCG: active=4347 iterations=80 residual=7.289e-3 elapsed=33.13 ms
+CUDA PCG: active=4347 iterations=80 residual=3.644e-5 elapsed=37.77 ms
+CUDA PCG: active=4347 iterations=80 residual=8.056e-3 elapsed=38.49 ms
+profile step ms: predict/tool=18.06 solve=345.97 [assemble=44.95 factor=3.61 pcg=290.12] collision=35.31 fracture=5.31 finish=16.19 pcg_iters=640 residual=8.056e-3
+CUDA PCG: active=4347 iterations=80 residual=3.579e-5 elapsed=34.23 ms
+CUDA PCG: active=4347 iterations=80 residual=8.452e-3 elapsed=36.97 ms
+CUDA PCG: active=4347 iterations=80 residual=3.567e-5 elapsed=37.22 ms
+CUDA PCG: active=4347 iterations=80 residual=8.157e-3 elapsed=34.37 ms
+CUDA PCG: active=4347 iterations=80 residual=3.554e-5 elapsed=47.25 ms
+CUDA PCG: active=4347 iterations=80 residual=7.914e-3 elapsed=49.28 ms
+CUDA PCG: active=4347 iterations=80 residual=3.569e-5 elapsed=48.19 ms
+CUDA PCG: active=4347 iterations=80 residual=8.972e-3 elapsed=45.71 ms
+profile step ms: predict/tool=18.29 solve=389.84 [assemble=45.56 factor=3.71 pcg=333.22] collision=36.01 fracture=5.37 finish=16.48 pcg_iters=640 residual=8.972e-3
+CUDA PCG: active=4347 iterations=80 residual=3.577e-5 elapsed=51.46 ms
+CUDA PCG: active=4347 iterations=80 residual=9.249e-3 elapsed=48.13 ms
+CUDA PCG: active=4347 iterations=80 residual=3.511e-5 elapsed=47.24 ms
+CUDA PCG: active=4347 iterations=80 residual=8.209e-3 elapsed=50.28 ms
+CUDA PCG: active=4347 iterations=80 residual=3.557e-5 elapsed=44.71 ms
+CUDA PCG: active=4347 iterations=80 residual=8.842e-3 elapsed=34.49 ms
+CUDA PCG: active=4347 iterations=80 residual=3.549e-5 elapsed=38.45 ms
+CUDA PCG: active=4347 iterations=80 residual=8.677e-3 elapsed=35.75 ms
+profile step ms: predict/tool=19.18 solve=410.95 [assemble=47.36 factor=4.58 pcg=350.51] collision=35.12 fracture=5.55 finish=16.29 pcg_iters=640 residual=8.677e-3
+CUDA PCG: active=4347 iterations=80 residual=3.579e-5 elapsed=40.82 ms
+CUDA PCG: active=4347 iterations=80 residual=8.904e-3 elapsed=46.05 ms
+CUDA PCG: active=4347 iterations=80 residual=3.534e-5 elapsed=46.82 ms
+CUDA PCG: active=4347 iterations=80 residual=9.055e-3 elapsed=38.11 ms
+CUDA PCG: active=4347 iterations=80 residual=3.587e-5 elapsed=42.33 ms
+CUDA PCG: active=4347 iterations=80 residual=9.042e-3 elapsed=38.26 ms
+CUDA PCG: active=4347 iterations=80 residual=3.531e-5 elapsed=37.25 ms
+CUDA PCG: active=4347 iterations=80 residual=8.288e-3 elapsed=34.61 ms
+profile step ms: predict/tool=17.83 solve=379.77 [assemble=44.50 factor=3.72 pcg=324.25] collision=34.08 fracture=5.21 finish=16.07 pcg_iters=640 residual=8.288e-3
+CUDA PCG: active=4347 iterations=80 residual=3.582e-5 elapsed=34.65 ms
+CUDA PCG: active=4347 iterations=80 residual=9.136e-3 elapsed=34.07 ms
+CUDA PCG: active=4347 iterations=80 residual=3.521e-5 elapsed=47.77 ms
+CUDA PCG: active=4347 iterations=80 residual=8.524e-3 elapsed=47.67 ms
+CUDA PCG: active=4347 iterations=80 residual=3.586e-5 elapsed=34.27 ms
+CUDA PCG: active=4347 iterations=80 residual=9.473e-3 elapsed=38.37 ms
+CUDA PCG: active=4347 iterations=80 residual=3.462e-5 elapsed=34.98 ms
+CUDA PCG: active=4347 iterations=80 residual=8.617e-3 elapsed=36.93 ms
+profile step ms: predict/tool=17.49 solve=363.36 [assemble=43.95 factor=3.59 pcg=308.72] collision=35.83 fracture=5.26 finish=15.86 pcg_iters=640 residual=8.617e-3
+CUDA PCG: active=4347 iterations=80 residual=3.549e-5 elapsed=45.62 ms
+CUDA PCG: active=4347 iterations=80 residual=9.443e-3 elapsed=38.17 ms
+CUDA PCG: active=4347 iterations=80 residual=3.563e-5 elapsed=42.07 ms
+CUDA PCG: active=4347 iterations=80 residual=1.031e-2 elapsed=36.63 ms
+CUDA PCG: active=4347 iterations=80 residual=3.529e-5 elapsed=34.69 ms
+CUDA PCG: active=4347 iterations=80 residual=1.026e-2 elapsed=35.25 ms
+CUDA PCG: active=4347 iterations=80 residual=3.445e-5 elapsed=33.89 ms
+CUDA PCG: active=4347 iterations=80 residual=9.562e-3 elapsed=33.49 ms
+profile step ms: predict/tool=17.44 solve=354.70 [assemble=44.12 factor=3.64 pcg=299.82] collision=33.78 fracture=5.25 finish=15.73 pcg_iters=640 residual=9.562e-3
+CUDA PCG: active=4347 iterations=80 residual=3.533e-5 elapsed=38.27 ms
+CUDA PCG: active=4347 iterations=80 residual=1.071e-2 elapsed=33.55 ms
+CUDA PCG: active=4347 iterations=80 residual=3.559e-5 elapsed=34.31 ms
+CUDA PCG: active=4347 iterations=80 residual=1.006e-2 elapsed=35.42 ms
+CUDA PCG: active=4347 iterations=80 residual=3.545e-5 elapsed=36.31 ms
+CUDA PCG: active=4347 iterations=80 residual=1.021e-2 elapsed=38.51 ms
+CUDA PCG: active=4347 iterations=80 residual=3.512e-5 elapsed=35.14 ms
+CUDA PCG: active=4347 iterations=80 residual=1.006e-2 elapsed=33.65 ms
+profile step ms: predict/tool=17.43 solve=339.27 [assemble=43.53 factor=3.60 pcg=285.16] collision=35.29 fracture=5.50 finish=15.82 pcg_iters=640 residual=1.006e-2
+CUDA PCG: active=4347 iterations=80 residual=3.536e-5 elapsed=41.13 ms
+CUDA PCG: active=4347 iterations=80 residual=1.028e-2 elapsed=32.15 ms
+CUDA PCG: active=4347 iterations=80 residual=3.536e-5 elapsed=35.28 ms
+CUDA PCG: active=4347 iterations=80 residual=1.031e-2 elapsed=32.71 ms
+CUDA PCG: active=4347 iterations=80 residual=3.531e-5 elapsed=35.76 ms
+CUDA PCG: active=4347 iterations=80 residual=1.046e-2 elapsed=32.82 ms
+CUDA PCG: active=4347 iterations=80 residual=3.535e-5 elapsed=35.24 ms
+CUDA PCG: active=4347 iterations=80 residual=1.053e-2 elapsed=32.07 ms
+profile step ms: predict/tool=17.15 solve=332.46 [assemble=44.67 factor=3.69 pcg=277.17] collision=41.17 fracture=5.17 finish=15.86 pcg_iters=640 residual=1.053e-2
+CUDA PCG: active=4347 iterations=80 residual=3.540e-5 elapsed=33.25 ms
+CUDA PCG: active=4347 iterations=80 residual=1.059e-2 elapsed=32.97 ms
+CUDA PCG: active=4347 iterations=80 residual=3.511e-5 elapsed=32.84 ms
+CUDA PCG: active=4347 iterations=80 residual=1.076e-2 elapsed=33.46 ms
+CUDA PCG: active=4347 iterations=80 residual=3.416e-5 elapsed=32.55 ms
+CUDA PCG: active=4347 iterations=80 residual=9.825e-3 elapsed=56.21 ms
+CUDA PCG: active=4347 iterations=80 residual=3.512e-5 elapsed=46.33 ms
+CUDA PCG: active=4347 iterations=80 residual=1.090e-2 elapsed=37.09 ms
+profile step ms: predict/tool=17.37 solve=360.73 [assemble=44.25 factor=4.72 pcg=304.71] collision=34.31 fracture=5.20 finish=16.10 pcg_iters=640 residual=1.090e-2
+CUDA PCG: active=4347 iterations=80 residual=3.401e-5 elapsed=33.31 ms
+CUDA PCG: active=4347 iterations=80 residual=1.018e-2 elapsed=33.11 ms
+CUDA PCG: active=4347 iterations=80 residual=3.490e-5 elapsed=35.01 ms
+CUDA PCG: active=4347 iterations=80 residual=1.100e-2 elapsed=33.05 ms
+CUDA PCG: active=4347 iterations=80 residual=3.469e-5 elapsed=33.64 ms
+CUDA PCG: active=4347 iterations=80 residual=1.031e-2 elapsed=32.63 ms
+CUDA PCG: active=4347 iterations=80 residual=3.473e-5 elapsed=40.88 ms
+CUDA PCG: active=4347 iterations=80 residual=1.123e-2 elapsed=37.23 ms
+profile step ms: predict/tool=17.61 solve=332.52 [assemble=43.35 factor=3.51 pcg=278.86] collision=34.24 fracture=5.17 finish=15.88 pcg_iters=640 residual=1.123e-2
+CUDA PCG: active=4347 iterations=80 residual=3.465e-5 elapsed=38.76 ms
+CUDA PCG: active=4347 iterations=80 residual=1.055e-2 elapsed=38.69 ms
+CUDA PCG: active=4347 iterations=80 residual=3.519e-5 elapsed=36.02 ms
+CUDA PCG: active=4347 iterations=80 residual=1.148e-2 elapsed=37.52 ms
+CUDA PCG: active=4347 iterations=80 residual=3.385e-5 elapsed=35.08 ms
+CUDA PCG: active=4347 iterations=80 residual=1.239e-2 elapsed=33.28 ms
+CUDA PCG: active=4347 iterations=80 residual=3.511e-5 elapsed=35.68 ms
+CUDA PCG: active=4347 iterations=80 residual=1.182e-2 elapsed=36.74 ms
+profile step ms: predict/tool=17.59 solve=346.97 [assemble=44.58 factor=3.67 pcg=291.78] collision=34.14 fracture=5.22 finish=15.66 pcg_iters=640 residual=1.182e-2
+CUDA PCG: active=4347 iterations=80 residual=3.424e-5 elapsed=36.54 ms
+CUDA PCG: active=4347 iterations=80 residual=1.251e-2 elapsed=35.50 ms
+CUDA PCG: active=4347 iterations=80 residual=3.442e-5 elapsed=35.99 ms
+CUDA PCG: active=4347 iterations=80 residual=1.174e-2 elapsed=36.83 ms
+CUDA PCG: active=4347 iterations=80 residual=3.433e-5 elapsed=36.48 ms
+CUDA PCG: active=4347 iterations=80 residual=1.237e-2 elapsed=36.59 ms
+CUDA PCG: active=4347 iterations=80 residual=3.404e-5 elapsed=38.73 ms
+CUDA PCG: active=4347 iterations=80 residual=1.120e-2 elapsed=44.73 ms
+profile step ms: predict/tool=17.21 solve=355.90 [assemble=43.76 factor=3.89 pcg=301.39] collision=33.87 fracture=5.18 finish=15.68 pcg_iters=640 residual=1.120e-2
+CUDA PCG: active=4347 iterations=80 residual=3.436e-5 elapsed=44.54 ms
+CUDA PCG: active=4347 iterations=80 residual=1.266e-2 elapsed=52.09 ms
+CUDA PCG: active=4347 iterations=80 residual=3.406e-5 elapsed=44.11 ms
+CUDA PCG: active=4347 iterations=80 residual=1.323e-2 elapsed=35.08 ms
+CUDA PCG: active=4347 iterations=80 residual=3.398e-5 elapsed=37.56 ms
+CUDA PCG: active=4347 iterations=80 residual=1.275e-2 elapsed=40.73 ms
+CUDA PCG: active=4347 iterations=80 residual=3.373e-5 elapsed=45.54 ms
+CUDA PCG: active=4347 iterations=80 residual=1.308e-2 elapsed=41.27 ms
+profile step ms: predict/tool=17.44 solve=395.20 [assemble=43.76 factor=3.72 pcg=340.91] collision=33.37 fracture=5.20 finish=15.79 pcg_iters=640 residual=1.308e-2
+CUDA PCG: active=4347 iterations=80 residual=3.393e-5 elapsed=41.05 ms
+CUDA PCG: active=4347 iterations=80 residual=1.300e-2 elapsed=34.42 ms
+CUDA PCG: active=4347 iterations=80 residual=3.389e-5 elapsed=36.51 ms
+CUDA PCG: active=4347 iterations=80 residual=1.298e-2 elapsed=33.54 ms
+CUDA PCG: active=4347 iterations=80 residual=3.413e-5 elapsed=41.17 ms
+CUDA PCG: active=4347 iterations=80 residual=1.314e-2 elapsed=45.25 ms
+CUDA PCG: active=4347 iterations=80 residual=3.395e-5 elapsed=46.08 ms
+CUDA PCG: active=4347 iterations=80 residual=1.330e-2 elapsed=51.41 ms
+profile step ms: predict/tool=17.21 solve=383.85 [assemble=43.86 factor=3.73 pcg=329.42] collision=33.02 fracture=5.28 finish=15.79 pcg_iters=640 residual=1.330e-2
+CUDA PCG: active=4347 iterations=80 residual=3.414e-5 elapsed=35.61 ms
+CUDA PCG: active=4347 iterations=80 residual=1.313e-2 elapsed=42.89 ms
+CUDA PCG: active=4347 iterations=80 residual=3.418e-5 elapsed=35.03 ms
+CUDA PCG: active=4347 iterations=80 residual=1.350e-2 elapsed=36.26 ms
+CUDA PCG: active=4347 iterations=80 residual=3.409e-5 elapsed=33.30 ms
+CUDA PCG: active=4347 iterations=80 residual=1.345e-2 elapsed=34.38 ms
+CUDA PCG: active=4347 iterations=80 residual=3.407e-5 elapsed=34.41 ms
+CUDA PCG: active=4347 iterations=80 residual=1.360e-2 elapsed=34.06 ms
+profile step ms: predict/tool=17.65 solve=340.13 [assemble=43.73 factor=3.58 pcg=285.95] collision=32.26 fracture=5.37 finish=15.83 pcg_iters=640 residual=1.360e-2
+CUDA PCG: active=4347 iterations=80 residual=3.406e-5 elapsed=37.20 ms
+CUDA PCG: active=4347 iterations=80 residual=1.362e-2 elapsed=33.03 ms
+CUDA PCG: active=4347 iterations=80 residual=3.410e-5 elapsed=34.60 ms
+CUDA PCG: active=4347 iterations=80 residual=1.374e-2 elapsed=36.52 ms
+CUDA PCG: active=4347 iterations=80 residual=3.410e-5 elapsed=36.61 ms
+CUDA PCG: active=4347 iterations=80 residual=1.379e-2 elapsed=35.28 ms
+CUDA PCG: active=4347 iterations=80 residual=3.392e-5 elapsed=41.98 ms
+CUDA PCG: active=4347 iterations=80 residual=1.383e-2 elapsed=39.80 ms
+profile step ms: predict/tool=17.60 solve=349.75 [assemble=43.97 factor=3.63 pcg=295.02] collision=32.92 fracture=5.51 finish=15.88 pcg_iters=640 residual=1.383e-2
+CUDA PCG: active=4347 iterations=80 residual=3.373e-5 elapsed=45.27 ms
+CUDA PCG: active=4347 iterations=80 residual=1.406e-2 elapsed=36.76 ms
+CUDA PCG: active=4347 iterations=80 residual=3.420e-5 elapsed=34.28 ms
+CUDA PCG: active=4347 iterations=80 residual=1.408e-2 elapsed=35.99 ms
+CUDA PCG: active=4347 iterations=80 residual=3.392e-5 elapsed=36.39 ms
+CUDA PCG: active=4347 iterations=80 residual=1.436e-2 elapsed=37.85 ms
+CUDA PCG: active=4347 iterations=80 residual=3.397e-5 elapsed=41.01 ms
+CUDA PCG: active=4347 iterations=80 residual=1.427e-2 elapsed=35.05 ms
+profile step ms: predict/tool=17.43 solve=357.40 [assemble=44.12 factor=3.65 pcg=302.60] collision=31.86 fracture=5.27 finish=15.65 pcg_iters=640 residual=1.427e-2
+CUDA PCG: active=4347 iterations=80 residual=3.389e-5 elapsed=33.69 ms
+CUDA PCG: active=4347 iterations=80 residual=1.420e-2 elapsed=32.40 ms
+CUDA PCG: active=4347 iterations=80 residual=3.404e-5 elapsed=37.24 ms
+CUDA PCG: active=4347 iterations=80 residual=1.426e-2 elapsed=32.97 ms
+CUDA PCG: active=4347 iterations=80 residual=3.416e-5 elapsed=34.14 ms
+CUDA PCG: active=4347 iterations=80 residual=1.438e-2 elapsed=33.62 ms
+CUDA PCG: active=4347 iterations=80 residual=3.430e-5 elapsed=34.77 ms
+CUDA PCG: active=4347 iterations=80 residual=1.469e-2 elapsed=34.50 ms
+profile step ms: predict/tool=17.39 solve=327.79 [assemble=43.78 factor=3.66 pcg=273.34] collision=33.09 fracture=5.17 finish=15.94 pcg_iters=640 residual=1.469e-2
+CUDA PCG: active=4347 iterations=80 residual=3.336e-5 elapsed=35.84 ms
+CUDA PCG: active=4347 iterations=80 residual=1.338e-2 elapsed=34.27 ms
+CUDA PCG: active=4347 iterations=80 residual=3.415e-5 elapsed=35.40 ms
+CUDA PCG: active=4347 iterations=80 residual=1.486e-2 elapsed=32.50 ms
+CUDA PCG: active=4347 iterations=80 residual=3.367e-5 elapsed=33.21 ms
+CUDA PCG: active=4347 iterations=80 residual=1.380e-2 elapsed=36.50 ms
+CUDA PCG: active=4347 iterations=80 residual=3.426e-5 elapsed=39.20 ms
+CUDA PCG: active=4347 iterations=80 residual=1.485e-2 elapsed=38.90 ms
+profile step ms: predict/tool=17.48 solve=340.19 [assemble=43.96 factor=3.64 pcg=285.83] collision=32.75 fracture=5.31 finish=15.87 pcg_iters=640 residual=1.485e-2
+CUDA PCG: active=4347 iterations=80 residual=3.386e-5 elapsed=37.53 ms
+CUDA PCG: active=4347 iterations=80 residual=1.402e-2 elapsed=32.75 ms
+CUDA PCG: active=4347 iterations=80 residual=3.425e-5 elapsed=34.81 ms
+CUDA PCG: active=4347 iterations=80 residual=1.526e-2 elapsed=32.60 ms
+CUDA PCG: active=4347 iterations=80 residual=3.325e-5 elapsed=46.82 ms
+CUDA PCG: active=4347 iterations=80 residual=1.397e-2 elapsed=48.20 ms
+CUDA PCG: active=4347 iterations=80 residual=3.378e-5 elapsed=36.93 ms
+CUDA PCG: active=4347 iterations=80 residual=1.549e-2 elapsed=34.02 ms
+profile step ms: predict/tool=17.33 solve=358.26 [assemble=44.12 factor=3.56 pcg=303.66] collision=33.24 fracture=5.24 finish=15.78 pcg_iters=640 residual=1.549e-2
+CUDA PCG: active=4347 iterations=80 residual=3.344e-5 elapsed=33.35 ms
+CUDA PCG: active=4347 iterations=80 residual=1.638e-2 elapsed=34.49 ms
+CUDA PCG: active=4347 iterations=80 residual=3.408e-5 elapsed=34.40 ms
+CUDA PCG: active=4347 iterations=80 residual=1.547e-2 elapsed=34.14 ms
+CUDA PCG: active=4347 iterations=80 residual=3.388e-5 elapsed=33.41 ms
+CUDA PCG: active=4347 iterations=80 residual=1.600e-2 elapsed=32.80 ms
+CUDA PCG: active=4347 iterations=80 residual=3.386e-5 elapsed=33.34 ms
+CUDA PCG: active=4347 iterations=80 residual=1.454e-2 elapsed=32.43 ms
+profile step ms: predict/tool=17.35 solve=322.35 [assemble=43.63 factor=3.65 pcg=268.35] collision=32.26 fracture=5.42 finish=15.48 pcg_iters=640 residual=1.454e-2
+CUDA PCG: active=4347 iterations=80 residual=3.383e-5 elapsed=35.22 ms
+CUDA PCG: active=4347 iterations=80 residual=1.643e-2 elapsed=36.87 ms
+CUDA PCG: active=4347 iterations=80 residual=3.403e-5 elapsed=34.88 ms
+CUDA PCG: active=4347 iterations=80 residual=1.731e-2 elapsed=44.17 ms
+CUDA PCG: active=4347 iterations=80 residual=3.371e-5 elapsed=37.76 ms
+CUDA PCG: active=4347 iterations=80 residual=1.647e-2 elapsed=33.36 ms
+CUDA PCG: active=4347 iterations=80 residual=3.322e-5 elapsed=34.58 ms
+CUDA PCG: active=4347 iterations=80 residual=1.684e-2 elapsed=34.36 ms
+profile step ms: predict/tool=17.43 solve=346.37 [assemble=44.42 factor=3.71 pcg=291.20] collision=36.39 fracture=5.31 finish=15.75 pcg_iters=640 residual=1.684e-2
+CUDA PCG: active=4347 iterations=80 residual=3.343e-5 elapsed=40.97 ms
+CUDA PCG: active=4347 iterations=80 residual=1.652e-2 elapsed=41.23 ms
+CUDA PCG: active=4347 iterations=80 residual=3.335e-5 elapsed=44.92 ms
+CUDA PCG: active=4347 iterations=80 residual=1.649e-2 elapsed=51.94 ms
+CUDA PCG: active=4347 iterations=80 residual=3.319e-5 elapsed=52.31 ms
+CUDA PCG: active=4347 iterations=80 residual=1.683e-2 elapsed=50.74 ms
+CUDA PCG: active=4347 iterations=80 residual=3.346e-5 elapsed=53.35 ms
+CUDA PCG: active=4347 iterations=80 residual=1.694e-2 elapsed=43.40 ms
+profile step ms: predict/tool=17.57 solve=434.48 [assemble=44.80 factor=3.72 pcg=378.85] collision=36.56 fracture=5.31 finish=16.05 pcg_iters=640 residual=1.694e-2
+CUDA PCG: active=4347 iterations=80 residual=3.347e-5 elapsed=34.61 ms
+CUDA PCG: active=4347 iterations=80 residual=1.693e-2 elapsed=35.92 ms
+CUDA PCG: active=4347 iterations=80 residual=3.351e-5 elapsed=39.62 ms
+CUDA PCG: active=4347 iterations=80 residual=1.684e-2 elapsed=44.24 ms
+CUDA PCG: active=4347 iterations=80 residual=3.350e-5 elapsed=48.38 ms
+CUDA PCG: active=4347 iterations=80 residual=1.702e-2 elapsed=45.33 ms
+CUDA PCG: active=4347 iterations=80 residual=3.347e-5 elapsed=36.79 ms
+CUDA PCG: active=4347 iterations=80 residual=1.704e-2 elapsed=32.65 ms
+profile step ms: predict/tool=17.99 solve=373.61 [assemble=45.45 factor=3.77 pcg=317.53] collision=32.39 fracture=5.28 finish=15.74 pcg_iters=640 residual=1.704e-2
+CUDA PCG: active=4347 iterations=80 residual=3.332e-5 elapsed=34.13 ms
+CUDA PCG: active=4347 iterations=80 residual=1.700e-2 elapsed=32.67 ms
+CUDA PCG: active=4347 iterations=80 residual=3.314e-5 elapsed=39.73 ms
+CUDA PCG: active=4347 iterations=80 residual=1.722e-2 elapsed=45.61 ms
+CUDA PCG: active=4347 iterations=80 residual=3.338e-5 elapsed=47.89 ms
+CUDA PCG: active=4347 iterations=80 residual=1.726e-2 elapsed=40.15 ms
+CUDA PCG: active=4347 iterations=80 residual=3.299e-5 elapsed=39.53 ms
+CUDA PCG: active=4347 iterations=80 residual=1.734e-2 elapsed=38.97 ms
+profile step ms: predict/tool=16.86 solve=371.68 [assemble=42.91 factor=3.47 pcg=318.68] collision=31.39 fracture=5.22 finish=15.15 pcg_iters=640 residual=1.734e-2
+CUDA PCG: active=4347 iterations=80 residual=3.334e-5 elapsed=37.49 ms
+CUDA PCG: active=4347 iterations=80 residual=1.748e-2 elapsed=32.44 ms
+CUDA PCG: active=4347 iterations=80 residual=3.340e-5 elapsed=35.95 ms
+CUDA PCG: active=4347 iterations=80 residual=1.709e-2 elapsed=37.28 ms
+CUDA PCG: active=4347 iterations=80 residual=3.285e-5 elapsed=33.12 ms
+CUDA PCG: active=4347 iterations=80 residual=1.755e-2 elapsed=38.76 ms
+CUDA PCG: active=4347 iterations=80 residual=3.328e-5 elapsed=37.02 ms
+CUDA PCG: active=4347 iterations=80 residual=1.769e-2 elapsed=39.23 ms
+profile step ms: predict/tool=17.04 solve=345.18 [assemble=43.41 factor=3.55 pcg=291.30] collision=31.48 fracture=5.19 finish=15.68 pcg_iters=640 residual=1.769e-2
+CUDA PCG: active=4347 iterations=80 residual=3.329e-5 elapsed=40.13 ms
+CUDA PCG: active=4347 iterations=80 residual=1.775e-2 elapsed=35.29 ms
+CUDA PCG: active=4347 iterations=80 residual=3.267e-5 elapsed=38.94 ms
+CUDA PCG: active=4347 iterations=80 residual=1.800e-2 elapsed=34.25 ms
+CUDA PCG: active=4347 iterations=80 residual=3.301e-5 elapsed=46.57 ms
+CUDA PCG: active=4347 iterations=80 residual=1.800e-2 elapsed=41.71 ms
+CUDA PCG: active=4347 iterations=80 residual=3.334e-5 elapsed=50.20 ms
+CUDA PCG: active=4347 iterations=80 residual=1.809e-2 elapsed=39.91 ms
+profile step ms: predict/tool=17.33 solve=381.24 [assemble=43.68 factor=3.59 pcg=327.00] collision=31.97 fracture=5.19 finish=15.72 pcg_iters=640 residual=1.809e-2
+CUDA PCG: active=4347 iterations=80 residual=3.328e-5 elapsed=34.99 ms
+CUDA PCG: active=4347 iterations=80 residual=1.790e-2 elapsed=35.82 ms
+CUDA PCG: active=4347 iterations=80 residual=3.335e-5 elapsed=34.95 ms
+CUDA PCG: active=4347 iterations=80 residual=1.831e-2 elapsed=31.60 ms
+CUDA PCG: active=4347 iterations=80 residual=3.318e-5 elapsed=36.54 ms
+CUDA PCG: active=4347 iterations=80 residual=1.838e-2 elapsed=35.96 ms
+CUDA PCG: active=4347 iterations=80 residual=3.331e-5 elapsed=34.17 ms
+CUDA PCG: active=4347 iterations=80 residual=1.820e-2 elapsed=33.18 ms
+profile step ms: predict/tool=19.00 solve=332.98 [assemble=44.84 factor=4.11 pcg=277.20] collision=31.15 fracture=5.27 finish=15.58 pcg_iters=640 residual=1.820e-2
+CUDA PCG: active=4347 iterations=80 residual=3.294e-5 elapsed=33.38 ms
+CUDA PCG: active=4347 iterations=80 residual=1.834e-2 elapsed=32.78 ms
+CUDA PCG: active=4347 iterations=80 residual=3.307e-5 elapsed=33.27 ms
+CUDA PCG: active=4347 iterations=80 residual=1.847e-2 elapsed=33.23 ms
+CUDA PCG: active=4347 iterations=80 residual=3.277e-5 elapsed=34.78 ms
+CUDA PCG: active=4347 iterations=80 residual=1.834e-2 elapsed=35.32 ms
+CUDA PCG: active=4347 iterations=80 residual=3.283e-5 elapsed=38.34 ms
+CUDA PCG: active=4347 iterations=80 residual=1.864e-2 elapsed=35.76 ms
+profile step ms: predict/tool=17.41 solve=330.49 [assemble=43.26 factor=3.57 pcg=276.86] collision=31.12 fracture=5.15 finish=15.82 pcg_iters=640 residual=1.864e-2
+CUDA PCG: active=4347 iterations=80 residual=3.279e-5 elapsed=38.79 ms
+CUDA PCG: active=4347 iterations=80 residual=1.856e-2 elapsed=36.30 ms
+CUDA PCG: active=4347 iterations=80 residual=3.317e-5 elapsed=34.67 ms
+CUDA PCG: active=4347 iterations=80 residual=1.871e-2 elapsed=33.92 ms
+CUDA PCG: active=4347 iterations=80 residual=3.279e-5 elapsed=33.94 ms
+CUDA PCG: active=4347 iterations=80 residual=1.885e-2 elapsed=32.36 ms
+CUDA PCG: active=4347 iterations=80 residual=3.334e-5 elapsed=32.34 ms
+CUDA PCG: active=4347 iterations=80 residual=1.854e-2 elapsed=33.95 ms
+profile step ms: predict/tool=17.10 solve=329.48 [assemble=43.08 factor=3.44 pcg=276.27] collision=30.97 fracture=5.29 finish=15.19 pcg_iters=640 residual=1.854e-2
+CUDA PCG: active=4347 iterations=80 residual=3.338e-5 elapsed=36.90 ms
+CUDA PCG: active=4347 iterations=80 residual=1.861e-2 elapsed=32.91 ms
+CUDA PCG: active=4347 iterations=80 residual=3.329e-5 elapsed=34.62 ms
+CUDA PCG: active=4347 iterations=80 residual=1.908e-2 elapsed=33.57 ms
+CUDA PCG: active=4347 iterations=80 residual=3.330e-5 elapsed=32.70 ms
+CUDA PCG: active=4347 iterations=80 residual=1.906e-2 elapsed=32.60 ms
+CUDA PCG: active=4347 iterations=80 residual=3.327e-5 elapsed=32.69 ms
+CUDA PCG: active=4347 iterations=80 residual=1.907e-2 elapsed=33.83 ms
+profile step ms: predict/tool=17.42 solve=324.50 [assemble=44.07 factor=3.76 pcg=269.82] collision=31.23 fracture=5.19 finish=15.38 pcg_iters=640 residual=1.907e-2
+CUDA PCG: active=4347 iterations=80 residual=3.268e-5 elapsed=33.96 ms
+CUDA PCG: active=4347 iterations=80 residual=1.919e-2 elapsed=34.39 ms
+CUDA PCG: active=4347 iterations=80 residual=3.335e-5 elapsed=39.28 ms
+CUDA PCG: active=4347 iterations=80 residual=1.926e-2 elapsed=38.61 ms
+CUDA PCG: active=4347 iterations=80 residual=3.253e-5 elapsed=35.62 ms
+CUDA PCG: active=4347 iterations=80 residual=1.923e-2 elapsed=32.67 ms
+CUDA PCG: active=4347 iterations=80 residual=3.326e-5 elapsed=33.28 ms
+CUDA PCG: active=4347 iterations=80 residual=1.949e-2 elapsed=32.80 ms
+profile step ms: predict/tool=17.04 solve=334.82 [assemble=43.66 factor=3.72 pcg=280.59] collision=31.63 fracture=5.17 finish=15.80 pcg_iters=640 residual=1.949e-2
+CUDA PCG: active=4347 iterations=80 residual=3.297e-5 elapsed=33.66 ms
+CUDA PCG: active=4347 iterations=80 residual=1.929e-2 elapsed=32.59 ms
+CUDA PCG: active=4347 iterations=80 residual=3.329e-5 elapsed=34.49 ms
+CUDA PCG: active=4347 iterations=80 residual=1.964e-2 elapsed=39.63 ms
+CUDA PCG: active=4347 iterations=80 residual=3.237e-5 elapsed=40.99 ms
+CUDA PCG: active=4347 iterations=80 residual=1.785e-2 elapsed=34.63 ms
+CUDA PCG: active=4347 iterations=80 residual=3.328e-5 elapsed=34.18 ms
+CUDA PCG: active=4347 iterations=80 residual=1.943e-2 elapsed=37.76 ms
+profile step ms: predict/tool=17.14 solve=341.19 [assemble=42.93 factor=3.52 pcg=287.93] collision=31.50 fracture=5.16 finish=15.41 pcg_iters=640 residual=1.943e-2
+CUDA PCG: active=4347 iterations=80 residual=3.317e-5 elapsed=34.38 ms
+CUDA PCG: active=4347 iterations=80 residual=1.952e-2 elapsed=33.85 ms
+CUDA PCG: active=4347 iterations=80 residual=3.218e-5 elapsed=36.68 ms
+CUDA PCG: active=4347 iterations=80 residual=1.814e-2 elapsed=33.79 ms
+CUDA PCG: active=4347 iterations=80 residual=3.324e-5 elapsed=34.51 ms
+CUDA PCG: active=4347 iterations=80 residual=1.966e-2 elapsed=34.24 ms
+CUDA PCG: active=4347 iterations=80 residual=3.263e-5 elapsed=37.10 ms
+CUDA PCG: active=4347 iterations=80 residual=1.852e-2 elapsed=35.68 ms
+profile step ms: predict/tool=16.98 solve=333.73 [assemble=43.20 factor=3.50 pcg=280.22] collision=31.44 fracture=5.02 finish=15.26 pcg_iters=640 residual=1.852e-2
+CUDA PCG: active=4347 iterations=80 residual=3.324e-5 elapsed=33.31 ms
+CUDA PCG: active=4347 iterations=80 residual=1.977e-2 elapsed=35.93 ms
+CUDA PCG: active=4347 iterations=80 residual=3.259e-5 elapsed=33.47 ms
+CUDA PCG: active=4347 iterations=80 residual=1.828e-2 elapsed=33.79 ms
+CUDA PCG: active=4347 iterations=80 residual=3.326e-5 elapsed=39.60 ms
+CUDA PCG: active=4347 iterations=80 residual=1.998e-2 elapsed=37.51 ms
+CUDA PCG: active=4347 iterations=80 residual=3.243e-5 elapsed=37.86 ms
+CUDA PCG: active=4347 iterations=80 residual=1.882e-2 elapsed=34.07 ms
+profile step ms: predict/tool=17.16 solve=339.45 [assemble=43.18 factor=3.95 pcg=285.54] collision=31.74 fracture=5.07 finish=15.37 pcg_iters=640 residual=1.882e-2
+CUDA PCG: active=4347 iterations=80 residual=3.275e-5 elapsed=38.98 ms
+CUDA PCG: active=4347 iterations=80 residual=2.013e-2 elapsed=34.03 ms
+CUDA PCG: active=4347 iterations=80 residual=3.197e-5 elapsed=38.38 ms
+CUDA PCG: active=4347 iterations=80 residual=2.150e-2 elapsed=34.40 ms
+CUDA PCG: active=4347 iterations=80 residual=3.316e-5 elapsed=35.79 ms
+CUDA PCG: active=4347 iterations=80 residual=2.006e-2 elapsed=36.90 ms
+CUDA PCG: active=4347 iterations=80 residual=3.264e-5 elapsed=42.14 ms
+CUDA PCG: active=4347 iterations=80 residual=1.875e-2 elapsed=34.87 ms
+profile step ms: predict/tool=17.13 solve=348.85 [assemble=43.10 factor=3.44 pcg=295.49] collision=33.86 fracture=5.09 finish=15.37 pcg_iters=640 residual=1.875e-2
+CUDA PCG: active=4347 iterations=80 residual=3.188e-5 elapsed=35.14 ms
+CUDA PCG: active=4347 iterations=80 residual=2.096e-2 elapsed=36.23 ms
+CUDA PCG: active=4347 iterations=80 residual=3.249e-5 elapsed=38.20 ms
+CUDA PCG: active=4347 iterations=80 residual=2.210e-2 elapsed=37.40 ms
+CUDA PCG: active=4347 iterations=80 residual=3.231e-5 elapsed=41.09 ms
+CUDA PCG: active=4347 iterations=80 residual=2.097e-2 elapsed=38.18 ms
+CUDA PCG: active=4347 iterations=80 residual=3.248e-5 elapsed=40.17 ms
+CUDA PCG: active=4347 iterations=80 residual=2.026e-2 elapsed=39.10 ms
+profile step ms: predict/tool=17.29 solve=359.94 [assemble=43.84 factor=3.63 pcg=305.50] collision=34.99 fracture=5.25 finish=15.67 pcg_iters=640 residual=2.026e-2
+CUDA PCG: active=4347 iterations=80 residual=3.218e-5 elapsed=33.79 ms
+CUDA PCG: active=4347 iterations=80 residual=2.114e-2 elapsed=32.29 ms
+CUDA PCG: active=4347 iterations=80 residual=3.250e-5 elapsed=41.36 ms
+CUDA PCG: active=4347 iterations=80 residual=1.915e-2 elapsed=33.48 ms
+CUDA PCG: active=4347 iterations=80 residual=3.234e-5 elapsed=41.94 ms
+CUDA PCG: active=4347 iterations=80 residual=2.126e-2 elapsed=46.69 ms
+CUDA PCG: active=4347 iterations=80 residual=3.246e-5 elapsed=54.09 ms
+CUDA PCG: active=4347 iterations=80 residual=2.239e-2 elapsed=49.92 ms
+profile step ms: predict/tool=17.04 solve=387.54 [assemble=43.54 factor=3.62 pcg=333.56] collision=32.16 fracture=5.66 finish=16.48 pcg_iters=640 residual=2.239e-2
+CUDA PCG: active=4347 iterations=80 residual=3.161e-5 elapsed=49.31 ms
+CUDA PCG: active=4347 iterations=80 residual=2.137e-2 elapsed=54.67 ms
+CUDA PCG: active=4347 iterations=80 residual=3.202e-5 elapsed=36.21 ms
+CUDA PCG: active=4347 iterations=80 residual=2.172e-2 elapsed=44.47 ms
+CUDA PCG: active=4347 iterations=80 residual=3.235e-5 elapsed=40.98 ms
+CUDA PCG: active=4347 iterations=80 residual=2.011e-2 elapsed=41.04 ms
+CUDA PCG: active=4347 iterations=80 residual=3.202e-5 elapsed=41.18 ms
+CUDA PCG: active=4347 iterations=80 residual=2.198e-2 elapsed=47.24 ms
+profile step ms: predict/tool=17.38 solve=409.20 [assemble=43.70 factor=3.57 pcg=355.09] collision=30.86 fracture=5.15 finish=15.46 pcg_iters=640 residual=2.198e-2
+CUDA PCG: active=4347 iterations=80 residual=3.190e-5 elapsed=49.16 ms
+CUDA PCG: active=4347 iterations=80 residual=2.176e-2 elapsed=42.32 ms
+CUDA PCG: active=4347 iterations=80 residual=3.195e-5 elapsed=43.71 ms
+CUDA PCG: active=4347 iterations=80 residual=2.159e-2 elapsed=37.33 ms
+CUDA PCG: active=4347 iterations=80 residual=3.203e-5 elapsed=33.30 ms
+CUDA PCG: active=4347 iterations=80 residual=2.169e-2 elapsed=32.57 ms
+CUDA PCG: active=4347 iterations=80 residual=3.198e-5 elapsed=33.95 ms
+CUDA PCG: active=4347 iterations=80 residual=2.201e-2 elapsed=39.14 ms
+profile step ms: predict/tool=17.28 solve=365.64 [assemble=43.68 factor=3.60 pcg=311.49] collision=30.14 fracture=5.19 finish=15.35 pcg_iters=640 residual=2.201e-2
+CUDA PCG: active=4347 iterations=80 residual=3.210e-5 elapsed=43.84 ms
+CUDA PCG: active=4347 iterations=80 residual=2.174e-2 elapsed=60.73 ms
+CUDA PCG: active=4347 iterations=80 residual=3.180e-5 elapsed=35.48 ms
+CUDA PCG: active=4347 iterations=80 residual=2.208e-2 elapsed=35.71 ms
+CUDA PCG: active=4347 iterations=80 residual=3.172e-5 elapsed=36.94 ms
+CUDA PCG: active=4347 iterations=80 residual=2.194e-2 elapsed=41.93 ms
+CUDA PCG: active=4347 iterations=80 residual=3.199e-5 elapsed=37.15 ms
+CUDA PCG: active=4347 iterations=80 residual=2.203e-2 elapsed=35.52 ms
+profile step ms: predict/tool=17.45 solve=382.81 [assemble=44.58 factor=3.65 pcg=327.30] collision=31.01 fracture=5.85 finish=15.92 pcg_iters=640 residual=2.203e-2
+CUDA PCG: active=4347 iterations=80 residual=3.192e-5 elapsed=40.05 ms
+CUDA PCG: active=4347 iterations=80 residual=2.200e-2 elapsed=38.04 ms
+CUDA PCG: active=4347 iterations=80 residual=3.200e-5 elapsed=37.01 ms
+CUDA PCG: active=4347 iterations=80 residual=2.191e-2 elapsed=37.30 ms
+CUDA PCG: active=4347 iterations=80 residual=3.157e-5 elapsed=39.18 ms
+CUDA PCG: active=4347 iterations=80 residual=2.224e-2 elapsed=39.69 ms
+CUDA PCG: active=4347 iterations=80 residual=3.174e-5 elapsed=40.57 ms
+CUDA PCG: active=4347 iterations=80 residual=2.234e-2 elapsed=37.50 ms
+profile step ms: predict/tool=17.62 solve=365.66 [assemble=45.44 factor=3.72 pcg=309.35] collision=31.85 fracture=5.72 finish=16.68 pcg_iters=640 residual=2.234e-2
+CUDA PCG: active=4347 iterations=80 residual=3.179e-5 elapsed=41.52 ms
+CUDA PCG: active=4347 iterations=80 residual=2.212e-2 elapsed=41.40 ms
+CUDA PCG: active=4347 iterations=80 residual=3.172e-5 elapsed=35.29 ms
+CUDA PCG: active=4347 iterations=80 residual=2.239e-2 elapsed=32.75 ms
+CUDA PCG: active=4347 iterations=80 residual=3.153e-5 elapsed=34.09 ms
+CUDA PCG: active=4347 iterations=80 residual=2.253e-2 elapsed=33.02 ms
+CUDA PCG: active=4347 iterations=80 residual=3.189e-5 elapsed=35.67 ms
+CUDA PCG: active=4347 iterations=80 residual=2.242e-2 elapsed=31.52 ms
+profile step ms: predict/tool=17.40 solve=339.57 [assemble=43.82 factor=3.57 pcg=285.26] collision=30.17 fracture=5.07 finish=15.20 pcg_iters=640 residual=2.242e-2
+CUDA PCG: active=4347 iterations=80 residual=3.162e-5 elapsed=34.63 ms
+CUDA PCG: active=4347 iterations=80 residual=2.254e-2 elapsed=31.05 ms
+CUDA PCG: active=4347 iterations=80 residual=3.171e-5 elapsed=43.80 ms
+CUDA PCG: active=4347 iterations=80 residual=2.251e-2 elapsed=33.87 ms
+CUDA PCG: active=4347 iterations=80 residual=3.181e-5 elapsed=32.50 ms
+CUDA PCG: active=4347 iterations=80 residual=2.250e-2 elapsed=32.52 ms
+CUDA PCG: active=4347 iterations=80 residual=3.170e-5 elapsed=50.02 ms
+CUDA PCG: active=4347 iterations=80 residual=2.260e-2 elapsed=45.26 ms
+profile step ms: predict/tool=16.78 solve=355.98 [assemble=42.21 factor=3.46 pcg=303.64] collision=31.89 fracture=5.23 finish=15.31 pcg_iters=640 residual=2.260e-2
+CUDA PCG: active=4347 iterations=80 residual=3.183e-5 elapsed=44.94 ms
+CUDA PCG: active=4347 iterations=80 residual=2.261e-2 elapsed=42.98 ms
+CUDA PCG: active=4347 iterations=80 residual=3.156e-5 elapsed=33.03 ms
+CUDA PCG: active=4347 iterations=80 residual=2.245e-2 elapsed=37.53 ms
+CUDA PCG: active=4347 iterations=80 residual=3.186e-5 elapsed=36.38 ms
+CUDA PCG: active=4347 iterations=80 residual=2.286e-2 elapsed=32.14 ms
+CUDA PCG: active=4347 iterations=80 residual=3.195e-5 elapsed=34.96 ms
+CUDA PCG: active=4347 iterations=80 residual=2.310e-2 elapsed=34.95 ms
+profile step ms: predict/tool=17.14 solve=350.96 [assemble=43.67 factor=3.76 pcg=296.91] collision=31.26 fracture=5.31 finish=15.66 pcg_iters=640 residual=2.310e-2
+CUDA PCG: active=4347 iterations=80 residual=3.179e-5 elapsed=32.97 ms
+CUDA PCG: active=4347 iterations=80 residual=2.277e-2 elapsed=33.03 ms
+CUDA PCG: active=4347 iterations=80 residual=3.184e-5 elapsed=42.35 ms
+CUDA PCG: active=4347 iterations=80 residual=2.282e-2 elapsed=46.02 ms
+CUDA PCG: active=4347 iterations=80 residual=3.141e-5 elapsed=48.72 ms
+CUDA PCG: active=4347 iterations=80 residual=2.283e-2 elapsed=34.08 ms
+CUDA PCG: active=4347 iterations=80 residual=3.188e-5 elapsed=36.85 ms
+CUDA PCG: active=4347 iterations=80 residual=2.293e-2 elapsed=31.27 ms
+profile step ms: predict/tool=17.37 solve=358.23 [assemble=42.44 factor=3.63 pcg=305.28] collision=31.45 fracture=5.53 finish=15.18 pcg_iters=640 residual=2.293e-2
+CUDA PCG: active=4347 iterations=80 residual=3.190e-5 elapsed=35.45 ms
+CUDA PCG: active=4347 iterations=80 residual=2.298e-2 elapsed=33.60 ms
+CUDA PCG: active=4347 iterations=80 residual=3.152e-5 elapsed=40.12 ms
+CUDA PCG: active=4347 iterations=80 residual=2.302e-2 elapsed=42.03 ms
+CUDA PCG: active=4347 iterations=80 residual=3.196e-5 elapsed=43.28 ms
+CUDA PCG: active=4347 iterations=80 residual=2.333e-2 elapsed=43.17 ms
+CUDA PCG: active=4347 iterations=80 residual=3.168e-5 elapsed=45.11 ms
+CUDA PCG: active=4347 iterations=80 residual=2.300e-2 elapsed=44.74 ms
+profile step ms: predict/tool=17.36 solve=380.78 [assemble=42.80 factor=3.51 pcg=327.50] collision=31.33 fracture=5.37 finish=15.49 pcg_iters=640 residual=2.300e-2
+CUDA PCG: active=4347 iterations=80 residual=3.187e-5 elapsed=43.26 ms
+CUDA PCG: active=4347 iterations=80 residual=2.333e-2 elapsed=44.51 ms
+CUDA PCG: active=4347 iterations=80 residual=3.169e-5 elapsed=44.69 ms
+CUDA PCG: active=4347 iterations=80 residual=2.322e-2 elapsed=33.24 ms
+CUDA PCG: active=4347 iterations=80 residual=3.178e-5 elapsed=33.89 ms
+CUDA PCG: active=4347 iterations=80 residual=2.310e-2 elapsed=31.26 ms
+CUDA PCG: active=4347 iterations=80 residual=3.165e-5 elapsed=32.97 ms
+CUDA PCG: active=4347 iterations=80 residual=2.322e-2 elapsed=31.97 ms
+profile step ms: predict/tool=17.14 solve=348.33 [assemble=42.51 factor=3.57 pcg=295.79] collision=30.33 fracture=4.95 finish=14.86 pcg_iters=640 residual=2.322e-2
+CUDA PCG: active=4347 iterations=80 residual=3.179e-5 elapsed=31.18 ms
+CUDA PCG: active=4347 iterations=80 residual=2.339e-2 elapsed=36.20 ms
+CUDA PCG: active=4347 iterations=80 residual=3.184e-5 elapsed=33.81 ms
+CUDA PCG: active=4347 iterations=80 residual=2.355e-2 elapsed=33.56 ms
+CUDA PCG: active=4347 iterations=80 residual=3.157e-5 elapsed=33.86 ms
+CUDA PCG: active=4347 iterations=80 residual=2.336e-2 elapsed=33.07 ms
+CUDA PCG: active=4347 iterations=80 residual=3.163e-5 elapsed=35.43 ms
+CUDA PCG: active=4347 iterations=80 residual=2.345e-2 elapsed=36.87 ms
+profile step ms: predict/tool=16.36 solve=325.14 [assemble=41.26 factor=3.38 pcg=273.98] collision=30.38 fracture=4.90 finish=14.93 pcg_iters=640 residual=2.345e-2
+CUDA PCG: active=4347 iterations=80 residual=3.118e-5 elapsed=35.79 ms
+CUDA PCG: active=4347 iterations=80 residual=2.359e-2 elapsed=34.23 ms
+CUDA PCG: active=4347 iterations=80 residual=3.179e-5 elapsed=31.18 ms
+CUDA PCG: active=4347 iterations=80 residual=2.334e-2 elapsed=33.05 ms
+CUDA PCG: active=4347 iterations=80 residual=3.142e-5 elapsed=35.08 ms
+CUDA PCG: active=4347 iterations=80 residual=2.355e-2 elapsed=39.91 ms
+CUDA PCG: active=4347 iterations=80 residual=3.148e-5 elapsed=47.19 ms
+CUDA PCG: active=4347 iterations=80 residual=2.353e-2 elapsed=43.66 ms
+profile step ms: predict/tool=16.58 solve=351.62 [assemble=41.54 factor=3.38 pcg=300.08] collision=36.91 fracture=5.31 finish=15.12 pcg_iters=640 residual=2.353e-2
+CUDA PCG: active=4347 iterations=80 residual=3.172e-5 elapsed=40.96 ms
+CUDA PCG: active=4347 iterations=80 residual=2.356e-2 elapsed=31.22 ms
+CUDA PCG: active=4347 iterations=80 residual=3.162e-5 elapsed=35.54 ms
+CUDA PCG: active=4347 iterations=80 residual=2.367e-2 elapsed=39.63 ms
+CUDA PCG: active=4347 iterations=80 residual=3.134e-5 elapsed=42.64 ms
+CUDA PCG: active=4347 iterations=80 residual=2.409e-2 elapsed=44.91 ms
+CUDA PCG: active=4347 iterations=80 residual=3.168e-5 elapsed=35.83 ms
+CUDA PCG: active=4347 iterations=80 residual=2.408e-2 elapsed=38.10 ms
+profile step ms: predict/tool=16.55 solve=361.37 [assemble=42.56 factor=3.36 pcg=308.82] collision=30.38 fracture=5.12 finish=15.01 pcg_iters=640 residual=2.408e-2
+CUDA PCG: active=4347 iterations=80 residual=3.169e-5 elapsed=34.24 ms
+CUDA PCG: active=4347 iterations=80 residual=2.380e-2 elapsed=42.33 ms
+CUDA PCG: active=4347 iterations=80 residual=3.121e-5 elapsed=40.78 ms
+CUDA PCG: active=4347 iterations=80 residual=2.411e-2 elapsed=37.10 ms
+CUDA PCG: active=4347 iterations=80 residual=3.170e-5 elapsed=38.73 ms
+CUDA PCG: active=4347 iterations=80 residual=2.429e-2 elapsed=31.44 ms
+CUDA PCG: active=4347 iterations=80 residual=3.170e-5 elapsed=34.82 ms
+CUDA PCG: active=4347 iterations=80 residual=2.384e-2 elapsed=32.15 ms
+profile step ms: predict/tool=16.60 solve=343.56 [assemble=42.05 factor=3.47 pcg=291.59] collision=29.71 fracture=5.05 finish=15.14 pcg_iters=640 residual=2.384e-2
+complete drift=0.000e0 gravity=[0.0, 0.0, -9.81]

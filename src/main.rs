@@ -27,6 +27,41 @@ fn launch(shape: Shape, scene: &Scene, ui: &Ui) -> Tool {
     }
     tool
 }
+
+fn fix_wood_base(scene: &mut Scene) {
+    let Some(wood_id) = voxel_physics_lab::material::Material::component_id("wood") else {
+        return;
+    };
+    let wood: Vec<_> = scene
+        .voxels
+        .iter()
+        .enumerate()
+        .filter(|(_, voxel)| {
+            voxel
+                .composition
+                .components
+                .iter()
+                .any(|&(component, fraction)| component == wood_id && fraction > 0.0)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let Some(lowest_z) = wood
+        .iter()
+        .map(|&index| scene.positions[index].z)
+        .min_by(f32::total_cmp)
+    else {
+        return;
+    };
+    let base: Vec<_> = wood
+        .into_iter()
+        .filter(|&index| (scene.positions[index].z - lowest_z).abs() <= scene::CELL * 0.1)
+        .collect();
+    scene
+        .fix_voxels(&base)
+        .expect("wood base indices come from this scene");
+    eprintln!("fixed wood base: {} REV at Z={lowest_z:.4} m", base.len());
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
     let path = args
@@ -36,6 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or("scenes/mounted_axe.ron");
     let config = SceneConfig::load(path)?;
     let mut scene = Scene::new(config.clone());
+    fix_wood_base(&mut scene);
     let mut ui = Ui::new(config.initial_speed, Vec3::from_array(config.tool_start));
     if let Some(index) = args.iter().position(|s| s == "--headless") {
         let steps: usize = args
@@ -160,6 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         PhysicalKey::Code(KeyCode::KeyR) => {
                             scene = Scene::new(config.clone());
+                            fix_wood_base(&mut scene);
                             tool = None;
                             accumulator = 0.0;
                             None

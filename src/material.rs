@@ -160,6 +160,106 @@ impl Material {
                 333_500.0,
                 2_256_000.0,
             ),
+            Self::new(
+                "aluminum",
+                2700.0,
+                69e9,
+                69e9,
+                26e9,
+                310e6,
+                310e6,
+                310e6,
+                180e6,
+                276e6,
+                897.0,
+                237.0,
+                933.15,
+                15_000.0,
+                15_000.0,
+                2743.0,
+                397_000.0,
+                10_500_000.0,
+            ),
+            Self::new(
+                "copper",
+                8960.0,
+                117e9,
+                117e9,
+                44e9,
+                220e6,
+                220e6,
+                210e6,
+                120e6,
+                70e6,
+                385.0,
+                401.0,
+                1357.77,
+                30_000.0,
+                30_000.0,
+                2835.0,
+                205_000.0,
+                4_730_000.0,
+            ),
+            Self::new(
+                "glass",
+                2500.0,
+                70e9,
+                70e9,
+                29e9,
+                45e6,
+                45e6,
+                1000e6,
+                35e6,
+                45e6,
+                840.0,
+                1.05,
+                1700.0,
+                10.0,
+                10.0,
+                f32::INFINITY,
+                0.0,
+                0.0,
+            ),
+            Self::new(
+                "concrete",
+                2400.0,
+                30e9,
+                30e9,
+                12.5e9,
+                3.5e6,
+                3.5e6,
+                40e6,
+                5e6,
+                3.5e6,
+                880.0,
+                1.7,
+                1773.0,
+                100.0,
+                100.0,
+                f32::INFINITY,
+                0.0,
+                0.0,
+            ),
+            Self::new(
+                "rubber",
+                1100.0,
+                10e6,
+                10e6,
+                3.3e6,
+                20e6,
+                20e6,
+                20e6,
+                10e6,
+                5e6,
+                1900.0,
+                0.2,
+                f32::INFINITY,
+                5_000.0,
+                5_000.0,
+                f32::INFINITY,
+                0.0,
+                0.0,
+            ),
         ];
         table[1].fracture_mode = FractureMode::Mixed;
         table[1].compressive_strength_perp = 2e6;
@@ -169,6 +269,15 @@ impl Material {
         table[2].fracture_mode = FractureMode::Ductile;
         table[2].hardening_modulus = 1e9;
         table[2].failure_plastic_strain = 0.15;
+        table[5].fracture_mode = FractureMode::Ductile;
+        table[5].hardening_modulus = 0.7e9;
+        table[5].failure_plastic_strain = 0.18;
+        table[6].fracture_mode = FractureMode::Ductile;
+        table[6].hardening_modulus = 0.45e9;
+        table[6].failure_plastic_strain = 0.30;
+        table[9].fracture_mode = FractureMode::Ductile;
+        table[9].hardening_modulus = 20e6;
+        table[9].failure_plastic_strain = 1.0;
         table
     }
     #[allow(clippy::too_many_arguments)]
@@ -324,5 +433,22 @@ impl Material {
 
     pub fn temperature(&self, mass: f32, energy: f32) -> f32 {
         self.phase_state(mass, energy).temperature_kelvin
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Material;
+
+    #[test]
+    fn starter_material_names_resolve_to_physical_entries() {
+        let table = Material::table();
+        for name in ["aluminum", "copper", "glass", "concrete", "rubber"] {
+            let id = Material::component_id(name).expect("starter component must resolve");
+            let material = &table[id as usize];
+            assert_eq!(material.name, name);
+            assert!(material.density > 0.0);
+            assert!(material.heat_capacity > 0.0);
+        }
     }
 }

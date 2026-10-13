@@ -124,6 +124,7 @@ pub fn resolve_velocities(scene: &mut Scene, contacts: &[Contact], targets: &[[O
                 continue;
             }
             let closing = (scene.voxels[c.j].velocity - scene.voxels[c.i].velocity).dot(c.normal);
+            let mut normal_impulse = 0.0;
             if closing < -1e-6 {
                 // A resting manifold must not bounce on each new gravity step.
                 // Restitution applies only if this pair started with a gap.
@@ -132,10 +133,83 @@ pub fn resolve_velocities(scene: &mut Scene, contacts: &[Contact], targets: &[[O
                 } else {
                     0.0
                 };
-                let impulse = -(1.0 + restitution) * closing / denom;
-                scene.voxels[c.i].velocity -= c.normal * (impulse * wi);
-                scene.voxels[c.j].velocity += c.normal * (impulse * wj);
+                normal_impulse = -(1.0 + restitution) * closing / denom;
+                scene.voxels[c.i].velocity -= c.normal * (normal_impulse * wi);
+                scene.voxels[c.j].velocity += c.normal * (normal_impulse * wj);
                 changed = true;
+            }
+
+            // Ground and voxel contacts use the same Coulomb friction rule as
+            // tool contacts. The normal impulse bounds the tangential impulse;
+            // per-axis inverse masses respect partially fixed scene constraints.
+            if normal_impulse > 0.0 && scene.config.fracture.friction > 0.0 {
+                let relative = scene.voxels[c.j].velocity - scene.voxels[c.i].velocity;
+                let tangent = relative - c.normal * relative.dot(c.normal);
+                let tangent_response: [f32; 3] = std::array::from_fn(|axis| {
+                    inverse_mass(scene, c.i, axis, targets)
+                        + inverse_mass(scene, c.j, axis, targets)
+                });
+                // Ignore tangential relative motion along axes that neither
+                // endpoint can respond on (for example, a partially fixed REV).
+                let responsive_tangent = Vec3::new(
+                    if tangent_response[0] > 0.0 {
+                        tangent.x
+                    } else {
+                        0.0
+                    },
+                    if tangent_response[1] > 0.0 {
+                        tangent.y
+                    } else {
+                        0.0
+                    },
+                    if tangent_response[2] > 0.0 {
+                        tangent.z
+                    } else {
+                        0.0
+                    },
+                );
+                let tangent_speed = responsive_tangent.length();
+                if tangent_speed > 1e-6 {
+                    let direction = responsive_tangent / tangent_speed;
+                    let tangent_weight = (0..3)
+                        .map(|axis| direction[axis].powi(2) * tangent_response[axis])
+                        .sum::<f32>();
+                    if tangent_weight > 0.0 {
+                        let impulse_magnitude = (tangent_speed / tangent_weight)
+                            .min(scene.config.fracture.friction * normal_impulse);
+                        // The relative tangential velocity is v_j - v_i, so
+                        // the contact impulse on j points opposite that motion.
+                        let impulse = -direction * impulse_magnitude;
+                        for axis in 0..3 {
+                            scene.voxels[c.i].velocity[axis] -=
+                                impulse[axis] * inverse_mass(scene, c.i, axis, targets);
+                            scene.voxels[c.j].velocity[axis] +=
+                                impulse[axis] * inverse_mass(scene, c.j, axis, targets);
+                        }
+                        // The constrained relative inverse mass used above
+                        // gives the exact kinetic loss for this tangential
+                        // impulse. Convert that loss to heat on free endpoints.
+                        let friction_heat = (impulse_magnitude as f64 * tangent_speed as f64
+                            - 0.5 * (impulse_magnitude as f64).powi(2) * tangent_weight as f64)
+                            .max(0.0);
+                        if friction_heat > 0.0 {
+                            let i_free = !scene.voxels[c.i].kinematic;
+                            let j_free = !scene.voxels[c.j].kinematic;
+                            let receivers = i_free as u8 + j_free as u8;
+                            if receivers > 0 {
+                                let heat_per_voxel = (friction_heat / receivers as f64) as f32;
+                                if i_free {
+                                    scene.voxels[c.i].internal_energy += heat_per_voxel;
+                                }
+                                if j_free {
+                                    scene.voxels[c.j].internal_energy += heat_per_voxel;
+                                }
+                                scene.energy.contact_friction_heat += friction_heat;
+                            }
+                        }
+                        changed = true;
+                    }
+                }
             }
         }
         if !changed {
@@ -491,6 +565,47 @@ mod tests {
         assert!(!contacts.is_empty());
         assert_eq!(scene.positions[1], wall);
         assert!(wall.x - scene.positions[0].x >= CELL - 1e-6);
+    }
+
+    #[test]
+    fn sliding_contact_dissipates_tangent_energy_into_voxel_heat() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [2, 1, 1];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        config.gravity = [0.0; 3];
+        config.fracture.friction = 0.35;
+        let mut scene = Scene::new(config);
+        scene.bonds[0][0].neighbor = EMPTY;
+        scene.set_voxel_kinematic(1, true).unwrap();
+        scene.previous.clone_from(&scene.positions);
+        scene.voxels[0].velocity = Vec3::new(1.0, 2.0, 5.0);
+        scene.positions[0].x += CELL * 0.2;
+        let targets = [[None, None, Some(scene.positions[0].z)], [None; 3]];
+        let contacts = project(&mut scene, &targets);
+        assert!(contacts
+            .iter()
+            .any(|contact| contact.i == 0 && contact.j == 1));
+
+        let mass = scene.voxels[0].mass as f64;
+        let tangent_ke_before = 0.5 * mass * (scene.voxels[0].velocity.y as f64).powi(2);
+        let internal_before = scene.voxels[0].internal_energy as f64;
+        resolve_velocities(&mut scene, &contacts, &targets);
+
+        let tangent_ke_after = 0.5 * mass * (scene.voxels[0].velocity.y as f64).powi(2);
+        let dissipated = tangent_ke_before - tangent_ke_after;
+        let internal_gain = scene.voxels[0].internal_energy as f64 - internal_before;
+        let internal_storage_tolerance = f32::EPSILON as f64 * internal_before.max(1.0);
+        assert!(scene.voxels[0].velocity.y.abs() < 2.0);
+        assert_eq!(scene.voxels[0].velocity.z, 5.0);
+        assert!(dissipated > 0.0);
+        assert!((dissipated - scene.energy.contact_friction_heat).abs() < 1e-7);
+        assert!(
+            (internal_gain - scene.energy.contact_friction_heat).abs()
+                <= internal_storage_tolerance,
+            "internal gain={internal_gain:.12e}, friction heat={:.12e}, initial internal={internal_before:.12e}, f32 tolerance={internal_storage_tolerance:.12e}",
+            scene.energy.contact_friction_heat
+        );
     }
 
     #[test]

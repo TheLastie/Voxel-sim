@@ -6,7 +6,7 @@ use std::{
 };
 use voxel_physics_lab::{
     bond::EMPTY,
-    scene::{Scene, SceneConfig},
+    scene::{Scene, SceneConfig, CELL},
     solver,
     tool::{Shape, Tool},
 };
@@ -31,7 +31,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         cfg.substeps = substeps;
     }
-    // A separate 3 cm coupon starts above the floor, to make gravity visible.
+    // A separate 3 cm coupon starts over a clear part of the finite floor so
+    // its fall exercises vertical support, independently of the axe and trunk.
     cfg.branch_dimensions = [3; 3];
     let mut scene = Scene::new(cfg);
     let probe_start = 4320;
@@ -49,10 +50,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     for i in probe_start..probe_end {
-        scene.positions[i] += Vec3::new(0.15, 0.12, 0.22);
+        scene.positions[i] += Vec3::new(-0.25, -0.25, 0.22);
         scene.previous[i] = scene.positions[i];
         scene.rest_positions[i] = scene.positions[i];
     }
+    let trunk_base: Vec<_> = (0..probe_start)
+        .filter(|&i| scene.positions[i].z <= CELL * 0.5 + 1e-6)
+        .collect();
+    scene.fix_voxels(&trunk_base)?;
     solver::rebuild_clusters(&mut scene);
     let mut axe = Tool::new(
         Shape::Wedge,
@@ -129,7 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert!(scene.positions.iter().all(|p| p.is_finite()));
         writeln!(
             out,
-            "F,{frame},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "F,{frame},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             t.position.x,
             t.position.y,
             t.position.z,
@@ -141,7 +146,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             t.external_force.x,
             scene.broken,
             scene.cluster_count,
-            drift
+            drift,
+            scene.energy.contact_friction_heat
         )?;
         let damage = scene.incident_bond_damage();
         for i in 0..probe_end {
