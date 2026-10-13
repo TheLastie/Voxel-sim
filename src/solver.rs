@@ -542,6 +542,9 @@ pub fn step_with_axis_targets_and_loads(
             let _ = t.advance(scene, 0.0, targets);
         }
         apply_releases(scene, targets);
+        if let Err(reason) = scene.conduct_heat(h) {
+            eprintln!("thermal transport skipped: {reason}");
+        }
         scene.substep_index += 1;
         stage_time[4] += phase_start.elapsed();
     }

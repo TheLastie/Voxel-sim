@@ -209,7 +209,7 @@ See `validation/knife-local-report.md` for the exact conditions and limits.
 ## Repository map
 
 - `src/scene.rs`, `src/voxel.rs`, `src/material.rs`: REV state, composition,
-  microstructure orientation, and material table.
+  microstructure orientation, material table, and enthalpy-derived phase state.
 - `src/bond.rs`, `src/fracture.rs`: six-neighbor bond state and mixed-mode
   failure, plasticity, fatigue, and energy accounting.
 - `src/solver.rs`, `src/collision.rs`, `src/tool.rs`: coupled mechanics,
@@ -217,6 +217,16 @@ See `validation/knife-local-report.md` for the exact conditions and limits.
 - `src/experiments.rs`, `src/bin/`: reproducible mechanical and contact tests.
 - `scenes/wood_chop.ron`: dimensions, grain axis, gravity, and solver settings.
 - `validation/`: test notes, captures, and review media.
+
+### Heat transfer
+
+`Scene::conduct_heat(seconds)` transfers energy between neighboring REVs across
+their remaining bonds. Pair conductance uses material conductivity in W/(m·K)
+and the bond's undamaged fraction. Equal and opposite pair fluxes update internal
+energy; the explicit update selects stable substeps automatically. Normal solver
+steps call this for each mechanical substep. Thermal work buffers are retained
+between calls. This first implementation has passed release compilation, but its
+energy balance and physical behavior still need a recorded thermal scenario.
 
 ## Limits
 

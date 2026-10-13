@@ -17,6 +17,14 @@ pub struct WorldBounds {
     pub max: Vec3,
 }
 
+#[derive(Default)]
+struct ThermalScratch {
+    edges: Vec<(usize, usize, f64)>,
+    conductance_sum: Vec<f64>,
+    temperature: Vec<f64>,
+    energy_delta: Vec<f64>,
+}
+
 /// Cumulative material and energy removed by world-boundary deletion.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct BoundaryRemovalLedger {
@@ -230,6 +238,8 @@ impl SceneConfig {
 pub struct Scene {
     /// Capacity-reusing workspace retained between physical steps.
     pub(crate) solver_scratch: crate::solver::SolverScratch,
+    /// Capacity-reusing thermal transport workspace retained between substeps.
+    thermal_scratch: ThermalScratch,
     /// Capacity-reusing spatial data for broadphase collision detection.
     pub(crate) collision_scratch: crate::collision::CollisionScratch,
     pub config: SceneConfig,
@@ -280,6 +290,7 @@ impl Scene {
         let mut scene = Self {
             config,
             solver_scratch: Default::default(),
+            thermal_scratch: Default::default(),
             collision_scratch: Default::default(),
             voxels: Vec::with_capacity(spawns.len()),
             external_forces: Vec::with_capacity(spawns.len()),
@@ -634,6 +645,84 @@ impl Scene {
         true
     }
 
+    /// Conduct heat across intact voxel bonds. Pairwise fluxes are equal and
+    /// opposite, and automatic subcycling keeps the explicit update stable.
+    /// The returned value is the number of thermal substeps used.
+    pub fn conduct_heat(&mut self, elapsed_seconds: f32) -> Result<usize, &'static str> {
+        if !elapsed_seconds.is_finite() || elapsed_seconds < 0.0 {
+            return Err("thermal elapsed time must be finite and nonnegative");
+        }
+        if elapsed_seconds == 0.0 || self.voxels.len() < 2 {
+            return Ok(0);
+        }
+
+        let voxel_count = self.voxels.len();
+        let scratch = &mut self.thermal_scratch;
+        scratch.edges.clear();
+        scratch.conductance_sum.resize(voxel_count, 0.0);
+        scratch.conductance_sum.fill(0.0);
+        scratch.temperature.resize(voxel_count, 0.0);
+        scratch.energy_delta.resize(voxel_count, 0.0);
+        for axis in 0..3 {
+            for (i, bond) in self.bonds[axis].iter().enumerate() {
+                if bond.neighbor == EMPTY {
+                    continue;
+                }
+                let j = bond.neighbor as usize;
+                let ki = self.properties[i].thermal_cond.max(0.0) as f64;
+                let kj = self.properties[j].thermal_cond.max(0.0) as f64;
+                if ki == 0.0 || kj == 0.0 {
+                    continue;
+                }
+                let harmonic_k = 2.0 * ki * kj / (ki + kj);
+                let conductance =
+                    harmonic_k * CELL as f64 * (1.0 - bond.damage as f64).clamp(0.0, 1.0);
+                if conductance == 0.0 {
+                    continue;
+                }
+                scratch.edges.push((i, j, conductance));
+                scratch.conductance_sum[i] += conductance;
+                scratch.conductance_sum[j] += conductance;
+            }
+        }
+        if scratch.edges.is_empty() {
+            return Ok(0);
+        }
+
+        let maximum_rate = self
+            .voxels
+            .iter()
+            .zip(&self.properties)
+            .zip(&scratch.conductance_sum)
+            .map(|((voxel, material), conductance)| {
+                conductance
+                    / (voxel.mass.max(1e-20) as f64 * material.heat_capacity.max(1e-12) as f64)
+            })
+            .fold(0.0f64, f64::max);
+        let thermal_steps = ((elapsed_seconds as f64 * maximum_rate / 0.45).ceil() as usize).max(1);
+        if thermal_steps > 100_000 {
+            return Err("thermal update requires more than 100000 stability substeps");
+        }
+        let dt = elapsed_seconds as f64 / thermal_steps as f64;
+        for _ in 0..thermal_steps {
+            for i in 0..self.voxels.len() {
+                scratch.temperature[i] = self.properties[i]
+                    .temperature(self.voxels[i].mass, self.voxels[i].internal_energy)
+                    as f64;
+            }
+            scratch.energy_delta.fill(0.0);
+            for &(i, j, conductance) in &scratch.edges {
+                let heat = conductance * (scratch.temperature[j] - scratch.temperature[i]) * dt;
+                scratch.energy_delta[i] += heat;
+                scratch.energy_delta[j] -= heat;
+            }
+            for (voxel, delta) in self.voxels.iter_mut().zip(&scratch.energy_delta) {
+                voxel.internal_energy = (voxel.internal_energy as f64 + delta).max(0.0) as f32;
+            }
+        }
+        Ok(thermal_steps)
+    }
+
     /// Derived display data for all incident bonds, including the negative-axis
     /// endpoint. Original outside faces are not damage. No visual state is stored.
     pub fn incident_bond_damage(&self) -> Vec<(f32, u8)> {
@@ -772,6 +861,7 @@ impl Scene {
         Self {
             config,
             solver_scratch: Default::default(),
+            thermal_scratch: Default::default(),
             collision_scratch: Default::default(),
             external_forces: vec![Vec3::ZERO; n],
             external_accelerations: vec![Vec3::ZERO; n],
