@@ -270,3 +270,22 @@ Validation: `cargo test --no-default-features --lib --test supports` checks floo
 settling, partial-axis motion and release, constrained impulses, mounted contact
 reactions and complete base fixation/unmounting. Desktop compilation is checked
 separately; this update does not establish real-time performance or a complete cut.
+
+### Extended live capture
+
+The current GIF records 88 evenly spaced states from an 840-step physical run:
+
+![Extended solver capture](validation/live-support.gif)
+
+The run covers 0.84 seconds of simulated time and 8.8 seconds of video at 10 FPS.
+It took 185.5 seconds on this CPU run, kept guide drift at zero, and ended with
+11,108 broken bonds. This is excessive fragmentation, not a successful chop.
+Start the viewer first, then stream a new capture with:
+
+```sh
+python3 validation/live_viewer.py --host 0.0.0.0 --port 8765 --csv validation/live-support.csv --label "Mounted axe and gravity"
+RUSTUP_HOME="$PWD/.toolchain/rustup" CARGO_HOME="$PWD/.toolchain/cargo" RAYON_NUM_THREADS=1 ./.toolchain/cargo/bin/cargo run --release --no-default-features --bin support_capture -- validation/live-support.csv 840 88
+```
+
+Open `http://127.0.0.1:8765`. The capture flushes frames as it runs; the GIF
+is served at `/gif` and the MP4 at `/video` when encoded locally.
