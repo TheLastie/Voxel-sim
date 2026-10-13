@@ -57,10 +57,12 @@ matvec `6.104e-5`, Jacobi `5.960e-8`, ошибка направления `0`, �
 смещение на `tid` и добавил в probe проверку 17 ненулевых partials. Проверка на
 RTX 5060 дала сумму 153 для 17 partials; synthetic PCG после всех 80 фиксированных
 итераций имеет residual `4.131e-17`. Запись PID 6263, собранная до этого фикса,
-остановилась на шаге 955/1680 и считается неполной. Новый capture из исправленного
-бинаря начался с успешных CUDA solves на 4 203 REV (`residual≈1.4e-6`). После
-разрыва 36 связей на шаге 296 позднее наблюдался CPU PCG, что указывает на
-fallback при изменённой топологии; точную причину пока не извлекли из stdout.
+остановилась на шаге 955/1680 и считается неполной. В профилированной записи из
+исправленного бинаря первые отдельные CUDA solves на 4 203 REV сошлись до
+`residual≈1.4e-6`, но лог также показывает отказ CUDA PCG до разрушения связей
+(`8.656e-5` при допуске `1e-5`) и CPU fallback. По всем шагам CPU выполнял
+значительную часть PCG; capture является смешанным CUDA/CPU, а не GPU-only
+валидацией.
 Новый capture завершён: 1 680 шагов, 177 состояний, `dt=1 ms`, 4 подшага,
 примерно 8 min wall time (около 3,4 шага/с). PNG/GIF/MP4 созданы из всех
 сохранённых состояний; GIF — 1600×1000, 177 кадров; MP4 — H.264 1600×1000,
@@ -111,8 +113,8 @@ target/release/support_capture validation/agent2-support-cuda-postfix.csv 1680
 
 CSV подтверждён: 1 680 шагов, 177 реальных состояний, 769 419 REV-записей.
 Первый CUDA fallback наступил примерно около шага 90, когда связей ещё не было
-сломано. Всего профиль сохранил 360 успешных CUDA вызовов и 1 591 fixed step
-с CUDA fallback. Все fallback вызовы исчерпали 80 итераций: residual min/median/
+сломано. Всего профиль сохранил 360 успешных CUDA вызовов и CUDA fallback на 1 591
+fixed step; один шаг может содержать несколько CPU PCG solves. Все fallback вызовы исчерпали 80 итераций: residual min/median/
 max `2.531e-5` / `1.960e-4` / `2.608e-4` при допуске `1e-5`. Для успешных CUDA
 вызовов median residual `1.429e-6`, максимум `7.393e-6`, median time `6.43 ms`.
 После fallback CPU solve завершал fixed steps с median residual `8.639e-6`,
@@ -433,6 +435,10 @@ restitution heat is `7.000165470e-7 J`. COM moved from `x=0.0150 m` to
 `x=-0.05359 m`; GIF/MP4 follow the group and show this coordinate. Both files
 have 177 frames at 1600×1000, 10 fps, 17.7 s, and the MP4 decodes fully. Direct
 viewer :8765 and catalog selector :8774 status/GIF/MP4 return HTTP 200. This is
-a small 3-REV mechanics capture, not an FPS benchmark.
+a small 3-REV mechanics capture, not an FPS benchmark. Later CUDA-requested runs
+logged relative PCG residual `5.521e7` at tolerance `1e-5` and explicitly fell
+back to CPU PCG; the capture is not evidence of GPU physical simulation.
+The momentum check starts after the applied launch impulse and is for the full
+three-REV assembly; per-cluster mass/momentum ledgers remain open.
 
 — Агент 1
