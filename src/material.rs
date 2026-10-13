@@ -37,6 +37,8 @@ pub struct Material {
     pub hardness: f32,
     pub heat_capacity: f32,
     pub thermal_cond: f32,
+    /// Dynamic viscosity for the liquid phase, pascal-seconds (Pa·s).
+    pub dynamic_viscosity_pa_s: f32,
     /// Electrical conductivity, siemens per metre (S/m).
     pub electrical_conductivity: f32,
     /// Relative dielectric permittivity (dimensionless, vacuum = 1).
@@ -284,6 +286,7 @@ impl Material {
         table[1].failure_plastic_strain = 0.04;
         table[2].fracture_mode = FractureMode::Ductile;
         table[2].electrical_conductivity = 1.0e7;
+        table[2].dynamic_viscosity_pa_s = 6.0e-3;
         table[2].relative_permittivity = 1.0;
         table[2].thermal_expansion_parallel = 12.0e-6;
         table[2].thermal_expansion_perpendicular = 12.0e-6;
@@ -292,6 +295,7 @@ impl Material {
         table[2].failure_plastic_strain = 0.15;
         table[5].fracture_mode = FractureMode::Ductile;
         table[5].electrical_conductivity = 3.5e7;
+        table[5].dynamic_viscosity_pa_s = 1.3e-3;
         table[5].relative_permittivity = 1.0;
         table[5].thermal_expansion_parallel = 23.0e-6;
         table[5].thermal_expansion_perpendicular = 23.0e-6;
@@ -300,6 +304,7 @@ impl Material {
         table[5].failure_plastic_strain = 0.18;
         table[6].fracture_mode = FractureMode::Ductile;
         table[6].electrical_conductivity = 5.96e7;
+        table[6].dynamic_viscosity_pa_s = 4.0e-3;
         table[6].relative_permittivity = 1.0;
         table[6].thermal_expansion_parallel = 16.5e-6;
         table[6].thermal_expansion_perpendicular = 16.5e-6;
@@ -307,6 +312,7 @@ impl Material {
         table[6].hardening_modulus = 0.45e9;
         table[6].failure_plastic_strain = 0.30;
         table[7].strength_softening_start_ratio = 0.7;
+        table[7].dynamic_viscosity_pa_s = 1.0e3;
         table[8].strength_softening_start_ratio = 0.7;
         table[3].electrical_conductivity = 1.0e-10;
         table[3].relative_permittivity = 5.0;
@@ -316,6 +322,7 @@ impl Material {
         table[4].relative_permittivity = 80.0;
         table[4].thermal_expansion_parallel = 69.0e-6;
         table[4].thermal_expansion_perpendicular = 69.0e-6;
+        table[4].dynamic_viscosity_pa_s = 1.002e-3;
         table[7].electrical_conductivity = 1.0e-12;
         table[7].relative_permittivity = 7.0;
         table[7].thermal_expansion_parallel = 9.0e-6;
@@ -374,6 +381,7 @@ impl Material {
             hardness: yield_strength,
             heat_capacity,
             thermal_cond,
+            dynamic_viscosity_pa_s: 0.0,
             electrical_conductivity: 1.0e-14,
             relative_permittivity: 1.0,
             thermal_expansion_parallel: 0.0,
@@ -428,6 +436,12 @@ impl Material {
             fracture_energy,
             fracture_energy_perp
         );
+        // Starter mixture estimate: dynamic viscosity is mass-fraction weighted.
+        result.dynamic_viscosity_pa_s = c
+            .components
+            .iter()
+            .map(|&(id, fraction)| table[id as usize].dynamic_viscosity_pa_s * fraction)
+            .sum();
         // Series-mixture (lower-bound) rule: component resistivities add by
         // volume fraction, keeping composition and geometry explicit.
         let contains_insulator = c
@@ -570,6 +584,8 @@ mod tests {
             assert!(material.density > 0.0);
             assert!(material.heat_capacity > 0.0);
         }
+        let water_id = Material::component_id("water").unwrap();
+        assert!((table[water_id as usize].dynamic_viscosity_pa_s - 1.002e-3).abs() < 1e-8);
     }
 
     #[test]
@@ -602,6 +618,8 @@ mod tests {
             1.0 / (0.25 / iron_material.density + 0.75 / copper_material.density);
         let expected_heat_capacity =
             0.25 * iron_material.heat_capacity + 0.75 * copper_material.heat_capacity;
+        let expected_viscosity = 0.25 * iron_material.dynamic_viscosity_pa_s
+            + 0.75 * copper_material.dynamic_viscosity_pa_s;
         let expected_expansion_parallel = 0.25 * iron_material.thermal_expansion_parallel
             + 0.75 * copper_material.thermal_expansion_parallel;
         let expected_expansion_perpendicular = 0.25 * iron_material.thermal_expansion_perpendicular
@@ -616,6 +634,7 @@ mod tests {
                 + copper_volume / copper_material.relative_permittivity);
         assert!((mixture.density - expected_density).abs() <= expected_density * 1e-6);
         assert!((mixture.heat_capacity - expected_heat_capacity).abs() <= 1e-5);
+        assert!((mixture.dynamic_viscosity_pa_s - expected_viscosity).abs() <= 1e-8);
         assert!((mixture.thermal_expansion_parallel - expected_expansion_parallel).abs() <= 1e-10);
         assert!(
             (mixture.thermal_expansion_perpendicular - expected_expansion_perpendicular).abs()

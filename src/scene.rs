@@ -30,13 +30,32 @@ pub struct WorldBounds {
     pub max: Vec3,
 }
 
-/// Material and impact thresholds for automatic thermal bond formation.
+/// Temperature, impact, pressure, and dwell thresholds for automatic bonding.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ThermalBondingRule {
     pub component: u16,
     pub minimum_mass_fraction: f32,
     pub minimum_temperature_kelvin: f32,
     pub minimum_impact_energy_j: f64,
+    /// Normal contact impulse divided by fixed-step duration and REV face area.
+    pub minimum_contact_pressure_pa: f32,
+    /// Continuous time for which the contact pressure threshold is maintained.
+    pub minimum_dwell_seconds: f32,
+}
+
+/// Automatic fusion criterion evaluated from real contact impulses and dwell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThermalFusionRule {
+    pub minimum_temperature_kelvin: f32,
+    pub minimum_contact_pressure_pa: f32,
+    pub minimum_dwell_seconds: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BondingContactState {
+    dwell_seconds: f32,
+    impact_qualified: bool,
+    last_seen_substep: u64,
 }
 
 #[derive(Default)]
@@ -319,6 +338,10 @@ pub struct Scene {
     pub solver_residual: f32,
     world_bounds: Option<WorldBounds>,
     thermal_bonding_rule: Option<ThermalBondingRule>,
+    bonding_contacts: HashMap<(usize, usize), BondingContactState>,
+    thermal_fusion_rule: Option<ThermalFusionRule>,
+    fusion_contacts: HashMap<(usize, usize), BondingContactState>,
+    pending_fusion: Option<(usize, usize)>,
     boundary_removals: BoundaryRemovalLedger,
 }
 impl Scene {
@@ -346,6 +369,26 @@ impl Scene {
         let id = Material::component_id(material_name)
             .ok_or_else(|| format!("unknown material: {material_name}"))? as usize;
         self.materials[id].strength_softening_start_ratio = onset_ratio;
+        for (voxel, properties) in self.voxels.iter().zip(&mut self.properties) {
+            *properties = Material::mixed(&voxel.composition, &self.materials);
+        }
+        Ok(())
+    }
+
+    /// Set a built-in material's liquid dynamic viscosity in pascal-seconds.
+    /// Mixtures use a mass-fraction weighted estimate; current values are
+    /// constant across temperature and are not material-calibrated curves.
+    pub fn set_material_dynamic_viscosity(
+        &mut self,
+        material_name: &str,
+        viscosity_pa_s: f32,
+    ) -> Result<(), String> {
+        if !viscosity_pa_s.is_finite() || viscosity_pa_s < 0.0 {
+            return Err("dynamic viscosity must be finite and nonnegative".into());
+        }
+        let id = Material::component_id(material_name)
+            .ok_or_else(|| format!("unknown material: {material_name}"))? as usize;
+        self.materials[id].dynamic_viscosity_pa_s = viscosity_pa_s;
         for (voxel, properties) in self.voxels.iter().zip(&mut self.properties) {
             *properties = Material::mixed(&voxel.composition, &self.materials);
         }
@@ -426,6 +469,10 @@ impl Scene {
             solver_residual: 0.0,
             world_bounds: None,
             thermal_bonding_rule: None,
+            bonding_contacts: HashMap::new(),
+            thermal_fusion_rule: None,
+            fusion_contacts: HashMap::new(),
+            pending_fusion: None,
             boundary_removals: BoundaryRemovalLedger::default(),
         };
         let mut occupancy = HashMap::with_capacity(spawns.len());
@@ -535,15 +582,19 @@ impl Scene {
         self.world_bounds = None;
     }
 
-    /// Enable impact-triggered bonding for a material. Both endpoints must
-    /// meet the mass-fraction and temperature thresholds, and their inelastic
-    /// normal impact energy must meet the supplied joule threshold.
+    /// Enable thermal bonding for a material. Both endpoints must meet the
+    /// component and temperature thresholds. A qualifying new impact arms a
+    /// pair; normal impulse divided by substep duration and face area estimates
+    /// contact pressure, which must remain above its threshold for the dwell
+    /// duration. Set impact energy to zero for pressure/dwell-only bonding.
     pub fn set_thermal_bonding_rule(
         &mut self,
         material_name: &str,
         minimum_mass_fraction: f32,
         minimum_temperature_kelvin: f32,
         minimum_impact_energy_j: f64,
+        minimum_contact_pressure_pa: f32,
+        minimum_dwell_seconds: f32,
     ) -> Result<(), String> {
         if !minimum_mass_fraction.is_finite()
             || !(0.0..=1.0).contains(&minimum_mass_fraction)
@@ -551,10 +602,14 @@ impl Scene {
             || !minimum_temperature_kelvin.is_finite()
             || minimum_temperature_kelvin < 0.0
             || !minimum_impact_energy_j.is_finite()
-            || minimum_impact_energy_j <= 0.0
+            || minimum_impact_energy_j < 0.0
+            || !minimum_contact_pressure_pa.is_finite()
+            || minimum_contact_pressure_pa < 0.0
+            || !minimum_dwell_seconds.is_finite()
+            || minimum_dwell_seconds < 0.0
         {
             return Err(
-                "thermal bonding thresholds must be finite and positive (fraction in (0, 1])"
+                "thermal bonding thresholds must be finite and nonnegative (fraction in (0, 1])"
                     .into(),
             );
         }
@@ -565,40 +620,50 @@ impl Scene {
             minimum_mass_fraction,
             minimum_temperature_kelvin,
             minimum_impact_energy_j,
+            minimum_contact_pressure_pa,
+            minimum_dwell_seconds,
         });
+        self.bonding_contacts.clear();
         Ok(())
     }
 
     /// Disable automatic thermal/impact bond formation.
     pub fn clear_thermal_bonding_rule(&mut self) {
         self.thermal_bonding_rule = None;
+        self.bonding_contacts.clear();
     }
 
     pub fn thermal_bonding_rule(&self) -> Option<ThermalBondingRule> {
         self.thermal_bonding_rule
     }
 
-    /// Apply the scene rule to contact impact energies measured before
-    /// restitution and only create topology after contact resolution.
+    /// Advance contact pressure and dwell state after the contact impulse solve.
     pub(crate) fn form_thermal_bonds(
         &mut self,
         contacts: &[crate::collision::Contact],
         impact_energies_j: &[f64],
+        normal_impulses_ns: &[f32],
+        elapsed_seconds: f32,
     ) -> usize {
         let Some(rule) = self.thermal_bonding_rule else {
             return 0;
         };
         let mut formed = 0;
-        for (contact, &impact_energy_j) in contacts.iter().zip(impact_energies_j) {
-            if !contact.new_impact || impact_energy_j < rule.minimum_impact_energy_j {
-                continue;
-            }
+        let current_substep = self.substep_index;
+        for (index, contact) in contacts.iter().enumerate() {
             let i = contact.i;
             let j = contact.j;
-            if i >= self.voxels.len()
-                || j >= self.voxels.len()
-                || self.voxels[i].kinematic != self.voxels[j].kinematic
+            if i >= self.voxels.len() || j >= self.voxels.len() {
+                continue;
+            }
+            let key = if i < j { (i, j) } else { (j, i) };
+            if self.voxels[i].kinematic != self.voxels[j].kinematic
+                || self
+                    .bonds
+                    .iter()
+                    .any(|axis| axis[i].neighbor == j as u32 || axis[j].neighbor == i as u32)
             {
+                self.bonding_contacts.remove(&key);
                 continue;
             }
             let qualifies =
@@ -615,13 +680,45 @@ impl Scene {
                         .temperature_kelvin
                         >= rule.minimum_temperature_kelvin
                 };
-            if qualifies(i, self)
-                && qualifies(j, self)
-                && self.connect_adjacent_voxels(i, j).is_ok()
-            {
-                formed += 1;
+            if !qualifies(i, self) || !qualifies(j, self) {
+                self.bonding_contacts.remove(&key);
+                continue;
+            }
+            let impact_energy_j = impact_energies_j.get(index).copied().unwrap_or(0.0);
+            self.bonding_contacts
+                .entry(key)
+                .or_default()
+                .last_seen_substep = current_substep;
+            if rule.minimum_impact_energy_j == 0.0 {
+                self.bonding_contacts
+                    .entry(key)
+                    .or_default()
+                    .impact_qualified = true;
+            }
+            if contact.new_impact && impact_energy_j >= rule.minimum_impact_energy_j {
+                self.bonding_contacts
+                    .entry(key)
+                    .or_default()
+                    .impact_qualified = true;
+            }
+            let pressure_pa = normal_impulses_ns.get(index).copied().unwrap_or(0.0)
+                / (elapsed_seconds.max(f32::MIN_POSITIVE) * CELL * CELL);
+            let state = self.bonding_contacts.entry(key).or_default();
+            if pressure_pa >= rule.minimum_contact_pressure_pa {
+                state.dwell_seconds += elapsed_seconds;
+            } else {
+                state.dwell_seconds = 0.0;
+            }
+            let ready = state.impact_qualified
+                && state.dwell_seconds + f32::EPSILON >= rule.minimum_dwell_seconds;
+            if ready {
+                let connected = self.connect_adjacent_voxels(i, j).is_ok();
+                self.bonding_contacts.remove(&key);
+                formed += usize::from(connected);
             }
         }
+        self.bonding_contacts
+            .retain(|_, state| state.last_seen_substep == current_substep);
         formed
     }
 
@@ -748,6 +845,8 @@ impl Scene {
             rest_neighbor: upper as u32,
             ..BondWorkspace::default()
         };
+        self.bonding_contacts
+            .remove(&(lower.min(upper), lower.max(upper)));
         let cell_coordinate = (self.rest_positions[lower][axis] / CELL - 0.5).round() as i32;
         let color = axis * 2 + cell_coordinate.rem_euclid(2) as usize;
         if !self.colors[color].contains(&lower) {
@@ -758,6 +857,214 @@ impl Scene {
         self.collision_scratch = Default::default();
         crate::solver::rebuild_clusters(self);
         Ok(())
+    }
+
+    /// Fuse two free, face-adjacent REVs into one compressed representative
+    /// volume. Mass-weighted composition, linear momentum, and total energy are
+    /// conserved; relative kinetic energy becomes internal heat. The fused REV
+    /// retains one cell's geometry, so this operation models local compaction,
+    /// not expansion into a two-cell-shaped body. Both inputs must be free of
+    /// bonds, pending fracture releases, and kinematic constraints.
+    pub fn fuse_adjacent_voxels(&mut self, a: usize, b: usize) -> Result<usize, &'static str> {
+        if a >= self.voxels.len() || b >= self.voxels.len() {
+            return Err("voxel index out of range");
+        }
+        if a == b {
+            return Err("cannot fuse a voxel with itself");
+        }
+        if self.voxels[a].kinematic || self.voxels[b].kinematic {
+            return Err("fusion requires unconstrained voxels");
+        }
+        if self.axis_targets[a].iter().any(Option::is_some)
+            || self.axis_targets[b].iter().any(Option::is_some)
+        {
+            return Err("fusion requires unconstrained voxels");
+        }
+        let lattice_delta = (self.rest_positions[b] - self.rest_positions[a]) / CELL;
+        let rounded = lattice_delta.round();
+        if (lattice_delta - rounded).abs().max_element() > 1e-3
+            || rounded.abs().element_sum() != 1.0
+        {
+            return Err("fused voxels must be adjacent on the REV lattice");
+        }
+        let face_normal = rounded.normalize_or_zero();
+        let separation = self.positions[b] - self.positions[a];
+        let normal_gap = separation.dot(face_normal).abs();
+        let tangential_offset = separation - face_normal * separation.dot(face_normal);
+        if (normal_gap - CELL).abs() > CELL * 1e-3 || tangential_offset.abs().max_element() >= CELL
+        {
+            return Err("fused voxels must be in face contact");
+        }
+        let incident_bond = |voxel: usize| {
+            self.bonds.iter().any(|axis| {
+                axis.iter().enumerate().any(|(i, bond)| {
+                    bond.neighbor != EMPTY && (i == voxel || bond.neighbor as usize == voxel)
+                })
+            })
+        };
+        if incident_bond(a) || incident_bond(b) {
+            return Err("fusion currently requires unbonded input voxels");
+        }
+        if self
+            .releases
+            .iter()
+            .any(|release| release.i == a || release.j == a || release.i == b || release.j == b)
+        {
+            return Err("cannot fuse voxels with pending fracture releases");
+        }
+
+        let (survivor, consumed) = if a < b { (a, b) } else { (b, a) };
+        let mass_a = self.voxels[survivor].mass as f64;
+        let mass_b = self.voxels[consumed].mass as f64;
+        let mass_total = mass_a + mass_b;
+        let merged_mass = mass_total as f32;
+        if !merged_mass.is_finite() || merged_mass <= 0.0 {
+            return Err("fused mass is outside the supported range");
+        }
+        let va = self.voxels[survivor].velocity;
+        let vb = self.voxels[consumed].velocity;
+        let kinetic_before =
+            0.5 * mass_a * va.length_squared() as f64 + 0.5 * mass_b * vb.length_squared() as f64;
+        let position = (self.positions[survivor] * mass_a as f32
+            + self.positions[consumed] * mass_b as f32)
+            / mass_total as f32;
+        let velocity = (va * mass_a as f32 + vb * mass_b as f32) / mass_total as f32;
+        let kinetic_after = 0.5 * merged_mass as f64 * velocity.length_squared() as f64;
+        let fusion_heat_j = (kinetic_before - kinetic_after).max(0.0);
+
+        let mut fractions = std::collections::BTreeMap::<u16, f64>::new();
+        for &(component, fraction) in &self.voxels[survivor].composition.components {
+            *fractions.entry(component).or_default() += mass_a * fraction as f64;
+        }
+        for &(component, fraction) in &self.voxels[consumed].composition.components {
+            *fractions.entry(component).or_default() += mass_b * fraction as f64;
+        }
+        let mut composition = Composition {
+            components: Default::default(),
+        };
+        for (component, component_mass) in fractions {
+            composition
+                .components
+                .push((component, (component_mass / mass_total) as f32));
+        }
+        composition
+            .validate(self.materials.len())
+            .map_err(|_| "merged composition is invalid")?;
+
+        let specific_b = mass_b / mass_total;
+        let internal_b = self.voxels[consumed].total_internal_energy_j();
+        let reference_temperature = ((mass_a * self.reference_temperatures_kelvin[survivor] as f64
+            + mass_b * self.reference_temperatures_kelvin[consumed] as f64)
+            / mass_total) as f32;
+        let merged_microstructure = Microstructure {
+            orientation: self.voxels[survivor]
+                .microstructure
+                .orientation
+                .slerp(
+                    self.voxels[consumed].microstructure.orientation,
+                    specific_b as f32,
+                )
+                .normalize(),
+            anisotropy: ((mass_a * self.voxels[survivor].microstructure.anisotropy as f64
+                + mass_b * self.voxels[consumed].microstructure.anisotropy as f64)
+                / mass_total) as f32,
+        };
+        let merged_material = Material::mixed(&composition, &self.materials);
+
+        {
+            let merged = &mut self.voxels[survivor];
+            merged.mass = merged_mass;
+            merged.composition = composition;
+            merged.velocity = velocity;
+            merged.microstructure = merged_microstructure;
+            merged.add_internal_energy_j(internal_b + kinetic_before - kinetic_after);
+        }
+        self.positions[survivor] = position;
+        self.previous[survivor] = position;
+        self.rest_positions[survivor] = position;
+        self.reference_temperatures_kelvin[survivor] = reference_temperature;
+        let merged_force = self.external_forces[survivor] + self.external_forces[consumed];
+        self.external_forces[survivor] = merged_force;
+        self.external_accelerations[survivor] = (self.external_accelerations[survivor]
+            * mass_a as f32
+            + self.external_accelerations[consumed] * mass_b as f32)
+            / mass_total as f32;
+        self.properties[survivor] = merged_material;
+        self.energy.fusion_heat += fusion_heat_j;
+        self.rotations[survivor] = self.rotations[survivor]
+            .slerp(self.rotations[consumed], specific_b as f32)
+            .normalize();
+
+        let old_count = self.voxels.len();
+        let keep: Vec<bool> = (0..old_count).map(|i| i != consumed).collect();
+        let mut remap = vec![EMPTY; old_count];
+        let mut next = 0u32;
+        for i in 0..old_count {
+            if keep[i] {
+                remap[i] = next;
+                next += 1;
+            }
+        }
+        for release in &mut self.releases {
+            release.i = remap[release.i] as usize;
+            release.j = remap[release.j] as usize;
+        }
+        for axis in 0..3 {
+            let old_bonds = std::mem::take(&mut self.bonds[axis]);
+            let old_workspace = std::mem::take(&mut self.workspace[axis]);
+            for i in 0..old_count {
+                if !keep[i] {
+                    continue;
+                }
+                let mut bond = old_bonds[i];
+                let mut workspace = old_workspace[i];
+                if bond.neighbor != EMPTY {
+                    bond.neighbor = remap[bond.neighbor as usize];
+                }
+                if workspace.rest_neighbor != EMPTY {
+                    workspace.rest_neighbor = remap[workspace.rest_neighbor as usize];
+                }
+                self.bonds[axis].push(bond);
+                self.workspace[axis].push(workspace);
+            }
+        }
+        self.bonding_contacts = std::mem::take(&mut self.bonding_contacts)
+            .into_iter()
+            .filter_map(|((i, j), state)| {
+                (keep[i] && keep[j]).then_some(((remap[i] as usize, remap[j] as usize), state))
+            })
+            .collect();
+        for color in &mut self.colors {
+            color.retain(|&i| keep[i]);
+            for i in color {
+                *i = remap[*i] as usize;
+            }
+        }
+        macro_rules! compact {
+            ($field:ident) => {{
+                self.$field = std::mem::take(&mut self.$field)
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, value)| keep[i].then_some(value))
+                    .collect();
+            }};
+        }
+        compact!(voxels);
+        compact!(positions);
+        compact!(rest_positions);
+        compact!(reference_temperatures_kelvin);
+        compact!(previous);
+        compact!(external_forces);
+        compact!(external_accelerations);
+        compact!(axis_targets);
+        compact!(properties);
+        compact!(rotations);
+        compact!(clusters);
+        self.solver_scratch = Default::default();
+        self.thermal_scratch = Default::default();
+        self.collision_scratch = Default::default();
+        crate::solver::rebuild_clusters(self);
+        Ok(remap[survivor] as usize)
     }
 
     /// Compatibility API for partial world-space constraints.
@@ -794,6 +1101,13 @@ impl Scene {
                 next += 1;
             }
         }
+
+        self.bonding_contacts = std::mem::take(&mut self.bonding_contacts)
+            .into_iter()
+            .filter_map(|((i, j), state)| {
+                (keep[i] && keep[j]).then_some(((remap[i] as usize, remap[j] as usize), state))
+            })
+            .collect();
 
         for i in 0..old_count {
             if keep[i] {
@@ -1201,6 +1515,7 @@ impl Scene {
             solver_residual: 0.0,
             world_bounds: None,
             thermal_bonding_rule: None,
+            bonding_contacts: HashMap::new(),
             boundary_removals: BoundaryRemovalLedger::default(),
         }
     }
@@ -1316,6 +1631,36 @@ mod world_bounds_tests {
         assert!((ledger.kinetic_energy_j - expected_kinetic).abs() < 1e-12);
         assert_eq!(ledger.momentum_kg_m_s, expected_momentum);
         assert_eq!(ledger.pending_bond_energy_j, 0.25);
+    }
+
+    #[test]
+    fn boundary_compaction_reindexes_bonding_dwell_pairs() {
+        let iron = Material::component_id("iron").unwrap();
+        let mut scene = SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], iron))
+            .add_voxel(VoxelSpawn::at_cell([1, 0, 0], iron))
+            .add_voxel(VoxelSpawn::at_cell([2, 0, 0], iron))
+            .build()
+            .unwrap();
+        scene.bonding_contacts.insert(
+            (1, 2),
+            BondingContactState {
+                dwell_seconds: 0.25,
+                impact_qualified: true,
+                last_seen_substep: 7,
+            },
+        );
+        assert_eq!(
+            scene.set_world_bounds(Vec3::new(0.01, 0.0, 0.0), Vec3::splat(1.0)),
+            Ok(1)
+        );
+        assert_eq!(scene.bonding_contacts.len(), 1);
+        assert_eq!(scene.bonding_contacts[&(0, 1)].dwell_seconds, 0.25);
+        assert!(scene
+            .set_world_bounds(Vec3::new(0.02, 0.0, 0.0), Vec3::splat(1.0))
+            .is_ok());
+        assert!(scene.bonding_contacts.is_empty());
     }
 }
 
@@ -1455,6 +1800,174 @@ mod topology_mutation_tests {
     }
 
     #[test]
+    fn fusion_mixes_composition_and_conserves_mass_momentum_and_energy() {
+        let iron = Material::component_id("iron").unwrap();
+        let copper = Material::component_id("copper").unwrap();
+        let mut scene = SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .add_voxel(
+                VoxelSpawn::at_cell([0, 0, 0], iron)
+                    .fixed()
+                    .with_velocity(Vec3::Y * 0.01)
+                    .at_temperature(500.0),
+            )
+            .add_voxel(
+                VoxelSpawn::at_cell([1, 0, 0], copper)
+                    .with_velocity(Vec3::NEG_Y * 0.02)
+                    .at_temperature(700.0),
+            )
+            .add_voxel(VoxelSpawn::at_cell([3, 0, 0], iron))
+            .add_voxel(VoxelSpawn::at_cell([4, 0, 0], iron))
+            .build()
+            .unwrap();
+        scene.release_voxel(0).unwrap();
+        scene.positions[1].y += 0.002;
+        scene.previous[1].y += 0.002;
+        scene.voxels[0].velocity = Vec3::Y * 0.01;
+        scene.external_forces[0] = Vec3::X;
+        scene.external_forces[1] = Vec3::NEG_X * 0.5;
+        scene.external_accelerations[0] = Vec3::Y;
+        scene.external_accelerations[1] = Vec3::Y * 3.0;
+        let expected_iron_fraction = scene.voxels[0].mass as f64
+            / (scene.voxels[0].mass as f64 + scene.voxels[1].mass as f64);
+        let expected_acceleration_y = (scene.voxels[0].mass as f64
+            + 3.0 * scene.voxels[1].mass as f64)
+            / (scene.voxels[0].mass as f64 + scene.voxels[1].mass as f64);
+        let initial_mass = scene.total_mass_kg();
+        let initial_momentum: Vec3 = scene
+            .voxels
+            .iter()
+            .fold(Vec3::ZERO, |sum, voxel| sum + voxel.velocity * voxel.mass);
+        let initial_energy: f64 = scene
+            .voxels
+            .iter()
+            .map(|voxel| {
+                voxel.total_internal_energy_j()
+                    + 0.5 * voxel.mass as f64 * voxel.velocity.length_squared() as f64
+            })
+            .sum();
+        scene.energy.pending_release = 0.5;
+        scene.releases.push(crate::fracture::Release {
+            i: 2,
+            j: 3,
+            energy: 0.5,
+            due: 100,
+        });
+
+        let fused_index = scene.fuse_adjacent_voxels(1, 0).unwrap();
+
+        assert_eq!(fused_index, 0);
+        assert_eq!(scene.voxels.len(), 3);
+        assert!((scene.total_mass_kg() - initial_mass).abs() < 1e-9);
+        let final_momentum: Vec3 = scene
+            .voxels
+            .iter()
+            .fold(Vec3::ZERO, |sum, voxel| sum + voxel.velocity * voxel.mass);
+        assert!((final_momentum - initial_momentum).length() < 1e-9);
+        let final_energy: f64 = scene
+            .voxels
+            .iter()
+            .map(|voxel| {
+                voxel.total_internal_energy_j()
+                    + 0.5 * voxel.mass as f64 * voxel.velocity.length_squared() as f64
+            })
+            .sum();
+        assert!((final_energy - initial_energy).abs() < 1e-9);
+        assert!(scene.energy.fusion_heat > 0.0);
+        assert_eq!(scene.releases[0].i, 1);
+        assert_eq!(scene.releases[0].j, 2);
+        assert_eq!(scene.bonds[0][1].neighbor, 2);
+        assert_eq!(scene.workspace[0][1].rest_neighbor, 2);
+        assert_eq!(scene.cluster_count, 2);
+        assert_eq!(scene.energy.pending_release, 0.5);
+        let iron_mass_fraction = scene.voxels[0]
+            .composition
+            .components
+            .iter()
+            .find(|(component, _)| *component == iron)
+            .unwrap()
+            .1;
+        assert!((iron_mass_fraction as f64 - expected_iron_fraction).abs() < 1e-6);
+        assert!((scene.external_forces[0] - Vec3::X * 0.5).length() < 1e-6);
+        assert!((scene.external_accelerations[0].y as f64 - expected_acceleration_y).abs() < 1e-6);
+        assert_eq!(scene.axis_targets.len(), scene.voxels.len());
+        assert_eq!(scene.properties.len(), scene.voxels.len());
+        assert!(scene
+            .colors
+            .iter()
+            .flatten()
+            .all(|&i| i < scene.voxels.len()));
+    }
+
+    #[test]
+    fn fusion_rejects_bonds_constraints_and_nonadjacent_voxels_without_mutation() {
+        let iron = Material::component_id("iron").unwrap();
+        let mut bonded = SceneBuilder::standard()
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], iron))
+            .add_voxel(VoxelSpawn::at_cell([1, 0, 0], iron))
+            .build()
+            .unwrap();
+        assert!(bonded.fuse_adjacent_voxels(0, 1).is_err());
+        assert_eq!(bonded.voxels.len(), 2);
+
+        let mut constrained = SceneBuilder::standard()
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], iron).fixed())
+            .add_voxel(VoxelSpawn::at_cell([1, 0, 0], iron))
+            .build()
+            .unwrap();
+        constrained.release_voxel(0).unwrap();
+        constrained
+            .fix_voxel_axes(0, [Some(0.005), None, None])
+            .unwrap();
+        assert!(constrained.fuse_adjacent_voxels(0, 1).is_err());
+        assert_eq!(constrained.voxels.len(), 2);
+
+        let mut distant = SceneBuilder::standard()
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], iron).fixed())
+            .add_voxel(VoxelSpawn::at_cell([2, 0, 0], iron))
+            .build()
+            .unwrap();
+        distant.release_voxel(0).unwrap();
+        assert!(distant.fuse_adjacent_voxels(0, 1).is_err());
+        assert_eq!(distant.voxels.len(), 2);
+
+        let mut pending = SceneBuilder::standard()
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], iron).fixed())
+            .add_voxel(VoxelSpawn::at_cell([1, 0, 0], iron))
+            .build()
+            .unwrap();
+        pending.release_voxel(0).unwrap();
+        pending.releases.push(crate::fracture::Release {
+            i: 0,
+            j: 1,
+            energy: 0.25,
+            due: 1,
+        });
+        assert!(pending.fuse_adjacent_voxels(0, 1).is_err());
+        assert_eq!(pending.voxels.len(), 2);
+        assert_eq!(pending.releases.len(), 1);
+    }
+
+    #[test]
+    fn liquid_viscosity_api_validates_and_refreshes_derived_properties() {
+        let water = Material::component_id("water").unwrap();
+        let mut scene = SceneBuilder::standard()
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], water))
+            .build()
+            .unwrap();
+        assert!((scene.properties[0].dynamic_viscosity_pa_s - 1.002e-3).abs() < 1e-8);
+        scene.set_material_dynamic_viscosity("water", 0.25).unwrap();
+        assert_eq!(scene.properties[0].dynamic_viscosity_pa_s, 0.25);
+        assert!(scene.set_material_dynamic_viscosity("water", -1.0).is_err());
+        assert!(scene
+            .set_material_dynamic_viscosity("water", f32::INFINITY)
+            .is_err());
+        assert!(scene
+            .set_material_dynamic_viscosity("unknown", 0.1)
+            .is_err());
+    }
+
+    #[test]
     fn connecting_rejects_nonadjacent_or_constraint_mismatched_revs() {
         let iron = Material::component_id("iron").unwrap();
         let mut scene = SceneBuilder::standard()
@@ -1564,7 +2077,7 @@ mod topology_mutation_tests {
     fn thermal_bond_rule_automatically_connects_hot_impact() {
         let mut scene = impact_pair(363.15);
         scene
-            .set_thermal_bonding_rule("iron", 1.0, 350.0, 1.0e-8)
+            .set_thermal_bonding_rule("iron", 1.0, 350.0, 1.0e-8, 0.0, 0.0)
             .unwrap();
         for _ in 0..40 {
             scene.tick();
@@ -1580,13 +2093,44 @@ mod topology_mutation_tests {
     fn thermal_bond_rule_leaves_cold_impact_unbonded() {
         let mut scene = impact_pair(293.15);
         scene
-            .set_thermal_bonding_rule("iron", 1.0, 350.0, 1.0e-8)
+            .set_thermal_bonding_rule("iron", 1.0, 350.0, 1.0e-8, 0.0, 0.0)
             .unwrap();
         for _ in 0..40 {
             scene.tick();
         }
         assert_eq!(scene.bonds[0][0].neighbor, EMPTY);
         assert_eq!(scene.cluster_count, 2);
+    }
+
+    #[test]
+    fn thermal_bond_rule_requires_pressure_dwell_after_qualifying_impact() {
+        let mut scene = impact_pair(363.15);
+        scene.positions[1] = scene.positions[0] + Vec3::X * CELL;
+        scene.previous[1] = scene.positions[1];
+        scene
+            .set_thermal_bonding_rule("iron", 1.0, 350.0, 1e-8, 1.0e6, 0.02)
+            .unwrap();
+        let first = crate::collision::Contact {
+            i: 0,
+            j: 1,
+            normal: Vec3::X,
+            new_impact: true,
+        };
+        assert_eq!(scene.form_thermal_bonds(&[first], &[1e-5], &[0.5], 0.01), 0);
+        assert_eq!(scene.bonds[0][0].neighbor, EMPTY);
+        let resting = crate::collision::Contact {
+            new_impact: false,
+            ..first
+        };
+        assert_eq!(
+            scene.form_thermal_bonds(&[resting], &[0.0], &[1.0], 0.01),
+            0
+        );
+        assert_eq!(
+            scene.form_thermal_bonds(&[resting], &[0.0], &[1.0], 0.01),
+            1
+        );
+        assert_eq!(scene.bonds[0][0].neighbor, 1);
     }
 
     #[test]
@@ -1597,21 +2141,25 @@ mod topology_mutation_tests {
             .build()
             .unwrap();
         assert!(scene
-            .set_thermal_bonding_rule("unknown", 1.0, 300.0, 1e-8)
+            .set_thermal_bonding_rule("unknown", 1.0, 300.0, 1e-8, 0.0, 0.0)
             .is_err());
         assert!(scene
-            .set_thermal_bonding_rule("iron", 0.0, 300.0, 1e-8)
+            .set_thermal_bonding_rule("iron", 0.0, 300.0, 1e-8, 0.0, 0.0)
             .is_err());
         assert!(scene
-            .set_thermal_bonding_rule("iron", 1.0, f32::NAN, 1e-8)
+            .set_thermal_bonding_rule("iron", 1.0, f32::NAN, 1e-8, 0.0, 0.0)
             .is_err());
         assert!(scene
-            .set_thermal_bonding_rule("iron", 1.0, 300.0, 0.0)
+            .set_thermal_bonding_rule("iron", 1.0, 300.0, 0.0, -1.0, 0.0)
             .is_err());
         scene
-            .set_thermal_bonding_rule("iron", 0.75, 350.0, 1e-8)
+            .set_thermal_bonding_rule("iron", 0.75, 350.0, 1e-8, 2.0e6, 0.5)
             .unwrap();
         assert_eq!(scene.thermal_bonding_rule().unwrap().component, iron);
+        assert_eq!(
+            scene.thermal_bonding_rule().unwrap().minimum_dwell_seconds,
+            0.5
+        );
         scene.clear_thermal_bonding_rule();
         assert_eq!(scene.thermal_bonding_rule(), None);
     }

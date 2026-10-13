@@ -650,8 +650,10 @@ pub fn step_with_axis_targets_and_loads(
                 }
             }
         }
-        collision::resolve_velocities(scene, &contacts, targets);
-        let formed_bonds = scene.form_thermal_bonds(&contacts, &impact_energies_j);
+        let normal_impulses_ns = collision::resolve_velocities(scene, &contacts, targets);
+        collision::resolve_liquid_viscosity(scene, &contacts, targets, h);
+        let formed_bonds =
+            scene.form_thermal_bonds(&contacts, &impact_energies_j, &normal_impulses_ns, h);
         if formed_bonds > 0 {
             topology_changed = true;
             // Bond assembly changed while the local per-step workspace was out

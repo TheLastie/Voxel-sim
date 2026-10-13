@@ -42,6 +42,22 @@
       "video": "bond-formation.mp4"
     },
     {
+      "id": "iron-copper-fusion",
+      "label": "Слияние железа и меди · сохранение массы и энергии",
+      "mode": "csv",
+      "csv": "fusion.csv",
+      "gif": "fusion.gif",
+      "video": "fusion.mp4"
+    },
+    {
+      "id": "liquid-viscosity",
+      "label": "Вязкое касательное течение воды · 2 жидких REV",
+      "mode": "csv",
+      "csv": "liquid-viscosity.csv",
+      "gif": "liquid-viscosity.gif",
+      "video": "liquid-viscosity.mp4"
+    },
+    {
       "id": "thermal-strength",
       "label": "Температурное размягчение стеклянной связи · 2 REV",
       "mode": "thermal",

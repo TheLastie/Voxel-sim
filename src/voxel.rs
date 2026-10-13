@@ -32,10 +32,24 @@ impl Voxel {
         if !joules.is_finite() {
             return;
         }
-        let total = (self.total_internal_energy_j() + joules).max(0.0);
-        let rounded = total.min(f32::MAX as f64) as f32;
+        // Accumulate small increments beside (rather than into) the much
+        // larger f32 energy. Adding them to the full f64 total first can lose
+        // increments below that total's f64 ULP before the f32 rounding step.
+        let increment = self.internal_energy_remainder_j + joules;
+        let raw_total = self.internal_energy as f64 + increment;
+        if raw_total <= 0.0 {
+            self.internal_energy = 0.0;
+            self.internal_energy_remainder_j = 0.0;
+            return;
+        }
+        let rounded = raw_total.min(f32::MAX as f64) as f32;
+        let represented_delta = rounded as f64 - self.internal_energy as f64;
         self.internal_energy = rounded;
-        self.internal_energy_remainder_j = total - rounded as f64;
+        self.internal_energy_remainder_j = if raw_total >= f32::MAX as f64 {
+            0.0
+        } else {
+            increment - represented_delta
+        };
     }
 
     /// f32 thermal energy passed to the material EOS. The residual is kept

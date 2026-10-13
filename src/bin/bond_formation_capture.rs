@@ -9,6 +9,7 @@ use voxel_physics_lab::{
     bond::EMPTY,
     material::Material,
     scene::{Scene, SceneBuilder, VoxelSpawn},
+    solver,
 };
 
 const DT: f32 = 0.01;
@@ -17,6 +18,9 @@ const FRAME_STRIDE: usize = 10;
 const FRAMES: usize = STEPS / FRAME_STRIDE + 1;
 const INITIAL_SPEED: f32 = 0.01;
 const HOT_TEMPERATURE_K: f32 = 363.15;
+const COMPRESSION_FORCE_N: f32 = 0.1;
+const MIN_CONTACT_PRESSURE_PA: f32 = 900.0;
+const MIN_DWELL_SECONDS: f32 = 0.1;
 
 fn kinetic(scene: &Scene) -> f64 {
     scene
@@ -102,7 +106,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     scene.release_voxels(&[0, 1])?;
     scene.voxels[0].velocity = Vec3::X * INITIAL_SPEED;
     scene.set_material_thermal_expansion("iron", 12.0e-6)?;
-    scene.set_thermal_bonding_rule("iron", 1.0, 350.0, 1.0e-8)?;
+    scene.set_thermal_bonding_rule(
+        "iron",
+        1.0,
+        350.0,
+        0.0,
+        MIN_CONTACT_PRESSURE_PA,
+        MIN_DWELL_SECONDS,
+    )?;
     let mut heater_input_j = 0.0f64;
     for i in 0..scene.voxels.len() {
         let hot_u =
@@ -112,6 +123,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         heater_input_j += increment as f64;
     }
     scene.config.fracture.restitution = 0.0;
+    solver::set_force(&mut scene, 0, Vec3::X * COMPRESSION_FORCE_N)?;
+    solver::set_force(&mut scene, 1, Vec3::NEG_X * COMPRESSION_FORCE_N)?;
     let initial_mass = scene.total_mass_kg();
     let initial_internal = internal(&scene);
     let initial_momentum = momentum(&scene);
@@ -123,16 +136,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "N,hot_contact_bonding,formation_offset_m,heater_input_J"
     )?;
     writeln!(out, "R,setup,{heater_input_j}")?;
+    writeln!(
+        out,
+        "R,pressure,{COMPRESSION_FORCE_N},{MIN_CONTACT_PRESSURE_PA},{MIN_DWELL_SECONDS}"
+    )?;
     let mut formed_step = None;
+    let mut external_work_j = 0.0f64;
     let start = Instant::now();
     write_frame(&mut out, &scene, 0, false)?;
     for step in 1..=STEPS {
+        let positions_before = scene.positions.clone();
         scene.tick();
+        for i in 0..scene.voxels.len() {
+            external_work_j +=
+                (scene.external_forces[i].dot(scene.positions[i] - positions_before[i])) as f64;
+        }
         if formed_step.is_none() && scene.bonds[0][0].neighbor == 1 {
             formed_step = Some(step);
             writeln!(out, "E,{step},bond,formed_0_1")?;
+            solver::set_force(&mut scene, 0, Vec3::ZERO)?;
+            solver::set_force(&mut scene, 1, Vec3::ZERO)?;
             eprintln!(
-                "automatic bond formed at impact step={step}, t={:.3}s separation={:.9}m formation_offset={:?}",
+                "automatic bond formed at step={step}, t={:.3}s separation={:.9}m formation_offset={:?}",
                 step as f32 * DT,
                 (scene.positions[1] - scene.positions[0]).length(),
                 scene.bonds[0][0].formation_offset
@@ -140,10 +165,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if step % FRAME_STRIDE == 0 {
             write_frame(&mut out, &scene, step, formed_step.is_some())?;
+            writeln!(out, "W,{step},{external_work_j:.12e}")?;
         }
     }
     let final_total = internal(&scene) + kinetic(&scene);
-    let expected_total = initial_internal + initial_kinetic;
+    let expected_total = initial_internal + initial_kinetic + external_work_j;
     let energy_error = final_total - expected_total;
     let momentum_error = (momentum(&scene) - initial_momentum).length();
     let broken = scene.broken;
