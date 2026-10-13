@@ -89,10 +89,10 @@ video; the `/video` endpoint supports browser seeking. For another completed
 capture, start the viewer with `--video path/to/capture.mp4 --label "Run description"`
 and place an optional same-name `.gif` next to it.
 
-The current extended capture contains 840 solver steps and 88 evenly spaced
+An earlier extended capture contains 840 solver steps and 88 evenly spaced
 frames (0.84 s of simulated time, 8.8 s of video). Its physical result includes
-catastrophic fragmentation after the long force ramp; the recording shows this
-failure rather than presenting it as a successful chop.
+catastrophic fragmentation after the long force ramp; the historical result is
+recorded in `PROGRESS_2026-10-12.md`.
 
 ### General scene and engine APIs
 
@@ -281,20 +281,22 @@ settling, partial-axis motion and release, constrained impulses, mounted contact
 reactions and complete base fixation/unmounting. Desktop compilation is checked
 separately; this update does not establish real-time performance or a complete cut.
 
-### Extended live capture
+### Latest live capture
 
-The current GIF records 88 evenly spaced states from an 840-step physical run:
+The current GIF records 22 evenly spaced states from a 210-step solver run:
 
-![Extended solver capture](validation/live-support.gif)
+![Latest solver capture](validation/live-support.gif)
 
-The run covers 0.84 seconds of simulated time and 8.8 seconds of video at 10 FPS.
-It took 185.5 seconds on this CPU run, kept guide drift at zero, and ended with
-11,108 broken bonds. This is excessive fragmentation, not a successful chop.
+The run covers 0.21 seconds of simulated time and 2.2 seconds of video at 10 FPS.
+It took 39.1 seconds of solver wall time, kept guide drift at zero, and ended
+with zero broken bonds. It exercises the solver with heat transfer enabled at
+uniform initial temperature; it does not verify nonzero thermal flux or its
+energy balance. This is a stability/performance sample, not a full-cut result.
 Start the viewer first, then stream a new capture with:
 
 ```sh
 python3 validation/live_viewer.py --host 0.0.0.0 --port 8765 --csv validation/live-support.csv --label "Mounted axe and gravity"
-RUSTUP_HOME="$PWD/.toolchain/rustup" CARGO_HOME="$PWD/.toolchain/cargo" RAYON_NUM_THREADS=1 ./.toolchain/cargo/bin/cargo run --release --no-default-features --bin support_capture -- validation/live-support.csv 840 88
+RUSTUP_HOME="$PWD/.toolchain/rustup" CARGO_HOME="$PWD/.toolchain/cargo" RAYON_NUM_THREADS=1 ./.toolchain/cargo/bin/cargo run --release --no-default-features --bin support_capture -- validation/live-support.csv 210 22
 ```
 
 Open `http://127.0.0.1:8765`. The capture flushes frames as it runs; the GIF
