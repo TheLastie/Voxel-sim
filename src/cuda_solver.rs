@@ -382,11 +382,13 @@ pub(crate) fn solve_pcg(
         (&mut count_arg as *mut u32).cast(),
     ];
     cuda.launch(3, vector_grid, &mut init_params)?;
-    // All reductions and scalar updates stay on the device. The host submits a
-    // fixed PCG iteration sequence and synchronizes only to read the final state.
+    // Vectors and recurrence scalars stay on the device. Check the residual in
+    // coarse batches so converged systems do not spend the remaining iteration
+    // budget in no-op PCG work; the host transfers one scalar per checkpoint.
     let mut rho = rho_a;
     let mut rho_next = rho_b;
     let mut iterations = 0;
+    let mut residual_squared_host = f64::INFINITY;
     for _ in 0..max_iterations {
         let mut x_arg = p;
         let mut neighbors_arg = neighbor_ptr;
@@ -446,27 +448,35 @@ pub(crate) fn solve_pcg(
         cuda.launch(3, vector_grid, &mut direction_params)?;
         std::mem::swap(&mut rho, &mut rho_next);
         iterations += 1;
+        if iterations % 16 == 0 || iterations == max_iterations {
+            cuda.launch_dot(r, r, count, residual_squared)?;
+            check(
+                unsafe {
+                    (cuda.driver.copy_dtoh)(
+                        (&mut residual_squared_host as *mut f64).cast(),
+                        residual_squared,
+                        8,
+                    )
+                },
+                "read PCG residual checkpoint",
+            )?;
+            check(
+                unsafe { (cuda.driver.context_synchronize)() },
+                "synchronize PCG residual checkpoint",
+            )?;
+            if !residual_squared_host.is_finite() || residual_squared_host < 0.0 {
+                return Err("CUDA PCG produced a non-finite residual norm".into());
+            }
+            let relative = (residual_squared_host.sqrt() / initial) as f32;
+            if relative <= tolerance {
+                break;
+            }
+        }
     }
-    cuda.launch_dot(r, r, count, residual_squared)?;
     let mut output = vec![0.0f32; flat_rhs.len()];
     check(
         unsafe { (cuda.driver.copy_dtoh)(output.as_mut_ptr().cast(), dx, output.len() * 4) },
         "read PCG correction",
-    )?;
-    let mut residual_squared_host = 0.0f64;
-    check(
-        unsafe {
-            (cuda.driver.copy_dtoh)(
-                (&mut residual_squared_host as *mut f64).cast(),
-                residual_squared,
-                8,
-            )
-        },
-        "read PCG residual norm",
-    )?;
-    check(
-        unsafe { (cuda.driver.context_synchronize)() },
-        "cuCtxSynchronize",
     )?;
     if !residual_squared_host.is_finite() || residual_squared_host < 0.0 {
         return Err("CUDA PCG produced a non-finite residual norm".into());
