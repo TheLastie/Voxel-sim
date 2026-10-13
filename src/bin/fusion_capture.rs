@@ -66,7 +66,7 @@ fn write_frame(out: &mut BufWriter<File>, scene: &Scene, step: usize) -> std::io
     let p = momentum(scene);
     writeln!(
         out,
-        "L,{step},{},0,{},{},{},{},{},{},{},{}",
+        "L,{step},{},0,{},{},{},{},{},{},{},{},{},{},{},{},{}",
         scene.voxels.len(),
         scene.total_mass_kg(),
         internal(scene),
@@ -75,7 +75,12 @@ fn write_frame(out: &mut BufWriter<File>, scene: &Scene, step: usize) -> std::io
         p.x,
         p.y,
         p.z,
-        scene.energy.fusion_heat
+        scene.energy.fusion_heat,
+        scene.energy.contact_restitution_heat,
+        scene.energy.contact_friction_heat,
+        scene.energy.plastic_heat,
+        scene.energy.damage_heat,
+        scene.energy.external_work
     )?;
     // Identity tool pose keeps the shared live mechanical viewer active.
     writeln!(out, "F,{step},0,0,0,0,0,0,1,0,0,0,0,0,{},0", scene.broken)?;
@@ -162,10 +167,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .components
             .iter()
             .all(|(_, fraction)| *fraction > 0.0);
-    eprintln!("fusion_capture complete states={FRAMES} physical_s={:.2} fused_step={fused_at:?} mass={:.9}kg momentum_error={momentum_error:.3e}kg*m/s energy_residual={energy_error:.3e}J external_work={external_work_j:.9e}J residual_over_work={:.3e} fusion_heat={:.9e}J composition_ok={composition_ok} clusters={} wall_s={:.3}",
+    eprintln!("fusion_capture complete states={FRAMES} physical_s={:.2} fused_step={fused_at:?} mass={:.9}kg momentum_error={momentum_error:.3e}kg*m/s energy_residual={energy_error:.3e}J external_work={external_work_j:.9e}J residual_over_work={:.3e} restitution_heat={:.9e}J friction_heat={:.9e}J plastic_heat={:.9e}J damage_heat={:.9e}J fusion_heat={:.9e}J composition_ok={composition_ok} clusters={} wall_s={:.3}",
         STEPS as f32 * DT, scene.total_mass_kg(),
         energy_error.abs() / external_work_j.abs().max(f64::MIN_POSITIVE),
-        scene.energy.fusion_heat, scene.cluster_count,
+        scene.energy.contact_restitution_heat,
+        scene.energy.contact_friction_heat,
+        scene.energy.plastic_heat,
+        scene.energy.damage_heat,
+        scene.energy.fusion_heat,
+        scene.cluster_count,
         start.elapsed().as_secs_f64());
     if fused_at.is_none()
         || scene.voxels.len() != 1

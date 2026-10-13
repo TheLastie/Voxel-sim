@@ -46,6 +46,11 @@ for number, (step, frame) in enumerate(sorted(frames.items()), 1):
     centers = {i: (560 + (v["p"][0] - cx0) * 4200, 330 - (v["p"][1] - cy0) * 4200) for i, v in voxels.items()}
     ledger = frame["ledger"]
     mass, internal, kinetic, fusion_heat = map(float, [ledger[4], ledger[5], ledger[6], ledger[11]])
+    restitution_heat = float(ledger[12]) if len(ledger) > 12 else 0.0
+    friction_heat = float(ledger[13]) if len(ledger) > 13 else 0.0
+    plastic_heat = float(ledger[14]) if len(ledger) > 14 else 0.0
+    damage_heat = float(ledger[15]) if len(ledger) > 15 else 0.0
+    ledger_work = float(ledger[16]) if len(ledger) > 16 else 0.0
     external_work = frame.get("external_work", 0.0)
     energy_residual = frame.get("energy_residual", 0.0)
     px, py, pz = map(float, ledger[8:11])
@@ -70,10 +75,11 @@ for number, (step, frame) in enumerate(sorted(frames.items()), 1):
         elems.append(f'<text x="{x:.1f}" y="{y+4:.1f}" text-anchor="middle" fill="#07101c" font-size="12" font-family="sans-serif">{label}</text>')
         elems.append(f'<text x="{x:.1f}" y="{y+34:.1f}" text-anchor="middle" fill="#ebf2fa" font-size="11" font-family="sans-serif">{voxel.get("temp", 0.0):.1f} K</text>')
     state = "один смешанный REV" if fused else "два отдельных REV"
-    elems.append('<rect x="55" y="510" width="1010" height="145" rx="16" fill="#111d2c" stroke="#3d5267" stroke-width="2"/>')
+    elems.append('<rect x="55" y="510" width="1010" height="175" rx="16" fill="#111d2c" stroke="#3d5267" stroke-width="2"/>')
     elems.append(f'<text x="82" y="546" fill="#42d6c4" font-size="20" font-family="sans-serif">Состояние: {state} · Fe {fe:.5f} · Cu {cu:.5f} · масса {mass:.9f} kg</text>')
     elems.append(f'<text x="82" y="580" fill="#ebf2fa" font-size="16" font-family="sans-serif">U {internal:.9e} J · K {kinetic:.9e} J · работа {external_work:.9e} J · остаток {energy_residual:.3e} J</text>')
-    elems.append(f'<text x="82" y="636" fill="#e6b96b" font-size="13" font-family="sans-serif">Fusion heat {fusion_heat:.3e} J · работа — сумма F·Δx (с gravity) за substep; остаток не закрыт</text>')
+    elems.append(f'<text x="82" y="636" fill="#e6b96b" font-size="13" font-family="sans-serif">Q contact: restitution {restitution_heat:.3e} J · friction {friction_heat:.3e} J · work ledger {ledger_work:.3e} J</text>')
+    elems.append(f'<text x="82" y="660" fill="#e6b96b" font-size="13" font-family="sans-serif">Q fracture/fusion: plastic {plastic_heat:.3e} J · damage {damage_heat:.3e} J · fusion {fusion_heat:.3e} J · balance не закрыт</text>')
     elems.append(f'<text x="82" y="612" fill="#99aec6" font-size="16" font-family="sans-serif">Импульс ({px:.3e}, {py:.3e}, {pz:.3e}) kg·m/s · разорвано связей {ledger[3]}</text>')
     svg = prefix.parent / f"{prefix.name}-{number:03}.svg"
     svg.write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}">' + "".join(elems) + "</svg>", encoding="utf-8")

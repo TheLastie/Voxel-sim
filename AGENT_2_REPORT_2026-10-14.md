@@ -809,3 +809,14 @@ contact/cooling, and simultaneous thermal rules (bond formation prevents a
 pending fusion), plus an external-work ledger check. Full CPU test suite passes
 85/85. GIF and MP4 were regenerated from all 177 saved physical states; each is
 1120×700, 10 fps and 17.7 s.
+
+
+The follow-up diagnostic request is included in each saved `L` row: cumulative
+contact restitution heat, contact friction heat, plastic heat, damage heat,
+fusion heat, and engine external work. Final channels are respectively
+`1.114864458e-3 J`, `0`, `0`, `0`, `2.094925452e-7 J`, and
+`4.998999292e-4 J`. At step 10, measured work is `4.998999294e-4 J`, residual
+is `4.947903454e-4 J`, and contact restitution heat is `9.955282255e-4 J`;
+these values point toward the contact/integration path as where the energy
+discrepancy appears, but do not isolate a single faulty operation. The new
+frame renderer shows the channels and residual.
