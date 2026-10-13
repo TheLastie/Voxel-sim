@@ -30,6 +30,15 @@ pub struct WorldBounds {
     pub max: Vec3,
 }
 
+/// Material and impact thresholds for automatic thermal bond formation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThermalBondingRule {
+    pub component: u16,
+    pub minimum_mass_fraction: f32,
+    pub minimum_temperature_kelvin: f32,
+    pub minimum_impact_energy_j: f64,
+}
+
 #[derive(Default)]
 struct ThermalScratch {
     edges: Vec<(usize, usize, f64)>,
@@ -309,6 +318,7 @@ pub struct Scene {
     pub substep_index: u64,
     pub solver_residual: f32,
     world_bounds: Option<WorldBounds>,
+    thermal_bonding_rule: Option<ThermalBondingRule>,
     boundary_removals: BoundaryRemovalLedger,
 }
 impl Scene {
@@ -415,6 +425,7 @@ impl Scene {
             substep_index: 0,
             solver_residual: 0.0,
             world_bounds: None,
+            thermal_bonding_rule: None,
             boundary_removals: BoundaryRemovalLedger::default(),
         };
         let mut occupancy = HashMap::with_capacity(spawns.len());
@@ -522,6 +533,96 @@ impl Scene {
     /// Remove world barriers. Removed REV are not restored.
     pub fn clear_world_bounds(&mut self) {
         self.world_bounds = None;
+    }
+
+    /// Enable impact-triggered bonding for a material. Both endpoints must
+    /// meet the mass-fraction and temperature thresholds, and their inelastic
+    /// normal impact energy must meet the supplied joule threshold.
+    pub fn set_thermal_bonding_rule(
+        &mut self,
+        material_name: &str,
+        minimum_mass_fraction: f32,
+        minimum_temperature_kelvin: f32,
+        minimum_impact_energy_j: f64,
+    ) -> Result<(), String> {
+        if !minimum_mass_fraction.is_finite()
+            || !(0.0..=1.0).contains(&minimum_mass_fraction)
+            || minimum_mass_fraction == 0.0
+            || !minimum_temperature_kelvin.is_finite()
+            || minimum_temperature_kelvin < 0.0
+            || !minimum_impact_energy_j.is_finite()
+            || minimum_impact_energy_j <= 0.0
+        {
+            return Err(
+                "thermal bonding thresholds must be finite and positive (fraction in (0, 1])"
+                    .into(),
+            );
+        }
+        let component = Material::component_id(material_name)
+            .ok_or_else(|| format!("unknown material: {material_name}"))?;
+        self.thermal_bonding_rule = Some(ThermalBondingRule {
+            component,
+            minimum_mass_fraction,
+            minimum_temperature_kelvin,
+            minimum_impact_energy_j,
+        });
+        Ok(())
+    }
+
+    /// Disable automatic thermal/impact bond formation.
+    pub fn clear_thermal_bonding_rule(&mut self) {
+        self.thermal_bonding_rule = None;
+    }
+
+    pub fn thermal_bonding_rule(&self) -> Option<ThermalBondingRule> {
+        self.thermal_bonding_rule
+    }
+
+    /// Apply the scene rule to contact impact energies measured before
+    /// restitution and only create topology after contact resolution.
+    pub(crate) fn form_thermal_bonds(
+        &mut self,
+        contacts: &[crate::collision::Contact],
+        impact_energies_j: &[f64],
+    ) -> usize {
+        let Some(rule) = self.thermal_bonding_rule else {
+            return 0;
+        };
+        let mut formed = 0;
+        for (contact, &impact_energy_j) in contacts.iter().zip(impact_energies_j) {
+            if !contact.new_impact || impact_energy_j < rule.minimum_impact_energy_j {
+                continue;
+            }
+            let i = contact.i;
+            let j = contact.j;
+            if i >= self.voxels.len()
+                || j >= self.voxels.len()
+                || self.voxels[i].kinematic != self.voxels[j].kinematic
+            {
+                continue;
+            }
+            let qualifies =
+                |voxel: usize, scene: &Scene| {
+                    scene.voxels[voxel].composition.components.iter().any(
+                        |&(component, fraction)| {
+                            component == rule.component && fraction >= rule.minimum_mass_fraction
+                        },
+                    ) && scene.properties[voxel]
+                        .phase_state(
+                            scene.voxels[voxel].mass,
+                            scene.voxels[voxel].thermal_energy_f32(),
+                        )
+                        .temperature_kelvin
+                        >= rule.minimum_temperature_kelvin
+                };
+            if qualifies(i, self)
+                && qualifies(j, self)
+                && self.connect_adjacent_voxels(i, j).is_ok()
+            {
+                formed += 1;
+            }
+        }
+        formed
     }
 
     pub fn world_bounds(&self) -> Option<WorldBounds> {
@@ -1099,6 +1200,7 @@ impl Scene {
             substep_index: 0,
             solver_residual: 0.0,
             world_bounds: None,
+            thermal_bonding_rule: None,
             boundary_removals: BoundaryRemovalLedger::default(),
         }
     }
@@ -1431,5 +1533,86 @@ mod topology_mutation_tests {
         );
         assert!((scene.positions[1].x - (scene.positions[0].x + CELL)).abs() < 1e-6);
         assert_eq!(energy_after, energy_before);
+    }
+
+    fn impact_pair(temperature_kelvin: f32) -> Scene {
+        let iron = Material::component_id("iron").unwrap();
+        let mut scene = SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .with_timestep(0.01, 2)
+            .add_voxel(
+                VoxelSpawn::at_cell([0, 0, 0], iron)
+                    .fixed()
+                    .with_velocity(Vec3::X * 0.01)
+                    .at_temperature(temperature_kelvin),
+            )
+            .add_voxel(
+                VoxelSpawn::at_cell([1, 0, 0], iron)
+                    .with_velocity(Vec3::NEG_X * 0.01)
+                    .at_temperature(temperature_kelvin),
+            )
+            .build()
+            .unwrap();
+        scene.positions[1].x += 0.005;
+        scene.previous[1] = scene.positions[1];
+        scene.release_voxels(&[0, 1]).unwrap();
+        scene.voxels[0].velocity = Vec3::X * 0.01;
+        scene
+    }
+
+    #[test]
+    fn thermal_bond_rule_automatically_connects_hot_impact() {
+        let mut scene = impact_pair(363.15);
+        scene
+            .set_thermal_bonding_rule("iron", 1.0, 350.0, 1.0e-8)
+            .unwrap();
+        for _ in 0..40 {
+            scene.tick();
+            if scene.bonds[0][0].neighbor == 1 {
+                break;
+            }
+        }
+        assert_eq!(scene.bonds[0][0].neighbor, 1);
+        assert_eq!(scene.cluster_count, 1);
+    }
+
+    #[test]
+    fn thermal_bond_rule_leaves_cold_impact_unbonded() {
+        let mut scene = impact_pair(293.15);
+        scene
+            .set_thermal_bonding_rule("iron", 1.0, 350.0, 1.0e-8)
+            .unwrap();
+        for _ in 0..40 {
+            scene.tick();
+        }
+        assert_eq!(scene.bonds[0][0].neighbor, EMPTY);
+        assert_eq!(scene.cluster_count, 2);
+    }
+
+    #[test]
+    fn thermal_bond_rule_validates_and_can_be_cleared() {
+        let iron = Material::component_id("iron").unwrap();
+        let mut scene = SceneBuilder::standard()
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], iron))
+            .build()
+            .unwrap();
+        assert!(scene
+            .set_thermal_bonding_rule("unknown", 1.0, 300.0, 1e-8)
+            .is_err());
+        assert!(scene
+            .set_thermal_bonding_rule("iron", 0.0, 300.0, 1e-8)
+            .is_err());
+        assert!(scene
+            .set_thermal_bonding_rule("iron", 1.0, f32::NAN, 1e-8)
+            .is_err());
+        assert!(scene
+            .set_thermal_bonding_rule("iron", 1.0, 300.0, 0.0)
+            .is_err());
+        scene
+            .set_thermal_bonding_rule("iron", 0.75, 350.0, 1e-8)
+            .unwrap();
+        assert_eq!(scene.thermal_bonding_rule().unwrap().component, iron);
+        scene.clear_thermal_bonding_rule();
+        assert_eq!(scene.thermal_bonding_rule(), None);
     }
 }

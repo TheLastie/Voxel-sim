@@ -601,7 +601,31 @@ cluster. GIF/MP4 contain 177 frames at 1120×700, 10 fps/17.7 s. Live viewer
 `:8797` serves CSV/GIF/MP4 with HTTP 200; catalog selector `:8800` also
 serves this experiment; existing `:8765` was left running.
 
-Full CPU suite: 70/70 tests. The renderer, capture binary and formatting checks
-pass. This controlled capture validates contact-time topology formation and
-energy neutrality of the bond operation; automatic welding criteria, material
-adhesion, REV fusion/composition transfer and healing rules remain incomplete.
+Full CPU suite before automatic bonding: 70/70 tests. The renderer, capture
+binary and formatting checks passed. This controlled capture validates
+contact-time topology formation and energy neutrality of the bond operation.
+
+#### Automatic hot-contact bonding follow-up
+
+Added `ThermalBondingRule` and public `Scene::set_thermal_bonding_rule`. At a
+new collision the solver calculates normal closing energy before restitution.
+It creates a stress-free bond if both REVs meet the selected component fraction
+and temperature thresholds and the impact energy meets the configured joule
+threshold. The capture now configures the scene rule and never calls
+`connect_adjacent_voxels` from the capture controller.
+
+With iron fraction 1.0, `Tmin=350 K`, and `Eimpact,min=1e-8 J`, the two 363.15 K
+REVs automatically bond on impact step 25. The actual 1,760-step, 17.6-second
+run retains 177 saved states. Mass is 0.015739998 kg, momentum error is zero,
+total-energy error is zero, restitution heat is 7.87e-7 J, and the bond remains
+intact in one cluster. Regenerated GIF/MP4 contain 177 actual frames at
+1120×700 and 10 fps/17.7 s. Viewer `:8797` and selector `:8800` serve CSV/GIF/MP4
+with HTTP 200; viewer `:8765` remains active. Regressions cover hot formation,
+cold-contact rejection, and rule validation/clearing.
+
+The full CPU suite passes 73/73 tests (57 library, 5 smoke, 1 contact energy,
+1 preconditioner, 3 fatigue topology, 6 supports). Targeted rustfmt, renderer
+`py_compile`, manifest JSON parsing, and `git diff --check` pass.
+
+Pressure/dwell dependence, adhesion across different materials, REV fusion
+with composition/mass transfer, and healing after fracture remain incomplete.

@@ -102,6 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     scene.release_voxels(&[0, 1])?;
     scene.voxels[0].velocity = Vec3::X * INITIAL_SPEED;
     scene.set_material_thermal_expansion("iron", 12.0e-6)?;
+    scene.set_thermal_bonding_rule("iron", 1.0, 350.0, 1.0e-8)?;
     let mut heater_input_j = 0.0f64;
     for i in 0..scene.voxels.len() {
         let hot_u =
@@ -127,23 +128,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_frame(&mut out, &scene, 0, false)?;
     for step in 1..=STEPS {
         scene.tick();
-        let relative_speed = (scene.voxels[1].velocity - scene.voxels[0].velocity).length();
-        if formed_step.is_none()
-            && (scene.positions[1] - scene.positions[0]).length() <= 0.01001
-            && relative_speed <= 1e-5
-        {
-            let before_internal = internal(&scene);
-            let before_momentum = momentum(&scene);
-            scene.connect_adjacent_voxels(0, 1)?;
-            let energy_jump = internal(&scene) - before_internal;
-            let momentum_jump = (momentum(&scene) - before_momentum).length();
-            if scene.bonds[0][0].neighbor != 1 || energy_jump != 0.0 || momentum_jump != 0.0 {
-                return Err("bond formation changed energy/momentum or failed to connect".into());
-            }
+        if formed_step.is_none() && scene.bonds[0][0].neighbor == 1 {
             formed_step = Some(step);
             writeln!(out, "E,{step},bond,formed_0_1")?;
             eprintln!(
-                "bond formed at step={step}, t={:.3}s separation={:.9}m formation_offset={:?}",
+                "automatic bond formed at impact step={step}, t={:.3}s separation={:.9}m formation_offset={:?}",
                 step as f32 * DT,
                 (scene.positions[1] - scene.positions[0]).length(),
                 scene.bonds[0][0].formation_offset

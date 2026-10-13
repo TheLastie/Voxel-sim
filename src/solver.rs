@@ -557,6 +557,39 @@ pub fn step_with_axis_targets_and_loads(
         // measurable kinetic error in simple free fall.
         let solved_positions = scene.positions.clone();
         let contacts = collision::project(scene, targets);
+        let impact_energies_j: Vec<f64> = contacts
+            .iter()
+            .map(|contact| {
+                if !contact.new_impact {
+                    return 0.0;
+                }
+                let axis = if contact.normal.x.abs() > 0.5 {
+                    0
+                } else if contact.normal.y.abs() > 0.5 {
+                    1
+                } else {
+                    2
+                };
+                let inverse_mass = |voxel: usize| {
+                    if scene.voxels[voxel].kinematic || targets[voxel][axis].is_some() {
+                        0.0
+                    } else {
+                        1.0 / scene.voxels[voxel].mass
+                    }
+                };
+                let inverse_effective_mass = inverse_mass(contact.i) + inverse_mass(contact.j);
+                if inverse_effective_mass <= 0.0 {
+                    return 0.0;
+                }
+                let closing_speed = (scene.voxels[contact.j].velocity
+                    - scene.voxels[contact.i].velocity)
+                    .dot(contact.normal);
+                if closing_speed >= 0.0 {
+                    return 0.0;
+                }
+                0.5 * closing_speed as f64 * closing_speed as f64 / inverse_effective_mass as f64
+            })
+            .collect();
         stage_time[2] += phase_start.elapsed();
         phase_start = Instant::now();
         // Actual converged strain defines elastic energy and constitutive stress.
@@ -618,6 +651,13 @@ pub fn step_with_axis_targets_and_loads(
             }
         }
         collision::resolve_velocities(scene, &contacts, targets);
+        let formed_bonds = scene.form_thermal_bonds(&contacts, &impact_energies_j);
+        if formed_bonds > 0 {
+            topology_changed = true;
+            // Bond assembly changed while the local per-step workspace was out
+            // of the scene; rebuild it before the next substep uses the graph.
+            solver_scratch = Default::default();
+        }
         if let Some(t) = tool {
             // Structural correction can move material back into the blade.
             // Run a zero-time geometric/impulse pass before leaving the substep.

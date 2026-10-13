@@ -1522,6 +1522,18 @@ CUDA PCG stage median 53.53 ms/fixed step против CPU IC(0) 53.93 ms, но 
 
 Завершил проверку предыдущей записи: `VOXEL_SOLVER_BACKEND=cpu cargo test --no-default-features` PASS 70/70 (54 library, 5 smoke, 1 contact energy, 1 preconditioner, 3 fatigue topology, 6 supports). `rustfmt --check src/scene.rs src/solver.rs` и `git diff --check` PASS. — Агент 2
 
+### Агент 2: автоматическое bonding и отчёт
+
+Добавил автоматическое образование stress-free bond при новом контакте по настраиваемым порогам состава, температуры обоих REV и энергии нормального удара. Capture больше не вызывает `connect_adjacent_voxels` вручную: engine образует связь на шаге 25. Проверки горячего/холодного удара и валидации правила проходят; сейчас записываю результат в `AGENT_2_REPORT_2026-10-14.md`, progress и матрицу механик. — Агент 2
+
 ### Агент 2: hot-contact bond capture готов
 
 `Bond` теперь хранит local `formation_offset`; solver применяет его в rest displacement, constitutive stress и fracture displacement. `Scene::connect_adjacent_voxels` требует контакт (центр-центр 10 mm ±10 μm), одинаковые constraints, соседство исходной решётки и отсутствие pending release; новый formation offset даёт нулевой начальный strain даже для горячего контакта. Реальный capture: два нагретых iron REV (363.15 K), скорости ±0.01 m/s, `dt=10ms`, 2 substeps; zero-restitution contact на шаге25, затем public API создаёт bond, run продолжается до1760 steps/17.6s. 177 уникальных states; heater 495.810058594J, mass 0.01573999785kg, restitution heat 7.87e-7J, energy error0J, momentum error0, bond intact, 1 cluster. GIF/MP4: 177 кадров 1120×700 10fps/17.7s. Direct live :8797 и catalog selector :8800 подтверждают status/CSV/GIF/MP4 HTTP200; :8765 сохранён без изменений. Полный CPU suite 70/70, targeted rustfmt, renderer py_compile, JSON parse, git diff --check PASS. Автоматический weld temperature/pressure/dwell criterion и fusion/composition transfer остаются следующими требованиями. — Агент 2
+
+### Агент 2: результат автоматического bonding
+
+Проверка завершена: полный CPU suite PASS 73/73; capture сообщает автоматическое создание связи на шаге 25, 177 физических состояний за 17.6 s, нулевую ошибку импульса/энергии и целую связь. GIF/MP4 обновлены; viewer :8797 и selector :8800 отдают CSV/GIF/MP4 HTTP 200. Обновил матрицу механик, progress и отчёт. Ограничения модели и оставшиеся пункты указаны там. — Агент 2
+
+### Агент 1: отклонён CUDA CTA tuning
+
+Прогнал 128-thread node/vector CTA на 4 203 REV, 176 шагах/177 состояниях. Прогон завершился без CPU fallback и дрейфа, но frame 100 занял 13.5 s против 11.9 s у baseline 256, поэтому изменения CUDA block size откатил. CSV остался в validation/cuda-node128-cta.csv; GIF не сформирован: в текущем Python нет Pillow. Продолжаю от baseline. — Агент 1
