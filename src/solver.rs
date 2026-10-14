@@ -109,6 +109,18 @@ fn bond_elastic_displacement(scene: &Scene, i: usize, j: usize, axis: usize, fra
         - Vec3::from_array(scene.bonds[axis][i].formation_offset)
 }
 
+/// Recover the current stored elastic energy of an intact bond (joules).
+/// This is also used when a topology operation removes the bond before its
+/// strain energy can be dissipated through fracture or melting.
+pub(crate) fn bond_stored_elastic_energy_j(scene: &Scene, i: usize, j: usize, axis: usize) -> f64 {
+    let bond = scene.bonds[axis][i];
+    let frame = basis(axis, scene.rotations[i].slerp(scene.rotations[j], 0.5));
+    let displacement = bond_elastic_displacement(scene, i, j, axis, frame)
+        - Vec3::from_array(bond.plastic_strain) * CELL;
+    let stiffness = stiffness_matrix(scene, i, j, frame);
+    (0.5 * (1.0 - bond.damage) * displacement.dot(stiffness * displacement)).max(0.0) as f64
+}
+
 pub fn bond_limits(scene: &Scene, i: usize, j: usize, direction: Vec3) -> crate::fracture::Limits {
     let alignment =
         [i, j].map(|n| direction.dot(scene.rotations[n] * scene.voxels[n].microstructure.fibers()));
@@ -474,8 +486,15 @@ pub fn step_with_axis_targets_and_loads(
     // Fall back once, then avoid repeating the costly CUDA setup until the next
     // fixed step, where the matrix and residual have changed.
     let mut cuda_enabled_for_step = true;
+    let mut substep_start_positions = Vec::with_capacity(scene.positions.len());
+    let mut substep_start_velocities = Vec::with_capacity(scene.voxels.len());
+    let mut load_integrated_velocities = vec![Vec3::ZERO; scene.voxels.len()];
+    let mut contact_work_mode = vec![0u8; scene.voxels.len()];
     for _ in 0..scene.config.substeps {
         let mut phase_start = Instant::now();
+        substep_start_positions.clone_from(&scene.positions);
+        substep_start_velocities.clear();
+        substep_start_velocities.extend(scene.voxels.iter().map(|voxel| voxel.velocity));
         scene.previous.clone_from(&scene.positions);
         let mut drift_velocity = vec![Vec3::ZERO; scene.voxels.len()];
         for (i, (p, v)) in scene
@@ -556,7 +575,18 @@ pub fn step_with_axis_targets_and_loads(
         // subtracting two large f32 positions every step otherwise accumulates
         // measurable kinetic error in simple free fall.
         let solved_positions = scene.positions.clone();
+        let pre_contact_velocities: Vec<_> = drift_velocity
+            .iter()
+            .zip(&contact_velocity)
+            .map(|(&drift, &contact)| drift + contact)
+            .collect();
         let contacts = collision::project(scene, targets);
+        contact_work_mode.fill(0);
+        for contact in &contacts {
+            let mode = if contact.new_impact { 2 } else { 1 };
+            contact_work_mode[contact.i] = contact_work_mode[contact.i].max(mode);
+            contact_work_mode[contact.j] = contact_work_mode[contact.j].max(mode);
+        }
         let impact_energies_j: Vec<f64> = contacts
             .iter()
             .map(|contact| {
@@ -649,9 +679,20 @@ pub fn step_with_axis_targets_and_loads(
                     }
                 }
             }
+            load_integrated_velocities[i] = scene.voxels[i].velocity;
         }
-        collision::resolve_velocities(scene, &contacts, targets);
-        let formed_bonds = scene.form_thermal_bonds(&contacts, &impact_energies_j);
+        let normal_impulses_ns = collision::resolve_velocities_with_precontact(
+            scene,
+            &contacts,
+            targets,
+            &pre_contact_velocities,
+        );
+        collision::resolve_liquid_viscosity(scene, &contacts, targets, h);
+        let formed_bonds =
+            scene.form_thermal_bonds(&contacts, &impact_energies_j, &normal_impulses_ns, h);
+        // A bond formed during this contact solve takes precedence over fusion:
+        // the fusion primitive only accepts unbonded pairs.
+        scene.form_thermal_fusions(&contacts, &normal_impulses_ns, h, targets);
         if formed_bonds > 0 {
             topology_changed = true;
             // Bond assembly changed while the local per-step workspace was out
@@ -667,8 +708,35 @@ pub fn step_with_axis_targets_and_loads(
         if let Err(reason) = scene.conduct_heat(h) {
             eprintln!("thermal transport skipped: {reason}");
         }
+        for i in 0..scene.voxels.len() {
+            if !scene.voxels[i].kinematic {
+                let applied_force = applied_loads[i] + gravity * scene.voxels[i].mass;
+                let work = match contact_work_mode[i] {
+                    // Use the velocity quadrature of the force/integration
+                    // phase before an impact impulse is applied.
+                    0 | 2 => applied_force.dot(
+                        (substep_start_velocities[i] + load_integrated_velocities[i]) * (0.5 * h),
+                    ),
+                    // A persistent contact constrains the actual projected
+                    // displacement, so don't count its trial velocity as work.
+                    _ => applied_force.dot(scene.positions[i] - substep_start_positions[i]),
+                };
+                scene.energy.external_work += work as f64;
+            }
+        }
         scene.substep_index += 1;
         stage_time[4] += phase_start.elapsed();
+    }
+    if let Some((i, j)) = scene.take_pending_fusion() {
+        match scene.fuse_adjacent_voxels(i, j) {
+            Ok(_) => {
+                topology_changed = true;
+                solver_scratch = Default::default();
+            }
+            Err(reason) => {
+                eprintln!("automatic thermal fusion cancelled for REV {i}/{j}: {reason}")
+            }
+        }
     }
     if topology_changed {
         rebuild_clusters(scene);
@@ -838,12 +906,22 @@ mod tests {
     fn persistent_force_and_acceleration_use_voxel_mass() {
         let mut s = free_voxel();
         let mass = s.voxels[0].mass;
+        let initial_velocity = s.voxels[0].velocity;
         set_force(&mut s, 0, Vec3::X * (3.0 * mass)).unwrap();
         set_acceleration(&mut s, 0, Vec3::Y * 2.0).unwrap();
         let mut tool = None;
         step(&mut s, &mut tool);
         assert!((s.voxels[0].velocity.x - 0.03).abs() < 1e-5);
         assert!((s.voxels[0].velocity.y - 0.02).abs() < 1e-5);
+        let total_force = Vec3::X * (3.0 * mass) + Vec3::Y * (2.0 * mass);
+        let expected_work = total_force
+            .dot((initial_velocity + s.voxels[0].velocity) * (0.5 * s.config.fixed_dt))
+            as f64;
+        assert!((s.energy.external_work - expected_work).abs() < 1e-10);
+        let kinetic_change = 0.5
+            * mass as f64
+            * (s.voxels[0].velocity.length_squared() - initial_velocity.length_squared()) as f64;
+        assert!((s.energy.external_work - kinetic_change).abs() < 1e-10);
         step(&mut s, &mut tool);
         assert!((s.voxels[0].velocity.x - 0.06).abs() < 1e-5);
         assert!((s.voxels[0].velocity.y - 0.04).abs() < 1e-5);
@@ -851,6 +929,62 @@ mod tests {
         step(&mut s, &mut tool);
         assert!((s.voxels[0].velocity.x - 0.06).abs() < 1e-5);
         assert!((s.voxels[0].velocity.y - 0.04).abs() < 1e-5);
+    }
+
+    #[test]
+    fn solver_commits_automatic_fusion_at_fixed_step_boundary() {
+        let iron = crate::material::Material::component_id("iron").unwrap();
+        let copper = crate::material::Material::component_id("copper").unwrap();
+        let mut s = crate::scene::SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .with_timestep(0.01, 2)
+            .add_voxel(
+                crate::scene::VoxelSpawn::at_cell([0, 0, 0], iron)
+                    .fixed()
+                    .at_temperature(363.15),
+            )
+            .add_voxel(crate::scene::VoxelSpawn::at_cell([1, 0, 0], copper).at_temperature(363.15))
+            .build()
+            .unwrap();
+        s.positions[1].x += 0.005;
+        s.previous[1] = s.positions[1];
+        s.release_voxel(0).unwrap();
+        s.voxels[0].velocity = Vec3::new(0.01, 0.005, 0.0);
+        s.voxels[1].velocity = Vec3::new(-0.01, -0.005, 0.0);
+        s.config.fracture.restitution = 0.0;
+        s.config.fracture.friction = 0.0;
+        set_force(&mut s, 0, Vec3::X * 0.1).unwrap();
+        set_force(&mut s, 1, Vec3::NEG_X * 0.1).unwrap();
+        s.set_thermal_fusion_rule(350.0, 900.0, 0.1).unwrap();
+        let total_energy = |scene: &Scene| {
+            scene
+                .voxels
+                .iter()
+                .map(|voxel| {
+                    voxel.total_internal_energy_j()
+                        + 0.5 * voxel.mass as f64 * voxel.velocity.length_squared() as f64
+                })
+                .sum::<f64>()
+        };
+        let initial_energy = total_energy(&s);
+        let initial_external_work = s.energy.external_work;
+        let mut tool = None;
+        for _ in 0..20 {
+            step(&mut s, &mut tool);
+            if s.voxels.len() == 1 {
+                break;
+            }
+        }
+        assert_eq!(s.voxels.len(), 1);
+        assert!(s.energy.fusion_heat > 0.0);
+        assert!(s.energy.external_work > 0.0);
+        assert_eq!(s.cluster_count, 1);
+        let residual =
+            total_energy(&s) - initial_energy - (s.energy.external_work - initial_external_work);
+        assert!(
+            residual.abs() < 1e-7,
+            "automatic fusion energy residual={residual:.12e} J"
+        );
     }
     #[test]
     fn velocity_and_impulse_are_mass_consistent() {
@@ -1172,9 +1306,12 @@ pub(crate) struct SolverScratch {
     factor_matrix: Vec<Mat3>,
     factor_diagonal: Vec<Mat3>,
     factor_edges: Vec<Mat3>,
+    cpu_preconditioner_ready: bool,
     preconditioner_work: Vec<Vec3>,
     rhs: Vec<Vec3>,
     constraints: Vec<Constraint>,
+    constraint_slots: Vec<Option<Constraint>>,
+    constraint_forces: Vec<Vec3>,
     pcg_rows: Vec<PcgRow>,
     cuda_neighbors: Vec<[u32; 6]>,
     cuda_blocks: Vec<[f32; 54]>,
@@ -1253,27 +1390,31 @@ fn right_solve_lower_transpose(m: Mat3, l: Mat3) -> Mat3 {
 // the elasticity matrix. It costs more than diagonal scaling per PCG pass,
 // but should cut the pass count on the long-wavelength modes that dominate
 // this structured REV lattice.
-fn build_ic0(scene: &Scene, scratch: &mut SolverScratch) {
+fn build_ic0(
+    scene: &Scene,
+    free: &[Vec3],
+    diagonal: &[Mat3],
+    incidence: &[[u32; 6]],
+    incidence_len: &[u8],
+    constraints: &[Constraint],
+    factor_matrix: &mut Vec<Mat3>,
+    factor_diagonal: &mut Vec<Mat3>,
+    factor_edges: &mut Vec<Mat3>,
+) {
     let n = scene.voxels.len();
-    scratch.factor_matrix.resize(n, Mat3::ZERO);
-    scratch.factor_diagonal.resize(n, Mat3::IDENTITY);
-    scratch
-        .factor_edges
-        .resize(scratch.constraints.len(), Mat3::ZERO);
+    factor_matrix.resize(n, Mat3::ZERO);
+    factor_diagonal.resize(n, Mat3::IDENTITY);
+    factor_edges.resize(constraints.len(), Mat3::ZERO);
     for i in 0..n {
-        let projection = Mat3::from_diagonal(scratch.free[i]);
-        scratch.factor_matrix[i] =
-            projection * scratch.diagonal[i] * projection + Mat3::IDENTITY - projection;
+        let projection = Mat3::from_diagonal(free[i]);
+        factor_matrix[i] = projection * diagonal[i] * projection + Mat3::IDENTITY - projection;
     }
-    let incidence = &scratch.incidence;
-    let incidence_len = &scratch.incidence_len;
-    let constraints = &scratch.constraints;
     for row in 0..n {
-        if scratch.free[row] == Vec3::ZERO {
-            scratch.factor_diagonal[row] = Mat3::IDENTITY;
+        if free[row] == Vec3::ZERO {
+            factor_diagonal[row] = Mat3::IDENTITY;
             continue;
         }
-        let row_projection = Mat3::from_diagonal(scratch.free[row]);
+        let row_projection = Mat3::from_diagonal(free[row]);
         let row_edges = &incidence[row][..incidence_len[row] as usize];
         for &edge in row_edges {
             let edge = edge as usize;
@@ -1282,7 +1423,7 @@ fn build_ic0(scene: &Scene, scratch: &mut SolverScratch) {
                 continue;
             }
             let col = c.i;
-            let col_projection = Mat3::from_diagonal(scratch.free[col]);
+            let col_projection = Mat3::from_diagonal(free[col]);
             let mut value = -row_projection * c.k * col_projection;
             let col_edges = &incidence[col][..incidence_len[col] as usize];
             for &row_shared in row_edges {
@@ -1295,26 +1436,23 @@ fn build_ic0(scene: &Scene, scratch: &mut SolverScratch) {
                     let col_shared = col_shared as usize;
                     let s = &constraints[col_shared];
                     if s.j == col && s.i == r.i {
-                        value -= scratch.factor_edges[row_shared]
-                            * scratch.factor_edges[col_shared].transpose();
+                        value -= factor_edges[row_shared] * factor_edges[col_shared].transpose();
                         break;
                     }
                 }
             }
-            scratch.factor_edges[edge] =
-                right_solve_lower_transpose(value, scratch.factor_diagonal[col]);
-            scratch.factor_matrix[row] -=
-                scratch.factor_edges[edge] * scratch.factor_edges[edge].transpose();
+            factor_edges[edge] = right_solve_lower_transpose(value, factor_diagonal[col]);
+            factor_matrix[row] -= factor_edges[edge] * factor_edges[edge].transpose();
         }
-        scratch.factor_diagonal[row] = cholesky_lower(scratch.factor_matrix[row]);
+        factor_diagonal[row] = cholesky_lower(factor_matrix[row]);
     }
 }
 
-fn build_block_jacobi(scratch: &mut SolverScratch) {
-    let n = scratch.diagonal.len();
-    scratch.factor_diagonal.resize(n, Mat3::IDENTITY);
+fn build_block_jacobi(diagonal: &[Mat3], factor_diagonal: &mut Vec<Mat3>) {
+    let n = diagonal.len();
+    factor_diagonal.resize(n, Mat3::IDENTITY);
     for row in 0..n {
-        scratch.factor_diagonal[row] = cholesky_lower(scratch.diagonal[row]);
+        factor_diagonal[row] = cholesky_lower(diagonal[row]);
     }
 }
 
@@ -1439,6 +1577,14 @@ fn solve_coupled(
             scratch.active.push(i);
         }
     }
+    let active_count = scratch.active.len();
+    let backend = std::env::var("VOXEL_SOLVER_BACKEND").unwrap_or_else(|_| "auto".into());
+    let try_cuda = *cuda_enabled_for_step
+        && match backend.as_str() {
+            "cpu" => false,
+            "cuda" => true,
+            _ => active_count >= 2_048,
+        };
     scratch.masses.clear();
     scratch
         .masses
@@ -1457,42 +1603,115 @@ fn solve_coupled(
         scratch.rhs[i] = (predicted[i] - scene.positions[i]) * scratch.masses[i]
             + loads.get(i).copied().unwrap_or(Vec3::ZERO);
     }
-    scratch.constraints.clear();
-    for axis in 0..3 {
-        for i in 0..n {
-            let bond = scene.bonds[axis][i];
-            if bond.neighbor == EMPTY {
-                continue;
-            }
-            let j = bond.neighbor as usize;
-            if scratch.free[i] == Vec3::ZERO
-                && scratch.free[j] == Vec3::ZERO
-                && scene.voxels[i].kinematic
-            {
-                continue;
-            }
-            let constraint = make_constraint(scene, i, axis, j);
-            if scratch.free[i] == Vec3::ZERO && scratch.free[j] == Vec3::ZERO {
-                // The solve has no free degree of freedom, but fracture still
-                // needs the current undamaged stiffness and local frame.
-                scratch.constraints.push(constraint);
-                continue;
-            }
-            let force = constraint.k * (scene.positions[j] - scene.positions[i] - constraint.rest);
-            scratch.rhs[i] += force;
-            scratch.rhs[j] -= force;
-            scratch.diagonal[i] += constraint.k;
-            scratch.diagonal[j] += constraint.k;
-            let edge = u32::try_from(scratch.constraints.len())
-                .expect("bond constraint count exceeds the voxel index range");
-            for vertex in [i, j] {
-                let slot = scratch.incidence_len[vertex] as usize;
-                debug_assert!(slot < 6, "face-connected voxel has more than six bonds");
-                scratch.incidence[vertex][slot] = edge;
-                scratch.incidence_len[vertex] += 1;
-            }
-            scratch.constraints.push(constraint);
+    // Constraint constitutive matrices are independent across bonds. Build
+    // them in parallel for large zones, then consume the stable axis-major
+    // sequence below so accumulation and edge indexing remain deterministic.
+    scratch.constraint_slots.resize_with(3 * n, || None);
+    let free = &scratch.free;
+    let build_constraint = |slot: usize| {
+        let axis = slot / n;
+        let i = slot % n;
+        let bond = scene.bonds[axis][i];
+        if bond.neighbor == EMPTY {
+            return None;
         }
+        let j = bond.neighbor as usize;
+        if free[i] == Vec3::ZERO && free[j] == Vec3::ZERO && scene.voxels[i].kinematic {
+            return None;
+        }
+        Some(make_constraint(scene, i, axis, j))
+    };
+    if parallel_enabled_for(n) {
+        scratch
+            .constraint_slots
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(slot, output)| *output = build_constraint(slot));
+    } else {
+        for (slot, output) in scratch.constraint_slots.iter_mut().enumerate() {
+            *output = build_constraint(slot);
+        }
+    }
+    scratch.constraints.clear();
+    for constraint in scratch.constraint_slots.iter_mut().filter_map(Option::take) {
+        let i = constraint.i;
+        let j = constraint.j;
+        if scratch.free[i] == Vec3::ZERO && scratch.free[j] == Vec3::ZERO {
+            // The solve has no free degree of freedom, but fracture still
+            // needs the current undamaged stiffness and local frame.
+            scratch.constraints.push(constraint);
+            continue;
+        }
+        let edge = u32::try_from(scratch.constraints.len())
+            .expect("bond constraint count exceeds the voxel index range");
+        for vertex in [i, j] {
+            let slot = scratch.incidence_len[vertex] as usize;
+            debug_assert!(slot < 6, "face-connected voxel has more than six bonds");
+            scratch.incidence[vertex][slot] = edge;
+            scratch.incidence_len[vertex] += 1;
+        }
+        scratch.constraints.push(constraint);
+    }
+    // Edge contributions are independent. Keep stable edge IDs, then gather
+    // each REV's incident terms in edge order; this reproduces the former
+    // axis-major endpoint-scatter sum without serial endpoint contention.
+    // Constraints were compacted from ascending axis-major slots, and each
+    // edge appends its ID to both endpoints. Thus every incidence row is
+    // already sorted by edge ID, which is also the deterministic sum order.
+    scratch
+        .constraint_forces
+        .resize(scratch.constraints.len(), Vec3::ZERO);
+    let constraints = &scratch.constraints;
+    let forces = &mut scratch.constraint_forces;
+    let calculate_edge_force = |(edge, force): (usize, &mut Vec3)| {
+        let constraint = &constraints[edge];
+        if scratch.free[constraint.i] == Vec3::ZERO && scratch.free[constraint.j] == Vec3::ZERO {
+            return;
+        }
+        *force = constraint.k
+            * (scene.positions[constraint.j] - scene.positions[constraint.i] - constraint.rest);
+    };
+    if parallel_enabled_for(n) {
+        forces
+            .par_iter_mut()
+            .enumerate()
+            .for_each(calculate_edge_force);
+    } else {
+        forces.iter_mut().enumerate().for_each(calculate_edge_force);
+    }
+    let incidence = &scratch.incidence;
+    let incidence_len = &scratch.incidence_len;
+    let accumulate_row = |(i, (rhs, diagonal)): (usize, (&mut Vec3, &mut Mat3))| {
+        let mut row_rhs = *rhs;
+        let mut row_diagonal = *diagonal;
+        for &edge in &incidence[i][..incidence_len[i] as usize] {
+            let edge = edge as usize;
+            let constraint = &constraints[edge];
+            let force = forces[edge];
+            if constraint.i == i {
+                row_rhs += force;
+            } else {
+                row_rhs -= force;
+            }
+            row_diagonal += constraint.k;
+        }
+        *rhs = row_rhs;
+        *diagonal = row_diagonal;
+    };
+    if parallel_enabled_for(n) {
+        scratch
+            .rhs
+            .par_iter_mut()
+            .zip(scratch.diagonal.par_iter_mut())
+            .enumerate()
+            .for_each(accumulate_row);
+    } else {
+        scratch
+            .rhs
+            .iter_mut()
+            .zip(scratch.diagonal.iter_mut())
+            .enumerate()
+            .for_each(accumulate_row);
     }
     for i in 0..n {
         scratch.rhs[i] *= scratch.free[i];
@@ -1503,12 +1722,28 @@ fn solve_coupled(
     let assembly_time = assembly_start.elapsed();
     let factor_start = Instant::now();
     if !reuse_preconditioner {
-        match scene.config.cpu_preconditioner {
-            CpuPreconditioner::IncompleteCholesky0 => build_ic0(scene, scratch),
-            CpuPreconditioner::BlockJacobi => build_block_jacobi(scratch),
+        scratch.cpu_preconditioner_ready = false;
+        if !try_cuda {
+            match scene.config.cpu_preconditioner {
+                CpuPreconditioner::IncompleteCholesky0 => build_ic0(
+                    scene,
+                    &scratch.free,
+                    &scratch.diagonal,
+                    &scratch.incidence,
+                    &scratch.incidence_len,
+                    &scratch.constraints,
+                    &mut scratch.factor_matrix,
+                    &mut scratch.factor_diagonal,
+                    &mut scratch.factor_edges,
+                ),
+                CpuPreconditioner::BlockJacobi => {
+                    build_block_jacobi(&scratch.diagonal, &mut scratch.factor_diagonal)
+                }
+            }
+            scratch.cpu_preconditioner_ready = true;
         }
     }
-    let factor_time = factor_start.elapsed();
+    let mut factor_time = factor_start.elapsed();
     let free = &scratch.free;
     let active = &scratch.active;
     let active_index = &scratch.active_index;
@@ -1573,7 +1808,6 @@ fn solve_coupled(
                 .sum()
         }
     };
-    let active_count = active.len();
     scratch.dx.resize(active_count, Vec3::ZERO);
     scratch.dx.fill(Vec3::ZERO);
     scratch.ap.resize(active_count, Vec3::ZERO);
@@ -1585,14 +1819,7 @@ fn solve_coupled(
     scratch.preconditioner_work.resize(active_count, Vec3::ZERO);
     let pcg_start = Instant::now();
     let profile_cuda = std::env::var_os("VOXEL_PROFILE_STEP").is_some();
-    let backend = std::env::var("VOXEL_SOLVER_BACKEND").unwrap_or_else(|_| "auto".into());
     let mut cuda_solution = None;
-    let try_cuda = *cuda_enabled_for_step
-        && match backend.as_str() {
-            "cpu" => false,
-            "cuda" => true,
-            _ => active_count >= 2_048,
-        };
     if try_cuda {
         scratch.cuda_neighbors.resize(active_count, [u32::MAX; 6]);
         scratch.cuda_blocks.resize(active_count, [0.0; 54]);
@@ -1697,6 +1924,27 @@ fn solve_coupled(
         );
     }
     let cpu_pcg_start = Instant::now();
+    if !scratch.cpu_preconditioner_ready {
+        let factor_start = Instant::now();
+        match scene.config.cpu_preconditioner {
+            CpuPreconditioner::IncompleteCholesky0 => build_ic0(
+                scene,
+                &scratch.free,
+                &scratch.diagonal,
+                &scratch.incidence,
+                &scratch.incidence_len,
+                &scratch.constraints,
+                &mut scratch.factor_matrix,
+                &mut scratch.factor_diagonal,
+                &mut scratch.factor_edges,
+            ),
+            CpuPreconditioner::BlockJacobi => {
+                build_block_jacobi(&scratch.diagonal, &mut scratch.factor_diagonal)
+            }
+        }
+        factor_time += factor_start.elapsed();
+        scratch.cpu_preconditioner_ready = true;
+    }
     apply_preconditioner(
         scene.config.cpu_preconditioner,
         constraints,

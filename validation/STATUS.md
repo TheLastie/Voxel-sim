@@ -16,13 +16,32 @@
 | 4 m/s pilot, 0.5 s after contact | 812 broken bonds, two pieces of 4318 and 2 REV |
 | 4 m/s, 6 s capture, 12 N/s to 60 N | 894 broken bonds; two pieces of 4319 and 1 REV; maximum two components throughout the saved trace |
 | Encoded capture | PASS, 17.10 s MP4 at 1440×900 and 17.08 s GIF; all frames decoded |
-| Complete blade severing | NOT VERIFIED; a band of damaged bonds is not a complete cut |
+| Complete blade severing | VERIFIED in a guided force-driven coupon regression on 2026-10-14; free axe strike and post-cut fall remain unverified |
 | Energy balance | NOT VALIDATED; contact dissipation and projection/integration work need a complete ledger |
 
 The force-ramp recording and final diagnostics are in `knife-local-run.txt`
 and `knife-local-measurements.json`. There is no fragment-count clamp, material
 strength reduction, or prescribed fracture plane. The capture keeps the
 material inputs and fracture parameters used by the earlier recordings.
+
+## 2026-10-14: guided blade severing regression
+
+The previous 30 ms onset test passed with a single connected component. It now
+uses a force-driven blade on the public rigid-tool guide API and only passes
+when two fragments each contain at least 10% of the coupon. With 200 N, the
+12×12×30 REV coupon separates at 139 ms into largest components of 2,142 and
+1,669 REV; 5,373 bonds are broken and the scene has 260 clusters. Repeating the
+release test produced the same result. This verifies a through-cut in a guided
+coupon. It still produces 509 REV of debris, is not a free axe strike, and has
+no saved long-form CSV/GIF/MP4 capture; fracture/contact energy and post-cut
+fall remain unvalidated.
+
+The 0.5 s follow-through pilot (`guided-knife-braked-pilot.csv`) shows the
+remaining failure: a 2 kN opposing actuator brake slows the blade to 0.126 m/s
+by 180 ms, but fracture cascade has already grown to 8,066 broken bonds / 622
+clusters; by 500 ms it reaches 11,462 / 3,686 clusters and peak REV speed
+16.531 m/s. Do not present this pilot as stable post-cut behavior. A full
+17.6 s recording is being recalculated with these actual dynamics retained.
 
 ## Earlier checkpoint
 

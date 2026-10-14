@@ -220,6 +220,12 @@ fn fatigue_generated_fragments_collide_through_solver_contact() {
         .sum();
     assert!((momentum_after - momentum_before).length() < 1e-5);
     assert!((scene.total_mass_kg() - mass_before).abs() < 1e-12);
-    assert!((total_energy_after - total_energy_before).abs() < 1e-6);
+    assert!(
+        (total_energy_after - total_energy_before).abs() < 1e-6,
+        "energy delta={:.9e} J, restitution heat delta={:.9e} J, friction heat delta={:.9e} J",
+        total_energy_after - total_energy_before,
+        scene.energy.contact_restitution_heat - contact_heat_before,
+        scene.energy.contact_friction_heat
+    );
     assert_eq!(scene.cluster_count, 3);
 }

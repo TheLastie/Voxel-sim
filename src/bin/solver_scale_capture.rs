@@ -66,6 +66,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = SceneConfig::default();
     config.dimensions = [NX, NY, NZ];
     config.fixed_dt = DT;
+    // Large-grid CUDA PCG needs a larger cap than the small-scene default of 160.
+    // Keep this workload explicit so it cannot silently fall back after a
+    // near-converged first solve.
+    config.cuda_iterations = 640;
     // Keep the standard four substeps and 80-iteration IC(0) solver settings.
     let mut spawns = Vec::with_capacity(NX * NY * NZ);
     for z in 0..NZ {

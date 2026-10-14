@@ -1585,6 +1585,7 @@ dependencies = [
  "pollster",
  "rayon",
  "ron",
+ "rustc-hash",
  "serde",
  "smallvec",
  "wgpu",

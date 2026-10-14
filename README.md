@@ -66,10 +66,32 @@ yet; a collision alone does not claim to weld two metal voxels.
 
 - [Knife contact video](validation/knife-cut-demo.mp4) shows the earlier
   contact-onset prototype. It does not demonstrate complete severing or a
-  calibrated post-impact fall; those remain open physics work.
+  calibrated post-impact fall. A separate short regression now verifies a
+  complete cut in a force-driven, guided wood coupon; see the
+  [knife diagnosis](validation/knife-diagnosis.md) for its debris and energy
+  limitations.
 - [Cut-onset still](validation/knife-cut-final-frame.png)
 - Detailed results: [validation status](validation/STATUS.md) and
   [knife diagnosis](validation/knife-diagnosis.md).
+
+The guided fixture can be recorded for diagnosis, but its post-cut response is
+currently unstable: a 5.8 m/s, 200 N pilot breaks down into 3,243 clusters by
+0.37 s even after the blade brake engages. The 17.6 s command below reproduces
+that physical response; it is not validated final cutting footage. Start a
+dedicated viewer first (port 8765 may already belong to another capture and
+should be left untouched):
+
+```sh
+python3 validation/live_viewer.py --port 8850 --csv validation/guided-knife-cut.csv --label "Нож 5.8 м/с · диагностика каскада после пропила"
+RAYON_NUM_THREADS=1 cargo run --release --no-default-features --bin guided_knife_capture -- validation/guided-knife-cut.csv 17600 100 200
+```
+
+The guided cutter stops its 200 N feed and applies an opposing 2 kN brake when
+two large fragments form, then continues recording actual solver states. This
+isolated coupon has no gravity or floor; it demonstrates the initial severing
+and also exposes the unstable post-cut cascade. It is not a free axe swing or a
+falling tree. The current partial pilot and measurements are documented in
+`validation/knife-diagnosis.md`.
 
 For live solver frames, start the browser viewer against the capture CSV before
 starting the model:

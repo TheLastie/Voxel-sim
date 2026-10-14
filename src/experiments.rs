@@ -11,6 +11,25 @@ pub struct TestResult {
     pub passed: bool,
     pub detail: String,
 }
+fn wood_fragment_sizes(scene: &Scene) -> Vec<usize> {
+    let mut counts = std::collections::HashMap::<u32, usize>::new();
+    for (&cluster, voxel) in scene.clusters.iter().zip(&scene.voxels) {
+        if !voxel.kinematic {
+            *counts.entry(cluster).or_default() += 1;
+        }
+    }
+    let mut sizes = counts.into_values().collect::<Vec<_>>();
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    sizes
+}
+fn blade_trailing_face_x(tool: &Tool) -> f32 {
+    tool.position.x
+        + tool
+            .cells
+            .iter()
+            .map(|&p| (tool.rotation * p).x)
+            .fold(f32::NEG_INFINITY, f32::max)
+}
 fn specimen(dimensions: [usize; 3], fiber: Vec3) -> Scene {
     let mut c = SceneConfig::load("scenes/wood_chop.ron").unwrap();
     c.dimensions = dimensions;
@@ -261,42 +280,83 @@ pub fn wedge_split() -> TestResult {
     config.branch_dimensions = [0; 3];
     config.ground_dimensions = [0; 3];
     config.fibers = Vec3::Z.to_array();
-    config.gravity = [0.0; 3];
+    config.gravity = [0.0, 0.0, -9.81];
     config.fixed_dt = 0.001;
     config.substeps = 4;
     config.iterations = 120;
     config.corotation_iterations = 2;
     config.tool_dimensions = [10, 2, 8];
     let mut scene = Scene::new(config);
+    let bottom = scene
+        .positions
+        .iter()
+        .map(|p| p.z)
+        .fold(f32::INFINITY, f32::min);
+    // Constrain only the rooted bottom layer vertically. The REV bonds remain
+    // intact, so the trunk transfers the axe load into its support.
+    let root_targets = scene
+        .positions
+        .iter()
+        .map(|p| {
+            if (p.z - bottom).abs() < CELL * 0.1 {
+                [None, None, Some(p.z)]
+            } else {
+                [None; 3]
+            }
+        })
+        .collect::<Vec<_>>();
     let mut tool = Some(Tool::new(
         Shape::Wedge,
         &scene,
         Vec3::new(0.0, 0.0, 0.38),
         -Vec3::Z,
-        3.0,
+        6.0,
     ));
-    for _ in 0..400 {
-        solver::step(&mut scene, &mut tool);
+    if let Some(tool) = &mut tool {
+        tool.mount_base(Vec3::ZERO, -Vec3::Z)
+            .expect("valid axe guide");
+        tool.set_external_force(-Vec3::Z * 50.0)
+            .expect("finite axe feed force");
     }
-    let sizes = {
-        let mut counts = std::collections::HashMap::<u32, usize>::new();
-        for (&cluster, voxel) in scene.clusters.iter().zip(&scene.voxels) {
-            if !voxel.kinematic {
-                *counts.entry(cluster).or_default() += 1;
+    let mut cut_step = None;
+    let mut peak_speed = 0.0f32;
+    for step in 1..=500 {
+        if cut_step.is_some() {
+            let speed = tool.as_ref().unwrap().velocity.z;
+            let brake = if speed < -0.05 { 2_000.0 } else { 0.0 };
+            tool.as_mut()
+                .unwrap()
+                .set_external_force(Vec3::Z * brake)
+                .expect("finite axe brake");
+        }
+        solver::step_with_axis_targets(&mut scene, &mut tool, &root_targets);
+        if cut_step.is_none() {
+            let sizes = wood_fragment_sizes(&scene);
+            if sizes.len() >= 2 && sizes[1] >= scene.voxels.len() / 10 {
+                cut_step = Some(step);
             }
         }
-        counts.values().copied().collect::<Vec<_>>()
-    };
-    let large_fragments = sizes.iter().filter(|&&n| n >= 20).count();
-    let passed = (2..=4).contains(&scene.cluster_count) && (2..=4).contains(&large_fragments);
+        peak_speed = peak_speed.max(
+            scene
+                .voxels
+                .iter()
+                .map(|v| v.velocity.length())
+                .fold(0.0, f32::max),
+        );
+        if cut_step.is_some_and(|cut| step >= cut + 100) {
+            break;
+        }
+    }
+    let mut sizes = wood_fragment_sizes(&scene);
+    sizes.truncate(8);
+    let passed = cut_step.is_some() && sizes.len() >= 2 && sizes[1] >= scene.voxels.len() / 10;
     TestResult {
         name: "wedge_split_12x12x30".into(),
         passed,
         detail: format!(
-            "broken_bonds={} wood_clusters={} fragments_over_20_REV={} tool_z={:.3} m",
+            "cut_step={cut_step:?} broken_bonds={} wood_clusters={} largest_fragment_sizes={sizes:?} peak_REV_speed={peak_speed:.3} m/s tool_z={:.3} m",
             scene.broken,
             scene.cluster_count,
-            large_fragments,
             tool.as_ref().map_or(0.0, |t| t.position.z)
         ),
     }
@@ -324,17 +384,21 @@ pub fn knife_cut() -> TestResult {
     let mut tool = Some(Tool::new(
         Shape::Blade,
         &scene,
-        // Scene X is centered around zero; wood's outer face is x=0.06 m.
-        // A 20 cm blade extends 10 cm from its center, so x=0.16 m puts its
-        // leading face flush with the specimen instead of leaving a gap.
         Vec3::new(0.16, 0.0, 0.15),
         -Vec3::X,
-        6.0,
+        5.8,
     ));
     if let Some(tool) = &mut tool {
         // Local blade X advances through the trunk, Z spans its width, and Y
         // supplies the thin vertical cutting edge.
         tool.rotation = Quat::from_mat3(&Mat3::from_cols(-Vec3::X, Vec3::Z, Vec3::Y));
+        // Drive the edge through the trunk on a straight guide. The previous
+        // free impact bounced the blade off after making only a surface notch.
+        // This is a force-driven cutter, not a prescribed fracture plane.
+        tool.mount_base(Vec3::ZERO, -Vec3::X)
+            .expect("valid blade guide");
+        tool.set_external_force(-Vec3::X * 2_000.0)
+            .expect("finite blade force");
     }
     let x_min = scene
         .positions
@@ -361,35 +425,53 @@ pub fn knife_cut() -> TestResult {
         .iter()
         .map(|p| p.z)
         .fold(f32::INFINITY, f32::min);
-    let clamp: Vec<_> = scene
+    let targets = scene
         .positions
         .iter()
         .map(|p| {
             let corner = (p.x - x_min).abs() < CELL * 0.1 || (p.x - x_max).abs() < CELL * 0.1;
             let side = (p.y - y_min).abs() < CELL * 0.1 || (p.y - y_max).abs() < CELL * 0.1;
-            (p.z - z_min).abs() < CELL * 0.1 && corner && side
+            ((p.z - z_min).abs() < CELL * 0.1 && corner && side).then_some(*p)
         })
-        .collect();
-    let targets: Vec<_> = scene
-        .positions
+        .collect::<Vec<_>>();
+    let specimen_x_min = scene
+        .rest_positions
         .iter()
-        .zip(clamp)
-        .map(|(&p, fixed)| fixed.then_some(p))
-        .collect();
-    for _ in 0..30 {
+        .map(|p| p.x)
+        .fold(f32::INFINITY, f32::min);
+    // Require the rear of the blade to clear the far face as well as two large
+    // connected components. A contact shock that merely cracks the coupon is
+    // not accepted as a through-cut.
+    let mut severing_step = 0usize;
+    for step in 1..=250 {
         solver::step_with_targets(&mut scene, &mut tool, &targets);
+        severing_step = step;
+        let sizes = wood_fragment_sizes(&scene);
+        let blade_rear_x = blade_trailing_face_x(tool.as_ref().unwrap());
+        if sizes.len() >= 2 && sizes[1] >= scene.voxels.len() / 10 && blade_rear_x < specimen_x_min
+        {
+            break;
+        }
     }
-    // A 30 ms strike should establish a local cutting plane without turning
-    // the whole coupon into debris.
-    let max_cut_damage = 4 * 12 * 30;
-    let passed = (300..=max_cut_damage).contains(&scene.broken) && scene.cluster_count <= 20;
+    let sizes = wood_fragment_sizes(&scene);
+    let blade_rear_x = blade_trailing_face_x(tool.as_ref().unwrap());
+    let passed = blade_rear_x < specimen_x_min
+        && sizes.len() >= 2
+        && sizes[0] >= scene.voxels.len() / 10
+        && sizes[1] >= scene.voxels.len() / 10;
+    let mut largest_sizes = sizes;
+    largest_sizes.truncate(8);
     TestResult {
-        name: "knife_cut_onset_12x12x30".into(),
+        name: "knife_severs_trunk_12x12x30".into(),
         passed,
         detail: format!(
-            "broken_bonds={} wood_clusters={} tool_position=({:.3},{:.3},{:.3}) m",
+            "simulated_time_ms={} broken_bonds={} wood_clusters={} largest_fragment_sizes={:?} blade_rear_x={:.3} m specimen_far_face_x={:.3} m tool_position=({:.3},{:.3},{:.3}) m",
+            severing_step,
             scene.broken,
             scene.cluster_count,
+            largest_sizes,
+            blade_rear_x,
+            specimen_x_min,
             tool.as_ref().map_or(0.0, |t| t.position.x),
             tool.as_ref().map_or(0.0, |t| t.position.y),
             tool.as_ref().map_or(0.0, |t| t.position.z)
@@ -411,6 +493,54 @@ pub fn capture_knife(
     ramp_force_newtons: f32,
     ramp_seconds: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    capture_knife_internal(
+        path,
+        stride,
+        speed,
+        frames,
+        attack_angle_degrees,
+        approach_seconds,
+        roll_degrees,
+        ramp_force_newtons,
+        ramp_seconds,
+        None,
+    )
+}
+
+/// Capture the reproducible force-driven severing fixture using the public
+/// tool guide API. Feed stops and actively brakes the tool after full severing.
+pub fn capture_guided_knife(
+    path: &str,
+    stride: usize,
+    frames: usize,
+    force_newtons: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    capture_knife_internal(
+        path,
+        stride,
+        5.8,
+        frames,
+        0.0,
+        0.0,
+        0.0,
+        force_newtons,
+        0.001,
+        Some(force_newtons),
+    )
+}
+
+fn capture_knife_internal(
+    path: &str,
+    stride: usize,
+    speed: f32,
+    frames: usize,
+    attack_angle_degrees: f32,
+    approach_seconds: f32,
+    roll_degrees: f32,
+    ramp_force_newtons: f32,
+    ramp_seconds: f32,
+    guided_force_newtons: Option<f32>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::{
         fs::File,
         io::{BufWriter, Write},
@@ -423,6 +553,7 @@ pub fn capture_knife(
         || approach_seconds < 0.0
         || !speed.is_finite()
         || speed < 0.0
+        || guided_force_newtons.is_some_and(|force| !force.is_finite() || force < 0.0)
     {
         return Err("capture requires finite nonnegative speed, approach and force, and positive ramp duration".into());
     }
@@ -473,6 +604,12 @@ pub fn capture_knife(
         // with the outer wood layer and being depenetrated before the strike.
         t.position.x = specimen_x_max + leading_extent + CELL;
         t.position -= t.velocity * approach_seconds;
+        if let Some(force) = guided_force_newtons {
+            t.mount_base(Vec3::ZERO, -Vec3::X)
+                .map_err(std::io::Error::other)?;
+            t.set_external_force(-Vec3::X * force)
+                .map_err(std::io::Error::other)?;
+        }
     }
     let x_min = scene
         .positions
@@ -499,7 +636,7 @@ pub fn capture_knife(
         .iter()
         .map(|p| p.z)
         .fold(f32::INFINITY, f32::min);
-    let targets: Vec<_> = scene
+    let targets = scene
         .positions
         .iter()
         .map(|p| {
@@ -507,7 +644,7 @@ pub fn capture_knife(
             let side = (p.y - y_min).abs() < CELL * 0.1 || (p.y - y_max).abs() < CELL * 0.1;
             ((p.z - z_min).abs() < CELL * 0.1 && corner && side).then_some(*p)
         })
-        .collect();
+        .collect::<Vec<_>>();
     let out = File::create(path)?;
     let mut out = BufWriter::new(out);
     let wall_start = std::time::Instant::now();
@@ -528,6 +665,7 @@ pub fn capture_knife(
     let stride = stride.max(1);
     let drive_direction = Quat::from_rotation_y(attack_angle_degrees.to_radians()) * -Vec3::X;
     let mut drive_work = 0.0f64;
+    let mut cut_frame = None;
     writeln!(
         out,
         "R,{ramp_force_newtons},{ramp_seconds},{approach_seconds}"
@@ -537,8 +675,20 @@ pub fn capture_knife(
             // A real force through the blade COM, not a prescribed trajectory.
             // Midpoint sampling integrates a linear ramp without a frame bias.
             let time = (frame as f32 - 0.5) * scene.config.fixed_dt;
-            let force =
-                ramp_force_newtons * ((time - approach_seconds) / ramp_seconds).clamp(0.0, 1.0);
+            let force = if let Some(force) = guided_force_newtons {
+                if cut_frame.is_some() {
+                    let feed_speed = tool.as_ref().unwrap().velocity.dot(drive_direction);
+                    if feed_speed > 0.05 {
+                        -force.max(2_000.0)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    force
+                }
+            } else {
+                ramp_force_newtons * ((time - approach_seconds) / ramp_seconds).clamp(0.0, 1.0)
+            };
             let before = tool.as_ref().unwrap().position;
             tool.as_mut()
                 .unwrap()
@@ -546,6 +696,22 @@ pub fn capture_knife(
             solver::step_with_targets(&mut scene, &mut tool, &targets);
             drive_work +=
                 (drive_direction * force).dot(tool.as_ref().unwrap().position - before) as f64;
+            if guided_force_newtons.is_some() && cut_frame.is_none() {
+                let sizes = wood_fragment_sizes(&scene);
+                let rear_x = blade_trailing_face_x(tool.as_ref().unwrap());
+                if sizes.len() >= 2 && sizes[1] >= scene.voxels.len() / 10 && rear_x < x_min {
+                    cut_frame = Some(frame);
+                    eprintln!(
+                        "guided blade passed fully through coupon at {:.3}s: rear_x={:.3} m far_face_x={:.3} m broken={} clusters={} largest={:?}",
+                        frame as f32 * scene.config.fixed_dt,
+                        rear_x,
+                        x_min,
+                        scene.broken,
+                        scene.cluster_count,
+                        &sizes[..sizes.len().min(8)]
+                    );
+                }
+            }
         }
         if frame % 100 == 0 {
             eprintln!("frame={frame}/{frames} sim={:.3}s wall={:.3}s broken={} clusters={} residual={:.3e}",
@@ -554,7 +720,9 @@ pub fn capture_knife(
         }
         let impact_frame = (approach_seconds / scene.config.fixed_dt).round() as usize;
         let near_impact = frame >= impact_frame.saturating_sub(10) && frame <= impact_frame + 60;
-        if !near_impact && frame % stride != 0 && frame != frames {
+        let near_cut =
+            cut_frame.is_some_and(|cut| frame >= cut.saturating_sub(10) && frame <= cut + 60);
+        if !near_impact && !near_cut && frame % stride != 0 && frame != frames {
             continue;
         }
         let t = tool.as_ref().unwrap();

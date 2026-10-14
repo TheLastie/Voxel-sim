@@ -28,6 +28,7 @@ glam = { version = "=0.27.0", features = ["serde"] }
 serde = { version = "=1.0.203", features = ["derive"] }
 ron = "=0.8.1"
 rayon = "=1.10.0"
+rustc-hash = "=1.1.0"
 bytemuck = { version = "=1.16.3", features = ["derive"] }
 
 # Sparse composition storage and synchronous startup of async wgpu setup.

@@ -42,6 +42,86 @@
       "video": "bond-formation.mp4"
     },
     {
+      "id": "iron-copper-fusion",
+      "label": "Автоматическое слияние железа и меди · остаток энергии показан",
+      "mode": "csv",
+      "csv": "fusion.csv",
+      "gif": "fusion.gif",
+      "video": "fusion.mp4"
+    },
+    {
+      "id": "liquid-viscosity",
+      "label": "Вязкое касательное течение воды · 2 жидких REV",
+      "mode": "csv",
+      "csv": "liquid-viscosity.csv",
+      "gif": "liquid-viscosity.gif",
+      "video": "liquid-viscosity.mp4"
+    },
+    {
+      "id": "liquid-viscosity-temperature",
+      "label": "Вязкость воды по Arrhenius · 333 K · Ea 17 kJ/mol (демо)",
+      "mode": "csv",
+      "csv": "liquid-viscosity-temperature.csv",
+      "gif": "liquid-viscosity-temperature.gif",
+      "video": "liquid-viscosity-temperature.mp4"
+    },
+    {
+      "id": "liquid-solid-viscosity",
+      "label": "Вязкий сдвиг воды на твёрдой границе · 2 REV",
+      "mode": "csv",
+      "csv": "liquid-solid-viscosity.csv",
+      "gif": "liquid-solid-viscosity.gif",
+      "video": "liquid-solid-viscosity.mp4"
+    },
+    {
+      "id": "cpu-broadphase",
+      "label": "CPU broadphase · 4 203 REV · 176 шагов",
+      "mode": "csv",
+      "csv": "cpu-pcg-row-optimized.csv",
+      "gif": "cpu-pcg-row-optimized.gif",
+      "video": "cpu-pcg-row-optimized.mp4"
+    },
+    {
+      "id": "cpu-broadphase-final",
+      "label": "CPU broadphase final · 4 203 REV · 176 шагов",
+      "mode": "csv",
+      "csv": "cpu-broadphase-final.csv",
+      "gif": "cpu-broadphase-final.gif",
+      "video": "cpu-broadphase-final.mp4"
+    },
+    {
+      "id": "cpu-broadphase-diagnostic",
+      "label": "CPU collision profile · 4 203 REV · 176 шагов",
+      "mode": "csv",
+      "csv": "cpu-broadphase-diagnostic.csv",
+      "gif": "cpu-broadphase-diagnostic.gif",
+      "video": "cpu-broadphase-diagnostic.mp4"
+    },
+    {
+      "id": "cpu-fxhash-profile",
+      "label": "CPU FxHashMap broadphase · 4 203 REV · profile",
+      "mode": "csv",
+      "csv": "cpu-fxhash-profile.csv",
+      "gif": "cpu-fxhash-profile.gif",
+      "video": "cpu-fxhash-profile.mp4"
+    },
+    {
+      "id": "cpu-fine-bin-profile",
+      "label": "CPU half-cell broadphase · 4 203 REV · profile",
+      "mode": "csv",
+      "csv": "cpu-fine-bin-profile.csv",
+      "gif": "cpu-fine-bin-profile.gif",
+      "video": "cpu-fine-bin-profile.mp4"
+    },
+    {
+      "id": "cpu-fine-bin-final",
+      "label": "CPU half-cell broadphase · 4 203 REV · capture",
+      "mode": "csv",
+      "csv": "cpu-fine-bin-final.csv",
+      "gif": "cpu-fine-bin-final.gif",
+      "video": "cpu-fine-bin-final.mp4"
+    },
+    {
       "id": "thermal-strength",
       "label": "Температурное размягчение стеклянной связи · 2 REV",
       "mode": "thermal",
@@ -107,11 +187,11 @@
     },
     {
       "id": "world-bounds",
-      "label": "Мировые границы · ledger · 6 REV",
+      "label": "Мировые границы · энергия удаляемой связи · 8 REV",
       "mode": "thermal",
-      "csv": "world-bounds.csv",
-      "gif": "world-bounds.gif",
-      "video": "world-bounds.mp4"
+      "csv": "world-bounds-ledger.csv",
+      "gif": "world-bounds-ledger.gif",
+      "video": "world-bounds-ledger.mp4"
     },
     {
       "id": "pcg-cpu",
@@ -160,6 +240,78 @@
       "csv": "solver-scale-36k.csv",
       "gif": "solver-scale-36k.gif",
       "video": "solver-scale-36k.mp4"
+    },
+    {
+      "id": "cuda-adaptive-36k",
+      "label": "CUDA PCG · adaptive reductions · 35 712 REV · сцена разрушилась",
+      "mode": "csv",
+      "csv": "cuda-adaptive-36k.csv",
+      "gif": "cuda-adaptive-36k.gif",
+      "video": "cuda-adaptive-36k.mp4"
+    },
+    {
+      "id": "cuda-parallel-assembly-36k",
+      "label": "CUDA PCG · parallel assembly · 35 712 REV · сцена разрушилась",
+      "mode": "csv",
+      "csv": "cuda-parallel-assembly-36k.csv",
+      "gif": "cuda-parallel-assembly-36k.gif",
+      "video": "cuda-parallel-assembly-36k.mp4"
+    },
+    {
+      "id": "cuda-parallel-row-gather-36k",
+      "label": "CUDA PCG · deterministic row gather · 35 712 REV · сцена разрушилась",
+      "mode": "csv",
+      "csv": "cuda-parallel-row-gather-36k.csv",
+      "gif": "cuda-parallel-row-gather-36k.gif",
+      "video": "cuda-parallel-row-gather-36k.mp4"
+    },
+    {
+      "id": "cuda-parallel-prep-36k",
+      "label": "CUDA PCG · host-prep A/B · −10.5% скорости · сцена разрушилась",
+      "mode": "csv",
+      "csv": "cuda-parallel-prep-36k.csv",
+      "gif": "cuda-parallel-prep-36k.gif",
+      "video": "cuda-parallel-prep-36k.mp4"
+    },
+    {
+      "id": "cuda-lazy-ic0-36k",
+      "label": "CUDA PCG · ленивый IC(0) · 35 712 REV · сцена распалась",
+      "mode": "csv",
+      "csv": "cuda-lazy-ic0-36k.csv",
+      "gif": "cuda-lazy-ic0-36k.gif",
+      "video": "cuda-lazy-ic0-36k.mp4"
+    },
+    {
+      "id": "cuda-cached-neighbors-4k",
+      "label": "CUDA · кэш таблицы связей · опыт поддержки · 4 203 REV",
+      "mode": "csv",
+      "csv": "cuda-cached-neighbors-4k.csv",
+      "gif": "cuda-cached-neighbors-4k.gif",
+      "video": "cuda-cached-neighbors-4k.mp4"
+    },
+    {
+      "id": "cpu-ic0-row-cache-4k",
+      "label": "CPU IC(0) · кэш строк связей · опыт поддержки · 4 203 REV",
+      "mode": "csv",
+      "csv": "cpu-ic0-row-cache-4k.csv",
+      "gif": "cpu-ic0-row-cache-4k.gif",
+      "video": "cpu-ic0-row-cache-4k.mp4"
+    },
+    {
+      "id": "cpu-ic0-baseline-clean-4k",
+      "label": "CPU IC(0) · baseline · matched support · 4 203 REV",
+      "mode": "csv",
+      "csv": "cpu-ic0-baseline-clean-4k.csv",
+      "gif": "cpu-ic0-baseline-clean-4k.gif",
+      "video": "cpu-ic0-baseline-clean-4k.mp4"
+    },
+    {
+      "id": "cpu-ic0-row-cache-clean-4k",
+      "label": "CPU IC(0) · cached row refs · matched support · 4 203 REV",
+      "mode": "csv",
+      "csv": "cpu-ic0-row-cache-clean-4k.csv",
+      "gif": "cpu-ic0-row-cache-clean-4k.gif",
+      "video": "cpu-ic0-row-cache-clean-4k.mp4"
     }
   ]
 }

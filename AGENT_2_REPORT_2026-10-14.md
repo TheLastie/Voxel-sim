@@ -623,9 +623,294 @@ intact in one cluster. Regenerated GIF/MP4 contain 177 actual frames at
 with HTTP 200; viewer `:8765` remains active. Regressions cover hot formation,
 cold-contact rejection, and rule validation/clearing.
 
-The full CPU suite passes 73/73 tests (57 library, 5 smoke, 1 contact energy,
-1 preconditioner, 3 fatigue topology, 6 supports). Targeted rustfmt, renderer
+The full CPU suite after pressure/dwell and contact persistence passes 77/77
+tests (61 library, 5 smoke, 1 contact energy, 1 preconditioner, 3 fatigue
+topology, 6 supports). Targeted rustfmt, renderer
 `py_compile`, manifest JSON parsing, and `git diff --check` pass.
 
 Pressure/dwell dependence, adhesion across different materials, REV fusion
 with composition/mass transfer, and healing after fracture remain incomplete.
+
+#### Pressure and dwell follow-up
+
+Collision velocity resolution now returns accumulated normal impulse per contact.
+The bonding rule estimates face pressure as `Jnormal/(dt·CELL²)` in Pa and
+tracks continuous dwell while pressure remains above its threshold. Contact
+manifolds persist across fixed steps within the same 2 μm projection shell;
+dwell state is reindexed during world-bound compaction. Regressions cover
+sub-threshold pressure, 1 MPa contact for 20 ms, and persistence of a resting
+contact after projection.
+
+The current 1,760-step capture uses a 0 Pa minimum pressure and 0.1 s dwell.
+With the same hot iron impact conditions, bonding formed at step 35 (0.350 s),
+0.1 s after solver contact first stopped the pair. It has 177 actual states over
+17.6 s; mass is 0.015739998 kg, momentum and total-energy errors are zero, and
+restitution heat is 7.87e-7 J. The regenerated 177-frame GIF/MP4 are served by
+`:8797` and selector `:8800`; the existing `:8765` viewer was left untouched.
+
+A nonzero pressure threshold is covered by a focused regression using supplied
+contact impulses; the physical capture does not claim a calibrated pressure
+measurement. This is an impulse-per-face-area estimate, not a continuum stress
+field. Material calibration, bonding across differing kinematic constraints,
+cross-material adhesion, REV fusion and post-fracture healing remain open.
+
+#### Viscous shear between liquid REVs
+
+Added material dynamic viscosity in Pa·s, a Scene setter with input validation,
+water's reference value of `1.002e-3 Pa·s`, and a first engine-level tangential
+viscous contact response. It only acts when both contacting REVs have liquid
+fraction; the pair impulse conserves momentum and converts the measured kinetic
+loss into compensated internal energy. An earlier release capture exposed a
+precision defect in `Voxel::add_internal_energy_j`: tiny heat increments were
+lost when added to a large f64 energy total. The accumulator now sums small
+increments beside its f32 base energy, and a regression checks retained
+sub-ULP heat.
+
+The physical reference capture uses two water REVs at 293.15 K, `μ=1.002e-3
+Pa·s`, initial opposite tangential velocities of `5e-4 m/s`, zero gravity,
+`dt=10 ms`, 2 substeps, 1,760 fixed steps and 177 saved states. The relative
+speed falls from `1.00000e-3` to `8.9984e-4 m/s`; cumulative viscous heat is
+`4.756888595e-11 J`. Total energy error is `1.111e-13 J`, momentum error is
+zero, mass remains `0.002 kg`, and the run spans 17.6 physical seconds. The
+GIF and MP4 each contain 177 actual states at 1120×700, 10 fps and 17.7 s;
+viewer `:8811` serves current CSV/GIF/MP4 with HTTP 200. The earlier viewer
+`:8765` remains untouched.
+
+This is a first contact-shear model, not general liquid hydrodynamics. It has
+no pressure equation of state, bulk flow solver, free-surface tension,
+temperature-dependent calibrated viscosity, or refreezing topology. The
+pressure/dwell bonding capture still uses a zero pressure threshold; the
+nonzero threshold is currently covered by a focused regression only.
+
+After the viscosity work, `VOXEL_SOLVER_BACKEND=cpu cargo test --no-default-features`
+passes 79/79 tests (63 library, 5 smoke, 1 contact energy, 1 CPU preconditioner,
+3 fatigue topology, 6 supports). `cargo fmt --all -- --check`, renderer
+`py_compile`, manifest JSON parsing and `git diff --check` also pass.
+
+#### Physical bonding capture with positive contact pressure
+
+Responding to the review in `chat.md`, changed the physical bond capture to use
+opposing engine forces of `0.1 N` and a nonzero minimum pressure of `900 Pa`.
+The engine pressure comes from measured normal contact impulse divided by
+substep duration and REV face area. A diagnostic run showed sustained contact
+estimates near `1,000 Pa` after first impact; the rule formed the bond after
+`0.1 s` above the configured threshold, at step 12 (`0.12 s`). The impact-energy
+threshold is zero, so this experiment isolates pressure plus dwell. The capture
+then clears both forces through `solver::set_force`.
+
+Release capture result: 1,760 fixed steps, 177 saved states over 17.6 s, mass
+`0.015739998 kg`, final momentum error `4.84e-9 kg·m/s`, total energy discrepancy
+`6.519e-4 J` after accounting for measured external work (`4.9990e-4 J`),
+intact bond and one cluster. GIF/MP4 each have 177 real frames at 1120×700,
+10 fps and 17.7 s. Dedicated viewer `:8812` served CSV, GIF and MP4 with HTTP
+200; the existing `:8765` viewer was not touched. This closes the earlier gap
+where a physical capture used a zero pressure threshold. The 900 Pa value is a
+model threshold, not a calibrated welding pressure for iron.
+
+#### Предварительная операция слияния REV
+
+Добавлен публичный `Scene::fuse_adjacent_voxels(a,b)`. Он принимает только
+свободную пару REV в face contact на соседних исходных ячейках; входы с
+kinematic/axis constraints, bonds или pending fracture releases отвергаются до
+изменения сцены. Состав смешивается по mass fractions, microstructure и
+reference temperature усредняются по массе; относительная кинетическая энергия
+переходит во внутреннюю, скорость задаёт общий линейный импульс. После удаления
+второго REV reindex-ятся силы, acceleration, releases, bonds/workspaces,
+contact-dwell pairs, color buckets и все per-REV массивы; solver/thermal/collision
+caches сбрасываются, cluster labels перестраиваются.
+
+Два новых regression-теста проверяют смесь iron/copper, сохранение массы,
+импульса и энергии, объединение force/acceleration inputs, сохранение соседней
+bond-пары и reindex отдельного pending event, а также атомарный отказ при bond,
+ограничении, разрыве lattice adjacency и pending release. Это пока только
+управляемая engine topology operation. Автоматический trigger по температуре /
+давлению, физический capture, слияние REV внутри связанного тела и модель
+изменённого физического объёма ещё не реализованы. Сейчас операция складывает
+массу в геометрию одного 1 cm REV, поэтому её нельзя считать полноценной
+объёмно-сохраняющей моделью fusion.
+
+Fusion dissipated energy is also exposed in `EnergyLedger::fusion_heat`. With this
+addition the complete CPU test suite passes 80/80 tests (64 library, 5 smoke,
+1 contact energy, 1 CPU preconditioner, 3 fatigue topology, 6 supports).
+
+#### Physical fusion capture
+
+`fusion_capture` builds a hot iron/copper pair through `SceneBuilder`, starts
+with an unbonded pair, and uses the ordinary solver to create collision contact.
+The capture calls `Scene::fuse_adjacent_voxels` only after the solver records
+normal restitution heat at the actual contact. On step 25 the two REVs become
+one mixed REV with iron fraction `0.46761733` and copper fraction `0.53238267`.
+The 1,760-step physical run saves 177 real states over 17.6 s. Total mass is
+`0.016829997 kg`; momentum error is `9.095e-13 kg·m/s`; total energy error is
+`-8.394e-14 J`; fusion heat is `2.094925404e-7 J`; one cluster remains. GIF and
+MP4 contain 177 frames at 1120×700, 10 fps and 17.7 s. Viewer `:8814` serves
+current CSV/GIF/MP4 with HTTP 200. This demonstrates the public topology API
+triggered by a real solver contact. It does not yet provide automatic
+pressure/temperature-based fusion, connected multi-REV fusion, or volume-
+conserving coarse geometry.
+
+The capture is registered in `validation/experiments.json`. A catalog selector
+started on `:8815` with the current manifest lists `iron-copper-fusion`; its
+experiment status and CSV/GIF/MP4 endpoints all return HTTP 200. The dedicated
+live capture viewer remains available at `:8814`. Visual inspection of saved
+frames confirms two touching component REVs before the event and one mixed REV
+after it; frame geometry has been scaled to the actual 1 cm REV spacing.
+
+After the face-overlap validation and capture integration, the complete CPU suite
+passes 81/81 tests (65 library, 5 smoke, 1 contact energy, 1 CPU preconditioner,
+3 fatigue topology, 6 supports). `cargo fmt --all -- --check`,
+`cargo check --no-default-features`, renderer `py_compile`, manifest JSON
+parsing and `git diff --check` pass.
+
+#### Automatic thermal fusion follow-up
+
+Moved the trigger into the engine as `ThermalFusionRule` and
+`Scene::set_thermal_fusion_rule(Tmin, Pmin, dwell)`. The solver updates contact
+pressure/dwell from each resolved normal impulse, queues an eligible fusion, and
+commits it only after the fixed-step substeps finish. It rejects constrained,
+bonded, pending-release, nonadjacent, or non-face-contact pairs. Fusion contact
+states are compacted with world-bound reindexing; regressions cover threshold validation, subthreshold pressure, dwell, cache
+reindexing, reset after contact loss/cooling, simultaneous bonding precedence,
+and an end-to-end solver event committed at the fixed-step boundary. `fusion_capture` now only configures the rule and the opposing
+`0.1 N` loads; it no longer calls the fusion API directly.
+
+With both REV at 363.15 K, `Tmin=350 K`, `Pmin=900 Pa` and dwell `0.1 s`,
+automatic fusion occurs on step 12 (`0.12 s`). Final iron/copper fractions are
+`0.46761733/0.53238267`; mass `0.016829997 kg`; momentum error
+`3.601e-8 kg·m/s`; the preliminary capture had an estimated work ledger
+(residual `-3.860e-4 J`, work `1.500e-3 J`), superseded by the accurately
+measured follow-up below; fusion heat `2.094925452e-7 J`; one cluster. The
+capture retains 1,760 steps/177 actual states over 17.6 s and the GIF/MP4 each
+have 177 frames at 1120×700, 10 fps/17.7 s. The catalog selector `:8815` and
+live capture viewer `:8814` serve the current CSV/GIF/MP4 with HTTP 200.
+
+This automatic rule is still a threshold model, not a calibrated sintering or
+welding law. It fuses an unbonded pair and compresses the combined mass into one
+1 cm cell geometry; volume-preserving fusion and mergers within bonded clusters
+remain open.
+
+
+##### Auto-fusion review follow-up
+
+The solver now accumulates `EnergyLedger::external_work` per substep as applied
+nodal force plus gravity dotted with that REV's actual substep displacement,
+before any topology compaction. The fusion capture reads this engine ledger; it
+no longer reconstructs work from already-compacted post-step positions. Current
+release CPU result: external work `4.998999292e-4 J`, total energy residual
+`+6.141e-4 J`, or 1.228 times the measured work. This is an unclosed energy
+balance, not a conservation pass. The residual is written into per-frame CSV W
+rows and shown in GIF/MP4; capture acceptance checks topology, mass, momentum,
+composition and positive fusion heat, not energy closure. The solver's discrete
+contact/integration energy discrepancy remains a limitation requiring a future
+energy-consistent integrator/contact-work model.
+
+Added regressions for actual solver-triggered fusion, dwell reset on missing
+contact/cooling, and simultaneous thermal rules (bond formation prevents a
+pending fusion), plus an external-work ledger check. Full CPU test suite passes
+85/85. GIF and MP4 were regenerated from all 177 saved physical states; each is
+1120×700, 10 fps and 17.7 s.
+
+
+Before the contact heat correction, the follow-up diagnostic request was included in each saved `L` row; those measurements are historical and are superseded by the correction below. It recorded: cumulative
+contact restitution heat, contact friction heat, plastic heat, damage heat,
+fusion heat, and engine external work. Final channels are respectively
+`1.114864458e-3 J`, `0`, `0`, `0`, `2.094925452e-7 J`, and
+`4.998999292e-4 J`. At step 10, measured work is `4.998999294e-4 J`, residual
+is `4.947903454e-4 J`, and contact restitution heat is `9.955282255e-4 J`;
+these values point toward the contact/integration path as where the energy
+discrepancy appears, but do not isolate a single faulty operation. The new
+frame renderer shows the channels and residual.
+
+
+##### Contact impulse heat correction
+
+The diagnostic localized most of the earlier energy residual to normal impulses
+repeated on the persistent compressed contact: those impulses had been counted
+as impact heat each substep even though the incoming velocity was produced only
+by the current force/contact correction. `resolve_velocities_with_precontact`
+now tracks a separate physical velocity component that begins from the drift/tool
+velocity before the coupled load solve. Persistent-contact impulses remove
+heat only from that incoming component; new impacts still use the full resolved
+impact impulse, and pressure/dwell continues to use the complete normal impulse.
+A solver regression checks 20 loaded resting-contact steps with no accumulated
+impact heat, and the fracture-generated fragment collision regression still
+passes.
+
+Repeated release CPU capture: automatic fusion remains at step 12, with 177
+actual states over 17.6 s. Contact restitution heat is `5.181831960e-4 J`;
+friction/plastic/damage heat are zero; fusion heat is `2.094925452e-7 J`; engine
+external work is `4.998999292e-4 J`; residual is `+1.744532031e-5 J`, 3.49%
+of measured work and 35.2 times smaller than the earlier residual. The residual
+remains visible and is not called closed. GIF/MP4 were regenerated with these
+per-frame channels. Full CPU suite: 86/86.
+
+#### External-work quadrature follow-up
+
+The per-step D rows showed that the earlier mismatch began before fusion.
+Updated the engine ledger to follow the integrator: free/new-impact substeps use
+midpoint velocity from the start and load-integrated state before contact
+impulse; a persistent contact uses its constrained displacement. The free-body
+constant-load regression verifies external work against kinetic-energy change.
+The capture now gates `abs(energy_residual) / abs(external_work) <= 1e-5`.
+
+Final release CPU capture: 1,760 physical steps, 177 actual states over 17.6 s,
+automatic fusion at step 12, mass `0.016829997 kg`, Fe/Cu fractions
+`0.46761733/0.53238267`, momentum error `3.601e-8 kg*m/s`, external work
+`5.173444941e-4 J`, energy residual `7.553650965e-10 J` (`1.460e-6` of work),
+so the strict gate passes with about 6.8x margin. D rows show `1.88e-10 J` at
+step 1, a maximum about `7.86e-10 J` at step 4, then `7.55e-10 J` through
+fusion/end. Restitution heat is `5.181831960e-4 J`; friction, plastic and damage
+heat are zero; fusion heat is `2.094925452e-7 J`. GIF and MP4 each contain 177
+real frames at 1120x700 and 10 fps. CPU suite passes 86/86.
+
+#### World-bound elastic-energy ledger follow-up
+
+Closed the audit gap for intact bonds destroyed by boundary compaction. The
+engine measures constitutive strain energy with the bond's damage-adjusted
+stiffness before deleting topology and records it in
+`BoundaryRemovalLedger::elastic_bond_energy_j`; a stored bond is counted once
+even if both endpoints leave. Added tests for ordinary fixed-step removal and a
+strained bonded pair. The release CPU capture `world-bounds-ledger` ran 1,760
+steps and saved 177 real states over 17.6 s. Six free probes crossed all six
+faces, and an additional bonded pair crossed X+; all 8 REV were removed. The
+capture recorded elastic bond energy `8.673616492e-8 J`, pending release 0,
+mass error 0 and full total-energy residual `1.603e-13 J` against the
+mechanical-energy-scaled tolerance `1.158e-9 J`. The engine now includes retained
+plastic work in the boundary ledger, including plastic work on a broken bond
+whose rest topology is still present. `Scene::elastic_bond_energy_j()` and
+`Scene::stored_plastic_bond_energy_j()` expose the derived energy channels. The
+capture recorded stored plastic energy 0 J and pending release 0 J. GIF/MP4 each
+have 177 frames at 1120×700 and 10 fps; viewer `:8820` and selector `:8821`
+served the current run. Regressions check an intact two-bond chain and stored
+plastic work on a broken bond. More complex multi-bond accounting remains open.
+
+#### World-bound fixed-step regression
+
+Added and ran `fixed_step_removes_crossing_voxel_and_records_boundary_ledger`:
+a moving REV crosses configured bounds during `Scene::tick`, is removed at the
+fixed-step boundary, and its mass, internal/kinetic energy, and momentum are
+recorded. Targeted test and full CPU suite pass; 88/88 total tests.
+
+
+Final validation after the tighter ledger regression tolerance (`1e-5` relative):
+full CPU suite 88/88, release all-target check, fmt, renderer `py_compile`, JSON
+parse and `git diff --check` pass. The capture and media use 177 saved physical
+states; `world-bounds-ledger.gif` and `.mp4` decode to 177 frames each. Live
+viewer `:8820` and catalog selector `:8821` were checked by Agent 2.
+
+#### Stored plastic energy at boundary removal
+
+The boundary ledger now also records the unheated fraction of cumulative bond
+plastic work. `Scene::stored_plastic_bond_energy_j()` reports current retained
+plastic energy; removal transfers it when either endpoint leaves, including for
+a broken bond whose original endpoint remains indexed through `rest_neighbor`.
+Regressions cover intact multi-bond chains and a broken bond. `world-bounds-ledger`
+was rerun with the expanded energy total (internal, kinetic, elastic, stored
+plastic and pending release): stored plastic and pending release are both 0 J
+for this capture; total-energy residual remains `1.603e-13 J` against
+`1.158e-9 J` tolerance. CSV, GIF and MP4 include the new channel.
+
+Full CPU suite after this change: 89/89; release all-target check, formatter,
+renderer syntax, catalog JSON and `git diff --check` pass. CSV has 177 states and
+ledger rows (14 columns); GIF and MP4 each decode to 177 frames at 10 fps.
+Catalog selector `:8821` returns the updated CSV/GIF/MP4 with HTTP 200.

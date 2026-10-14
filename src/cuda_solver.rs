@@ -40,6 +40,10 @@ type LaunchKernel = unsafe extern "C" fn(
     *mut *mut c_void,
 ) -> Status;
 
+// RTX 5060 Laptop measurements: single-CTA wins through 8,192 REV;
+// multi-CTA wins starting at 16,384 REV.
+const SINGLE_CTA_REDUCTION_MAX_REVS: u32 = 8_192;
+
 struct Driver {
     _library: Library,
     init: Init,
@@ -59,8 +63,9 @@ struct CudaSolver {
     driver: Driver,
     context: Handle,
     module: Handle,
-    kernels: [Handle; 9],
+    kernels: [Handle; 11],
     buffers: HashMap<&'static str, (DevicePtr, usize)>,
+    cached_neighbors: Vec<[u32; 6]>,
 }
 
 static CUDA: OnceLock<Result<Mutex<CudaSolver>, String>> = OnceLock::new();
@@ -121,7 +126,7 @@ impl CudaSolver {
                     "cuModuleLoadData(PCG PTX) failed with CUDA status {status}"
                 ));
             }
-            let mut kernels = [0; 9];
+            let mut kernels = [0; 11];
             for (slot, name) in [
                 b"block_sparse_matvec\0".as_slice(),
                 b"block_jacobi\0".as_slice(),
@@ -132,6 +137,8 @@ impl CudaSolver {
                 b"dot_reduce_ratio\0".as_slice(),
                 b"scalar_ratio\0".as_slice(),
                 b"pcg_update_precondition\0".as_slice(),
+                b"dot_product_single\0".as_slice(),
+                b"dot_reduce_ratio_single\0".as_slice(),
             ]
             .into_iter()
             .enumerate()
@@ -153,6 +160,7 @@ impl CudaSolver {
                 module,
                 kernels,
                 buffers: HashMap::new(),
+                cached_neighbors: Vec::new(),
             })
         }
     }
@@ -218,27 +226,40 @@ impl CudaSolver {
         count: u32,
         output: DevicePtr,
     ) -> Result<(), String> {
-        let partial_count = count.div_ceil(256) as usize;
-        let partials = self.buffer("dot_partials", partial_count * 8)?;
+        if count > SINGLE_CTA_REDUCTION_MAX_REVS {
+            let partial_count = count.div_ceil(256);
+            let partials = self.buffer("dot_partials", partial_count as usize * 8)?;
+            let mut a = a;
+            let mut b = b;
+            let mut partials_arg = partials;
+            let mut count_arg = count;
+            let mut partial_params = [
+                (&mut a as *mut DevicePtr).cast(),
+                (&mut b as *mut DevicePtr).cast(),
+                (&mut partials_arg as *mut DevicePtr).cast(),
+                (&mut count_arg as *mut u32).cast(),
+            ];
+            self.launch(4, partial_count, &mut partial_params)?;
+            let mut output = output;
+            let mut partial_count_arg = partial_count;
+            let mut reduce_params = [
+                (&mut partials_arg as *mut DevicePtr).cast(),
+                (&mut output as *mut DevicePtr).cast(),
+                (&mut partial_count_arg as *mut u32).cast(),
+            ];
+            return self.launch(5, 1, &mut reduce_params);
+        }
         let mut a = a;
         let mut b = b;
-        let mut partials_arg = partials;
+        let mut output = output;
         let mut count = count;
         let mut params = [
             (&mut a as *mut DevicePtr).cast(),
             (&mut b as *mut DevicePtr).cast(),
-            (&mut partials_arg as *mut DevicePtr).cast(),
+            (&mut output as *mut DevicePtr).cast(),
             (&mut count as *mut u32).cast(),
         ];
-        self.launch(4, count.div_ceil(256), &mut params)?;
-        let mut output = output;
-        let mut partial_count_arg = partial_count as u32;
-        let mut reduce_params = [
-            (&mut partials_arg as *mut DevicePtr).cast(),
-            (&mut output as *mut DevicePtr).cast(),
-            (&mut partial_count_arg as *mut u32).cast(),
-        ];
-        self.launch(5, 1, &mut reduce_params)
+        self.launch(9, 1, &mut params)
     }
 
     fn launch_dot_ratio(
@@ -249,29 +270,44 @@ impl CudaSolver {
         numerator: DevicePtr,
         output: DevicePtr,
     ) -> Result<(), String> {
-        let partial_count = count.div_ceil(256) as usize;
-        let partials = self.buffer("dot_partials", partial_count * 8)?;
+        if count > SINGLE_CTA_REDUCTION_MAX_REVS {
+            let partial_count = count.div_ceil(256);
+            let partials = self.buffer("dot_partials", partial_count as usize * 8)?;
+            let mut a = a;
+            let mut b = b;
+            let mut partials_arg = partials;
+            let mut count_arg = count;
+            let mut partial_params = [
+                (&mut a as *mut DevicePtr).cast(),
+                (&mut b as *mut DevicePtr).cast(),
+                (&mut partials_arg as *mut DevicePtr).cast(),
+                (&mut count_arg as *mut u32).cast(),
+            ];
+            self.launch(4, partial_count, &mut partial_params)?;
+            let mut numerator = numerator;
+            let mut output = output;
+            let mut partial_count_arg = partial_count;
+            let mut reduce_params = [
+                (&mut partials_arg as *mut DevicePtr).cast(),
+                (&mut numerator as *mut DevicePtr).cast(),
+                (&mut output as *mut DevicePtr).cast(),
+                (&mut partial_count_arg as *mut u32).cast(),
+            ];
+            return self.launch(6, 1, &mut reduce_params);
+        }
         let mut a = a;
         let mut b = b;
-        let mut partials_arg = partials;
-        let mut count_arg = count;
-        let mut dot_params = [
-            (&mut a as *mut DevicePtr).cast(),
-            (&mut b as *mut DevicePtr).cast(),
-            (&mut partials_arg as *mut DevicePtr).cast(),
-            (&mut count_arg as *mut u32).cast(),
-        ];
-        self.launch(4, count.div_ceil(256), &mut dot_params)?;
         let mut numerator = numerator;
         let mut output = output;
-        let mut partial_count_arg = partial_count as u32;
-        let mut reduce_params = [
-            (&mut partials_arg as *mut DevicePtr).cast(),
+        let mut count_arg = count;
+        let mut params = [
+            (&mut a as *mut DevicePtr).cast(),
+            (&mut b as *mut DevicePtr).cast(),
             (&mut numerator as *mut DevicePtr).cast(),
             (&mut output as *mut DevicePtr).cast(),
-            (&mut partial_count_arg as *mut u32).cast(),
+            (&mut count_arg as *mut u32).cast(),
         ];
-        self.launch(6, 1, &mut reduce_params)
+        self.launch(10, 1, &mut params)
     }
 
     fn launch_ratio(
@@ -352,7 +388,22 @@ pub(crate) fn solve_pcg(
         unsafe { (cuda.driver.context_set_current)(cuda.context) },
         "cuCtxSetCurrent",
     )?;
-    let neighbor_ptr = cuda.upload("neighbors", neighbors)?;
+    // The packed adjacency is a pure function of the current topology and is
+    // shared by all corotational PCG solves until a bond breaks or a REV is
+    // removed. Compare the complete packed table so topology changes always
+    // refresh the device copy without relying on a lossy hash or an external
+    // invalidation flag.
+    let neighbor_ptr = if cuda.cached_neighbors == neighbors {
+        cuda.buffers
+            .get("neighbors")
+            .map(|(pointer, _)| *pointer)
+            .ok_or_else(|| "cached CUDA neighbors have no device buffer".to_string())?
+    } else {
+        let pointer = cuda.upload("neighbors", neighbors)?;
+        cuda.cached_neighbors.clear();
+        cuda.cached_neighbors.extend_from_slice(neighbors);
+        pointer
+    };
     let diagonal_ptr = cuda.upload("diagonal", diagonal)?;
     let block_ptr = cuda.upload("blocks", blocks)?;
     let inverse_ptr = cuda.upload("inverse", inverse_diagonal)?;
@@ -516,4 +567,59 @@ pub(crate) fn solve_pcg(
         .map(|v| Vec3::new(v[0], v[1], v[2]))
         .collect();
     Ok((correction, iterations, relative))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CudaSolver;
+
+    #[test]
+    fn cuda_adaptive_dot_and_ratio_match_cpu_when_explicitly_requested() {
+        if std::env::var_os("VOXEL_REQUIRE_CUDA_TEST").is_none() {
+            return;
+        }
+        let mut cuda = CudaSolver::initialize().expect("forced CUDA PTX module initialization");
+        super::check(
+            unsafe { (cuda.driver.context_set_current)(cuda.context) },
+            "cuCtxSetCurrent(test)",
+        )
+        .unwrap();
+        for count in [600u32, 16_385] {
+            let left: Vec<f32> = (0..count * 3)
+                .map(|i| (i % 97 + 1) as f32 * 0.03125)
+                .collect();
+            let right: Vec<f32> = (0..count * 3)
+                .map(|i| (i % 53 + 1) as f32 * 0.015625)
+                .collect();
+            let expected: f64 = left
+                .iter()
+                .zip(&right)
+                .map(|(&a, &b)| a as f64 * b as f64)
+                .sum();
+            let left_ptr = cuda.upload("test_left", &left).unwrap();
+            let right_ptr = cuda.upload("test_right", &right).unwrap();
+            let dot_ptr = cuda.buffer("test_dot", 8).unwrap();
+            cuda.launch_dot(left_ptr, right_ptr, count, dot_ptr)
+                .unwrap();
+            let mut dot = f64::NAN;
+            super::check(
+                unsafe { (cuda.driver.copy_dtoh)((&mut dot as *mut f64).cast(), dot_ptr, 8) },
+                "read test dot",
+            )
+            .unwrap();
+            assert!((dot - expected).abs() <= expected.abs().max(1.0) * 1e-12);
+
+            let rho = cuda.upload("test_rho", &[expected * 0.75]).unwrap();
+            let alpha_ptr = cuda.buffer("test_alpha", 4).unwrap();
+            cuda.launch_dot_ratio(left_ptr, right_ptr, count, rho, alpha_ptr)
+                .unwrap();
+            let mut alpha = f32::NAN;
+            super::check(
+                unsafe { (cuda.driver.copy_dtoh)((&mut alpha as *mut f32).cast(), alpha_ptr, 4) },
+                "read test alpha",
+            )
+            .unwrap();
+            assert!((alpha - 0.75).abs() <= 1e-6);
+        }
+    }
 }

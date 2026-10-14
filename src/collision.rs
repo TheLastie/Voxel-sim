@@ -1,7 +1,9 @@
 use crate::scene::{Scene, CELL};
 use glam::Vec3;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::FxHashMap;
 use std::time::Instant;
+
+const COLLISION_BIN_SCALE: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Contact {
@@ -14,13 +16,14 @@ pub struct Contact {
 
 #[derive(Default)]
 pub(crate) struct CollisionScratch {
-    bins: HashMap<[i32; 3], Vec<usize>>,
+    bins: FxHashMap<[i32; 3], Vec<usize>>,
     bin_pool: Vec<Vec<usize>>,
-    static_bins: HashMap<[i32; 3], Vec<usize>>,
+    static_bins: FxHashMap<[i32; 3], Vec<usize>>,
     static_indices: Vec<usize>,
     static_positions: Vec<Vec3>,
+    dynamic_lower_by_index: Vec<[i32; 3]>,
+    static_lower_by_index: Vec<[i32; 3]>,
     static_ready: bool,
-    unique: HashSet<u64>,
     pairs: Vec<(usize, usize)>,
     adjacency: Vec<[u32; 6]>,
 }
@@ -84,6 +87,15 @@ pub fn project(scene: &mut Scene, targets: &[[Option<f32>; 3]]) -> Vec<Contact> 
                     normal,
                     new_impact: (starts[j] - starts[i]).dot(normal) > CELL + 2e-6,
                 });
+                continue;
+            }
+            if let Some(normal) = touching_normal(scene.positions[i], scene.positions[j]) {
+                contacts.push(Contact {
+                    i,
+                    j,
+                    normal,
+                    new_impact: false,
+                });
             }
         }
         if !changed {
@@ -112,10 +124,26 @@ pub fn project(scene: &mut Scene, targets: &[[Option<f32>; 3]]) -> Vec<Contact> 
 
 /// Remove closing normal velocity after position projection. Restitution is
 /// applied once at the contact pair; separating motion is left unchanged.
-pub fn resolve_velocities(scene: &mut Scene, contacts: &[Contact], targets: &[[Option<f32>; 3]]) {
+pub fn resolve_velocities(
+    scene: &mut Scene,
+    contacts: &[Contact],
+    targets: &[[Option<f32>; 3]],
+) -> Vec<f32> {
+    let pre_contact_velocities: Vec<_> = scene.voxels.iter().map(|voxel| voxel.velocity).collect();
+    resolve_velocities_with_precontact(scene, contacts, targets, &pre_contact_velocities)
+}
+
+pub(crate) fn resolve_velocities_with_precontact(
+    scene: &mut Scene,
+    contacts: &[Contact],
+    targets: &[[Option<f32>; 3]],
+    pre_contact_velocities: &[Vec3],
+) -> Vec<f32> {
+    let mut normal_impulses = vec![0.0; contacts.len()];
+    let mut physical_velocities = pre_contact_velocities.to_vec();
     for iteration in 0..4 {
         let mut changed = false;
-        for c in contacts {
+        for (contact_index, c) in contacts.iter().enumerate() {
             let axis = normal_axis(c.normal);
             let wi = inverse_mass(scene, c.i, axis, targets);
             let wj = inverse_mass(scene, c.j, axis, targets);
@@ -134,11 +162,34 @@ pub fn resolve_velocities(scene: &mut Scene, contacts: &[Contact], targets: &[[O
                     0.0
                 };
                 normal_impulse = -(1.0 + restitution) * closing / denom;
+                normal_impulses[contact_index] += normal_impulse;
+                let physical_closing =
+                    (physical_velocities[c.j] - physical_velocities[c.i]).dot(c.normal);
+                let physical_impulse = if c.new_impact {
+                    normal_impulse
+                } else if physical_closing < -1e-6 {
+                    (-physical_closing / denom).min(normal_impulse)
+                } else {
+                    0.0
+                };
                 scene.voxels[c.i].velocity -= c.normal * (normal_impulse * wi);
                 scene.voxels[c.j].velocity += c.normal * (normal_impulse * wj);
-                let restitution_heat = (normal_impulse as f64 * -(closing as f64)
-                    - 0.5 * (normal_impulse as f64).powi(2) * denom as f64)
-                    .max(0.0);
+                // A persistent manifold can receive a solver impulse solely
+                // to balance this substep's applied load. Track only the
+                // incoming kinetic component that existed before that solve.
+                let heat_closing = if c.new_impact {
+                    closing
+                } else {
+                    physical_closing
+                };
+                let heat_impulse = physical_impulse;
+                let restitution_heat = if heat_closing < -1e-6 && heat_impulse > 0.0 {
+                    (heat_impulse as f64 * -(heat_closing as f64)
+                        - 0.5 * (heat_impulse as f64).powi(2) * denom as f64)
+                        .max(0.0)
+                } else {
+                    0.0
+                };
                 if restitution_heat > 0.0 {
                     let i_free = wi > 0.0;
                     let j_free = wj > 0.0;
@@ -152,6 +203,8 @@ pub fn resolve_velocities(scene: &mut Scene, contacts: &[Contact], targets: &[[O
                     }
                     scene.energy.contact_restitution_heat += restitution_heat;
                 }
+                physical_velocities[c.i] -= c.normal * (physical_impulse * wi);
+                physical_velocities[c.j] += c.normal * (physical_impulse * wj);
                 changed = true;
             }
 
@@ -232,6 +285,108 @@ pub fn resolve_velocities(scene: &mut Scene, contacts: &[Contact], targets: &[[O
             break;
         }
     }
+    normal_impulses
+}
+
+/// Apply a viscous shear impulse to contacting liquid-bearing REVs. The
+/// equal-and-opposite impulse conserves momentum; its exact kinetic loss is
+/// returned to the free endpoints as internal heat.
+pub(crate) fn resolve_liquid_viscosity(
+    scene: &mut Scene,
+    contacts: &[Contact],
+    targets: &[[Option<f32>; 3]],
+    elapsed_seconds: f32,
+) {
+    if elapsed_seconds <= 0.0 || !elapsed_seconds.is_finite() {
+        return;
+    }
+    for contact in contacts {
+        let i = contact.i;
+        let j = contact.j;
+        let phase_i = scene.properties[i]
+            .phase_state(scene.voxels[i].mass, scene.voxels[i].thermal_energy_f32());
+        let phase_j = scene.properties[j]
+            .phase_state(scene.voxels[j].mass, scene.voxels[j].thermal_energy_f32());
+        let liquid_i = phase_i.liquid_fraction.clamp(0.0, 1.0);
+        let liquid_j = phase_j.liquid_fraction.clamp(0.0, 1.0);
+        let viscosity = match (liquid_i > 0.0, liquid_j > 0.0) {
+            (true, true) => {
+                let mu_i =
+                    scene.properties[i].liquid_viscosity_at_temperature(phase_i.temperature_kelvin);
+                let mu_j =
+                    scene.properties[j].liquid_viscosity_at_temperature(phase_j.temperature_kelvin);
+                if mu_i <= 0.0 || mu_j <= 0.0 {
+                    continue;
+                }
+                (2.0 * mu_i * mu_j / (mu_i + mu_j)) * liquid_i.min(liquid_j)
+            }
+            (true, false) => {
+                scene.properties[i].liquid_viscosity_at_temperature(phase_i.temperature_kelvin)
+                    * liquid_i
+            }
+            (false, true) => {
+                scene.properties[j].liquid_viscosity_at_temperature(phase_j.temperature_kelvin)
+                    * liquid_j
+            }
+            (false, false) => continue,
+        };
+        let normal_axis = normal_axis(contact.normal);
+        let delta = scene.positions[j] - scene.positions[i];
+        let area = (0..3)
+            .filter(|&axis| axis != normal_axis)
+            .map(|axis| (CELL - delta[axis].abs()).clamp(0.0, CELL))
+            .product::<f32>();
+        if area <= 0.0 {
+            continue;
+        }
+        let separation = delta.dot(contact.normal).abs().max(CELL);
+        let relative = scene.voxels[j].velocity - scene.voxels[i].velocity;
+        let tangent = relative - contact.normal * relative.dot(contact.normal);
+        let tangent_speed = tangent.length();
+        if tangent_speed <= 1e-9 {
+            continue;
+        }
+        let mut direction = tangent / tangent_speed;
+        let response: [f32; 3] = std::array::from_fn(|axis| {
+            inverse_mass(scene, i, axis, targets) + inverse_mass(scene, j, axis, targets)
+        });
+        direction.x *= (response[0] > 0.0) as u8 as f32;
+        direction.y *= (response[1] > 0.0) as u8 as f32;
+        direction.z *= (response[2] > 0.0) as u8 as f32;
+        let responsive_speed = direction.length() * tangent_speed;
+        if responsive_speed <= 1e-9 {
+            continue;
+        }
+        direction = direction.normalize();
+        let inverse_effective_mass = (0..3)
+            .map(|axis| direction[axis].powi(2) * response[axis])
+            .sum::<f32>();
+        if inverse_effective_mass <= 0.0 {
+            continue;
+        }
+        let requested_impulse = viscosity * area / separation * elapsed_seconds * responsive_speed;
+        let impulse_magnitude = requested_impulse.min(responsive_speed / inverse_effective_mass);
+        let impulse = direction * impulse_magnitude;
+        for axis in 0..3 {
+            scene.voxels[i].velocity[axis] += impulse[axis] * inverse_mass(scene, i, axis, targets);
+            scene.voxels[j].velocity[axis] -= impulse[axis] * inverse_mass(scene, j, axis, targets);
+        }
+        let heat_j = (impulse_magnitude as f64 * responsive_speed as f64
+            - 0.5 * (impulse_magnitude as f64).powi(2) * inverse_effective_mass as f64)
+            .max(0.0);
+        if heat_j > 0.0 {
+            let i_free = (0..3).any(|axis| inverse_mass(scene, i, axis, targets) > 0.0);
+            let j_free = (0..3).any(|axis| inverse_mass(scene, j, axis, targets) > 0.0);
+            let receivers = i_free as u8 + j_free as u8;
+            if i_free {
+                scene.voxels[i].add_internal_energy_j(heat_j / receivers as f64);
+            }
+            if j_free {
+                scene.voxels[j].add_internal_energy_j(heat_j / receivers as f64);
+            }
+            scene.energy.liquid_viscous_heat += heat_j;
+        }
+    }
 }
 
 fn candidate_pairs(scene: &Scene, starts: &[Vec3], scratch: &mut CollisionScratch) {
@@ -240,10 +395,13 @@ fn candidate_pairs(scene: &Scene, starts: &[Vec3], scratch: &mut CollisionScratc
         ids.clear();
         scratch.bin_pool.push(ids);
     }
-    scratch.unique.clear();
     scratch.pairs.clear();
     let bins = &mut scratch.bins;
     let bin_pool = &mut scratch.bin_pool;
+    scratch
+        .dynamic_lower_by_index
+        .resize(scene.voxels.len(), [0; 3]);
+    scratch.dynamic_lower_by_index.fill([0; 3]);
     for i in 0..scene.voxels.len() {
         if scene.voxels[i].kinematic {
             continue;
@@ -251,6 +409,7 @@ fn candidate_pairs(scene: &Scene, starts: &[Vec3], scratch: &mut CollisionScratc
         let a = starts[i].min(scene.positions[i]) / CELL;
         let b = starts[i].max(scene.positions[i]) / CELL;
         let (lo, hi) = bin_bounds(a, b);
+        scratch.dynamic_lower_by_index[i] = lo;
         for z in lo[2]..=hi[2] {
             for y in lo[1]..=hi[1] {
                 for x in lo[0]..=hi[0] {
@@ -261,7 +420,7 @@ fn candidate_pairs(scene: &Scene, starts: &[Vec3], scratch: &mut CollisionScratc
             }
         }
     }
-    let unique = &mut scratch.unique;
+    let lower_by_index = &scratch.dynamic_lower_by_index;
     let pairs = &mut scratch.pairs;
     let static_bins = &scratch.static_bins;
     for (key, ids) in bins.iter() {
@@ -269,18 +428,35 @@ fn candidate_pairs(scene: &Scene, starts: &[Vec3], scratch: &mut CollisionScratc
             for b in (a + 1)..ids.len() {
                 let i = ids[a].min(ids[b]);
                 let j = ids[a].max(ids[b]);
-                let key = ((i as u64) << 32) | j as u64;
-                if unique.insert(key) {
+                let lo_i = lower_by_index[i];
+                let lo_j = lower_by_index[j];
+                let canonical = [
+                    lo_i[0].max(lo_j[0]),
+                    lo_i[1].max(lo_j[1]),
+                    lo_i[2].max(lo_j[2]),
+                ];
+                if *key == canonical {
                     pairs.push((i, j));
                 }
             }
         }
         if let Some(fixed_ids) = static_bins.get(key) {
-            for &i in ids {
-                for &j in fixed_ids {
-                    let (i, j) = (i.min(j), i.max(j));
-                    let pair_key = ((i as u64) << 32) | j as u64;
-                    if unique.insert(pair_key) {
+            for &dynamic_index in ids {
+                for &static_index in fixed_ids {
+                    let (i, j) = (
+                        dynamic_index.min(static_index),
+                        dynamic_index.max(static_index),
+                    );
+                    // Keep source arrays associated with voxel classes even
+                    // after sorting the emitted pair by scene index.
+                    let lo_i = lower_by_index[dynamic_index];
+                    let lo_j = scratch.static_lower_by_index[static_index];
+                    let canonical = [
+                        lo_i[0].max(lo_j[0]),
+                        lo_i[1].max(lo_j[1]),
+                        lo_i[2].max(lo_j[2]),
+                    ];
+                    if *key == canonical {
                         pairs.push((i, j));
                     }
                 }
@@ -291,10 +467,37 @@ fn candidate_pairs(scene: &Scene, starts: &[Vec3], scratch: &mut CollisionScratc
 }
 
 fn bin_bounds(a: Vec3, b: Vec3) -> ([i32; 3], [i32; 3]) {
-    let eps = 1e-5;
-    let lo = (a - Vec3::splat(0.5 - eps)).floor().as_ivec3();
-    let hi = (b + Vec3::splat(0.5 - eps)).floor().as_ivec3();
+    // Expand each swept voxel by the same micrometre-scale shell used to
+    // retain resting contacts after positional projection.
+    let margin = 2e-4;
+    let lo = ((a - Vec3::splat(0.5 + margin)) * COLLISION_BIN_SCALE)
+        .floor()
+        .as_ivec3();
+    let hi = ((b + Vec3::splat(0.5 + margin)) * COLLISION_BIN_SCALE)
+        .floor()
+        .as_ivec3();
     (lo.to_array(), hi.to_array())
+}
+
+fn touching_normal(a: Vec3, b: Vec3) -> Option<Vec3> {
+    const CONTACT_SLOP: f32 = 2.0e-6;
+    let delta = b - a;
+    let gaps = delta.abs() - Vec3::splat(CELL);
+    let axis = if gaps.x >= gaps.y && gaps.x >= gaps.z {
+        0
+    } else if gaps.y >= gaps.z {
+        1
+    } else {
+        2
+    };
+    if gaps[axis] > CONTACT_SLOP
+        || (0..3).any(|other| other != axis && gaps[other] >= -CONTACT_SLOP)
+    {
+        return None;
+    }
+    let mut normal = Vec3::ZERO;
+    normal[axis] = if delta[axis] >= 0.0 { 1.0 } else { -1.0 };
+    Some(normal)
 }
 
 fn ensure_static_bins(scene: &Scene, starts: &[Vec3], scratch: &mut CollisionScratch) {
@@ -321,6 +524,10 @@ fn ensure_static_bins(scene: &Scene, starts: &[Vec3], scratch: &mut CollisionScr
     scratch.static_bins.clear();
     scratch.static_indices.clear();
     scratch.static_positions.clear();
+    scratch
+        .static_lower_by_index
+        .resize(scene.voxels.len(), [0; 3]);
+    scratch.static_lower_by_index.fill([0; 3]);
     for (i, voxel) in scene.voxels.iter().enumerate() {
         if !voxel.kinematic {
             continue;
@@ -330,6 +537,7 @@ fn ensure_static_bins(scene: &Scene, starts: &[Vec3], scratch: &mut CollisionScr
         let a = starts[i].min(scene.positions[i]) / CELL;
         let b = starts[i].max(scene.positions[i]) / CELL;
         let (lo, hi) = bin_bounds(a, b);
+        scratch.static_lower_by_index[i] = lo;
         for z in lo[2]..=hi[2] {
             for y in lo[1]..=hi[1] {
                 for x in lo[0]..=hi[0] {
@@ -584,6 +792,111 @@ mod tests {
     }
 
     #[test]
+    fn broadphase_finds_far_contact_when_fixed_voxel_has_lower_index() {
+        let iron = crate::material::Material::component_id("iron").unwrap();
+        for fixed_is_first in [false, true] {
+            let low_cell = crate::scene::VoxelSpawn::at_cell([20, 0, 0], iron);
+            let high_cell = crate::scene::VoxelSpawn::at_cell([21, 0, 0], iron);
+            let spawns = if fixed_is_first {
+                vec![low_cell.fixed(), high_cell]
+            } else {
+                vec![low_cell, high_cell.fixed()]
+            };
+            let mut scene = Scene::from_voxels(
+                SceneConfig {
+                    gravity: [0.0; 3],
+                    ..SceneConfig::default()
+                },
+                spawns,
+            )
+            .unwrap();
+            // A broken bond makes this a true contact candidate rather than an
+            // intact local-continuum neighbor excluded from rigid-box collision.
+            scene.bonds[0][0].neighbor = crate::bond::EMPTY;
+            scene.workspace[0][0].rest_neighbor = crate::bond::EMPTY;
+
+            let contacts = project(&mut scene, &[]);
+            assert!(contacts
+                .iter()
+                .any(|contact| (contact.i, contact.j) == (0, 1)));
+        }
+    }
+
+    #[test]
+    fn swept_broadphase_emits_each_dynamic_pair_once() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [3, 1, 1];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        config.gravity = [0.0; 3];
+        let mut scene = Scene::new(config);
+        scene.bonds[0]
+            .iter_mut()
+            .for_each(|bond| bond.neighbor = EMPTY);
+        scene.previous.clone_from(&scene.positions);
+        scene.positions[2] += Vec3::X * (CELL * 4.0);
+        let starts = scene.previous.clone();
+        let mut scratch = CollisionScratch::default();
+
+        candidate_pairs(&scene, &starts, &mut scratch);
+
+        assert_eq!(scratch.pairs, vec![(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn swept_broadphase_emits_dynamic_static_pair_once() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [2, 1, 1];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        config.gravity = [0.0; 3];
+        let mut scene = Scene::new(config);
+        scene.bonds[0][0].neighbor = EMPTY;
+        scene.set_voxel_kinematic(1, true).unwrap();
+        scene.previous.clone_from(&scene.positions);
+        scene.positions[0].x += 3.0 * CELL;
+        let starts = scene.previous.clone();
+        let mut scratch = CollisionScratch::default();
+
+        candidate_pairs(&scene, &starts, &mut scratch);
+
+        assert_eq!(scratch.pairs, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn half_cell_bins_cover_overlapping_swept_bounds() {
+        let motions = [
+            (-1.25_f32, -1.25_f32),
+            (-0.51, -0.49),
+            (-0.25, 0.25),
+            (-0.001, 0.001),
+            (0.0, 0.0),
+            (0.49, 0.51),
+            (0.75, 1.25),
+            (1.49, 1.51),
+            (-2.0, 2.0),
+        ];
+        for &(a0, a1) in &motions {
+            for &(b0, b1) in &motions {
+                let a_min = a0.min(a1);
+                let a_max = a0.max(a1);
+                let b_min = b0.min(b1);
+                let b_max = b0.max(b1);
+                let geometrically_overlaps = a_min - 0.5 - 2e-4 <= b_max + 0.5 + 2e-4
+                    && b_min - 0.5 - 2e-4 <= a_max + 0.5 + 2e-4;
+                let (a_lo, a_hi) = bin_bounds(Vec3::splat(a_min), Vec3::splat(a_max));
+                let (b_lo, b_hi) = bin_bounds(Vec3::splat(b_min), Vec3::splat(b_max));
+                let bins_overlap =
+                    (0..3).all(|axis| a_lo[axis] <= b_hi[axis] && b_lo[axis] <= a_hi[axis]);
+                assert!(
+                    !geometrically_overlaps || bins_overlap,
+                    "swept bounds [{a_min}, {a_max}] and [{b_min}, {b_max}] overlap but bins {a_lo:?}..={a_hi:?} and {b_lo:?}..={b_hi:?} do not"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn sliding_contact_dissipates_tangent_energy_into_voxel_heat() {
         let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
         config.dimensions = [2, 1, 1];
@@ -622,6 +935,33 @@ mod tests {
             (internal_gain - total_contact_heat).abs() <= internal_storage_tolerance,
             "internal gain={internal_gain:.12e}, contact heat={total_contact_heat:.12e}, initial internal={internal_before:.12e}, tolerance={internal_storage_tolerance:.12e}"
         );
+    }
+
+    #[test]
+    fn resting_contact_under_compression_does_not_accumulate_impact_heat() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [2, 1, 1];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        config.gravity = [0.0; 3];
+        config.fixed_dt = 0.01;
+        config.substeps = 2;
+        config.iterations = 1;
+        config.corotation_iterations = 1;
+        config.fracture.friction = 0.0;
+        config.fracture.restitution = 0.0;
+        let mut scene = Scene::new(config);
+        scene.bonds[0][0].neighbor = EMPTY;
+        scene.voxels[0].velocity = Vec3::ZERO;
+        scene.voxels[1].velocity = Vec3::ZERO;
+        scene.workspace[0][0].rest_neighbor = EMPTY;
+        solver::set_force(&mut scene, 0, Vec3::X * 0.1).unwrap();
+        solver::set_force(&mut scene, 1, Vec3::NEG_X * 0.1).unwrap();
+        for _ in 0..20 {
+            solver::step(&mut scene, &mut None);
+        }
+        assert!((scene.positions[1] - scene.positions[0]).length() <= CELL + 2e-6);
+        assert_eq!(scene.energy.contact_restitution_heat, 0.0);
     }
 
     #[test]
@@ -715,6 +1055,180 @@ mod tests {
             scene.voxels[1].velocity
         );
         assert!((scene.voxels[1].velocity - scene.voxels[0].velocity).x >= -1e-4);
+    }
+
+    #[test]
+    fn touching_contact_persists_after_projection_slop() {
+        let iron = crate::material::Material::component_id("iron").unwrap();
+        let mut scene = crate::scene::SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .add_voxel(crate::scene::VoxelSpawn::at_cell([0, 0, 0], iron).fixed())
+            .add_voxel(crate::scene::VoxelSpawn::at_cell([1, 0, 0], iron))
+            .build()
+            .unwrap();
+        scene.release_voxel(0).unwrap();
+        scene.positions[1].x += 0.005;
+        scene.previous[1] = scene.positions[1];
+        scene.voxels[0].velocity = Vec3::X * 0.01;
+        scene.voxels[1].velocity = Vec3::NEG_X * 0.01;
+        scene.positions[0].x += 0.002503;
+        scene.positions[1].x -= 0.002503;
+        let targets = vec![[None; 3]; 2];
+
+        let impact = project(&mut scene, &targets);
+        assert_eq!(impact.len(), 1);
+        assert!(impact[0].new_impact);
+        resolve_velocities(&mut scene, &impact, &targets);
+        scene.previous.clone_from(&scene.positions);
+
+        let resting = project(&mut scene, &targets);
+        assert_eq!(resting.len(), 1);
+        assert!(!resting[0].new_impact);
+        assert!((scene.positions[1] - scene.positions[0]).length() <= CELL + 2e-6);
+    }
+
+    #[test]
+    fn liquid_contact_viscosity_conserves_momentum_and_converts_loss_to_heat() {
+        let water = crate::material::Material::component_id("water").unwrap();
+        let mut scene = crate::scene::SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .add_voxel(crate::scene::VoxelSpawn::at_cell([0, 0, 0], water))
+            .add_voxel(crate::scene::VoxelSpawn::at_cell([1, 0, 0], water))
+            .build()
+            .unwrap();
+        scene.set_material_dynamic_viscosity("water", 1.0).unwrap();
+        scene.voxels[0].velocity = Vec3::Y * 0.01;
+        scene.voxels[1].velocity = Vec3::NEG_Y * 0.01;
+        let targets = vec![[None; 3]; 2];
+        let contact = Contact {
+            i: 0,
+            j: 1,
+            normal: Vec3::X,
+            new_impact: false,
+        };
+        let momentum_before = scene.voxels[0].velocity * scene.voxels[0].mass
+            + scene.voxels[1].velocity * scene.voxels[1].mass;
+        let energy_before: f64 = scene
+            .voxels
+            .iter()
+            .map(|voxel| {
+                voxel.total_internal_energy_j()
+                    + 0.5 * voxel.mass as f64 * voxel.velocity.length_squared() as f64
+            })
+            .sum();
+        let relative_before = (scene.voxels[1].velocity - scene.voxels[0].velocity).length();
+
+        resolve_liquid_viscosity(&mut scene, &[contact], &targets, 0.01);
+
+        let momentum_after = scene.voxels[0].velocity * scene.voxels[0].mass
+            + scene.voxels[1].velocity * scene.voxels[1].mass;
+        let energy_after: f64 = scene
+            .voxels
+            .iter()
+            .map(|voxel| {
+                voxel.total_internal_energy_j()
+                    + 0.5 * voxel.mass as f64 * voxel.velocity.length_squared() as f64
+            })
+            .sum();
+        let relative_after = (scene.voxels[1].velocity - scene.voxels[0].velocity).length();
+        assert!(relative_after < relative_before);
+        assert!((momentum_after - momentum_before).length() < 1e-10);
+        assert!((energy_after - energy_before).abs() < 1e-12);
+        assert!(scene
+            .voxels
+            .iter()
+            .any(|voxel| voxel.internal_energy_remainder_j > 0.0));
+        assert!(scene.energy.liquid_viscous_heat > 0.0);
+    }
+
+    #[test]
+    fn warmer_liquid_contact_uses_lower_arrhenius_viscosity() {
+        let water = crate::material::Material::component_id("water").unwrap();
+        let heat_for_temperature = |temperature_kelvin| {
+            let mut scene = crate::scene::SceneBuilder::standard()
+                .with_gravity(Vec3::ZERO)
+                .add_voxel(
+                    crate::scene::VoxelSpawn::at_cell([0, 0, 0], water)
+                        .with_velocity(Vec3::Y * 0.01)
+                        .at_temperature(temperature_kelvin),
+                )
+                .add_voxel(
+                    crate::scene::VoxelSpawn::at_cell([1, 0, 0], water)
+                        .with_velocity(Vec3::NEG_Y * 0.01)
+                        .at_temperature(temperature_kelvin),
+                )
+                .build()
+                .unwrap();
+            scene
+                .set_material_viscosity_temperature_model("water", 293.15, 17_000.0)
+                .unwrap();
+            let contact = Contact {
+                i: 0,
+                j: 1,
+                normal: Vec3::X,
+                new_impact: false,
+            };
+            resolve_liquid_viscosity(&mut scene, &[contact], &[[None; 3]; 2], 0.01);
+            scene.energy.liquid_viscous_heat
+        };
+
+        let cool_heat = heat_for_temperature(293.15);
+        let warm_heat = heat_for_temperature(333.15);
+        assert!(cool_heat > 0.0);
+        assert!(warm_heat > 0.0 && warm_heat < cool_heat);
+    }
+
+    #[test]
+    fn liquid_viscosity_transmits_shear_to_a_solid_contact_neighbor() {
+        let water = crate::material::Material::component_id("water").unwrap();
+        let iron = crate::material::Material::component_id("iron").unwrap();
+        let mut scene = crate::scene::SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .add_voxel(
+                crate::scene::VoxelSpawn::at_cell([0, 0, 0], water)
+                    .with_velocity(Vec3::Y * 0.01)
+                    .at_temperature(293.15),
+            )
+            .add_voxel(crate::scene::VoxelSpawn::at_cell([1, 0, 0], iron).at_temperature(293.15))
+            .build()
+            .unwrap();
+        scene.set_material_dynamic_viscosity("water", 1.0).unwrap();
+        scene.bonds[0][0].neighbor = crate::bond::EMPTY;
+        scene.workspace[0][0].rest_neighbor = crate::bond::EMPTY;
+        let contact = Contact {
+            i: 0,
+            j: 1,
+            normal: Vec3::X,
+            new_impact: false,
+        };
+        let momentum_before = scene.voxels[0].velocity * scene.voxels[0].mass
+            + scene.voxels[1].velocity * scene.voxels[1].mass;
+        let energy_before: f64 = scene
+            .voxels
+            .iter()
+            .map(|voxel| {
+                voxel.total_internal_energy_j()
+                    + 0.5 * voxel.mass as f64 * voxel.velocity.length_squared() as f64
+            })
+            .sum();
+
+        resolve_liquid_viscosity(&mut scene, &[contact], &[[None; 3]; 2], 0.01);
+
+        let momentum_after = scene.voxels[0].velocity * scene.voxels[0].mass
+            + scene.voxels[1].velocity * scene.voxels[1].mass;
+        let energy_after: f64 = scene
+            .voxels
+            .iter()
+            .map(|voxel| {
+                voxel.total_internal_energy_j()
+                    + 0.5 * voxel.mass as f64 * voxel.velocity.length_squared() as f64
+            })
+            .sum();
+        assert!(scene.voxels[0].velocity.y < 0.01);
+        assert!(scene.voxels[1].velocity.y > 0.0);
+        assert!((momentum_after - momentum_before).length() < 1e-10);
+        assert!((energy_after - energy_before).abs() < 1e-12);
+        assert!(scene.energy.liquid_viscous_heat > 0.0);
     }
 
     #[test]
