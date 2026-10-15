@@ -309,7 +309,7 @@ separately; this update does not establish real-time performance or a complete c
 The current GIF records 22 evenly spaced states from a 210-step solver run:
 
 ![Latest solver capture](validation/live-support.gif)
-
+![Latest solver capture](validation/axe-along-and-across.gif)
 The run covers 0.21 seconds of simulated time and 2.2 seconds of video at 10 FPS.
 It took 39.1 seconds of solver wall time, kept guide drift at zero, and ended
 with zero broken bonds. It exercises the solver with heat transfer enabled at
