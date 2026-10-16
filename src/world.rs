@@ -31,6 +31,7 @@ pub enum GeneratedCellContent {
     Mushroom,
     Bolete,
     Puffball,
+    Mycelium,
 }
 
 impl GeneratedCellContent {
@@ -38,7 +39,7 @@ impl GeneratedCellContent {
         match self {
             Self::OakWood | Self::BirchWood | Self::AcaciaWood => 0,
             Self::OakFoliage | Self::BirchFoliage | Self::AcaciaFoliage => 1,
-            Self::Mushroom | Self::Bolete | Self::Puffball => 2,
+            Self::Mushroom | Self::Bolete | Self::Puffball | Self::Mycelium => 2,
             Self::Fern | Self::Wildflower => 3,
             Self::Grass => 4,
             Self::Terrain => 5,
@@ -74,6 +75,8 @@ pub struct GeneratedWorld {
     terrain_voxels: Vec<TerrainVoxel>,
     plants: Vec<Plant>,
     plant_branches: Vec<Vec<BranchSegment>>,
+    mycelium_segments: Vec<MyceliumSegment>,
+    mycelium_buckets: Vec<Vec<usize>>,
     seed_hash: u64,
     pub age_years: f32,
     geometry_age_years: f32,
@@ -109,6 +112,13 @@ struct BranchSegment {
     end: Vec3,
     radius_m: f32,
     is_root: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MyceliumSegment {
+    start: Vec3,
+    end: Vec3,
+    radius_m: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -181,6 +191,8 @@ impl GeneratedWorld {
             terrain_voxels,
             plants: make_plants(seed_hash),
             plant_branches: Vec::new(),
+            mycelium_segments: Vec::new(),
+            mycelium_buckets: vec![Vec::new(); 25 * 25],
             seed_hash,
             age_years: 8.0,
             geometry_age_years: 8.0,
@@ -240,18 +252,20 @@ impl GeneratedWorld {
         let point = Vec3::new(x_m - WORLD_SIDE_M * 0.5, y_m - WORLD_SIDE_M * 0.5, z_m);
         let vegetation = if z_m <= terrain_height_m {
             self.root_content_at_point(point)
+                .or_else(|| self.mycelium_content_at_point(point))
         } else {
             self.vegetation_at_point(cell, point)
         };
-        let wood_in_soil = matches!(
+        let generated_soil_content = matches!(
             vegetation,
             Some(
                 GeneratedCellContent::OakWood
                     | GeneratedCellContent::BirchWood
                     | GeneratedCellContent::AcaciaWood
+                    | GeneratedCellContent::Mycelium
             )
         );
-        let content = if z_m <= terrain_height_m && !wood_in_soil {
+        let content = if z_m <= terrain_height_m && !generated_soil_content {
             GeneratedCellContent::Terrain
         } else {
             vegetation.unwrap_or(GeneratedCellContent::Air)
@@ -340,6 +354,34 @@ impl GeneratedWorld {
             .min_by_key(|content| content.priority())
     }
 
+    fn mycelium_content_at_point(&self, point: Vec3) -> Option<GeneratedCellContent> {
+        let gx = ((point.x + 4.8) / 0.4).floor() as i32;
+        let gy = ((point.y + 4.8) / 0.4).floor() as i32;
+        if !(0..25).contains(&gx) || !(0..25).contains(&gy) {
+            return None;
+        }
+        let bucket = (gy as usize) * 25 + gx as usize;
+        for &index in &self.mycelium_buckets[bucket] {
+            let segment = self.mycelium_segments[index];
+            if point.z < segment.start.z.min(segment.end.z) - segment.radius_m
+                || point.z > segment.start.z.max(segment.end.z) + segment.radius_m
+            {
+                continue;
+            }
+            let delta = segment.end - segment.start;
+            let length_squared = delta.length_squared();
+            if length_squared <= f32::EPSILON {
+                continue;
+            }
+            let along = ((point - segment.start).dot(delta) / length_squared).clamp(0.0, 1.0);
+            let closest = segment.start + delta * along;
+            if point.distance_squared(closest) <= segment.radius_m.powi(2) {
+                return Some(GeneratedCellContent::Mycelium);
+            }
+        }
+        None
+    }
+
     fn season_phase(&self) -> f32 {
         (self.geometry_age_years + self.season_phase_offset).fract()
     }
@@ -354,6 +396,11 @@ impl GeneratedWorld {
             .iter()
             .map(|plant| plant.branch_segments(self.geometry_age_years, self.seed_hash))
             .collect();
+        (self.mycelium_segments, self.mycelium_buckets) = make_mycelium(
+            self.seed_hash,
+            self.geometry_age_years,
+            &self.plants,
+        );
         self.voxels.clone_from(&self.terrain_voxels);
         let mut candidates = make_ground_flora(
             self.seed_hash,
@@ -740,6 +787,112 @@ fn fungus_form(
         _ => return None,
     };
     Some(form)
+}
+
+fn make_mycelium(
+    seed: u64,
+    age_years: f32,
+    plants: &[Plant],
+) -> (Vec<MyceliumSegment>, Vec<Vec<usize>>) {
+    const SITE_SIDE: usize = 25;
+    let mut segments = Vec::new();
+    let mut buckets = vec![Vec::new(); SITE_SIDE * SITE_SIDE];
+    if age_years < 1.0 {
+        return (segments, buckets);
+    }
+
+    let colony_growth = ((age_years - 1.0) / 40.0).clamp(0.0, 1.0);
+    for gy in 0..SITE_SIDE {
+        for gx in 0..SITE_SIDE {
+            let x = -4.8 + gx as f32 * 0.4;
+            let y = -4.8 + gy as f32 * 0.4;
+            let nx = (x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M;
+            let ny = (y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M;
+            let (moisture, fertility) = ecology_at(seed, nx, ny);
+            let site_hash = lattice_hash(seed ^ 0xDB4F_0B91_75AE_2165, gx as i32, gy as i32);
+            if site_hash % 13 != 0 || moisture < 0.58 {
+                continue;
+            }
+            let has_tree_host = plants.iter().any(|plant| {
+                matches!(plant.species, TreeSpecies::Oak | TreeSpecies::Birch)
+                    && (plant.x - x).powi(2) + (plant.y - y).powi(2) <= 2.5_f32.powi(2)
+            });
+            if !has_tree_host && fertility < 0.48 {
+                continue;
+            }
+
+            let arm_count = 4 + ((site_hash >> 12) % 4) as usize;
+            let spread = (0.12 + colony_growth * 0.72)
+                * (0.65 + moisture * 0.5)
+                * if has_tree_host { 1.12 } else { 1.0 };
+            let soil_z = terrain_height(seed, nx, ny) - 0.06;
+            let center = Vec3::new(x, y, soil_z);
+            let radius = 0.012 + moisture * 0.006;
+
+            for arm in 0..arm_count {
+                let arm_hash = lattice_hash(site_hash ^ 0xA24B_AED4_963E_E407, arm as i32, gy as i32 - gx as i32);
+                let angle = std::f32::consts::TAU * arm as f32 / arm_count as f32
+                    + unit_noise(arm_hash) * 0.30;
+                let direction = Vec3::new(angle.cos(), angle.sin(), 0.0);
+                let length = spread * (0.45 + (unit_noise(arm_hash.rotate_left(17)) + 1.0) * 0.275);
+                let depth = 0.04 + colony_growth * 0.12
+                    + (unit_noise(arm_hash.rotate_left(31)).abs() * 0.04);
+                let shoulder = center + direction * (length * 0.52) - Vec3::Z * (depth * 0.36);
+                let tip = center + direction * length - Vec3::Z * depth;
+                insert_mycelium_segment(
+                    MyceliumSegment { start: center, end: shoulder, radius_m: radius },
+                    &mut segments,
+                    &mut buckets,
+                );
+                insert_mycelium_segment(
+                    MyceliumSegment {
+                        start: shoulder,
+                        end: tip,
+                        radius_m: radius * 0.78,
+                    },
+                    &mut segments,
+                    &mut buckets,
+                );
+
+                let side_angle = angle + if arm % 2 == 0 { 0.82 } else { -0.82 };
+                let side_direction = Vec3::new(side_angle.cos(), side_angle.sin(), 0.0);
+                let side_tip = shoulder
+                    + side_direction * (length * 0.34)
+                    - Vec3::Z * (depth * 0.30);
+                insert_mycelium_segment(
+                    MyceliumSegment {
+                        start: shoulder,
+                        end: side_tip,
+                        radius_m: radius * 0.62,
+                    },
+                    &mut segments,
+                    &mut buckets,
+                );
+            }
+        }
+    }
+    (segments, buckets)
+}
+
+fn insert_mycelium_segment(
+    segment: MyceliumSegment,
+    segments: &mut Vec<MyceliumSegment>,
+    buckets: &mut [Vec<usize>],
+) {
+    let segment_index = segments.len();
+    segments.push(segment);
+    let min_x = (((segment.start.x.min(segment.end.x) - segment.radius_m + 4.8) / 0.4).floor()) as i32;
+    let max_x = (((segment.start.x.max(segment.end.x) + segment.radius_m + 4.8) / 0.4).floor()) as i32;
+    let min_y = (((segment.start.y.min(segment.end.y) - segment.radius_m + 4.8) / 0.4).floor()) as i32;
+    let max_y = (((segment.start.y.max(segment.end.y) + segment.radius_m + 4.8) / 0.4).floor()) as i32;
+    if max_x < 0 || max_y < 0 || min_x >= 25 || min_y >= 25 {
+        return;
+    }
+    for gy in min_y.max(0)..=max_y.min(24) {
+        for gx in min_x.max(0)..=max_x.min(24) {
+            buckets[gy as usize * 25 + gx as usize].push(segment_index);
+        }
+    }
 }
 
 impl Plant {
