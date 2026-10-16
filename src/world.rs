@@ -849,21 +849,24 @@ fn make_plants(seed: u64) -> Vec<Plant> {
     [(-2.7, -1.7), (0.2, 0.8), (2.8, -1.2)]
         .into_iter()
         .enumerate()
-        .map(|(index, (x, y))| {
+        .map(|(index, (anchor_x, anchor_y))| {
+            let site_hash = lattice_hash(
+                seed ^ 0xA24B_AED4_963E_E407,
+                index as i32,
+                0x5452_4545,
+            );
+            let x = anchor_x + unit_noise(site_hash) * 0.55;
+            let y = anchor_y + unit_noise(site_hash.rotate_left(29)) * 0.55;
             let nx = (x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M;
             let ny = (y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M;
-            let moisture = (0.52
-                + value_noise(seed ^ 0x8EBC_6AF0_9C88_C6E3, nx / 28.0, ny / 28.0) * 0.34)
-                .clamp(0.0, 1.0);
-            let temperature = (0.52
-                + value_noise(seed ^ 0x5899_65CC_7537_4CC3, nx / 31.0, ny / 31.0) * 0.38)
-                .clamp(0.0, 1.0);
-            let fertility = (0.58
-                + value_noise(seed ^ index as u64, nx / 20.0, ny / 20.0) * 0.28)
-                .clamp(0.1, 1.0);
-            let species = if temperature > 0.69 && moisture < 0.43 {
+            let soil_z = terrain_height(seed, nx, ny);
+            let (moisture, fertility) = ecology_at(seed, nx, ny);
+            let temperature_kelvin = climate_temperature(seed, nx, ny, soil_z);
+            let climate_index =
+                (0.52 + (temperature_kelvin - 288.15) * (0.38 / 11.4)).clamp(0.0, 1.0);
+            let species = if climate_index > 0.69 && moisture < 0.43 {
                 TreeSpecies::Acacia
-            } else if temperature < 0.35 || moisture > 0.78 {
+            } else if climate_index < 0.35 || moisture > 0.78 {
                 TreeSpecies::Birch
             } else {
                 TreeSpecies::Oak
@@ -871,7 +874,7 @@ fn make_plants(seed: u64) -> Vec<Plant> {
             Plant {
                 x,
                 y,
-                soil_z: terrain_height(seed, nx, ny),
+                soil_z,
                 moisture,
                 fertility,
                 species,
