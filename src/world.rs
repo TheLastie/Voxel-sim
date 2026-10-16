@@ -88,6 +88,7 @@ struct Plant {
     soil_z: f32,
     moisture: f32,
     fertility: f32,
+    temperature_kelvin: f32,
     species: TreeSpecies,
 }
 
@@ -716,8 +717,33 @@ fn fungus_form(
 }
 
 impl Plant {
+    /// Deterministic individual growth response from the seed and local habitat.
+    /// This affects generated shape only, not physical material state.
+    fn growth_vigor(self, seed: u64) -> f32 {
+        let (moisture_optimum, temperature_optimum) = match self.species {
+            TreeSpecies::Oak => (0.62, 289.0),
+            TreeSpecies::Birch => (0.68, 284.0),
+            TreeSpecies::Acacia => (0.30, 295.0),
+        };
+        let moisture_fit =
+            (1.0 - ((self.moisture - moisture_optimum) / 0.42).abs()).clamp(0.25, 1.0);
+        let temperature_fit =
+            (1.0 - ((self.temperature_kelvin - temperature_optimum) / 10.0).abs())
+                .clamp(0.25, 1.0);
+        let site_fit = 0.50
+            + self.fertility.clamp(0.0, 1.0) * 0.25
+            + moisture_fit * 0.15
+            + temperature_fit * 0.10;
+        let plant_x = ((self.x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M).round() as i32;
+        let plant_y = ((self.y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M).round() as i32;
+        let individual_hash = lattice_hash(seed ^ 0x94D0_49BB_1331_11EB, plant_x, plant_y);
+        let individual_variation = 0.90 + (unit_noise(individual_hash) + 1.0) * 0.10;
+        (0.85 + site_fit * 0.25) * individual_variation
+    }
+
     fn branch_segments(self, age_years: f32, seed: u64) -> Vec<BranchSegment> {
         let maturity = 0.08 + 0.92 * (age_years / 100.0).clamp(0.0, 1.0).powf(0.72);
+        let vigor = self.growth_vigor(seed);
         let (max_height, trunk_radius_factor, crown_radius, tiers, branches_per_tier, slope, width) =
             match self.species {
                 TreeSpecies::Oak => (
@@ -748,9 +774,9 @@ impl Plant {
                     0.42,
                 ),
             };
-        let height = max_height * maturity;
+        let height = max_height * maturity * vigor;
         let trunk_height = height * 0.76;
-        let trunk_radius = trunk_radius_factor * maturity;
+        let trunk_radius = trunk_radius_factor * maturity * vigor;
         let plant_x = ((self.x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M).round() as i32;
         let plant_y = ((self.y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M).round() as i32;
         let phase_hash = lattice_hash(seed ^ 0x7F4A_7C15_9E37_79B9, plant_x, plant_y);
@@ -772,7 +798,7 @@ impl Plant {
                     + std::f32::consts::TAU * branch as f32 / branches_per_tier as f32
                     + jitter;
                 let length_scale = 0.62 + unit_noise(hash ^ 0xD6E8_FEB8_6659_FD93) * 0.24;
-                let length_m = crown_radius * maturity * length_scale;
+                let length_m = crown_radius * maturity * vigor * length_scale;
                 let start = Vec3::new(self.x, self.y, start_z);
                 let horizontal = Vec3::new(angle.cos(), angle.sin(), 0.0);
                 let end = start + horizontal * length_m + Vec3::Z * (length_m * slope);
@@ -813,6 +839,7 @@ impl Plant {
     ) -> Option<GeneratedCellContent> {
         let growth = (age_years / 100.0).clamp(0.0, 1.0);
         let maturity = 0.08 + 0.92 * growth.powf(0.72);
+        let vigor = self.growth_vigor(seed);
         let (max_height, radius_base, crown_shape, crown_z_fraction) = match self.species {
             TreeSpecies::Oak => (
                 7.0 * (0.82 + self.fertility * 0.36) * (0.90 + self.moisture * 0.20),
@@ -833,9 +860,9 @@ impl Plant {
                 0.90,
             ),
         };
-        let height = max_height * maturity;
+        let height = max_height * maturity * vigor;
         let trunk_height = height * 0.76;
-        let trunk_radius = radius_base * maturity;
+        let trunk_radius = radius_base * maturity * vigor;
         let local_z = point.z - self.soil_z;
         let local_x = point.x - self.x;
         let local_y = point.y - self.y;
@@ -861,7 +888,7 @@ impl Plant {
         }
 
         let crown_center_z = self.soil_z + height * crown_z_fraction;
-        let radii = crown_shape * maturity;
+        let radii = crown_shape * (maturity * vigor);
         let normalized = Vec3::new(
             local_x / radii.x,
             local_y / radii.y,
@@ -886,6 +913,7 @@ impl Plant {
     ) -> Vec<TerrainVoxel> {
         let growth = (age_years / 100.0).clamp(0.0, 1.0);
         let maturity = 0.08 + 0.92 * growth.powf(0.72);
+        let vigor = self.growth_vigor(seed);
         let (max_height, trunk_radius, crown_shape, bark_color, leaf_color) = match self.species {
             TreeSpecies::Oak => (
                 7.0 * (0.82 + self.fertility * 0.36) * (0.90 + self.moisture * 0.20),
@@ -909,8 +937,9 @@ impl Plant {
                 [0.30, 0.43, 0.15, 1.0],
             ),
         };
-        let height = max_height * maturity;
+        let height = max_height * maturity * vigor;
         let trunk_height = height * 0.76;
+        let trunk_radius = trunk_radius * vigor;
         let trunk_cells = (trunk_height / WORLD_CELL_M).ceil() as i32;
         let max_radius_cells = (trunk_radius / WORLD_CELL_M).ceil().max(1.0) as i32;
         let mut result = Vec::new();
@@ -987,7 +1016,7 @@ impl Plant {
             }
         }
 
-        let crown_scale = maturity;
+        let crown_scale = maturity * vigor;
         let crown_center = Vec3::new(
             self.x,
             self.y,
@@ -1055,6 +1084,7 @@ fn make_plants(seed: u64) -> Vec<Plant> {
                 soil_z,
                 moisture,
                 fertility,
+                temperature_kelvin,
                 species,
             });
         }
