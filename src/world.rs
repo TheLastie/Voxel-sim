@@ -1,8 +1,38 @@
+use std::collections::HashMap;
+
 use glam::Vec3;
 
 pub const WORLD_SIDE_M: f32 = 10.0;
 pub const WORLD_CELL_M: f32 = 0.1;
 pub const WORLD_SIDE_CELLS: usize = (WORLD_SIDE_M / WORLD_CELL_M) as usize;
+/// Resolution of the generated REV lattice. This is a description grid; it is
+/// not a claim that every generated cell is currently simulated by the solver.
+pub const WORLD_REV_M: f32 = 0.01;
+pub const WORLD_REV_SIDE: i32 = (WORLD_SIDE_M / WORLD_REV_M) as i32;
+pub const MAX_WORLD_SAMPLE_CELLS: usize = 65_536;
+const VEGETATION_BIN_M: f32 = WORLD_CELL_M;
+const WORLD_SAMPLE_HEIGHT_M: f32 = 16.0;
+const WORLD_SAMPLE_HEIGHT_CELLS: i32 = (WORLD_SAMPLE_HEIGHT_M / WORLD_REV_M) as i32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeneratedCellContent {
+    Air,
+    Terrain,
+    Vegetation,
+}
+
+/// Seed-derived state at one 1 cm world coordinate. This describes generated
+/// content and ecology; physical mass, energy, and material response are added
+/// when this representation is connected to the engine's `Voxel` state.
+#[derive(Clone, Copy, Debug)]
+pub struct GeneratedCell {
+    pub cell: [i32; 3],
+    pub content: GeneratedCellContent,
+    pub terrain_height_m: f32,
+    pub soil_moisture: f32,
+    pub fertility: f32,
+    pub temperature_kelvin: f32,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct TerrainVoxel {
@@ -15,6 +45,7 @@ pub struct TerrainVoxel {
 pub struct GeneratedWorld {
     pub voxels: Vec<TerrainVoxel>,
     terrain_voxels: Vec<TerrainVoxel>,
+    vegetation_bins: HashMap<[i32; 3], Vec<usize>>,
     plants: Vec<Plant>,
     seed_hash: u64,
     pub age_years: f32,
@@ -71,6 +102,7 @@ impl GeneratedWorld {
         let mut world = Self {
             voxels: Vec::new(),
             terrain_voxels,
+            vegetation_bins: HashMap::new(),
             plants: make_plants(seed_hash),
             seed_hash,
             age_years: 8.0,
@@ -104,6 +136,96 @@ impl GeneratedWorld {
         format!("OAK {oak} BIRCH {birch} ACACIA {acacia}")
     }
 
+    /// Sample one cell on the deterministic 1 cm lattice. Coordinates start
+    /// at the south-west world corner; valid horizontal indices are 0..1000,
+    /// and the vertical sample domain is 0..1600. Cells represent the current
+    /// generated geometry, not dynamic solver state.
+    pub fn sample_cell(&self, cell: [i32; 3]) -> Option<GeneratedCell> {
+        let [x, y, z] = cell;
+        if !(0..WORLD_REV_SIDE).contains(&x)
+            || !(0..WORLD_REV_SIDE).contains(&y)
+            || !(0..WORLD_SAMPLE_HEIGHT_CELLS).contains(&z)
+        {
+            return None;
+        }
+
+        let x_m = (x as f32 + 0.5) * WORLD_REV_M;
+        let y_m = (y as f32 + 0.5) * WORLD_REV_M;
+        let z_m = (z as f32 + 0.5) * WORLD_REV_M;
+        let field_x = x_m / WORLD_CELL_M;
+        let field_y = y_m / WORLD_CELL_M;
+        let terrain_height_m = terrain_height(self.seed_hash, field_x, field_y);
+        let (soil_moisture, fertility) = ecology_at(self.seed_hash, field_x, field_y);
+        let temperature_kelvin = climate_temperature(self.seed_hash, field_x, field_y, z_m);
+
+        let content = if z_m <= terrain_height_m {
+            GeneratedCellContent::Terrain
+        } else if self.vegetation_at_cell(cell, [x_m - WORLD_SIDE_M * 0.5, y_m - WORLD_SIDE_M * 0.5, z_m]) {
+            GeneratedCellContent::Vegetation
+        } else {
+            GeneratedCellContent::Air
+        };
+
+        Some(GeneratedCell {
+            cell,
+            content,
+            terrain_height_m,
+            soil_moisture,
+            fertility,
+            temperature_kelvin,
+        })
+    }
+
+    /// Sample a half-open integer-cell region, subject to a hard work limit.
+    /// A request larger than `MAX_WORLD_SAMPLE_CELLS` returns `None` instead
+    /// of allocating or iterating an unexpectedly large fraction of the world.
+    pub fn sample_region(
+        &self,
+        min_cell: [i32; 3],
+        max_cell_exclusive: [i32; 3],
+    ) -> Option<Vec<GeneratedCell>> {
+        let extent = [
+            max_cell_exclusive[0].checked_sub(min_cell[0])?,
+            max_cell_exclusive[1].checked_sub(min_cell[1])?,
+            max_cell_exclusive[2].checked_sub(min_cell[2])?,
+        ];
+        if extent.iter().any(|&n| n <= 0) {
+            return None;
+        }
+        let count = extent
+            .into_iter()
+            .try_fold(1usize, |total, n| total.checked_mul(n as usize))?;
+        if count > MAX_WORLD_SAMPLE_CELLS {
+            return None;
+        }
+
+        let mut cells = Vec::with_capacity(count);
+        for z in min_cell[2]..max_cell_exclusive[2] {
+            for y in min_cell[1]..max_cell_exclusive[1] {
+                for x in min_cell[0]..max_cell_exclusive[0] {
+                    cells.push(self.sample_cell([x, y, z])?);
+                }
+            }
+        }
+        Some(cells)
+    }
+
+    fn vegetation_at_cell(&self, cell: [i32; 3], center: [f32; 3]) -> bool {
+        let bin = [
+            cell[0] / (WORLD_CELL_M / WORLD_REV_M) as i32,
+            cell[1] / (WORLD_CELL_M / WORLD_REV_M) as i32,
+            cell[2] / (WORLD_CELL_M / WORLD_REV_M) as i32,
+        ];
+        let Some(indices) = self.vegetation_bins.get(&bin) else {
+            return false;
+        };
+        indices.iter().any(|&index| {
+            let voxel = &self.voxels[index];
+            let delta = Vec3::from_array(center) - voxel.center;
+            delta.abs().cmple(voxel.size * 0.5).all()
+        })
+    }
+
     fn rebuild_vegetation(&mut self) {
         self.voxels.clone_from(&self.terrain_voxels);
         self.voxels
@@ -112,7 +234,34 @@ impl GeneratedWorld {
             self.voxels
                 .extend(plant.voxels_at_age(self.age_years, self.seed_hash));
         }
+        self.rebuild_vegetation_bins();
         self.generated_year = self.age_years.floor() as u32;
+    }
+
+    fn rebuild_vegetation_bins(&mut self) {
+        self.vegetation_bins.clear();
+        for index in self.terrain_voxels.len()..self.voxels.len() {
+            let voxel = &self.voxels[index];
+            let min = voxel.center - voxel.size * 0.5;
+            let max = voxel.center + voxel.size * 0.5;
+            let min_bin = [
+                ((min.x + WORLD_SIDE_M * 0.5) / VEGETATION_BIN_M).floor() as i32,
+                ((min.y + WORLD_SIDE_M * 0.5) / VEGETATION_BIN_M).floor() as i32,
+                (min.z / VEGETATION_BIN_M).floor() as i32,
+            ];
+            let max_bin = [
+                ((max.x + WORLD_SIDE_M * 0.5) / VEGETATION_BIN_M).floor() as i32,
+                ((max.y + WORLD_SIDE_M * 0.5) / VEGETATION_BIN_M).floor() as i32,
+                (max.z / VEGETATION_BIN_M).floor() as i32,
+            ];
+            for z in min_bin[2].max(0)..=max_bin[2].min((WORLD_SAMPLE_HEIGHT_M / VEGETATION_BIN_M) as i32) {
+                for y in min_bin[1].max(0)..=max_bin[1].min(WORLD_SIDE_CELLS as i32 - 1) {
+                    for x in min_bin[0].max(0)..=max_bin[0].min(WORLD_SIDE_CELLS as i32 - 1) {
+                        self.vegetation_bins.entry([x, y, z]).or_default().push(index);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -135,7 +284,7 @@ fn make_ground_flora(seed: u64, age_years: f32) -> Vec<TerrainVoxel> {
                 + value_noise(seed ^ 0x5899_65CC_7537_4CC3, nx as f32 / 22.0, ny as f32 / 22.0)
                     * 0.35)
                 .clamp(0.1, 1.0);
-            let ground_z = terrain_height(seed, nx, ny);
+            let ground_z = terrain_height(seed, nx as f32, ny as f32);
 
             if cell_hash % 5 != 0 {
                 continue;
@@ -182,7 +331,7 @@ fn make_ground_flora(seed: u64, age_years: f32) -> Vec<TerrainVoxel> {
                 continue;
             }
             let height = 0.06 + 0.08 * growth * (0.5 + moisture * 0.5);
-            let ground_z = terrain_height(seed, nx, ny);
+            let ground_z = terrain_height(seed, nx as f32, ny as f32);
             let stem_height = height * 0.62;
             result.push(TerrainVoxel {
                 center: Vec3::new(x, y, ground_z + stem_height * 0.5),
@@ -330,7 +479,7 @@ fn make_plants(seed: u64) -> Vec<Plant> {
             Plant {
                 x,
                 y,
-                soil_z: terrain_height(seed, nx as usize, ny as usize),
+                soil_z: terrain_height(seed, nx, ny),
                 moisture,
                 fertility,
                 species,
@@ -339,13 +488,28 @@ fn make_plants(seed: u64) -> Vec<Plant> {
         .collect()
 }
 
-fn terrain_height(seed: u64, x: usize, y: usize) -> f32 {
-    let x = x as f32;
-    let y = y as f32;
+fn terrain_height(seed: u64, x: f32, y: f32) -> f32 {
     let large = value_noise(seed, x / 34.0, y / 34.0);
     let medium = value_noise(seed ^ 0xA076_1D64_78BD_642F, x / 13.0, y / 13.0);
     let fine = value_noise(seed ^ 0xE703_7ED1_A0B4_28DB, x / 5.0, y / 5.0);
     (0.55 + large * 0.72 + medium * 0.26 + fine * 0.08).max(0.16)
+}
+
+fn ecology_at(seed: u64, x: f32, y: f32) -> (f32, f32) {
+    let moisture = (0.5
+        + value_noise(seed ^ 0x8EBC_6AF0_9C88_C6E3, x / 27.0, y / 27.0) * 0.38)
+        .clamp(0.0, 1.0);
+    let fertility = (0.55
+        + value_noise(seed ^ 0x5899_65CC_7537_4CC3, x / 22.0, y / 22.0) * 0.35)
+        .clamp(0.1, 1.0);
+    (moisture, fertility)
+}
+
+fn climate_temperature(seed: u64, x: f32, y: f32, altitude_m: f32) -> f32 {
+    // The current growth preview uses a seed-derived climate field. This value
+    // is ecological input only and is not yet coupled to the thermal solver.
+    288.15 + value_noise(seed ^ 0x5899_65CC_7537_4CC3, x / 31.0, y / 31.0) * 11.4
+        - altitude_m * 0.0065
 }
 
 fn hash_seed(seed: &str) -> u64 {

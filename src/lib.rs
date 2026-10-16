@@ -8,5 +8,6 @@ pub mod scene;
 pub mod solver;
 pub mod tool;
 pub mod voxel;
+pub mod world;
 
 pub mod experiments;

@@ -1,6 +1,5 @@
 mod render;
 mod ui;
-mod world;
 use voxel_physics_lab::{bond, scene, solver, tool};
 
 use glam::Vec3;
@@ -12,7 +11,7 @@ use std::{
 };
 use tool::{Shape, Tool};
 use ui::{Ui, UiAction};
-use world::GeneratedWorld;
+use voxel_physics_lab::world::GeneratedWorld;
 use winit::{
     event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
@@ -593,7 +592,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if generated_world.is_some() {
                             let world = generated_world.as_ref().unwrap();
                             window.set_title(&format!(
-                                "Voxel lab | WORLD seed {} | age {:.0} y | {} | {:.1} FPS",
+                                "Voxel lab | WORLD seed {} | 1cm implicit / 10cm render LOD | age {:.0} y | {} | {:.1} FPS",
                                 ui.seed_text,
                                 world.age_years,
                                 world.vegetation_summary(),

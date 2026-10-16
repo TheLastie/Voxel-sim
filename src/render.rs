@@ -3,8 +3,8 @@ use crate::{
     scene::{Scene, CELL},
     tool::Tool,
     ui::Rect,
-    world::GeneratedWorld,
 };
+use voxel_physics_lab::world::GeneratedWorld;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
 use std::sync::Arc;
