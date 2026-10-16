@@ -108,6 +108,7 @@ struct BranchSegment {
     start: Vec3,
     end: Vec3,
     radius_m: f32,
+    is_root: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -236,10 +237,12 @@ impl GeneratedWorld {
         let (soil_moisture, fertility) = ecology_at(self.seed_hash, field_x, field_y);
         let temperature_kelvin = climate_temperature(self.seed_hash, field_x, field_y, z_m);
 
-        let vegetation = self.vegetation_at_point(
-            cell,
-            Vec3::new(x_m - WORLD_SIDE_M * 0.5, y_m - WORLD_SIDE_M * 0.5, z_m),
-        );
+        let point = Vec3::new(x_m - WORLD_SIDE_M * 0.5, y_m - WORLD_SIDE_M * 0.5, z_m);
+        let vegetation = if z_m <= terrain_height_m {
+            self.root_content_at_point(point)
+        } else {
+            self.vegetation_at_point(cell, point)
+        };
         let wood_in_soil = matches!(
             vegetation,
             Some(
@@ -319,6 +322,21 @@ impl GeneratedWorld {
                 point,
                 &self.plants,
             ))
+            .min_by_key(|content| content.priority())
+    }
+
+    fn root_content_at_point(&self, point: Vec3) -> Option<GeneratedCellContent> {
+        self.plants
+            .iter()
+            .zip(&self.plant_branches)
+            .filter_map(|(plant, branches)| {
+                plant.root_content_at_point(
+                    self.geometry_age_years,
+                    point,
+                    self.seed_hash,
+                    branches,
+                )
+            })
             .min_by_key(|content| content.priority())
     }
 
@@ -725,6 +743,50 @@ fn fungus_form(
 }
 
 impl Plant {
+    fn root_profile(self) -> (usize, f32, f32) {
+        match self.species {
+            TreeSpecies::Oak => (8, 1.55, 0.46),
+            TreeSpecies::Birch => (10, 1.20, 0.24),
+            TreeSpecies::Acacia => (6, 1.10, 0.90),
+        }
+    }
+
+    fn root_content_at_point(
+        self,
+        age_years: f32,
+        point: Vec3,
+        seed: u64,
+        branches: &[BranchSegment],
+    ) -> Option<GeneratedCellContent> {
+        let maturity = 0.08 + 0.92 * (age_years / 100.0).clamp(0.0, 1.0).powf(0.72);
+        let vigor = self.growth_vigor(seed);
+        let (_, lateral_extent, depth_factor) = self.root_profile();
+        let root_extent = lateral_extent * maturity * vigor * (0.85 + self.fertility * 0.25);
+        let root_depth = depth_factor * maturity * vigor * (0.80 + self.moisture * 0.30);
+        let root_margin = 0.10;
+        if (point.x - self.x).abs() > root_extent + root_margin
+            || (point.y - self.y).abs() > root_extent + root_margin
+            || point.z > self.soil_z + root_margin
+            || point.z < self.soil_z - root_depth - root_margin
+        {
+            return None;
+        }
+
+        for branch in branches.iter().filter(|branch| branch.is_root) {
+            let segment = branch.end - branch.start;
+            let length_squared = segment.length_squared();
+            if length_squared <= f32::EPSILON {
+                continue;
+            }
+            let along = ((point - branch.start).dot(segment) / length_squared).clamp(0.0, 1.0);
+            let closest = branch.start + segment * along;
+            if point.distance_squared(closest) <= branch.radius_m.powi(2) {
+                return Some(self.species.generated_wood());
+            }
+        }
+        None
+    }
+
     /// Deterministic individual growth response from the seed and local habitat.
     /// This affects generated shape only, not physical material state.
     fn growth_vigor(self, seed: u64) -> f32 {
@@ -813,7 +875,12 @@ impl Plant {
                 let radius_m = trunk_radius
                     * width
                     * (0.72 + unit_noise(hash.rotate_left(17)).abs() * 0.28);
-                let primary = BranchSegment { start, end, radius_m };
+                let primary = BranchSegment {
+                    start,
+                    end,
+                    radius_m,
+                    is_root: false,
+                };
                 segments.push(primary);
 
                 let midpoint = start.lerp(end, 0.58);
@@ -827,6 +894,7 @@ impl Plant {
                         start: midpoint,
                         end: secondary_end,
                         radius_m: radius_m * 0.55,
+                        is_root: false,
                     });
                 }
             }
@@ -834,11 +902,7 @@ impl Plant {
 
         // Root architecture varies by species: broad and branched for oak,
         // shallow and fibrous for birch, deeper with fewer main roots for acacia.
-        let (root_count, lateral_extent, depth_factor) = match self.species {
-            TreeSpecies::Oak => (8, 1.55, 0.46),
-            TreeSpecies::Birch => (10, 1.20, 0.24),
-            TreeSpecies::Acacia => (6, 1.10, 0.90),
-        };
+        let (root_count, lateral_extent, depth_factor) = self.root_profile();
         let root_extent = lateral_extent * maturity * vigor * (0.85 + self.fertility * 0.25);
         let root_depth = depth_factor * maturity * vigor * (0.80 + self.moisture * 0.30);
         let base = Vec3::new(self.x, self.y, self.soil_z);
@@ -856,11 +920,13 @@ impl Plant {
                 start: base,
                 end: shoulder,
                 radius_m: (trunk_radius * 0.20).max(WORLD_REV_M * 0.55),
+                is_root: true,
             });
             segments.push(BranchSegment {
                 start: shoulder,
                 end: tip,
                 radius_m: (trunk_radius * 0.085).max(WORLD_REV_M * 0.45),
+                is_root: true,
             });
         }
         segments
