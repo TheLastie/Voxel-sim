@@ -846,21 +846,21 @@ impl Plant {
 }
 
 fn make_plants(seed: u64) -> Vec<Plant> {
-    [(-2.7, -1.7), (0.2, 0.8), (2.8, -1.2)]
-        .into_iter()
-        .enumerate()
-        .map(|(index, (anchor_x, anchor_y))| {
-            let site_hash = lattice_hash(
-                seed ^ 0xA24B_AED4_963E_E407,
-                index as i32,
-                0x5452_4545,
-            );
-            let x = anchor_x + unit_noise(site_hash) * 0.55;
-            let y = anchor_y + unit_noise(site_hash.rotate_left(29)) * 0.55;
+    let mut plants = Vec::with_capacity(10);
+    for gy in 0..4 {
+        for gx in 0..4 {
+            let site_hash = lattice_hash(seed ^ 0xA24B_AED4_963E_E407, gx, gy);
+            let x = -3.75 + gx as f32 * 2.5 + unit_noise(site_hash) * 0.35;
+            let y = -3.75 + gy as f32 * 2.5 + unit_noise(site_hash.rotate_left(29)) * 0.35;
             let nx = (x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M;
             let ny = (y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M;
             let soil_z = terrain_height(seed, nx, ny);
             let (moisture, fertility) = ecology_at(seed, nx, ny);
+            let site_roll = (unit_noise(site_hash.rotate_left(53)) + 1.0) * 0.5;
+            let establishment_chance = 0.30 + fertility * 0.28 + moisture * 0.12;
+            if site_roll > establishment_chance {
+                continue;
+            }
             let temperature_kelvin = climate_temperature(seed, nx, ny, soil_z);
             let climate_index =
                 (0.52 + (temperature_kelvin - 288.15) * (0.38 / 11.4)).clamp(0.0, 1.0);
@@ -871,16 +871,17 @@ fn make_plants(seed: u64) -> Vec<Plant> {
             } else {
                 TreeSpecies::Oak
             };
-            Plant {
+            plants.push(Plant {
                 x,
                 y,
                 soil_z,
                 moisture,
                 fertility,
                 species,
-            }
-        })
-        .collect()
+            });
+        }
+    }
+    plants
 }
 
 fn terrain_height(seed: u64, x: f32, y: f32) -> f32 {
