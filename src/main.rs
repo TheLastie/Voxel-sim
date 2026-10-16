@@ -216,8 +216,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|pair| pair[1].as_str());
     let mut generated_world: Option<GeneratedWorld> = initial_seed.map(|seed| {
         ui.world_active = true;
-        ui.paused = true;
-        eprintln!("generating deterministic terrain for seed {seed:?}");
+        ui.paused = false;
+        eprintln!("generating deterministic terrain and vegetation for seed {seed:?}");
         GeneratedWorld::from_seed(seed)
     });
     if generated_world.is_some() {
@@ -281,12 +281,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Some(UiAction::GenerateWorld(seed)) => {
                                 let generated = GeneratedWorld::from_seed(&seed);
                                 eprintln!(
-                                    "generated deterministic terrain: seed={seed:?}, area=100 m2, voxels={}",
-                                    generated.voxels.len()
+                                    "generated deterministic world: seed={seed:?}, area=100 m2, voxels={}, {}, growth clock=1 year/s",
+                                    generated.voxels.len(),
+                                    generated.vegetation_summary(),
                                 );
                                 generated_world = Some(generated);
                                 ui.world_active = true;
-                                ui.paused = true;
+                                ui.paused = false;
                                 ui.show_bonds = false;
                                 tool = None;
                                 mode = AppMode::Interactive;
@@ -422,6 +423,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let elapsed = now.duration_since(last).as_secs_f32();
                     last = now;
 
+                    if !ui.paused {
+                        if let Some(world) = generated_world.as_mut() {
+                            world.advance_growth(elapsed);
+                        }
+                    }
+
                     if generated_world.is_none()
                         && matches!(mode, AppMode::Interactive | AppMode::Recording)
                         && !ui.paused
@@ -514,7 +521,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             apply_frame(&mut scene, &mut tool, frame);
                         }
                     }
-                    let rects = ui.draw(scene.broken, scene.cluster_count, fps, sim_ms);
+                    let rects = ui.draw(
+                        scene.broken,
+                        scene.cluster_count,
+                        fps,
+                        sim_ms,
+                        generated_world.as_ref().map(|world| world.age_years),
+                    );
                     match renderer.draw(
                         &scene,
                         &tool,
@@ -578,9 +591,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
                         if generated_world.is_some() {
+                            let world = generated_world.as_ref().unwrap();
                             window.set_title(&format!(
-                                "Voxel lab | WORLD seed {} | 10 x 10 m | {:.1} FPS",
-                                ui.seed_text, fps
+                                "Voxel lab | WORLD seed {} | age {:.0} y | {} | {:.1} FPS",
+                                ui.seed_text,
+                                world.age_years,
+                                world.vegetation_summary(),
+                                fps,
                             ));
                         } else {
                             window.set_title(&format!(

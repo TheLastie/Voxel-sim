@@ -97,11 +97,18 @@ impl Ui {
         }
         None
     }
-    pub fn draw(&self, broken: usize, clusters: usize, fps: f32, sim_ms: f32) -> Vec<Rect> {
+    pub fn draw(
+        &self,
+        broken: usize,
+        clusters: usize,
+        fps: f32,
+        sim_ms: f32,
+        world_age_years: Option<f32>,
+    ) -> Vec<Rect> {
         let mut r = Vec::new();
         rect(
             &mut r,
-            [10.0, 10.0, 285.0, 680.0],
+            [10.0, 10.0, 285.0, 710.0],
             [0.025, 0.04, 0.06, 0.94],
         );
         text(&mut r, 24., 24., "VOXEL MECHANICS LAB", 1.5);
@@ -193,6 +200,15 @@ impl Ui {
             if self.world_active { "REGENERATE WORLD" } else { "GENERATE WORLD" },
             1.4,
         );
+        if let Some(age) = world_age_years {
+            text(
+                &mut r,
+                24.,
+                691.,
+                &format!("GROWTH PREVIEW: {age:.0} Y; 1 Y/SEC"),
+                1.0,
+            );
+        }
         r
     }
 }
