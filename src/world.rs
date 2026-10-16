@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::{
-    scene::VoxelSpawn,
+    scene::{Scene, SceneConfig, VoxelSpawn},
     voxel::{Composition, Microstructure},
 };
 use glam::{Quat, Vec3};
@@ -67,6 +67,17 @@ pub struct GeneratedCell {
     pub soil_moisture: f32,
     pub fertility: f32,
     pub temperature_kelvin: f32,
+}
+
+/// Caller-supplied physical material state for one generated cell. A scene
+/// derives mass and internal energy from the composition and temperature;
+/// constraints remain independent of the cell's finite mass.
+#[derive(Clone, Debug)]
+pub struct GeneratedCellPhysics {
+    pub composition: Composition,
+    pub anisotropy: f32,
+    pub velocity: Vec3,
+    pub kinematic: bool,
 }
 
 impl GeneratedCell {
@@ -389,6 +400,56 @@ impl GeneratedWorld {
             }
         }
         Some(cells)
+    }
+
+    /// Build a physical scene from a bounded 1 cm region of the generated
+    /// world. The material policy is explicit for every cell; `None` omits a
+    /// cell from the physical domain, while unsupported contents should return
+    /// an error. Region size is limited by `sample_region` to bound memory and
+    /// construction work.
+    pub fn build_physical_region<F>(
+        &self,
+        config: SceneConfig,
+        min_cell: [i32; 3],
+        max_cell_exclusive: [i32; 3],
+        mut physics_for_cell: F,
+    ) -> Result<Scene, String>
+    where
+        F: FnMut(GeneratedCell) -> Result<Option<GeneratedCellPhysics>, String>,
+    {
+        let cells = self
+            .sample_region(min_cell, max_cell_exclusive)
+            .ok_or_else(|| {
+                format!(
+                    "invalid physical world region {min_cell:?}..{max_cell_exclusive:?} or sample limit exceeded"
+                )
+            })?;
+        let mut spawns = Vec::with_capacity(cells.len());
+        for cell in cells {
+            let Some(state) = physics_for_cell(cell).map_err(|reason| {
+                format!(
+                    "material policy rejected {:?} at {:?}: {reason}",
+                    cell.content, cell.cell
+                )
+            })? else {
+                continue;
+            };
+            let spawn = cell
+                .to_voxel_spawn(
+                    state.composition,
+                    state.anisotropy,
+                    state.velocity,
+                    state.kinematic,
+                )
+                .map_err(|reason| {
+                    format!(
+                        "cannot create physical {:?} at {:?}: {reason}",
+                        cell.content, cell.cell
+                    )
+                })?;
+            spawns.push(spawn);
+        }
+        Scene::from_voxels(config, spawns)
     }
 
     fn vegetation_at_point(
