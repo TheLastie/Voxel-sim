@@ -11,13 +11,18 @@ pub const MAX_WORLD_SAMPLE_CELLS: usize = 65_536;
 const WORLD_SAMPLE_HEIGHT_M: f32 = 16.0;
 const WORLD_SAMPLE_HEIGHT_CELLS: i32 = (WORLD_SAMPLE_HEIGHT_M / WORLD_REV_M) as i32;
 
+/// Geometric identity of a generated 1 cm cell. These tags distinguish plant
+/// anatomy, but do not claim that matching physical material parameters exist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GeneratedCellContent {
     Air,
     Terrain,
-    Oak,
-    Birch,
-    Acacia,
+    OakWood,
+    OakFoliage,
+    BirchWood,
+    BirchFoliage,
+    AcaciaWood,
+    AcaciaFoliage,
     Grass,
     Fern,
     Mushroom,
@@ -26,12 +31,13 @@ pub enum GeneratedCellContent {
 impl GeneratedCellContent {
     fn priority(self) -> u8 {
         match self {
-            Self::Oak | Self::Birch | Self::Acacia => 0,
-            Self::Mushroom => 1,
-            Self::Fern => 2,
-            Self::Grass => 3,
-            Self::Terrain => 4,
-            Self::Air => 5,
+            Self::OakWood | Self::BirchWood | Self::AcaciaWood => 0,
+            Self::OakFoliage | Self::BirchFoliage | Self::AcaciaFoliage => 1,
+            Self::Mushroom => 2,
+            Self::Fern => 3,
+            Self::Grass => 4,
+            Self::Terrain => 5,
+            Self::Air => 6,
         }
     }
 }
@@ -85,11 +91,19 @@ enum TreeSpecies {
 }
 
 impl TreeSpecies {
-    fn generated_content(self) -> GeneratedCellContent {
+    fn generated_wood(self) -> GeneratedCellContent {
         match self {
-            Self::Oak => GeneratedCellContent::Oak,
-            Self::Birch => GeneratedCellContent::Birch,
-            Self::Acacia => GeneratedCellContent::Acacia,
+            Self::Oak => GeneratedCellContent::OakWood,
+            Self::Birch => GeneratedCellContent::BirchWood,
+            Self::Acacia => GeneratedCellContent::AcaciaWood,
+        }
+    }
+
+    fn generated_foliage(self) -> GeneratedCellContent {
+        match self {
+            Self::Oak => GeneratedCellContent::OakFoliage,
+            Self::Birch => GeneratedCellContent::BirchFoliage,
+            Self::Acacia => GeneratedCellContent::AcaciaFoliage,
         }
     }
 }
@@ -493,7 +507,7 @@ impl Plant {
             let taper = 0.72 + 0.28 * (1.0 - local_z / trunk_height.max(WORLD_REV_M));
             let radius = trunk_radius * taper;
             if local_x * local_x + local_y * local_y <= radius * radius {
-                return Some(self.species.generated_content());
+                return Some(self.species.generated_wood());
             }
         }
 
@@ -509,7 +523,7 @@ impl Plant {
                 ^ 0xD6E8_FEB8_6659_FD93
                 ^ (cell[2] as u32 as u64).wrapping_mul(0x9E37_79B1_85EB_CA87);
             if lattice_hash(canopy_seed, cell[0], cell[1]) % 11 != 0 {
-                return Some(self.species.generated_content());
+                return Some(self.species.generated_foliage());
             }
         }
         None
@@ -571,7 +585,7 @@ impl Plant {
                         center: Vec3::new(self.x + local_x, self.y + local_y, self.soil_z + z),
                         size: Vec3::splat(WORLD_CELL_M),
                         color,
-                        content: self.species.generated_content(),
+                        content: self.species.generated_wood(),
                     });
                 }
             }
@@ -607,7 +621,7 @@ impl Plant {
                             (leaf_color[2] + shade).clamp(0.0, 1.0),
                             1.0,
                         ],
-                        content: self.species.generated_content(),
+                        content: self.species.generated_foliage(),
                     });
                 }
             }
