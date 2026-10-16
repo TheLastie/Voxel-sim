@@ -79,9 +79,11 @@ pub struct GeneratedWorld {
     mycelium_buckets: Vec<Vec<usize>>,
     seed_hash: u64,
     pub age_years: f32,
+    calendar_years: f64,
     geometry_age_years: f32,
     season_phase_offset: f32,
     generated_growth_quarter: u32,
+    generated_calendar_quarter: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -195,9 +197,11 @@ impl GeneratedWorld {
             mycelium_buckets: vec![Vec::new(); 25 * 25],
             seed_hash,
             age_years: 8.0,
+            calendar_years: 8.0,
             geometry_age_years: 8.0,
             season_phase_offset,
             generated_growth_quarter: u32::MAX,
+            generated_calendar_quarter: u64::MAX,
         };
         world.rebuild_vegetation();
         world
@@ -206,9 +210,18 @@ impl GeneratedWorld {
     /// Advance the ecological preview clock. One wall second represents one
     /// procedural growth year; physics remains paused and is not time-scaled.
     pub fn advance_growth(&mut self, elapsed_seconds: f32) {
-        self.age_years = (self.age_years + elapsed_seconds.max(0.0)).min(100.0);
+        let elapsed_seconds = if elapsed_seconds.is_finite() {
+            elapsed_seconds.max(0.0)
+        } else {
+            0.0
+        };
+        self.calendar_years += f64::from(elapsed_seconds);
+        self.age_years = (self.age_years + elapsed_seconds).min(100.0);
         let growth_quarter = (self.age_years * 4.0).floor() as u32;
-        if growth_quarter != self.generated_growth_quarter {
+        let calendar_quarter = self.calendar_quarter();
+        if growth_quarter != self.generated_growth_quarter
+            || calendar_quarter != self.generated_calendar_quarter
+        {
             self.rebuild_vegetation();
         }
     }
@@ -383,7 +396,11 @@ impl GeneratedWorld {
     }
 
     fn season_phase(&self) -> f32 {
-        (self.geometry_age_years + self.season_phase_offset).fract()
+        (self.calendar_years + f64::from(self.season_phase_offset)).fract() as f32
+    }
+
+    fn calendar_quarter(&self) -> u64 {
+        ((self.calendar_years + f64::from(self.season_phase_offset)) * 4.0).floor() as u64
     }
 
     /// Build the displayed LOD from candidate geometry, retaining a preview
@@ -391,16 +408,19 @@ impl GeneratedWorld {
     fn rebuild_vegetation(&mut self) {
         self.geometry_age_years = (self.age_years * 4.0).floor() * 0.25;
         let season_phase = self.season_phase();
-        self.plant_branches = self
-            .plants
-            .iter()
-            .map(|plant| plant.branch_segments(self.geometry_age_years, self.seed_hash))
-            .collect();
-        (self.mycelium_segments, self.mycelium_buckets) = make_mycelium(
-            self.seed_hash,
-            self.geometry_age_years,
-            &self.plants,
-        );
+        let growth_quarter = (self.age_years * 4.0).floor() as u32;
+        if growth_quarter != self.generated_growth_quarter {
+            self.plant_branches = self
+                .plants
+                .iter()
+                .map(|plant| plant.branch_segments(self.geometry_age_years, self.seed_hash))
+                .collect();
+            (self.mycelium_segments, self.mycelium_buckets) = make_mycelium(
+                self.seed_hash,
+                self.geometry_age_years,
+                &self.plants,
+            );
+        }
         self.voxels.clone_from(&self.terrain_voxels);
         let mut candidates = make_ground_flora(
             self.seed_hash,
@@ -436,7 +456,8 @@ impl GeneratedWorld {
                 }
             }
         }
-        self.generated_growth_quarter = (self.age_years * 4.0).floor() as u32;
+        self.generated_growth_quarter = growth_quarter;
+        self.generated_calendar_quarter = self.calendar_quarter();
     }
 }
 
