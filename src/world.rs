@@ -27,6 +27,7 @@ pub enum GeneratedCellContent {
     AcaciaFoliage,
     Grass,
     Fern,
+    Wildflower,
     Mushroom,
     Bolete,
     Puffball,
@@ -38,7 +39,7 @@ impl GeneratedCellContent {
             Self::OakWood | Self::BirchWood | Self::AcaciaWood => 0,
             Self::OakFoliage | Self::BirchFoliage | Self::AcaciaFoliage => 1,
             Self::Mushroom | Self::Bolete | Self::Puffball => 2,
-            Self::Fern => 3,
+            Self::Fern | Self::Wildflower => 3,
             Self::Grass => 4,
             Self::Terrain => 5,
             Self::Air => 6,
@@ -409,15 +410,25 @@ fn make_ground_flora(
                 continue;
             }
             let plant_count = 2 + ((cell_hash >> 12) % 4) as usize;
-            let is_fern = moisture > 0.58;
+            let is_wildflower = wildflower_site(cell_hash, moisture, fertility);
+            let is_fern = !is_wildflower && moisture > 0.58;
+            let content = if is_wildflower {
+                GeneratedCellContent::Wildflower
+            } else if is_fern {
+                GeneratedCellContent::Fern
+            } else {
+                GeneratedCellContent::Grass
+            };
             for blade in 0..plant_count {
                 let blade_hash = lattice_hash(cell_hash, blade as i32, gy - gx);
                 let angle = (blade_hash >> 40) as f32 / 16_777_215.0 * std::f32::consts::TAU;
                 let radius = 0.035 + ((blade_hash >> 20) & 0xff) as f32 / 255.0 * 0.12;
+                let center_x = x + angle.cos() * radius;
+                let center_y = y + angle.sin() * radius;
                 let height = (0.12 + fertility * 0.24) * (0.12 + growth * 0.88);
                 let center = Vec3::new(
-                    x + angle.cos() * radius,
-                    y + angle.sin() * radius,
+                    center_x,
+                    center_y,
                     ground_z + height * 0.5,
                 );
                 let color = if is_fern {
@@ -429,12 +440,21 @@ fn make_ground_flora(
                     center,
                     size: Vec3::new(0.035, 0.035, height),
                     color,
-                    content: if is_fern {
-                        GeneratedCellContent::Fern
-                    } else {
-                        GeneratedCellContent::Grass
-                    },
+                    content,
                 });
+                if is_wildflower && wildflowers_blooming(season_phase) {
+                    let bloom_color = match blade_hash % 3 {
+                        0 => [0.95, 0.72, 0.16, 1.0],
+                        1 => [0.92, 0.38, 0.56, 1.0],
+                        _ => [0.62, 0.48, 0.88, 1.0],
+                    };
+                    result.push(TerrainVoxel {
+                        center: Vec3::new(center_x, center_y, ground_z + height * 0.94),
+                        size: Vec3::splat(0.05),
+                        color: bloom_color,
+                        content,
+                    });
+                }
             }
         }
     }
@@ -501,7 +521,15 @@ fn make_ground_flora(
     result
 }
 
-/// Evaluate seeded grass, fern, and fungal geometry directly at a point on
+fn wildflower_site(site_hash: u64, moisture: f32, fertility: f32) -> bool {
+    site_hash % 3 == 0 && fertility >= 0.68 && (0.32..=0.68).contains(&moisture)
+}
+
+fn wildflowers_blooming(season_phase: f32) -> bool {
+    (0.18..0.72).contains(&season_phase)
+}
+
+/// Evaluate seeded grass, fern, wildflower, and fungal geometry directly at a point on
 /// the REV lattice. This does not inspect or depend on the renderer's LOD list.
 fn ground_flora_at_point(
     seed: u64,
@@ -544,7 +572,10 @@ fn ground_flora_at_point(
             let height = (0.12 + fertility * 0.24)
                 * (0.12 + (age_years / 4.0).clamp(0.0, 1.0) * 0.88);
             let plant_count = 2 + ((cell_hash >> 12) % 4) as usize;
-            let content = if moisture > 0.58 {
+            let is_wildflower = wildflower_site(cell_hash, moisture, fertility);
+            let content = if is_wildflower {
+                GeneratedCellContent::Wildflower
+            } else if moisture > 0.58 {
                 GeneratedCellContent::Fern
             } else {
                 GeneratedCellContent::Grass
@@ -561,6 +592,15 @@ fn ground_flora_at_point(
                     && point.z <= ground_z + height
                 {
                     record(content);
+                }
+                if is_wildflower && wildflowers_blooming(season_phase) {
+                    let bloom_z = ground_z + height * 0.94;
+                    if (point.x - center_x).abs() <= 0.025
+                        && (point.y - center_y).abs() <= 0.025
+                        && (point.z - bloom_z).abs() <= 0.025
+                    {
+                        record(GeneratedCellContent::Wildflower);
+                    }
                 }
             }
         }
