@@ -915,7 +915,7 @@ impl Plant {
         let vigor = self.growth_vigor(seed);
         let (_, lateral_extent, depth_factor) = self.root_profile();
         let root_extent = lateral_extent * maturity * vigor * (0.85 + self.fertility * 0.25);
-        let root_depth = depth_factor * maturity * vigor * (0.80 + self.moisture * 0.30);
+        let root_depth = depth_factor * maturity * vigor * (1.10 - self.moisture * 0.50);
         let root_margin = 0.10;
         if (point.x - self.x).abs() > root_extent + root_margin
             || (point.y - self.y).abs() > root_extent + root_margin
@@ -1057,7 +1057,7 @@ impl Plant {
         // shallow and fibrous for birch, deeper with fewer main roots for acacia.
         let (root_count, lateral_extent, depth_factor) = self.root_profile();
         let root_extent = lateral_extent * maturity * vigor * (0.85 + self.fertility * 0.25);
-        let root_depth = depth_factor * maturity * vigor * (0.80 + self.moisture * 0.30);
+        let root_depth = depth_factor * maturity * vigor * (1.10 - self.moisture * 0.50);
         let base = Vec3::new(self.x, self.y, self.soil_z);
         for root in 0..root_count {
             let root_hash = lattice_hash(seed ^ 0xDB4F_0B91_75AE_2165, plant_x + root as i32, plant_y);
