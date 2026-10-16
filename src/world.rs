@@ -106,12 +106,102 @@ impl GeneratedWorld {
 
     fn rebuild_vegetation(&mut self) {
         self.voxels.clone_from(&self.terrain_voxels);
+        self.voxels
+            .extend(make_ground_flora(self.seed_hash, self.age_years));
         for plant in &self.plants {
             self.voxels
                 .extend(plant.voxels_at_age(self.age_years, self.seed_hash));
         }
         self.generated_year = self.age_years.floor() as u32;
     }
+}
+
+fn make_ground_flora(seed: u64, age_years: f32) -> Vec<TerrainVoxel> {
+    let growth = (age_years / 4.0).clamp(0.0, 1.0);
+    let mut result = Vec::new();
+    // Fixed 0.5 m sampling keeps density seed-locked and cheap to rebuild.
+    for gy in 0..20 {
+        for gx in 0..20 {
+            let cell_hash = lattice_hash(seed ^ 0xA24B_AED4_963E_E407, gx, gy);
+            let x = -4.75 + gx as f32 * 0.5;
+            let y = -4.75 + gy as f32 * 0.5;
+            let nx = ((x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M) as usize;
+            let ny = ((y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M) as usize;
+            let moisture = (0.5
+                + value_noise(seed ^ 0x8EBC_6AF0_9C88_C6E3, nx as f32 / 27.0, ny as f32 / 27.0)
+                    * 0.38)
+                .clamp(0.0, 1.0);
+            let fertility = (0.55
+                + value_noise(seed ^ 0x5899_65CC_7537_4CC3, nx as f32 / 22.0, ny as f32 / 22.0)
+                    * 0.35)
+                .clamp(0.1, 1.0);
+            let ground_z = terrain_height(seed, nx, ny);
+
+            if cell_hash % 5 != 0 {
+                continue;
+            }
+            let plant_count = 2 + ((cell_hash >> 12) % 4) as usize;
+            let is_fern = moisture > 0.58;
+            for blade in 0..plant_count {
+                let blade_hash = lattice_hash(cell_hash, blade as i32, gy - gx);
+                let angle = (blade_hash >> 40) as f32 / 16_777_215.0 * std::f32::consts::TAU;
+                let radius = 0.035 + ((blade_hash >> 20) & 0xff) as f32 / 255.0 * 0.12;
+                let height = (0.12 + fertility * 0.24) * (0.12 + growth * 0.88);
+                let center = Vec3::new(
+                    x + angle.cos() * radius,
+                    y + angle.sin() * radius,
+                    ground_z + height * 0.5,
+                );
+                let color = if is_fern {
+                    [0.11, 0.33 + fertility * 0.10, 0.13, 1.0]
+                } else {
+                    [0.26, 0.36 + fertility * 0.10, 0.12, 1.0]
+                };
+                result.push(TerrainVoxel {
+                    center,
+                    size: Vec3::new(0.035, 0.035, height),
+                    color,
+                });
+            }
+        }
+    }
+
+    // Fruiting bodies appear only where the seeded soil-moisture field is high.
+    for gy in 0..25 {
+        for gx in 0..25 {
+            let x = -4.8 + gx as f32 * 0.4;
+            let y = -4.8 + gy as f32 * 0.4;
+            let nx = ((x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M) as usize;
+            let ny = ((y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M) as usize;
+            let moisture = (0.5
+                + value_noise(seed ^ 0x8EBC_6AF0_9C88_C6E3, nx as f32 / 27.0, ny as f32 / 27.0)
+                    * 0.38)
+                .clamp(0.0, 1.0);
+            let spot = lattice_hash(seed ^ 0xDB4F_0B91_75AE_2165, gx, gy);
+            if moisture < 0.64 || spot % 13 != 0 || age_years < 1.0 {
+                continue;
+            }
+            let height = 0.06 + 0.08 * growth * (0.5 + moisture * 0.5);
+            let ground_z = terrain_height(seed, nx, ny);
+            let stem_height = height * 0.62;
+            result.push(TerrainVoxel {
+                center: Vec3::new(x, y, ground_z + stem_height * 0.5),
+                size: Vec3::new(0.035, 0.035, stem_height),
+                color: [0.82, 0.78, 0.62, 1.0],
+            });
+            let cap_color = if spot & 1 == 0 {
+                [0.58, 0.20, 0.12, 1.0]
+            } else {
+                [0.48, 0.32, 0.16, 1.0]
+            };
+            result.push(TerrainVoxel {
+                center: Vec3::new(x, y, ground_z + stem_height + height * 0.12),
+                size: Vec3::new(0.12, 0.12, 0.04),
+                color: cap_color,
+            });
+        }
+    }
+    result
 }
 
 impl Plant {
