@@ -1390,10 +1390,13 @@ fn ecology_at(seed: u64, x: f32, y: f32) -> (f32, f32) {
 }
 
 fn climate_temperature(seed: u64, x: f32, y: f32, altitude_m: f32) -> f32 {
-    // The current growth preview uses a seed-derived climate field. This value
-    // is ecological input only and is not yet coupled to the thermal solver.
-    288.15 + value_noise(seed ^ 0x5899_65CC_7537_4CC3, x / 31.0, y / 31.0) * 11.4
-        - altitude_m * 0.0065
+    // The seed selects a broad regional climate; spatial noise and elevation
+    // then create local variation. This is ecological input only and is not
+    // yet coupled to the thermal solver.
+    let regional_offset_k = unit_noise(seed ^ 0x243F_6A88_85A3_08D3) * 4.0;
+    let local_variation_k =
+        value_noise(seed ^ 0x5899_65CC_7537_4CC3, x / 31.0, y / 31.0) * 11.4;
+    288.15 + regional_offset_k + local_variation_k - altitude_m * 0.0065
 }
 
 fn hash_seed(seed: &str) -> u64 {
