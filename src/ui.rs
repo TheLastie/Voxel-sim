@@ -16,7 +16,16 @@ pub struct Ui {
     pub paused: bool,
     pub show_bonds: bool,
     pub selected: Shape,
+    pub seed_text: String,
+    pub seed_editing: bool,
+    pub world_active: bool,
 }
+
+pub enum UiAction {
+    Shape(Shape),
+    GenerateWorld(String),
+}
+
 impl Ui {
     pub fn new(speed: f32, start: Vec3, direction: Vec3) -> Self {
         Self {
@@ -27,6 +36,9 @@ impl Ui {
             paused: false,
             show_bonds: false,
             selected: Shape::Wedge,
+            seed_text: "1001".to_owned(),
+            seed_editing: false,
+            world_active: false,
         }
     }
     pub fn direction(&self) -> Vec3 {
@@ -34,6 +46,36 @@ impl Ui {
     }
     pub fn start(&self) -> Vec3 {
         self.start
+    }
+    pub fn click(&mut self, x: f32, y: f32) -> Option<UiAction> {
+        if (20.0..=280.0).contains(&x) && (615.0..=644.0).contains(&y) {
+            self.seed_editing = true;
+            return None;
+        }
+        if (20.0..=280.0).contains(&x) && (650.0..=678.0).contains(&y) {
+            self.seed_editing = false;
+            return Some(UiAction::GenerateWorld(self.seed_text.clone()));
+        }
+        self.seed_editing = false;
+        self.pointer(x, y).map(UiAction::Shape)
+    }
+    pub fn append_seed_text(&mut self, text: &str) {
+        if !self.seed_editing {
+            return;
+        }
+        for c in text.chars() {
+            if self.seed_text.chars().count() >= 24 {
+                break;
+            }
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                self.seed_text.push(c);
+            }
+        }
+    }
+    pub fn erase_seed_character(&mut self) {
+        if self.seed_editing {
+            self.seed_text.pop();
+        }
     }
     pub fn pointer(&mut self, x: f32, y: f32) -> Option<Shape> {
         if !(20.0..=280.0).contains(&x) {
@@ -59,7 +101,7 @@ impl Ui {
         let mut r = Vec::new();
         rect(
             &mut r,
-            [10.0, 10.0, 285.0, 590.0],
+            [10.0, 10.0, 285.0, 680.0],
             [0.025, 0.04, 0.06, 0.94],
         );
         text(&mut r, 24., 24., "VOXEL MECHANICS LAB", 1.5);
@@ -119,6 +161,38 @@ impl Ui {
         text(&mut r, 24., 548., "B BONDS  RMB ORBIT  WHEEL ZOOM", 1.);
         text(&mut r, 24., 572., "P START / STOP RECORDING", 1.);
         text(&mut r, 24., 590., "REPLAY LOOPS AT 1X", 1.);
+        text(&mut r, 24., 612., "WORLD SEED (100 M2)", 1.3);
+        rect(
+            &mut r,
+            [20., 632., 260., 24.],
+            if self.seed_editing {
+                [0.13, 0.22, 0.25, 1.]
+            } else {
+                [0.09, 0.14, 0.18, 1.]
+            },
+        );
+        let seed_display = self.seed_text.to_ascii_uppercase();
+        text(&mut r, 28., 640., &seed_display, 1.5);
+        if self.seed_editing {
+            let cursor_x = (28. + seed_display.len() as f32 * 9.0).min(270.0);
+            rect(&mut r, [cursor_x, 638., 2., 15.], [0.3, 0.85, 0.65, 1.]);
+        }
+        rect(
+            &mut r,
+            [20., 660., 260., 26.],
+            if self.world_active {
+                [0.12, 0.38, 0.33, 1.]
+            } else {
+                [0.14, 0.23, 0.29, 1.]
+            },
+        );
+        text(
+            &mut r,
+            50.,
+            667.,
+            if self.world_active { "REGENERATE WORLD" } else { "GENERATE WORLD" },
+            1.4,
+        );
         r
     }
 }

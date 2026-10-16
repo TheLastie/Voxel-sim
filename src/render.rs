@@ -3,6 +3,7 @@ use crate::{
     scene::{Scene, CELL},
     tool::Tool,
     ui::Rect,
+    world::GeneratedWorld,
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
@@ -335,31 +336,46 @@ impl Renderer {
         &mut self,
         scene: &Scene,
         tool: &Option<Tool>,
+        generated_world: Option<&GeneratedWorld>,
         camera: &Camera,
         ui: &[Rect],
         show_bonds: bool,
     ) -> Result<(), wgpu::SurfaceError> {
-        let damage = scene.incident_bond_damage();
-        let mut instances: Vec<_> = scene
-            .positions
-            .iter()
-            .enumerate()
-            .map(|(i, &p)| {
-                let color = if scene.voxels[i].kinematic {
-                    [0.24, 0.28, 0.3, 1.]
-                } else if scene.axis_targets[i].iter().any(Option::is_some) {
-                    [0.18, 0.55, 0.85, 1.]
-                } else if damage[i].1 >= 2 {
-                    [0.83, 0.28, 0.24, 1.]
-                } else if damage[i].1 == 1 {
-                    [0.92, 0.52, 0.24, 1.]
-                } else {
-                    let d = damage[i].0;
-                    [0.55 + 0.39 * d, 0.32 + 0.43 * d, 0.12 + 0.18 * d, 1.]
-                };
-                Instance::cube(p, scene.rotations[i], color)
-            })
-            .collect();
+        let mut instances: Vec<_> = if let Some(world) = generated_world {
+            world
+                .voxels
+                .iter()
+                .map(|voxel| Instance {
+                    center: voxel.center.to_array(),
+                    size: voxel.size.to_array(),
+                    color: voxel.color,
+                    rotation: Quat::IDENTITY.to_array(),
+                })
+                .collect()
+        } else {
+            let damage = scene.incident_bond_damage();
+            scene
+                .positions
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| {
+                    let color = if scene.voxels[i].kinematic {
+                        [0.24, 0.28, 0.3, 1.]
+                    } else if scene.axis_targets[i].iter().any(Option::is_some) {
+                        [0.18, 0.55, 0.85, 1.]
+                    } else if damage[i].1 >= 2 {
+                        [0.83, 0.28, 0.24, 1.]
+                    } else if damage[i].1 == 1 {
+                        [0.92, 0.52, 0.24, 1.]
+                    } else {
+                        let d = damage[i].0;
+                        [0.55 + 0.39 * d, 0.32 + 0.43 * d, 0.12 + 0.18 * d, 1.]
+                    };
+                    Instance::cube(p, scene.rotations[i], color)
+                })
+                .collect()
+        };
+        if generated_world.is_none() {
         if let Some(t) = tool {
             if let Some(m) = t.mount {
                 // External guide visualization, not an additional collision body.
@@ -408,6 +424,7 @@ impl Renderer {
                     instances[i].size = [CELL * 0.35; 3];
                 }
             }
+        }
         }
         if instances.len() > self.instance_capacity {
             self.instance_capacity = instances.len().next_power_of_two();

@@ -1,5 +1,6 @@
 mod render;
 mod ui;
+mod world;
 use voxel_physics_lab::{bond, scene, solver, tool};
 
 use glam::Vec3;
@@ -10,7 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tool::{Shape, Tool};
-use ui::Ui;
+use ui::{Ui, UiAction};
+use world::GeneratedWorld;
 use winit::{
     event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
@@ -202,11 +204,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     camera.radius = (height * 1.5).max(
         config.ground_dimensions[0].max(config.ground_dimensions[1]) as f32 * scene::CELL * 1.6,
     );
+    let initial_camera_radius = camera.radius;
     let initial_shape = selected_shape(&args);
     if let Some(shape) = initial_shape {
         ui.selected = shape;
     }
     let mut tool = initial_shape.map(|shape| launch(shape, &scene, &ui));
+    let initial_seed = args
+        .windows(2)
+        .find(|pair| pair[0] == "--seed")
+        .map(|pair| pair[1].as_str());
+    let mut generated_world: Option<GeneratedWorld> = initial_seed.map(|seed| {
+        ui.world_active = true;
+        ui.paused = true;
+        eprintln!("generating deterministic terrain for seed {seed:?}");
+        GeneratedWorld::from_seed(seed)
+    });
+    if generated_world.is_some() {
+        tool = None;
+        camera.target = Vec3::new(0.0, 0.0, 0.5);
+        camera.radius = 11.5;
+    }
     let mut pointer = (0.0f32, 0.0f32);
     let mut orbit = false;
     let mut dragging = false;
@@ -254,10 +272,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     dragging =
                         state == ElementState::Pressed && pointer.0 < 295.0 && pointer.1 >= 185.0;
                     if state == ElementState::Pressed {
-                        if let Some(shape) = ui.pointer(pointer.0, pointer.1) {
-                            if mode == AppMode::Interactive {
-                                tool = Some(launch(shape, &scene, &ui));
+                        match ui.click(pointer.0, pointer.1) {
+                            Some(UiAction::Shape(shape)) => {
+                                if mode == AppMode::Interactive && generated_world.is_none() {
+                                    tool = Some(launch(shape, &scene, &ui));
+                                }
                             }
+                            Some(UiAction::GenerateWorld(seed)) => {
+                                let generated = GeneratedWorld::from_seed(&seed);
+                                eprintln!(
+                                    "generated deterministic terrain: seed={seed:?}, area=100 m2, voxels={}",
+                                    generated.voxels.len()
+                                );
+                                generated_world = Some(generated);
+                                ui.world_active = true;
+                                ui.paused = true;
+                                ui.show_bonds = false;
+                                tool = None;
+                                mode = AppMode::Interactive;
+                                playback_frames.clear();
+                                playback_time_s = 0.0;
+                                accumulator = 0.0;
+                                camera.target = Vec3::new(0.0, 0.0, 0.5);
+                                camera.radius = 11.5;
+                                last = Instant::now();
+                            }
+                            None => {}
                         }
                     }
                 }
@@ -271,7 +311,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 WindowEvent::KeyboardInput { event, .. }
                     if event.state == ElementState::Pressed && !event.repeat =>
                 {
-                    let shape = match event.physical_key {
+                    let editing_seed = ui.seed_editing;
+                    if editing_seed {
+                        if event.physical_key == PhysicalKey::Code(KeyCode::Backspace) {
+                            ui.erase_seed_character();
+                        } else if let Some(text) = event.text.as_ref() {
+                            ui.append_seed_text(text.as_str());
+                        }
+                    }
+                    let shape = if editing_seed {
+                        None
+                    } else {
+                        match event.physical_key {
                         PhysicalKey::Code(KeyCode::Digit1) => Some(Shape::Wedge),
                         PhysicalKey::Code(KeyCode::Digit2) => Some(Shape::Blade),
                         PhysicalKey::Code(KeyCode::Digit3) => Some(Shape::Rod),
@@ -290,8 +341,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         PhysicalKey::Code(KeyCode::KeyR) => {
                             mode = AppMode::Interactive;
+                            generated_world = None;
+                            ui.world_active = false;
                             scene = Scene::new(config.clone());
                             fix_wood_base(&mut scene);
+                            camera.target = Vec3::Z * (height * 0.5);
+                            camera.radius = initial_camera_radius;
                             tool = None;
                             playback_frames.clear();
                             playback_time_s = 0.0;
@@ -354,7 +409,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             None
                         }
                         _ => None,
-                    };
+                    }};
                     if let Some(shape) = shape {
                         ui.selected = shape;
                         if mode == AppMode::Interactive {
@@ -367,7 +422,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let elapsed = now.duration_since(last).as_secs_f32();
                     last = now;
 
-                    if matches!(mode, AppMode::Interactive | AppMode::Recording) && !ui.paused {
+                    if generated_world.is_none()
+                        && matches!(mode, AppMode::Interactive | AppMode::Recording)
+                        && !ui.paused
+                    {
                         live_wall_s += f64::from(elapsed);
                         accumulator += f64::from(elapsed);
                         // Preserve elapsed time. Limit simulation catch-up to 40 ms per redraw
@@ -457,7 +515,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     let rects = ui.draw(scene.broken, scene.cluster_count, fps, sim_ms);
-                    match renderer.draw(&scene, &tool, &camera, &rects, ui.show_bonds) {
+                    match renderer.draw(
+                        &scene,
+                        &tool,
+                        generated_world.as_ref(),
+                        &camera,
+                        &rects,
+                        ui.show_bonds,
+                    ) {
                         Ok(()) => {}
                         Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                             let s = window.inner_size();
@@ -512,10 +577,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 )
                             }
                         };
-                        window.set_title(&format!(
-                            "Voxel lab | {mode_title} | {:.1} FPS | {:.1} ms/step | tool {:.2} m/s axis {:.3} | broken {}",
-                            fps, sim_ms, tool_speed, tool_axis_position, scene.broken
-                        ));
+                        if generated_world.is_some() {
+                            window.set_title(&format!(
+                                "Voxel lab | WORLD seed {} | 10 x 10 m | {:.1} FPS",
+                                ui.seed_text, fps
+                            ));
+                        } else {
+                            window.set_title(&format!(
+                                "Voxel lab | {mode_title} | {:.1} FPS | {:.1} ms/step | tool {:.2} m/s axis {:.3} | broken {}",
+                                fps, sim_ms, tool_speed, tool_axis_position, scene.broken
+                            ));
+                        }
                     }
                 }
                 _ => {}
