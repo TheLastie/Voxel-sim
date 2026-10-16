@@ -18,7 +18,25 @@ const WORLD_SAMPLE_HEIGHT_CELLS: i32 = (WORLD_SAMPLE_HEIGHT_M / WORLD_REV_M) as 
 pub enum GeneratedCellContent {
     Air,
     Terrain,
-    Vegetation,
+    Oak,
+    Birch,
+    Acacia,
+    Grass,
+    Fern,
+    Mushroom,
+}
+
+impl GeneratedCellContent {
+    fn priority(self) -> u8 {
+        match self {
+            Self::Oak | Self::Birch | Self::Acacia => 0,
+            Self::Mushroom => 1,
+            Self::Fern => 2,
+            Self::Grass => 3,
+            Self::Terrain => 4,
+            Self::Air => 5,
+        }
+    }
 }
 
 /// Seed-derived state at one 1 cm world coordinate. This describes generated
@@ -39,6 +57,7 @@ pub struct TerrainVoxel {
     pub center: Vec3,
     pub size: Vec3,
     pub color: [f32; 4],
+    pub content: GeneratedCellContent,
 }
 
 #[derive(Debug)]
@@ -69,6 +88,16 @@ enum TreeSpecies {
     Acacia,
 }
 
+impl TreeSpecies {
+    fn generated_content(self) -> GeneratedCellContent {
+        match self {
+            Self::Oak => GeneratedCellContent::Oak,
+            Self::Birch => GeneratedCellContent::Birch,
+            Self::Acacia => GeneratedCellContent::Acacia,
+        }
+    }
+}
+
 impl GeneratedWorld {
     /// Build a deterministic 10 m × 10 m terrain heightfield from the seed.
     /// These coarse visual voxels are not attached to the centimeter physics lattice.
@@ -96,6 +125,7 @@ impl GeneratedWorld {
                     ),
                     size: Vec3::new(WORLD_CELL_M, WORLD_CELL_M, height),
                     color,
+                    content: GeneratedCellContent::Terrain,
                 });
             }
         }
@@ -160,10 +190,12 @@ impl GeneratedWorld {
 
         let content = if z_m <= terrain_height_m {
             GeneratedCellContent::Terrain
-        } else if self.vegetation_at_cell(cell, [x_m - WORLD_SIDE_M * 0.5, y_m - WORLD_SIDE_M * 0.5, z_m]) {
-            GeneratedCellContent::Vegetation
         } else {
-            GeneratedCellContent::Air
+            self.vegetation_at_cell(
+                cell,
+                [x_m - WORLD_SIDE_M * 0.5, y_m - WORLD_SIDE_M * 0.5, z_m],
+            )
+            .unwrap_or(GeneratedCellContent::Air)
         };
 
         Some(GeneratedCell {
@@ -210,20 +242,31 @@ impl GeneratedWorld {
         Some(cells)
     }
 
-    fn vegetation_at_cell(&self, cell: [i32; 3], center: [f32; 3]) -> bool {
+    fn vegetation_at_cell(
+        &self,
+        cell: [i32; 3],
+        center: [f32; 3],
+    ) -> Option<GeneratedCellContent> {
         let bin = [
             cell[0] / (WORLD_CELL_M / WORLD_REV_M) as i32,
             cell[1] / (WORLD_CELL_M / WORLD_REV_M) as i32,
             cell[2] / (WORLD_CELL_M / WORLD_REV_M) as i32,
         ];
         let Some(indices) = self.vegetation_bins.get(&bin) else {
-            return false;
+            return None;
         };
-        indices.iter().any(|&index| {
-            let voxel = &self.voxels[index];
-            let delta = Vec3::from_array(center) - voxel.center;
-            delta.abs().cmple(voxel.size * 0.5).all()
-        })
+        indices
+            .iter()
+            .filter_map(|&index| {
+                let voxel = &self.voxels[index];
+                let delta = Vec3::from_array(center) - voxel.center;
+                delta
+                    .abs()
+                    .cmple(voxel.size * 0.5)
+                    .all()
+                    .then_some(voxel.content)
+            })
+            .min_by_key(|content| content.priority())
     }
 
     fn rebuild_vegetation(&mut self) {
@@ -310,6 +353,11 @@ fn make_ground_flora(seed: u64, age_years: f32) -> Vec<TerrainVoxel> {
                     center,
                     size: Vec3::new(0.035, 0.035, height),
                     color,
+                    content: if is_fern {
+                        GeneratedCellContent::Fern
+                    } else {
+                        GeneratedCellContent::Grass
+                    },
                 });
             }
         }
@@ -337,6 +385,7 @@ fn make_ground_flora(seed: u64, age_years: f32) -> Vec<TerrainVoxel> {
                 center: Vec3::new(x, y, ground_z + stem_height * 0.5),
                 size: Vec3::new(0.035, 0.035, stem_height),
                 color: [0.82, 0.78, 0.62, 1.0],
+                content: GeneratedCellContent::Mushroom,
             });
             let cap_color = if spot & 1 == 0 {
                 [0.58, 0.20, 0.12, 1.0]
@@ -347,6 +396,7 @@ fn make_ground_flora(seed: u64, age_years: f32) -> Vec<TerrainVoxel> {
                 center: Vec3::new(x, y, ground_z + stem_height + height * 0.12),
                 size: Vec3::new(0.12, 0.12, 0.04),
                 color: cap_color,
+                content: GeneratedCellContent::Mushroom,
             });
         }
     }
@@ -410,6 +460,7 @@ impl Plant {
                         center: Vec3::new(self.x + local_x, self.y + local_y, self.soil_z + z),
                         size: Vec3::splat(WORLD_CELL_M),
                         color,
+                        content: self.species.generated_content(),
                     });
                 }
             }
@@ -445,6 +496,7 @@ impl Plant {
                             (leaf_color[2] + shade).clamp(0.0, 1.0),
                             1.0,
                         ],
+                        content: self.species.generated_content(),
                     });
                 }
             }
