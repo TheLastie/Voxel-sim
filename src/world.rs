@@ -259,15 +259,43 @@ impl GeneratedWorld {
             .min_by_key(|content| content.priority())
     }
 
+    /// Build the displayed LOD from candidate geometry, retaining a preview
+    /// voxel only when its center's implicit 1 cm sample has matching content.
     fn rebuild_vegetation(&mut self) {
         self.voxels.clone_from(&self.terrain_voxels);
-        self.voxels
-            .extend(make_ground_flora(self.seed_hash, self.age_years));
+        let mut candidates = make_ground_flora(self.seed_hash, self.age_years);
         for plant in &self.plants {
-            self.voxels
-                .extend(plant.voxels_at_age(self.age_years, self.seed_hash));
+            candidates.extend(plant.voxels_at_age(self.age_years, self.seed_hash));
+        }
+        self.voxels.reserve(candidates.len());
+        for voxel in candidates {
+            let Some(cell) = cell_containing_point(voxel.center) else {
+                continue;
+            };
+            let Some(sample) = self.sample_cell(cell) else {
+                continue;
+            };
+            if sample.content == voxel.content {
+                self.voxels.push(voxel);
+            }
         }
         self.generated_year = self.age_years.floor() as u32;
+    }
+}
+
+fn cell_containing_point(point: Vec3) -> Option<[i32; 3]> {
+    let cell = [
+        ((point.x + WORLD_SIDE_M * 0.5) / WORLD_REV_M - 0.5).round() as i32,
+        ((point.y + WORLD_SIDE_M * 0.5) / WORLD_REV_M - 0.5).round() as i32,
+        (point.z / WORLD_REV_M - 0.5).round() as i32,
+    ];
+    if (0..WORLD_REV_SIDE).contains(&cell[0])
+        && (0..WORLD_REV_SIDE).contains(&cell[1])
+        && (0..WORLD_SAMPLE_HEIGHT_CELLS).contains(&cell[2])
+    {
+        Some(cell)
+    } else {
+        None
     }
 }
 
@@ -608,9 +636,6 @@ impl Plant {
                         continue;
                     }
                     let hash = lattice_hash(seed ^ 0xD6E8_FEB8_6659_FD93, x + 17, y - z * 3);
-                    if hash % 11 == 0 {
-                        continue;
-                    }
                     let shade = ((hash >> 24) as f32 / 16_777_215.0 - 0.5) * 0.08;
                     result.push(TerrainVoxel {
                         center: crown_center + offset,
