@@ -167,6 +167,8 @@ pub struct EnergyLedger {
     pub contact_restitution_heat: f64,
     /// Liquid shear energy converted to internal heat by dynamic viscosity (J).
     pub liquid_viscous_heat: f64,
+    /// Solid viscoelastic energy converted from bond-relative motion to heat (J).
+    pub solid_viscoelastic_heat: f64,
     /// Relative kinetic energy converted to heat during REV fusion (J).
     pub fusion_heat: f64,
     /// Mechanical work by applied nodal loads and gravity (J).
@@ -243,7 +245,9 @@ pub fn update(
     }
     // Failure is evaluated after plastic return mapping, not on the elastic predictor.
     // Using the trial stress here tears ductile materials at every strain increment.
-    let stress = k * u / AREA;
+    // Strength limits apply to the traction this damaged bond still carries.
+    // The solver degrades its stiffness by the same remaining intact fraction.
+    let stress = (k * u / AREA) * (1.0 - b.damage).max(0.001);
     let normal_limit = if stress.x >= 0.0 {
         l.tension
     } else {
@@ -271,8 +275,12 @@ pub fn update(
             b.damage = (b.damage + c.damage_rate * dt * ratio.min(10.0)).min(1.0);
         }
     }
-    if l.ductility > 1e-5 && b.equivalent_plastic_strain >= l.plastic_failure.max(1e-6) {
-        b.damage = (b.damage + c.damage_rate * dt).min(1.0);
+    if l.ductility > 1e-5 {
+        // Plastic failure follows accumulated irreversible strain, not elapsed
+        // time after a past overload. The material limit is a critical strain.
+        let plastic_damage =
+            (b.equivalent_plastic_strain / l.plastic_failure.max(1e-6)).clamp(0.0, 1.0);
+        b.damage = b.damage.max(plastic_damage);
     }
     if b.fatigue_damage >= 1.0 {
         b.damage = 1.0;

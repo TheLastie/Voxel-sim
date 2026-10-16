@@ -18,6 +18,71 @@ use winit::{
     window::WindowBuilder,
 };
 
+const RECORDING_DURATION_SECONDS: f64 = 17.6;
+const PLAYBACK_FRAME_INTERVAL_SECONDS: f64 = 0.1;
+const MAX_SIMULATED_SECONDS_PER_REDRAW: f64 = 0.040;
+const MAX_SOLVER_WALL_TIME_PER_REDRAW: Duration = Duration::from_millis(40);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppMode {
+    Interactive,
+    Recording,
+    Playback,
+}
+
+struct PlaybackFrame {
+    time_s: f64,
+    positions: Vec<Vec3>,
+    rotations: Vec<glam::Quat>,
+    bond_neighbors: Vec<u32>,
+    bond_damage: Vec<f32>,
+    broken: usize,
+    clusters: usize,
+    tool_pose: Option<(Vec3, glam::Quat)>,
+}
+
+fn capture_frame(scene: &Scene, tool: &Option<Tool>, time_s: f64) -> PlaybackFrame {
+    PlaybackFrame {
+        time_s,
+        positions: scene.positions.clone(),
+        rotations: scene.rotations.clone(),
+        bond_neighbors: scene
+            .bonds
+            .iter()
+            .flat_map(|axis| axis.iter().map(|bond| bond.neighbor))
+            .collect(),
+        bond_damage: scene
+            .bonds
+            .iter()
+            .flat_map(|axis| axis.iter().map(|bond| bond.damage))
+            .collect(),
+        broken: scene.broken,
+        clusters: scene.cluster_count,
+        tool_pose: tool.as_ref().map(|tool| (tool.position, tool.rotation)),
+    }
+}
+
+fn apply_frame(scene: &mut Scene, tool: &mut Option<Tool>, frame: &PlaybackFrame) {
+    scene.positions.clone_from(&frame.positions);
+    scene.rotations.clone_from(&frame.rotations);
+    for ((bond, &neighbor), &damage) in scene
+        .bonds
+        .iter_mut()
+        .flatten()
+        .zip(&frame.bond_neighbors)
+        .zip(&frame.bond_damage)
+    {
+        bond.neighbor = neighbor;
+        bond.damage = damage;
+    }
+    scene.broken = frame.broken;
+    scene.cluster_count = frame.clusters;
+    if let (Some(tool), Some((position, rotation))) = (tool.as_mut(), frame.tool_pose) {
+        tool.position = position;
+        tool.rotation = rotation;
+    }
+}
+
 fn launch(shape: Shape, scene: &Scene, ui: &Ui) -> Tool {
     let mut tool = Tool::new(shape, scene, ui.start(), ui.direction(), ui.speed);
     if matches!(shape, Shape::Wedge) {
@@ -29,9 +94,13 @@ fn launch(shape: Shape, scene: &Scene, ui: &Ui) -> Tool {
 }
 
 fn fix_wood_base(scene: &mut Scene) {
-    let Some(wood_id) = voxel_physics_lab::material::Material::component_id("wood") else {
+    let wood_ids: Vec<_> = ["wood", "oak"]
+        .into_iter()
+        .filter_map(voxel_physics_lab::material::Material::component_id)
+        .collect();
+    if wood_ids.is_empty() {
         return;
-    };
+    }
     let wood: Vec<_> = scene
         .voxels
         .iter()
@@ -41,7 +110,9 @@ fn fix_wood_base(scene: &mut Scene) {
                 .composition
                 .components
                 .iter()
-                .any(|&(component, fraction)| component == wood_id && fraction > 0.0)
+                .any(|&(component, fraction)| {
+                    wood_ids.contains(&component) && fraction > 0.0
+                })
         })
         .map(|(index, _)| index)
         .collect();
@@ -62,8 +133,20 @@ fn fix_wood_base(scene: &mut Scene) {
     eprintln!("fixed wood base: {} REV at Z={lowest_z:.4} m", base.len());
 }
 
+fn selected_shape(args: &[String]) -> Option<Shape> {
+    args.windows(2)
+        .find(|pair| pair[0] == "--tool")
+        .map(|pair| match pair[1].as_str() {
+            "knife" => Shape::Blade,
+            "rod" => Shape::Rod,
+            "stone" => Shape::Rounded,
+            _ => Shape::Wedge,
+        })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
+    let pause_on_fracture = args.iter().any(|arg| arg == "--pause-on-fracture");
     let path = args
         .windows(2)
         .find(|p| p[0] == "--scene")
@@ -72,22 +155,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = SceneConfig::load(path)?;
     let mut scene = Scene::new(config.clone());
     fix_wood_base(&mut scene);
-    let mut ui = Ui::new(config.initial_speed, Vec3::from_array(config.tool_start));
+    let mut ui = Ui::new(
+        config.initial_speed,
+        Vec3::from_array(config.tool_start),
+        Vec3::from_array(config.tool_direction),
+    );
     if let Some(index) = args.iter().position(|s| s == "--headless") {
         let steps: usize = args
             .get(index + 1)
             .and_then(|s| s.parse().ok())
             .unwrap_or(60);
-        let shape = match args
-            .windows(2)
-            .find(|p| p[0] == "--tool")
-            .map(|p| p[1].as_str())
-        {
-            Some("knife") => Shape::Blade,
-            Some("rod") => Shape::Rod,
-            Some("stone") => Shape::Rounded,
-            _ => Shape::Wedge,
-        };
+        let shape = selected_shape(&args).unwrap_or(Shape::Wedge);
         let mut tool = Some(launch(shape, &scene, &ui));
         let start = Instant::now();
         for _ in 0..steps {
@@ -124,13 +202,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     camera.radius = (height * 1.5).max(
         config.ground_dimensions[0].max(config.ground_dimensions[1]) as f32 * scene::CELL * 1.6,
     );
-    let mut tool = None;
+    let initial_shape = selected_shape(&args);
+    if let Some(shape) = initial_shape {
+        ui.selected = shape;
+    }
+    let mut tool = initial_shape.map(|shape| launch(shape, &scene, &ui));
     let mut pointer = (0.0f32, 0.0f32);
     let mut orbit = false;
     let mut dragging = false;
     let mut last = Instant::now();
-    let mut accumulator = 0.0f32;
+    let mut accumulator = 0.0f64;
+    let mut mode = AppMode::Interactive;
+    let mut playback_frames = Vec::new();
+    let mut playback_time_s = 0.0;
+    let mut live_simulated_s = 0.0;
+    let mut live_wall_s = 0.0;
+    let mut next_record_frame_s = PLAYBACK_FRAME_INTERVAL_SECONDS;
     let mut sim_ms = 0.0;
+    let mut fracture_pause_triggered = false;
     let mut fps = 0.0;
     let mut frames = 0;
     let mut fps_time = Instant::now();
@@ -166,7 +255,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         state == ElementState::Pressed && pointer.0 < 295.0 && pointer.1 >= 185.0;
                     if state == ElementState::Pressed {
                         if let Some(shape) = ui.pointer(pointer.0, pointer.1) {
-                            tool = Some(launch(shape, &scene, &ui));
+                            if mode == AppMode::Interactive {
+                                tool = Some(launch(shape, &scene, &ui));
+                            }
                         }
                     }
                 }
@@ -187,7 +278,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         PhysicalKey::Code(KeyCode::Digit4) => Some(Shape::Rounded),
                         PhysicalKey::Code(KeyCode::Space) => {
                             ui.paused = !ui.paused;
-                            accumulator = 0.0;
+                            if mode != AppMode::Playback {
+                                accumulator = 0.0;
+                            }
+                            last = Instant::now();
                             None
                         }
                         PhysicalKey::Code(KeyCode::KeyB) => {
@@ -195,10 +289,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             None
                         }
                         PhysicalKey::Code(KeyCode::KeyR) => {
+                            mode = AppMode::Interactive;
                             scene = Scene::new(config.clone());
                             fix_wood_base(&mut scene);
                             tool = None;
+                            playback_frames.clear();
+                            playback_time_s = 0.0;
+                            live_simulated_s = 0.0;
+                            live_wall_s = 0.0;
+                            next_record_frame_s = PLAYBACK_FRAME_INTERVAL_SECONDS;
                             accumulator = 0.0;
+                            ui.paused = false;
+                            fracture_pause_triggered = false;
+                            last = Instant::now();
+                            None
+                        }
+                        PhysicalKey::Code(KeyCode::KeyP) => {
+                            match mode {
+                                AppMode::Interactive => {
+                                    playback_frames.clear();
+                                    playback_frames.push(capture_frame(&scene, &tool, 0.0));
+                                    playback_time_s = 0.0;
+                                    live_simulated_s = 0.0;
+                                    live_wall_s = 0.0;
+                                    next_record_frame_s = PLAYBACK_FRAME_INTERVAL_SECONDS;
+                                    accumulator = 0.0;
+                                    ui.paused = false;
+                                    fracture_pause_triggered = false;
+                                    mode = AppMode::Recording;
+                                    last = Instant::now();
+                                }
+                                AppMode::Recording => {
+                                    if let Some(frame) = playback_frames.last() {
+                                        if live_simulated_s > frame.time_s + 1e-9 {
+                                            playback_frames.push(capture_frame(
+                                                &scene,
+                                                &tool,
+                                                live_simulated_s,
+                                            ));
+                                        }
+                                    }
+                                    mode = AppMode::Playback;
+                                    playback_time_s = 0.0;
+                                    accumulator = 0.0;
+                                    ui.paused = false;
+                                    if let Some(frame) = playback_frames.first() {
+                                        apply_frame(&mut scene, &mut tool, frame);
+                                    }
+                                    last = Instant::now();
+                                }
+                                AppMode::Playback => {
+                                    playback_time_s = 0.0;
+                                    ui.paused = false;
+                                    if let Some(frame) = playback_frames.first() {
+                                        apply_frame(&mut scene, &mut tool, frame);
+                                    }
+                                    last = Instant::now();
+                                }
+                            }
                             None
                         }
                         PhysicalKey::Code(KeyCode::Escape) => {
@@ -209,22 +357,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     if let Some(shape) = shape {
                         ui.selected = shape;
-                        tool = Some(launch(shape, &scene, &ui));
+                        if mode == AppMode::Interactive {
+                            tool = Some(launch(shape, &scene, &ui));
+                        }
                     }
                 }
                 WindowEvent::RedrawRequested => {
                     let now = Instant::now();
                     let elapsed = now.duration_since(last).as_secs_f32();
                     last = now;
-                    if !ui.paused {
-                        accumulator = (accumulator + elapsed).min(config.fixed_dt * 2.0);
-                        // Bounded catch-up: an overloaded simulation slows down, rather than spiralling.
+
+                    if matches!(mode, AppMode::Interactive | AppMode::Recording) && !ui.paused {
+                        live_wall_s += f64::from(elapsed);
+                        accumulator += f64::from(elapsed);
+                        // Preserve elapsed time. Limit simulation catch-up to 40 ms per redraw
+                        // and retain any backlog instead of dropping simulated time.
                         let start = Instant::now();
                         let mut steps = 0;
-                        while accumulator >= config.fixed_dt && steps < 2 {
+                        let fixed_dt = f64::from(config.fixed_dt);
+                        let max_steps =
+                            (MAX_SIMULATED_SECONDS_PER_REDRAW / fixed_dt).floor() as usize;
+                        while accumulator >= fixed_dt
+                            && steps < max_steps.max(1)
+                            && (steps == 0 || start.elapsed() < MAX_SOLVER_WALL_TIME_PER_REDRAW)
+                        {
+                            if let Some(active_tool) = tool.as_mut() {
+                                active_tool
+                                    .set_external_force(ui.direction() * ui.force_newtons)
+                                    .expect("UI force is finite");
+                            }
                             solver::step(&mut scene, &mut tool);
-                            accumulator -= config.fixed_dt;
+                            accumulator -= fixed_dt;
+                            live_simulated_s += fixed_dt;
                             steps += 1;
+                            if mode == AppMode::Recording {
+                                while live_simulated_s + fixed_dt * 0.5
+                                    >= next_record_frame_s
+                                {
+                                    playback_frames.push(capture_frame(
+                                        &scene,
+                                        &tool,
+                                        live_simulated_s,
+                                    ));
+                                    next_record_frame_s += PLAYBACK_FRAME_INTERVAL_SECONDS;
+                                }
+                                if live_simulated_s + fixed_dt * 0.5
+                                    >= RECORDING_DURATION_SECONDS
+                                {
+                                    if playback_frames
+                                        .last()
+                                        .is_some_and(|frame| {
+                                            frame.time_s + fixed_dt * 0.5
+                                                < live_simulated_s
+                                        })
+                                    {
+                                        playback_frames.push(capture_frame(
+                                            &scene,
+                                            &tool,
+                                            live_simulated_s,
+                                        ));
+                                    }
+                                    mode = AppMode::Playback;
+                                    playback_time_s = 0.0;
+                                    accumulator = 0.0;
+                                    if let Some(frame) = playback_frames.first() {
+                                        apply_frame(&mut scene, &mut tool, frame);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        if pause_on_fracture && !fracture_pause_triggered && scene.broken > 0 {
+                            ui.paused = true;
+                            ui.show_bonds = true;
+                            fracture_pause_triggered = true;
                         }
                         if steps > 0 {
                             sim_ms = start.elapsed().as_secs_f32() * 1000.0 / steps as f32;
@@ -232,6 +438,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if scene.positions.iter().any(|p| !p.is_finite()) {
                             eprintln!("Solver became non-finite; paused.");
                             ui.paused = true;
+                        }
+                    } else if mode == AppMode::Playback && !ui.paused {
+                        let duration = playback_frames
+                            .last()
+                            .map_or(0.0, |frame| frame.time_s);
+                        // Keep the last saved state visible for one sample interval, then
+                        // wrap to the beginning. Playback is a view of captured solver states;
+                        // it must not stop the physical run or synthesize intermediate states.
+                        let loop_duration = duration + PLAYBACK_FRAME_INTERVAL_SECONDS;
+                        playback_time_s = (playback_time_s + f64::from(elapsed)) % loop_duration;
+                        let sample_time_s = playback_time_s.min(duration);
+                        let frame_index = playback_frames
+                            .partition_point(|frame| frame.time_s <= sample_time_s)
+                            .saturating_sub(1);
+                        if let Some(frame) = playback_frames.get(frame_index) {
+                            apply_frame(&mut scene, &mut tool, frame);
                         }
                     }
                     let rects = ui.draw(scene.broken, scene.cluster_count, fps, sim_ms);
@@ -241,7 +463,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let s = window.inner_size();
                             renderer.resize(s.width, s.height);
                         }
-                        Err(wgpu::SurfaceError::OutOfMemory) => target.exit(),
+                        Err(wgpu::SurfaceError::OutOfMemory) => {
+                            target.exit();
+                        }
                         Err(wgpu::SurfaceError::Timeout) => {}
                     }
                     frames += 1;
@@ -249,9 +473,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         fps = frames as f32 / fps_time.elapsed().as_secs_f32();
                         frames = 0;
                         fps_time = Instant::now();
+                        let tool_axis_position = tool
+                            .as_ref()
+                            .map_or(f32::NAN, |t| t.position.dot(ui.direction()));
+                        let tool_speed = tool.as_ref().map_or(0.0, |t| t.velocity.length());
+                        let live_rate = if live_wall_s > 0.0 {
+                            live_simulated_s / live_wall_s
+                        } else {
+                            0.0
+                        };
+                        let mode_title = match mode {
+                            AppMode::Interactive => {
+                                if ui.paused {
+                                    "LIVE PAUSED".to_owned()
+                                } else {
+                                    format!("LIVE {:.3}x", live_rate)
+                                }
+                            }
+                            AppMode::Recording => format!(
+                                "RECORD {} {:.1}/{:.1}s | LIVE {:.3}x",
+                                if ui.paused { "PAUSED" } else { "LIVE" },
+                                live_simulated_s,
+                                RECORDING_DURATION_SECONDS,
+                                live_rate
+                            ),
+                            AppMode::Playback => {
+                                let state = if ui.paused { "PAUSED" } else { "1.00x" };
+                                let frame_count = playback_frames.len();
+                                let loop_duration = playback_frames
+                                    .last()
+                                    .map_or(PLAYBACK_FRAME_INTERVAL_SECONDS, |frame| {
+                                        frame.time_s + PLAYBACK_FRAME_INTERVAL_SECONDS
+                                    });
+                                format!(
+                                    "PLAYBACK {state} {:.1}/{:.1}s | {frame_count} frames",
+                                    playback_time_s.min(loop_duration),
+                                    loop_duration,
+                                )
+                            }
+                        };
                         window.set_title(&format!(
-                            "Voxel lab | {:.1} FPS | {:.1} ms/step | broken {}",
-                            fps, sim_ms, scene.broken
+                            "Voxel lab | {mode_title} | {:.1} FPS | {:.1} ms/step | tool {:.2} m/s axis {:.3} | broken {}",
+                            fps, sim_ms, tool_speed, tool_axis_position, scene.broken
                         ));
                     }
                 }

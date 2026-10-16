@@ -10,6 +10,46 @@ use std::{collections::HashMap, fs};
 pub const CELL: f32 = 0.01;
 pub const AREA: f32 = CELL * CELL;
 
+/// Uniform ambient dry air. Pressure and temperature determine density through
+/// the ideal-gas law; the force model uses a measured bluff-body drag
+/// coefficient for the exposed voxel surface.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AtmosphereConfig {
+    pub pressure_pa: f32,
+    pub temperature_kelvin: f32,
+    pub wind_velocity_m_s: [f32; 3],
+    pub drag_coefficient: f32,
+}
+
+impl Default for AtmosphereConfig {
+    fn default() -> Self {
+        Self {
+            pressure_pa: 101_325.0,
+            temperature_kelvin: 293.15,
+            wind_velocity_m_s: [0.0; 3],
+            drag_coefficient: 0.65,
+        }
+    }
+}
+
+impl AtmosphereConfig {
+    pub fn density_kg_m3(self) -> f32 {
+        const DRY_AIR_SPECIFIC_GAS_CONSTANT_J_KG_K: f32 = 287.05;
+        self.pressure_pa / (DRY_AIR_SPECIFIC_GAS_CONSTANT_J_KG_K * self.temperature_kelvin)
+    }
+
+    fn validate(self) -> bool {
+        self.pressure_pa.is_finite()
+            && self.pressure_pa >= 0.0
+            && self.temperature_kelvin.is_finite()
+            && self.temperature_kelvin > 0.0
+            && Vec3::from_array(self.wind_velocity_m_s).is_finite()
+            && self.drag_coefficient.is_finite()
+            && self.drag_coefficient >= 0.0
+    }
+}
+
 /// CPU preconditioner used by the coupled elastic PCG solver.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -222,6 +262,8 @@ pub struct SceneConfig {
     pub fibers: [f32; 3],
     pub anisotropy: f32,
     pub gravity: [f32; 3],
+    #[serde(default)]
+    pub atmosphere: AtmosphereConfig,
     pub fixed_dt: f32,
     pub substeps: usize,
     pub iterations: usize,
@@ -238,6 +280,9 @@ pub struct SceneConfig {
 
     pub initial_speed: f32,
     pub tool_start: [f32; 3],
+    /// Travel direction for the tool and its applied force; normalized on use.
+    #[serde(default = "default_tool_direction")]
+    pub tool_direction: [f32; 3],
 }
 
 impl Default for SceneConfig {
@@ -250,6 +295,7 @@ impl Default for SceneConfig {
             fibers: [0.0, 0.0, 1.0],
             anisotropy: 0.0,
             gravity: [0.0, 0.0, -9.81],
+            atmosphere: AtmosphereConfig::default(),
             fixed_dt: 0.001,
             substeps: 4,
             iterations: 80,
@@ -261,6 +307,7 @@ impl Default for SceneConfig {
             fracture: Default::default(),
             initial_speed: 0.0,
             tool_start: [0.0; 3],
+            tool_direction: default_tool_direction(),
         }
     }
 }
@@ -279,7 +326,10 @@ impl SceneConfig {
             || result.tool_dimensions.iter().any(|&n| n < 2)
             || !(0.0..=1.0).contains(&result.anisotropy)
             || !Vec3::from_array(result.gravity).is_finite()
+            || !result.atmosphere.validate()
             || !Vec3::from_array(result.tool_start).is_finite()
+            || !Vec3::from_array(result.tool_direction).is_finite()
+            || Vec3::from_array(result.tool_direction).length_squared() < 1e-8
             || !result.initial_speed.is_finite()
             || result.initial_speed < 0.0
             || !Vec3::from_array(result.fibers).is_finite()
@@ -303,7 +353,10 @@ impl SceneConfig {
 }
 
 fn default_cuda_iterations() -> usize {
-    160
+    320
+}
+fn default_tool_direction() -> [f32; 3] {
+    [1.0, 0.0, 0.0]
 }
 /// Positions are separate arrays; material identity exists only in composition.
 pub struct Scene {
@@ -1598,6 +1651,7 @@ impl Scene {
 
     pub fn new(config: SceneConfig) -> Self {
         let materials = Material::table();
+        let oak_component = Material::component_id("oak").expect("built-in oak profile");
         let mut voxels = Vec::new();
         let mut positions = Vec::new();
         let mut keys = Vec::new();
@@ -1636,7 +1690,7 @@ impl Scene {
                 for x in 0..nx {
                     add(
                         [x as i32 - nx as i32 / 2, y as i32 - ny as i32 / 2, z as i32],
-                        1,
+                        oak_component,
                         config.anisotropy,
                         false,
                         orientation,
@@ -1654,7 +1708,7 @@ impl Scene {
                             y as i32 - by as i32 / 2,
                             (nz * 2 / 3 + z) as i32,
                         ],
-                        1,
+                        oak_component,
                         config.anisotropy,
                         false,
                         Quat::from_rotation_arc(Vec3::Z, Vec3::X),

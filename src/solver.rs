@@ -72,6 +72,121 @@ pub fn stiffness_matrix(scene: &Scene, i: usize, j: usize, frame: Mat3) -> Mat3 
     (a_compliance + b_compliance).inverse() * (2.0 * AREA / CELL)
 }
 
+/// Apply an implicit Kelvin–Voigt dashpot along each intact bond's current
+/// centerline. Equal/opposite central impulses preserve linear and angular
+/// momentum; the measured loss in free nodal kinetic energy becomes heat.
+/// Tangential bond damping needs rotational inertia/torques, which this REV
+/// model does not currently represent, so it is intentionally not fabricated.
+fn translational_mobility(
+    scene: &Scene,
+    targets: &[[Option<f32>; 3]],
+    index: usize,
+) -> Vec3 {
+    let voxel = &scene.voxels[index];
+    if voxel.kinematic {
+        Vec3::ZERO
+    } else {
+        Vec3::new(
+            if targets[index][0].is_none() { 1.0 / voxel.mass } else { 0.0 },
+            if targets[index][1].is_none() { 1.0 / voxel.mass } else { 0.0 },
+            if targets[index][2].is_none() { 1.0 / voxel.mass } else { 0.0 },
+        )
+    }
+}
+
+fn apply_solid_viscoelastic_damping(
+    scene: &mut Scene,
+    targets: &[[Option<f32>; 3]],
+    dt: f32,
+) {
+    let free_kinetic = |velocity: Vec3, mass: f32, mobility: Vec3| {
+        0.5 * mass
+            * (if mobility.x > 0.0 { velocity.x * velocity.x } else { 0.0 }
+                + if mobility.y > 0.0 { velocity.y * velocity.y } else { 0.0 }
+                + if mobility.z > 0.0 { velocity.z * velocity.z } else { 0.0 })
+    };
+
+    for axis in 0..3 {
+        for i in 0..scene.voxels.len() {
+            let bond = scene.bonds[axis][i];
+            if bond.neighbor == EMPTY {
+                continue;
+            }
+            let j = bond.neighbor as usize;
+            if j >= scene.voxels.len() {
+                continue;
+            }
+            let kelvin_voigt_time = 0.5
+                * (scene.properties[i].solid_kelvin_voigt_time_s
+                    + scene.properties[j].solid_kelvin_voigt_time_s);
+            if !kelvin_voigt_time.is_finite() || kelvin_voigt_time <= 0.0 {
+                continue;
+            }
+
+            let separation = scene.positions[j] - scene.positions[i];
+            let normal = separation.normalize_or_zero();
+            if normal == Vec3::ZERO {
+                continue;
+            }
+            let mobility_i = translational_mobility(scene, targets, i);
+            let mobility_j = translational_mobility(scene, targets, j);
+            let inverse_effective_mass = (mobility_i + mobility_j).dot(normal * normal);
+            if inverse_effective_mass <= 0.0 {
+                continue;
+            }
+            let velocity_i = scene.voxels[i].velocity;
+            let velocity_j = scene.voxels[j].velocity;
+            let relative_speed = (velocity_j - velocity_i).dot(normal);
+            if relative_speed.abs() <= 1e-12 {
+                continue;
+            }
+
+            // A zero normal rate produces no dashpot force or heat. Test it
+            // before evaluating the temperature-dependent bond stiffness.
+            let frame = basis(axis, scene.rotations[i].slerp(scene.rotations[j], 0.5));
+            let stiffness = stiffness_matrix(scene, i, j, frame).x_axis.x
+                * (1.0 - bond.damage).clamp(0.0, 1.0);
+            let dashpot = kelvin_voigt_time * stiffness;
+            if !dashpot.is_finite() || dashpot <= 0.0 {
+                continue;
+            }
+
+            // Backward-Euler integration keeps stiff material dashpots stable.
+            let denominator = 1.0 + dt * dashpot * inverse_effective_mass;
+            if !denominator.is_finite() || denominator <= 0.0 {
+                continue;
+            }
+            let impulse_on_j = normal * (-dt * dashpot * relative_speed / denominator);
+            let new_velocity_i = velocity_i
+                - Vec3::new(
+                    mobility_i.x * impulse_on_j.x,
+                    mobility_i.y * impulse_on_j.y,
+                    mobility_i.z * impulse_on_j.z,
+                );
+            let new_velocity_j = velocity_j
+                + Vec3::new(
+                    mobility_j.x * impulse_on_j.x,
+                    mobility_j.y * impulse_on_j.y,
+                    mobility_j.z * impulse_on_j.z,
+                );
+
+            let before = free_kinetic(velocity_i, scene.voxels[i].mass, mobility_i)
+                + free_kinetic(velocity_j, scene.voxels[j].mass, mobility_j);
+            let after = free_kinetic(new_velocity_i, scene.voxels[i].mass, mobility_i)
+                + free_kinetic(new_velocity_j, scene.voxels[j].mass, mobility_j);
+            scene.voxels[i].velocity = new_velocity_i;
+            scene.voxels[j].velocity = new_velocity_j;
+
+            let heat = (before - after).max(0.0) as f64;
+            if heat > 0.0 {
+                scene.energy.solid_viscoelastic_heat += heat;
+                scene.voxels[i].add_internal_energy_j(heat * 0.5);
+                scene.voxels[j].add_internal_energy_j(heat * 0.5);
+            }
+        }
+    }
+}
+
 /// Free linear thermal displacement of a bond relative to each REV's
 /// stress-free temperature at scene creation. Each REV contributes half of
 /// its anisotropic eigenstrain tensor projected along the bond direction.
@@ -416,6 +531,76 @@ fn fit_rotations(scene: &mut Scene, scratch: &mut SolverScratch) -> f32 {
     }
 }
 
+/// First-order ambient-air coupling for the solid REV surface. Intact bonds
+/// hide their shared face; a broken or external face sees air. Pressure drag
+/// is integrated facewise so internal REV faces do not create artificial area.
+fn atmosphere_loads(
+    scene: &Scene,
+    exposed_faces: &mut Vec<[u8; 3]>,
+    loads: &mut Vec<Vec3>,
+) {
+    let air = scene.config.atmosphere;
+    let density = air.density_kg_m3();
+    let voxel_count = scene.voxels.len();
+    loads.resize(voxel_count, Vec3::ZERO);
+    if density <= 0.0 {
+        loads.fill(Vec3::ZERO);
+        return;
+    }
+
+    exposed_faces.resize(voxel_count, [2u8; 3]);
+    exposed_faces.fill([2u8; 3]);
+    for axis in 0..3 {
+        for (i, bond) in scene.bonds[axis].iter().enumerate() {
+            if bond.neighbor == EMPTY {
+                continue;
+            }
+            let j = bond.neighbor as usize;
+            if j >= scene.voxels.len() || i == j {
+                continue;
+            }
+            exposed_faces[i][axis] = exposed_faces[i][axis].saturating_sub(1);
+            exposed_faces[j][axis] = exposed_faces[j][axis].saturating_sub(1);
+        }
+    }
+
+    let wind = Vec3::from_array(air.wind_velocity_m_s);
+    let local_axes = [Vec3::X, Vec3::Y, Vec3::Z];
+    for (i, voxel) in scene.voxels.iter().enumerate() {
+        if voxel.kinematic {
+            loads[i] = Vec3::ZERO;
+            continue;
+        }
+        let mut force = Vec3::ZERO;
+        let material_density = scene.properties[i].density;
+        if material_density > 0.0 {
+            let displaced_air_mass = density * voxel.mass / material_density;
+            force -= Vec3::from_array(scene.config.gravity) * displaced_air_mass;
+        }
+
+        let relative_velocity = voxel.velocity - wind;
+        for axis in 0..3 {
+            let faces = exposed_faces[i][axis] as f32;
+            if faces == 0.0 {
+                continue;
+            }
+            let normal = (scene.rotations[i] * local_axes[axis]).normalize_or_zero();
+            let normal_speed = relative_velocity.dot(normal);
+            // Opposing faces both contribute to pressure drag. Splitting
+            // Cd evenly between them gives D = Cd * q * projected_area.
+            let face_force = -normal
+                * (0.25
+                    * density
+                    * air.drag_coefficient
+                    * AREA
+                    * normal_speed
+                    * normal_speed.abs());
+            force += face_force * faces;
+        }
+        loads[i] = force;
+    }
+}
+
 pub fn step(scene: &mut Scene, tool: &mut Option<Tool>) {
     step_with_targets(scene, tool, &[]);
 }
@@ -445,58 +630,95 @@ pub fn step_with_axis_targets_and_loads(
 ) {
     assert!(targets.is_empty() || targets.len() == scene.voxels.len());
     assert!(loads.is_empty() || loads.len() == scene.voxels.len());
+    // Keep the large per-step and per-substep work arrays alive across calls.
+    let mut solver_scratch = std::mem::take(&mut scene.solver_scratch);
+    let mut melted = std::mem::take(&mut solver_scratch.melted);
+    let mut topology_changed = break_fully_melted_bonds(scene, &mut melted);
     // Explicit per-step coordinates override persistent constraints on that axis.
-    let merged_targets: Vec<_> = scene
-        .axis_targets
-        .iter()
-        .enumerate()
-        .map(|(i, fixed)| std::array::from_fn(|a| targets.get(i).and_then(|t| t[a]).or(fixed[a])))
-        .collect();
+    let voxel_count = scene.voxels.len();
+    let mut merged_targets = std::mem::take(&mut solver_scratch.merged_targets);
+    merged_targets.clear();
+    merged_targets.reserve(voxel_count);
+    merged_targets.extend(scene.axis_targets.iter().enumerate().map(|(i, fixed)| {
+        std::array::from_fn(|a| targets.get(i).and_then(|t| t[a]).or(fixed[a]))
+    }));
     assert!(merged_targets
         .iter()
         .flatten()
         .flatten()
         .all(|p| p.is_finite()));
     let targets = merged_targets.as_slice();
-    let applied_loads: Vec<_> = scene
-        .voxels
-        .iter()
-        .enumerate()
-        .map(|(i, voxel)| {
-            if !voxel.kinematic {
-                scene.external_forces[i]
-                    + scene.external_accelerations[i] * voxel.mass
-                    + loads.get(i).copied().unwrap_or(Vec3::ZERO)
-            } else {
-                Vec3::ZERO
-            }
-        })
-        .collect();
+    let mut atmosphere_exposed_faces =
+        std::mem::take(&mut solver_scratch.atmosphere_exposed_faces);
+    let mut ambient_loads = std::mem::take(&mut solver_scratch.ambient_loads);
+    atmosphere_loads(scene, &mut atmosphere_exposed_faces, &mut ambient_loads);
+    let mut applied_loads = std::mem::take(&mut solver_scratch.applied_loads);
+    applied_loads.resize(voxel_count, Vec3::ZERO);
+    for (i, voxel) in scene.voxels.iter().enumerate() {
+        applied_loads[i] = if !voxel.kinematic {
+            scene.external_forces[i]
+                + scene.external_accelerations[i] * voxel.mass
+                + loads.get(i).copied().unwrap_or(Vec3::ZERO)
+                + ambient_loads[i]
+        } else {
+            Vec3::ZERO
+        };
+    }
     let h = scene.config.fixed_dt / scene.config.substeps as f32;
     let gravity = Vec3::from_array(scene.config.gravity);
-    let mut topology_changed = break_fully_melted_bonds(scene);
     let profile_step = std::env::var_os("VOXEL_PROFILE_STEP").is_some();
     let mut stage_time = [Duration::ZERO; 5];
     let mut total_pcg_iterations = 0usize;
     let mut solve_detail_time = [Duration::ZERO; 3];
+    let mut contact_finish_time = Duration::ZERO;
+    let mut tool_recheck_time = Duration::ZERO;
+    let mut release_time = Duration::ZERO;
+    let mut damping_time = Duration::ZERO;
+    let mut thermal_time = Duration::ZERO;
     // Reuse large solver buffers across substeps and corotation corrections.
-    let mut solver_scratch = std::mem::take(&mut scene.solver_scratch);
     // A failed device solve is unlikely to recover on another corotation
     // iteration/substep of this same fixed step (same device and scene state).
     // Fall back once, then avoid repeating the costly CUDA setup until the next
     // fixed step, where the matrix and residual have changed.
     let mut cuda_enabled_for_step = true;
-    let mut substep_start_positions = Vec::with_capacity(scene.positions.len());
-    let mut substep_start_velocities = Vec::with_capacity(scene.voxels.len());
-    let mut load_integrated_velocities = vec![Vec3::ZERO; scene.voxels.len()];
-    let mut contact_work_mode = vec![0u8; scene.voxels.len()];
+    // Reuse a prior substep solution as an initial guess only while the bond
+    // graph remains unchanged. The current matrix residual is checked against
+    // the configured tolerance inside `solve_coupled` before accepting it.
+    let mut reusable_cuda_solution = false;
+    let voxel_count = scene.voxels.len();
+    let mut substep_start_positions = std::mem::take(&mut solver_scratch.substep_start_positions);
+    substep_start_positions.resize(voxel_count, Vec3::ZERO);
+    let mut substep_start_velocities =
+        std::mem::take(&mut solver_scratch.substep_start_velocities);
+    substep_start_velocities.clear();
+    substep_start_velocities.reserve(voxel_count);
+    let mut load_integrated_velocities =
+        std::mem::take(&mut solver_scratch.load_integrated_velocities);
+    load_integrated_velocities.resize(voxel_count, Vec3::ZERO);
+    let mut contact_work_mode = std::mem::take(&mut solver_scratch.contact_work_mode);
+    contact_work_mode.resize(voxel_count, 0);
+    let mut tool_contact_velocity =
+        std::mem::take(&mut solver_scratch.tool_contact_velocity);
+    let mut drift_velocity = std::mem::take(&mut solver_scratch.drift_velocity);
+    let mut predicted = std::mem::take(&mut solver_scratch.predicted);
+    let mut solved_positions = std::mem::take(&mut solver_scratch.solved_positions);
+    let mut pre_contact_velocities =
+        std::mem::take(&mut solver_scratch.pre_contact_velocities);
+    let mut contacts = std::mem::take(&mut solver_scratch.contacts);
+    let mut impact_energies_j =
+        std::mem::take(&mut solver_scratch.impact_energies_j);
+    let mut normal_impulses_ns =
+        std::mem::take(&mut solver_scratch.normal_impulses_ns);
+    let mut contact_physical_velocities =
+        std::mem::take(&mut solver_scratch.contact_physical_velocities);
     for _ in 0..scene.config.substeps {
         let mut phase_start = Instant::now();
         substep_start_positions.clone_from(&scene.positions);
         substep_start_velocities.clear();
         substep_start_velocities.extend(scene.voxels.iter().map(|voxel| voxel.velocity));
         scene.previous.clone_from(&scene.positions);
-        let mut drift_velocity = vec![Vec3::ZERO; scene.voxels.len()];
+        drift_velocity.resize(scene.voxels.len(), Vec3::ZERO);
+        drift_velocity.fill(Vec3::ZERO);
         for (i, (p, v)) in scene
             .positions
             .iter_mut()
@@ -526,20 +748,21 @@ pub fn step_with_axis_targets_and_loads(
                 w.lambda = Vec3::ZERO;
             }
         }
-        let contact_velocity = if let Some(t) = tool {
-            t.advance(scene, h, targets)
+        if let Some(t) = tool {
+            t.advance_into(scene, h, targets, &mut tool_contact_velocity);
         } else {
-            vec![Vec3::ZERO; scene.positions.len()]
-        };
+            tool_contact_velocity.resize(scene.positions.len(), Vec3::ZERO);
+            tool_contact_velocity.fill(Vec3::ZERO);
+        }
         // Treat a contact impulse as acting near the middle of this substep.
         // Without this half-step drift, the new velocity is only integrated
         // on the next substep, after the implicit bond solve has already
         // damped the impact. That delayed stress made a sharp tool stop at the
         // surface without loading bonds enough to fail.
-        for (p, &delta_v) in scene.positions.iter_mut().zip(&contact_velocity) {
+        for (p, &delta_v) in scene.positions.iter_mut().zip(&tool_contact_velocity) {
             *p += delta_v * (0.5 * h);
         }
-        let predicted = scene.positions.clone();
+        predicted.clone_from(&scene.positions);
         fit_rotations(scene, &mut solver_scratch);
         stage_time[0] += phase_start.elapsed();
         phase_start = Instant::now();
@@ -552,8 +775,10 @@ pub fn step_with_axis_targets_and_loads(
                 &predicted,
                 &mut solver_scratch,
                 iteration > 0,
+                reusable_cuda_solution,
                 &mut cuda_enabled_for_step,
             );
+            reusable_cuda_solution = cuda_enabled_for_step;
             total_pcg_iterations += iterations;
             for index in 0..solve_detail_time.len() {
                 solve_detail_time[index] += detail_time[index];
@@ -574,25 +799,24 @@ pub fn step_with_axis_targets_and_loads(
         // velocity correction from the much smaller constraint displacement;
         // subtracting two large f32 positions every step otherwise accumulates
         // measurable kinetic error in simple free fall.
-        let solved_positions = scene.positions.clone();
-        let pre_contact_velocities: Vec<_> = drift_velocity
-            .iter()
-            .zip(&contact_velocity)
-            .map(|(&drift, &contact)| drift + contact)
-            .collect();
-        let contacts = collision::project(scene, targets);
+        solved_positions.clone_from(&scene.positions);
+        pre_contact_velocities.resize(voxel_count, Vec3::ZERO);
+        for i in 0..voxel_count {
+            pre_contact_velocities[i] = drift_velocity[i] + tool_contact_velocity[i];
+        }
+        collision::project_into(scene, targets, &mut contacts);
         contact_work_mode.fill(0);
         for contact in &contacts {
             let mode = if contact.new_impact { 2 } else { 1 };
             contact_work_mode[contact.i] = contact_work_mode[contact.i].max(mode);
             contact_work_mode[contact.j] = contact_work_mode[contact.j].max(mode);
         }
-        let impact_energies_j: Vec<f64> = contacts
-            .iter()
-            .map(|contact| {
-                if !contact.new_impact {
-                    return 0.0;
-                }
+        impact_energies_j.clear();
+        impact_energies_j.reserve(contacts.len());
+        for contact in &contacts {
+            let impact_energy = if !contact.new_impact {
+                0.0
+            } else {
                 let axis = if contact.normal.x.abs() > 0.5 {
                     0
                 } else if contact.normal.y.abs() > 0.5 {
@@ -607,19 +831,20 @@ pub fn step_with_axis_targets_and_loads(
                         1.0 / scene.voxels[voxel].mass
                     }
                 };
-                let inverse_effective_mass = inverse_mass(contact.i) + inverse_mass(contact.j);
-                if inverse_effective_mass <= 0.0 {
-                    return 0.0;
-                }
+                let inverse_effective_mass =
+                    inverse_mass(contact.i) + inverse_mass(contact.j);
                 let closing_speed = (scene.voxels[contact.j].velocity
                     - scene.voxels[contact.i].velocity)
                     .dot(contact.normal);
-                if closing_speed >= 0.0 {
-                    return 0.0;
+                if inverse_effective_mass <= 0.0 || closing_speed >= 0.0 {
+                    0.0
+                } else {
+                    0.5 * closing_speed as f64 * closing_speed as f64
+                        / inverse_effective_mass as f64
                 }
-                0.5 * closing_speed as f64 * closing_speed as f64 / inverse_effective_mass as f64
-            })
-            .collect();
+            };
+            impact_energies_j.push(impact_energy);
+        }
         stage_time[2] += phase_start.elapsed();
         phase_start = Instant::now();
         // Actual converged strain defines elastic energy and constitutive stress.
@@ -661,6 +886,7 @@ pub fn step_with_axis_targets_and_loads(
             if scene.bonds[axis][i].neighbor == EMPTY {
                 scene.broken += 1;
                 topology_changed = true;
+                reusable_cuda_solution = false;
             }
         }
         stage_time[3] += phase_start.elapsed();
@@ -675,19 +901,22 @@ pub fn step_with_axis_targets_and_loads(
                     } else {
                         scene.voxels[i].velocity[axis] = drift_velocity[i][axis]
                             + constraint_velocity[axis]
-                            + contact_velocity[i][axis];
+                            + tool_contact_velocity[i][axis];
                     }
                 }
             }
             load_integrated_velocities[i] = scene.voxels[i].velocity;
         }
-        let normal_impulses_ns = collision::resolve_velocities_with_precontact(
+        collision::resolve_velocities_with_precontact_into(
             scene,
             &contacts,
             targets,
             &pre_contact_velocities,
+            &mut normal_impulses_ns,
+            &mut contact_physical_velocities,
         );
         collision::resolve_liquid_viscosity(scene, &contacts, targets, h);
+        let contact_finish_start = profile_step.then(Instant::now);
         let formed_bonds =
             scene.form_thermal_bonds(&contacts, &impact_energies_j, &normal_impulses_ns, h);
         // A bond formed during this contact solve takes precedence over fusion:
@@ -695,18 +924,39 @@ pub fn step_with_axis_targets_and_loads(
         scene.form_thermal_fusions(&contacts, &normal_impulses_ns, h, targets);
         if formed_bonds > 0 {
             topology_changed = true;
+            reusable_cuda_solution = false;
             // Bond assembly changed while the local per-step workspace was out
             // of the scene; rebuild it before the next substep uses the graph.
             solver_scratch = Default::default();
         }
+        if let Some(start) = contact_finish_start {
+            contact_finish_time += start.elapsed();
+        }
         if let Some(t) = tool {
             // Structural correction can move material back into the blade.
             // Run a zero-time geometric/impulse pass before leaving the substep.
-            let _ = t.advance(scene, 0.0, targets);
+            let tool_start = profile_step.then(Instant::now);
+            t.advance_into(scene, 0.0, targets, &mut tool_contact_velocity);
+            if let Some(start) = tool_start {
+                tool_recheck_time += start.elapsed();
+            }
         }
+        let release_start = profile_step.then(Instant::now);
         apply_releases(scene, targets);
+        if let Some(start) = release_start {
+            release_time += start.elapsed();
+        }
+        let damping_start = profile_step.then(Instant::now);
+        apply_solid_viscoelastic_damping(scene, targets, h);
+        if let Some(start) = damping_start {
+            damping_time += start.elapsed();
+        }
+        let thermal_start = profile_step.then(Instant::now);
         if let Err(reason) = scene.conduct_heat(h) {
             eprintln!("thermal transport skipped: {reason}");
+        }
+        if let Some(start) = thermal_start {
+            thermal_time += start.elapsed();
         }
         for i in 0..scene.voxels.len() {
             if !scene.voxels[i].kinematic {
@@ -741,6 +991,24 @@ pub fn step_with_axis_targets_and_loads(
     if topology_changed {
         rebuild_clusters(scene);
     }
+    solver_scratch.merged_targets = merged_targets;
+    solver_scratch.atmosphere_exposed_faces = atmosphere_exposed_faces;
+    solver_scratch.ambient_loads = ambient_loads;
+    solver_scratch.applied_loads = applied_loads;
+    solver_scratch.substep_start_positions = substep_start_positions;
+    solver_scratch.substep_start_velocities = substep_start_velocities;
+    solver_scratch.load_integrated_velocities = load_integrated_velocities;
+    solver_scratch.contact_work_mode = contact_work_mode;
+    solver_scratch.tool_contact_velocity = tool_contact_velocity;
+    solver_scratch.drift_velocity = drift_velocity;
+    solver_scratch.predicted = predicted;
+    solver_scratch.solved_positions = solved_positions;
+    solver_scratch.pre_contact_velocities = pre_contact_velocities;
+    solver_scratch.contacts = contacts;
+    solver_scratch.impact_energies_j = impact_energies_j;
+    solver_scratch.melted = melted;
+    solver_scratch.normal_impulses_ns = normal_impulses_ns;
+    solver_scratch.contact_physical_velocities = contact_physical_velocities;
     scene.solver_scratch = solver_scratch;
     // World exits are a topology event at the fixed-step boundary. This keeps
     // every solver/contact array in one consistent index space for the step.
@@ -748,7 +1016,7 @@ pub fn step_with_axis_targets_and_loads(
     if profile_step {
         let ms = stage_time.map(|duration| duration.as_secs_f64() * 1000.0);
         eprintln!(
-            "profile step ms: predict/tool={:.2} solve={:.2} [assemble={:.2} factor={:.2} pcg={:.2}] collision={:.2} fracture={:.2} finish={:.2} pcg_iters={total_pcg_iterations} residual={:.3e}",
+            "profile step ms: predict/tool={:.2} solve={:.2} [assemble={:.2} factor={:.2} pcg={:.2}] collision={:.2} fracture={:.2} finish={:.2} post_contact={:.2} tool_recheck={:.2} releases={:.2} damping={:.2} thermal={:.2} pcg_iters={total_pcg_iterations} residual={:.3e}",
             ms[0],
             ms[1],
             solve_detail_time[0].as_secs_f64() * 1000.0,
@@ -757,6 +1025,11 @@ pub fn step_with_axis_targets_and_loads(
             ms[2],
             ms[3],
             ms[4],
+            contact_finish_time.as_secs_f64() * 1000.0,
+            tool_recheck_time.as_secs_f64() * 1000.0,
+            release_time.as_secs_f64() * 1000.0,
+            damping_time.as_secs_f64() * 1000.0,
+            thermal_time.as_secs_f64() * 1000.0,
             scene.solver_residual
         );
     }
@@ -765,18 +1038,14 @@ pub fn step_with_axis_targets_and_loads(
 /// Convert stored bond energy to heat and remove bonds that cannot exist in a
 /// fully liquid REV. Called at the fixed-step boundary so all solver workspaces
 /// see one consistent topology for the whole step.
-fn break_fully_melted_bonds(scene: &mut Scene) -> bool {
-    let melted: Vec<bool> = scene
-        .voxels
-        .iter()
-        .zip(&scene.properties)
-        .map(|(voxel, material)| {
-            material
-                .phase_state(voxel.mass, voxel.thermal_energy_f32())
-                .solid_fraction
-                <= 0.0
-        })
-        .collect();
+fn break_fully_melted_bonds(scene: &mut Scene, melted: &mut Vec<bool>) -> bool {
+    melted.clear();
+    melted.extend(scene.voxels.iter().zip(&scene.properties).map(|(voxel, material)| {
+        material
+            .phase_state(voxel.mass, voxel.thermal_energy_f32())
+            .solid_fraction
+            <= 0.0
+    }));
     if !melted.iter().any(|&value| value) {
         return false;
     }
@@ -1296,6 +1565,24 @@ impl Default for PcgRow {
 
 #[derive(Default)]
 pub(crate) struct SolverScratch {
+    merged_targets: Vec<[Option<f32>; 3]>,
+    atmosphere_exposed_faces: Vec<[u8; 3]>,
+    ambient_loads: Vec<Vec3>,
+    applied_loads: Vec<Vec3>,
+    substep_start_positions: Vec<Vec3>,
+    substep_start_velocities: Vec<Vec3>,
+    load_integrated_velocities: Vec<Vec3>,
+    contact_work_mode: Vec<u8>,
+    tool_contact_velocity: Vec<Vec3>,
+    drift_velocity: Vec<Vec3>,
+    predicted: Vec<Vec3>,
+    solved_positions: Vec<Vec3>,
+    pre_contact_velocities: Vec<Vec3>,
+    contacts: Vec<collision::Contact>,
+    impact_energies_j: Vec<f64>,
+    melted: Vec<bool>,
+    normal_impulses_ns: Vec<f32>,
+    contact_physical_velocities: Vec<Vec3>,
     free: Vec<Vec3>,
     active: Vec<usize>,
     active_index: Vec<u32>,
@@ -1551,6 +1838,7 @@ fn solve_coupled(
     predicted: &[Vec3],
     scratch: &mut SolverScratch,
     reuse_preconditioner: bool,
+    reuse_previous_solution: bool,
     cuda_enabled_for_step: &mut bool,
 ) -> (usize, [Duration; 3]) {
     let assembly_start = Instant::now();
@@ -1808,19 +2096,44 @@ fn solve_coupled(
                 .sum()
         }
     };
+    // Corotation repeats the same linear solve around a slightly updated
+    // frame. Reuse the preceding correction as an initial iterate, but only
+    // for the CUDA path, whose residual is checked against the original RHS.
+    let warm_start = try_cuda
+        && (reuse_preconditioner || reuse_previous_solution)
+        && scratch.dx.len() == active_count;
     scratch.dx.resize(active_count, Vec3::ZERO);
-    scratch.dx.fill(Vec3::ZERO);
+    if !warm_start {
+        scratch.dx.fill(Vec3::ZERO);
+    }
     scratch.ap.resize(active_count, Vec3::ZERO);
     scratch.r.resize(active_count, Vec3::ZERO);
     for (slot, &i) in active.iter().enumerate() {
         scratch.r[slot] = scratch.rhs[i];
     }
+    let rhs_norm = dot(&scratch.r, &scratch.r).sqrt();
+    if warm_start {
+        apply(&scratch.dx, &mut scratch.ap);
+        for (residual, &product) in scratch.r.iter_mut().zip(&scratch.ap) {
+            *residual -= product;
+        }
+    }
+    let residual_norm = dot(&scratch.r, &scratch.r).sqrt();
+    scene.solver_residual = if rhs_norm > 1e-12 {
+        (residual_norm / rhs_norm) as f32
+    } else {
+        0.0
+    };
     scratch.z.resize(active_count, Vec3::ZERO);
     scratch.preconditioner_work.resize(active_count, Vec3::ZERO);
     let pcg_start = Instant::now();
     let profile_cuda = std::env::var_os("VOXEL_PROFILE_STEP").is_some();
     let mut cuda_solution = None;
-    if try_cuda {
+    if try_cuda && residual_norm <= scene.config.solver_relative_tolerance as f64 * rhs_norm {
+        // The previous corotation iterate already satisfies the configured
+        // residual tolerance for this assembled system.
+        cuda_solution = Some(0);
+    } else if try_cuda {
         scratch.cuda_neighbors.resize(active_count, [u32::MAX; 6]);
         scratch.cuda_blocks.resize(active_count, [0.0; 54]);
         scratch.cuda_blocks.fill([0.0; 54]);
@@ -1875,15 +2188,38 @@ fn solve_coupled(
             &scratch.cuda_blocks,
             &scratch.cuda_inverse,
             scene.config.cuda_iterations,
-            scene.config.solver_relative_tolerance,
+            if warm_start && residual_norm > 0.0 {
+                (scene.config.solver_relative_tolerance as f64 * rhs_norm / residual_norm)
+                    .min(1.0) as f32
+            } else {
+                scene.config.solver_relative_tolerance
+            },
         ) {
             Ok((correction, iterations, residual)) => {
-                scratch.dx = correction;
-                scene.solver_residual = residual;
+                if warm_start {
+                    for (initial, delta) in scratch.dx.iter_mut().zip(correction) {
+                        *initial += delta;
+                    }
+                    scene.solver_residual = if rhs_norm > 1e-12 {
+                        (residual as f64 * residual_norm / rhs_norm) as f32
+                    } else {
+                        0.0
+                    };
+                } else {
+                    scratch.dx = correction;
+                    scene.solver_residual = residual;
+                }
                 cuda_solution = Some(iterations);
             }
             Err(error) => {
                 *cuda_enabled_for_step = false;
+                if warm_start {
+                    scratch.dx.fill(Vec3::ZERO);
+                    for (slot, &i) in active.iter().enumerate() {
+                        scratch.r[slot] = scratch.rhs[i];
+                    }
+                    scene.solver_residual = 0.0;
+                }
                 if profile_cuda {
                     eprintln!(
                         "CUDA PCG fallback: active={} max_iterations={} tolerance={:.3e} elapsed={:.2} ms reason={error}",

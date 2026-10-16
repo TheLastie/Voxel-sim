@@ -1,6 +1,7 @@
 use crate::tool::Shape;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
+const MAX_PUSH_FORCE_N: f32 = 15_000.0;
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Rect {
@@ -9,40 +10,30 @@ pub struct Rect {
 }
 pub struct Ui {
     pub speed: f32,
-    pub azimuth: f32,
-    pub elevation: f32,
-    pub height: f32,
-    pub lateral: f32,
-    pub distance: f32,
-    pub longitudinal: f32,
+    pub start: Vec3,
+    pub direction: Vec3,
+    pub force_newtons: f32,
     pub paused: bool,
     pub show_bonds: bool,
     pub selected: Shape,
 }
 impl Ui {
-    pub fn new(speed: f32, start: Vec3) -> Self {
+    pub fn new(speed: f32, start: Vec3, direction: Vec3) -> Self {
         Self {
             speed,
-            azimuth: 0.0,
-            elevation: 0.0,
-            height: start.z,
-            lateral: start.y,
-            distance: -start.x,
-            longitudinal: 0.0,
+            start,
+            direction: direction.normalize(),
+            force_newtons: 0.0,
             paused: false,
             show_bonds: false,
             selected: Shape::Wedge,
         }
     }
     pub fn direction(&self) -> Vec3 {
-        Vec3::new(
-            self.elevation.cos() * self.azimuth.cos(),
-            self.elevation.cos() * self.azimuth.sin(),
-            self.elevation.sin(),
-        )
+        self.direction
     }
     pub fn start(&self) -> Vec3 {
-        Vec3::new(self.longitudinal, self.lateral, self.height) - self.direction() * self.distance
+        self.start
     }
     pub fn pointer(&mut self, x: f32, y: f32) -> Option<Shape> {
         if !(20.0..=280.0).contains(&x) {
@@ -58,20 +49,9 @@ impl Ui {
                 return Some(shape);
             }
         }
-        for index in 0..7 {
-            let top = 205.0 + index as f32 * 42.0;
-            if (top..top + 16.0).contains(&y) {
-                let t = ((x - 25.0) / 245.0).clamp(0.0, 1.0);
-                match index {
-                    0 => self.speed = 0.5 + t * 19.5,
-                    1 => self.azimuth = (t - 0.5) * std::f32::consts::TAU,
-                    2 => self.elevation = (t - 0.5) * std::f32::consts::PI,
-                    3 => self.height = 0.03 + t * 3.2,
-                    4 => self.lateral = (t - 0.5) * 0.6,
-                    5 => self.distance = 0.45 + t * 0.8,
-                    _ => self.longitudinal = (t - 0.5) * 1.0,
-                }
-            }
+        if (246.0..278.0).contains(&y) {
+            let t = ((x - 25.0) / 245.0).clamp(0.0, 1.0);
+            self.force_newtons = t * t * MAX_PUSH_FORCE_N;
         }
         None
     }
@@ -96,50 +76,49 @@ impl Ui {
             rect(&mut r, [20., y, 260., 26.], [0.14, 0.23, 0.29, 1.]);
             text(&mut r, 30., y + 7., name, 1.5);
         }
-        let labels = [
-            format!("SPEED {:.1} M/S", self.speed),
-            format!("AZIMUTH {:.0} DEG", self.azimuth.to_degrees()),
-            format!("ELEVATION {:.0} DEG", self.elevation.to_degrees()),
-            format!("HEIGHT {:.2} M", self.height),
-            format!("LATERAL {:.2} M", self.lateral),
-            format!("START DIST {:.2} M", self.distance),
-            format!("CONTACT X {:.2} M", self.longitudinal),
-        ];
-        let values = [
-            (self.speed - 0.5) / 19.5,
-            self.azimuth / std::f32::consts::TAU + 0.5,
-            self.elevation / std::f32::consts::PI + 0.5,
-            (self.height - 0.03) / 3.2,
-            self.lateral / 0.6 + 0.5,
-            (self.distance - 0.45) / 0.8,
-            self.longitudinal + 0.5,
-        ];
-        for i in 0..7 {
-            let y = 205. + i as f32 * 42.;
-            text(&mut r, 24., y - 15., &labels[i], 1.25);
-            rect(&mut r, [25., y, 245., 8.], [0.2, 0.26, 0.3, 1.]);
-            rect(
-                &mut r,
-                [25. + values[i].clamp(0., 1.) * 245. - 3., y - 3., 6., 14.],
-                [0.3, 0.85, 0.65, 1.],
-            );
-        }
+        let force_fraction = (self.force_newtons / MAX_PUSH_FORCE_N)
+            .sqrt()
+            .clamp(0.0, 1.0);
+        text(&mut r, 24., 218., "CONSTANT PUSH FORCE", 1.5);
+        text(&mut r, 24., 237., &format!("{:.0} N", self.force_newtons), 1.6);
+        rect(&mut r, [25., 260., 245., 10.], [0.2, 0.26, 0.3, 1.]);
+        rect(
+            &mut r,
+            [25., 260., 245. * force_fraction, 10.],
+            [0.18, 0.65, 0.56, 1.],
+        );
+        rect(
+            &mut r,
+            [25. + force_fraction * 245. - 4., 256., 8., 18.],
+            [0.3, 0.85, 0.65, 1.],
+        );
+        text(&mut r, 25., 280., "0 N", 1.1);
+        text(&mut r, 216., 280., "15000 N", 1.1);
+        text(&mut r, 24., 300., "0 N CLEARS FORCE; TOOL COASTS", 0.9);
+        let (axis, sign) = if self.direction.x.abs() >= self.direction.y.abs() {
+            ("X", if self.direction.x < 0.0 { "-" } else { "+" })
+        } else {
+            ("Y", if self.direction.y < 0.0 { "-" } else { "+" })
+        };
+        text(&mut r, 24., 322., &format!("PUSH AXIS {sign}{axis}"), 1.2);
         text(
             &mut r,
             24.,
-            510.,
+            470.,
             &format!("BROKEN {} CLUSTERS {}", broken, clusters),
             1.2,
         );
         text(
             &mut r,
             24.,
-            528.,
+            490.,
             &format!("FPS {:.1} STEP {:.1} MS", fps, sim_ms),
             1.2,
         );
-        text(&mut r, 24., 549., "SPACE PAUSE   R RESET", 1.2);
-        text(&mut r, 24., 566., "B BONDS  RMB ORBIT  WHEEL ZOOM", 1.);
+        text(&mut r, 24., 530., "SPACE PAUSE   R RESET", 1.2);
+        text(&mut r, 24., 548., "B BONDS  RMB ORBIT  WHEEL ZOOM", 1.);
+        text(&mut r, 24., 572., "P START / STOP RECORDING", 1.);
+        text(&mut r, 24., 590., "REPLAY LOOPS AT 1X", 1.);
         r
     }
 }

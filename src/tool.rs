@@ -1,11 +1,11 @@
 use crate::{
     material::Material,
-    scene::{Scene, CELL},
+    scene::{Scene, AREA, CELL},
     voxel::Composition,
 };
 use glam::{Quat, Vec3};
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy)]
 pub enum Shape {
@@ -26,7 +26,20 @@ pub struct GuideMount {
 /// A rigid voxel object. The collision law never branches on Shape.
 pub struct Tool {
     pub cells: Vec<Vec3>,
+    collision_radius: f32,
+    /// Local exposed REV faces: (face centre, outward normal).
+    surface_faces: Vec<(Vec3, Vec3)>,
     spatial_bins: HashMap<[i32; 3], SmallVec<[usize; 2]>>,
+    spatial_keys: Vec<[i32; 3]>,
+    spatial_occupancy: Vec<u64>,
+    spatial_occupancy_min: [i32; 3],
+    spatial_occupancy_dims: [usize; 3],
+    spatial_occupancy_enabled: bool,
+    probe_bins: Vec<[i32; 3]>,
+    probe_cells: Vec<Vec3>,
+    probe_position: Vec3,
+    probe_rotation: Quat,
+    probe_cache_valid: bool,
     center_cache: Vec<Vec3>,
     pub composition: Composition,
     pub mass: f32,
@@ -46,9 +59,8 @@ impl Tool {
         let d = scene.config.tool_dimensions;
         let (dims, component, color) = match shape {
             Shape::Wedge => (d, 2, [0.65, 0.68, 0.72, 1.0]),
-            // Preserve a 5 REV spine and taper it to one REV at the edge.
-            // A single-row slab lost the bevel entirely and behaved like a
-            // flat plate that stalled against the first wood layer.
+            // Both tools share a bevel that tapers the 5 REV spine to a
+            // one-REV cutting edge at the leading (+X) face.
             Shape::Blade => ([d[0], d[1].max(5), d[2]], 2, [0.8, 0.8, 0.85, 1.0]),
             Shape::Rod => ([d[0], 4, 4], 1, [0.5, 0.28, 0.1, 1.0]),
             Shape::Rounded => ([14, 14, 14], 3, [0.4, 0.42, 0.45, 1.0]),
@@ -64,12 +76,7 @@ impl Tool {
                             let thickness = 0.5
                                 + (dims[0] - 1 - x) as f32 / (dims[0] - 1) as f32
                                     * (dims[1] as f32 * 0.5 - 0.5);
-                            let bluntness = if matches!(shape, Shape::Wedge) {
-                                0.5
-                            } else {
-                                0.0
-                            };
-                            p.y.abs() <= thickness + bluntness
+                            p.y.abs() <= thickness
                         }
                         Shape::Rod => p.y * p.y + p.z * p.z <= 4.0,
                         Shape::Rounded => p.length_squared() <= 49.0,
@@ -91,13 +98,42 @@ impl Tool {
         for p in &mut cells {
             *p -= centroid;
         }
+        let collision_radius = cells.iter().map(|p| p.length()).fold(0.0, f32::max);
+        let cell_key = |p: Vec3| (p / CELL).round().as_ivec3().to_array();
+        let occupied: HashSet<_> = cells.iter().copied().map(cell_key).collect();
+        let mut surface_faces = Vec::new();
+        for &cell in &cells {
+            let key = cell_key(cell);
+            for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+                for sign in [-1.0f32, 1.0] {
+                    let normal = axis * sign;
+                    let offset = (normal * 1.01).round().as_ivec3().to_array();
+                    let neighbor = [key[0] + offset[0], key[1] + offset[1], key[2] + offset[2]];
+                    if !occupied.contains(&neighbor) {
+                        surface_faces.push((cell + normal * (CELL * 0.5), normal));
+                    }
+                }
+            }
+        }
         let mut inertia = Vec3::ZERO;
         for &p in &cells {
             inertia += (Vec3::splat(p.length_squared() + CELL * CELL / 6.0) - p * p) * cell_mass;
         }
         Self {
             cells,
+            collision_radius,
+            surface_faces,
             spatial_bins: HashMap::new(),
+            spatial_keys: Vec::new(),
+            spatial_occupancy: Vec::new(),
+            spatial_occupancy_min: [0; 3],
+            spatial_occupancy_dims: [0; 3],
+            spatial_occupancy_enabled: false,
+            probe_bins: Vec::new(),
+            probe_cells: Vec::new(),
+            probe_position: Vec3::ZERO,
+            probe_rotation: Quat::IDENTITY,
+            probe_cache_valid: false,
             center_cache: Vec::new(),
             composition,
             mass,
@@ -187,6 +223,36 @@ impl Tool {
             self.rotation * (self.inverse_inertia * (self.rotation.conjugate() * torque))
         }
     }
+
+    fn atmospheric_wrench(&self, scene: &Scene) -> (Vec3, Vec3) {
+        let air = scene.config.atmosphere;
+        let density = air.density_kg_m3();
+        if density <= 0.0 {
+            return (Vec3::ZERO, Vec3::ZERO);
+        }
+
+        let gravity = Vec3::from_array(scene.config.gravity);
+        let displaced_air_mass = density * self.cells.len() as f32 * CELL.powi(3);
+        let mut force = -gravity * displaced_air_mass;
+        let mut torque = Vec3::ZERO;
+        let wind = Vec3::from_array(air.wind_velocity_m_s);
+        for &(local_center, local_normal) in &self.surface_faces {
+            let arm = self.rotation * local_center;
+            let normal = self.rotation * local_normal;
+            let surface_velocity = self.velocity + self.angular_velocity.cross(arm);
+            let normal_speed = (surface_velocity - wind).dot(normal);
+            let face_force = -normal
+                * (0.25
+                    * density
+                    * air.drag_coefficient
+                    * AREA
+                    * normal_speed
+                    * normal_speed.abs());
+            force += face_force;
+            torque += arm.cross(face_force);
+        }
+        (force, torque)
+    }
     /// Finite rigid mass, friction and angular impulse, with equal/opposite reaction.
     /// Microsteps prevent tunnelling through a 1 cm REV at typical strike speeds.
     pub fn advance(
@@ -195,27 +261,60 @@ impl Tool {
         dt: f32,
         targets: &[[Option<f32>; 3]],
     ) -> Vec<Vec3> {
+        let mut contact_velocity = Vec::with_capacity(scene.positions.len());
+        self.advance_into(scene, dt, targets, &mut contact_velocity);
+        contact_velocity
+    }
+
+    pub(crate) fn advance_into(
+        &mut self,
+        scene: &mut Scene,
+        dt: f32,
+        targets: &[[Option<f32>; 3]],
+        contact_velocity: &mut Vec<Vec3>,
+    ) {
         self.constrain_pose();
-        let mut contact_velocity = vec![Vec3::ZERO; scene.positions.len()];
-        let tool_radius = self.cells.iter().map(|p| p.length()).fold(0.0, f32::max);
+        contact_velocity.resize(scene.positions.len(), Vec3::ZERO);
+        contact_velocity.fill(Vec3::ZERO);
+        let tool_radius = self.collision_radius;
         let gravity = Vec3::from_array(scene.config.gravity);
-        let linear_acceleration =
-            self.project_translation(gravity + self.external_force / self.mass);
-        let angular_acceleration = self.angular_response(self.external_torque);
-        let linear_distance =
-            self.velocity.length() * dt + 0.5 * linear_acceleration.length() * dt * dt;
-        let angular_distance = (self.angular_velocity.length() * dt
-            + 0.5 * angular_acceleration.length() * dt * dt)
-            * tool_radius;
+        let (initial_air_force, initial_air_torque) = self.atmospheric_wrench(scene);
+        let linear_acceleration = self.project_translation(
+            gravity + (self.external_force + initial_air_force) / self.mass,
+        );
+        let angular_acceleration = self.angular_response(self.external_torque + initial_air_torque);
+        // The integrator updates velocity before position (semi-implicit Euler),
+        // so estimate travel with the same end-of-step velocity it will use.
+        let linear_distance = (self.velocity + linear_acceleration * dt).length() * dt;
+        let angular_distance =
+            (self.angular_velocity + angular_acceleration * dt).length() * dt * tool_radius;
         let linear_steps = linear_distance / (CELL * 0.4);
         let angular_steps = angular_distance / (CELL * 0.4);
         let steps = (linear_steps.max(angular_steps).ceil() as usize).max(1);
         let h = dt / steps as f32;
         let mut spatial = std::mem::take(&mut self.spatial_bins);
+        let mut spatial_keys = std::mem::take(&mut self.spatial_keys);
+        let mut spatial_occupancy = std::mem::take(&mut self.spatial_occupancy);
+        let mut spatial_occupancy_min = self.spatial_occupancy_min;
+        let mut spatial_occupancy_dims = self.spatial_occupancy_dims;
+        let mut spatial_occupancy_enabled = self.spatial_occupancy_enabled;
+        let mut probe_bins = std::mem::take(&mut self.probe_bins);
+        let mut probe_cells = std::mem::take(&mut self.probe_cells);
+        let mut probe_position = self.probe_position;
+        let mut probe_rotation = self.probe_rotation;
+        let mut probe_cache_valid = self.probe_cache_valid;
         let mut centers_cache = std::mem::take(&mut self.center_cache);
         for _ in 0..steps {
+            let (air_force, air_torque) = self.atmospheric_wrench(scene);
+            let linear_acceleration = self.project_translation(
+                gravity + (self.external_force + air_force) / self.mass,
+            );
+            let angular_acceleration =
+                self.angular_response(self.external_torque + air_torque);
+            let old_position = self.position;
+            let old_angular_velocity = self.angular_velocity;
             self.velocity += linear_acceleration * h;
-            self.angular_velocity += self.angular_response(self.external_torque) * h;
+            self.angular_velocity += angular_acceleration * h;
             self.position += self.velocity * h;
             let angle = self.angular_velocity.length() * h;
             if angle > 1e-8 {
@@ -223,10 +322,12 @@ impl Tool {
                     * self.rotation)
                     .normalize();
             }
-            spatial.clear();
-            for (i, &p) in scene.positions.iter().enumerate() {
-                spatial.entry(key(p)).or_default().push(i);
-            }
+            scene.energy.external_work += ((air_force + self.external_force)
+                .dot(self.position - old_position)
+                + (air_torque + self.external_torque)
+                    .dot((old_angular_velocity + self.angular_velocity) * (0.5 * h)))
+                as f64;
+            refresh_spatial_bins(&scene.positions, &mut spatial, &mut spatial_keys);
             let axes = [
                 self.rotation * Vec3::X,
                 self.rotation * Vec3::Y,
@@ -234,6 +335,50 @@ impl Tool {
             ];
             centers_cache.clear();
             centers_cache.extend(self.world_cells());
+            spatial_occupancy_enabled = refresh_spatial_occupancy(
+                &spatial_keys,
+                &mut spatial_occupancy,
+                &mut spatial_occupancy_min,
+                &mut spatial_occupancy_dims,
+            );
+            if !probe_cache_valid
+                || probe_position != self.position
+                || probe_rotation != self.rotation
+                || probe_cells != self.cells
+            {
+                probe_bins.clear();
+                for &center in &centers_cache {
+                    let (lo, hi) = obb_bin_bounds(center, axes);
+                    for z in lo[2]..=hi[2] {
+                        for y in lo[1]..=hi[1] {
+                            for x in lo[0]..=hi[0] {
+                                probe_bins.push([x, y, z]);
+                            }
+                        }
+                    }
+                }
+                probe_bins.sort_unstable();
+                probe_bins.dedup();
+                probe_cells.clone_from(&self.cells);
+                probe_position = self.position;
+                probe_rotation = self.rotation;
+                probe_cache_valid = true;
+            }
+            let has_scene_candidate = if spatial_occupancy_enabled {
+                probe_bins.iter().any(|&cell| {
+                    spatial_occupancy_contains(
+                        cell,
+                        &spatial_occupancy,
+                        spatial_occupancy_min,
+                        spatial_occupancy_dims,
+                    )
+                })
+            } else {
+                probe_bins.iter().any(|cell| spatial.contains_key(cell))
+            };
+            if !has_scene_candidate {
+                continue;
+            }
             // Several adjacent tool cells can overlap the same REV during one
             // microstep. Accumulate only the deepest correction; applying the
             // full depenetration once per pair would push the whole tool back
@@ -242,10 +387,48 @@ impl Tool {
             let mut max_penetration = 0.0f32;
             for &center in &centers_cache {
                 let (lo, hi) = obb_bin_bounds(center, axes);
-                for z in lo[2]..=hi[2] {
-                    for y in lo[1]..=hi[1] {
-                        for x in lo[0]..=hi[0] {
-                            let Some(indices) = spatial.get(&[x, y, z]) else {
+                let query_bounds = if spatial_occupancy_enabled {
+                    let Some(bounds) = clip_spatial_bounds(
+                        lo,
+                        hi,
+                        spatial_occupancy_min,
+                        spatial_occupancy_dims,
+                    ) else {
+                        continue;
+                    };
+                    bounds
+                } else {
+                    (lo, hi)
+                };
+                let x_stride = spatial_occupancy_dims[1] * spatial_occupancy_dims[2];
+                for z in query_bounds.0[2]..=query_bounds.1[2] {
+                    for y in query_bounds.0[1]..=query_bounds.1[1] {
+                        let row_offset = if spatial_occupancy_enabled {
+                            ((y - spatial_occupancy_min[1]) as usize
+                                * spatial_occupancy_dims[2])
+                                + (z - spatial_occupancy_min[2]) as usize
+                        } else {
+                            0
+                        };
+                        let mut occupancy_index = if spatial_occupancy_enabled {
+                            (query_bounds.0[0] - spatial_occupancy_min[0]) as usize * x_stride
+                                + row_offset
+                        } else {
+                            0
+                        };
+                        for x in query_bounds.0[0]..=query_bounds.1[0] {
+                            let cell = [x, y, z];
+                            if spatial_occupancy_enabled {
+                                let occupied = spatial_occupancy
+                                    [occupancy_index / u64::BITS as usize]
+                                    & (1u64 << (occupancy_index % u64::BITS as usize))
+                                    != 0;
+                                occupancy_index += x_stride;
+                                if !occupied {
+                                    continue;
+                                }
+                            }
+                            let Some(indices) = spatial.get(&cell) else {
                                 continue;
                             };
                             for &i in indices {
@@ -296,9 +479,14 @@ impl Tool {
                                 if closing > 0.0 {
                                     // This is a persistent, multi-point manifold. Applying
                                     // restitution at every cell contact repeatedly adds
-                                    // energy as the active normal changes. Use an inelastic
-                                    // normal solve here; friction and fracture dissipate it.
+                                    // energy as the active normal changes, so the normal
+                                    // solve is perfectly inelastic. Its lost relative kinetic
+                                    // energy must be thermalized on the receiving REV.
                                     let normal_impulse = closing / denom.max(1e-9);
+                                    let normal_heat =
+                                        (0.5 * normal_impulse as f64 * closing as f64).max(0.0);
+                                    scene.voxels[i].add_internal_energy_j(normal_heat);
+                                    scene.energy.contact_restitution_heat += normal_heat;
                                     let normal_vector = normal_impulse * n;
                                     let normal_voxel_delta =
                                         normal_vector * free / scene.voxels[i].mass;
@@ -426,12 +614,178 @@ impl Tool {
             }
         }
         self.spatial_bins = spatial;
+        self.spatial_keys = spatial_keys;
+        self.spatial_occupancy = spatial_occupancy;
+        self.spatial_occupancy_min = spatial_occupancy_min;
+        self.spatial_occupancy_dims = spatial_occupancy_dims;
+        self.spatial_occupancy_enabled = spatial_occupancy_enabled;
+        self.probe_bins = probe_bins;
+        self.probe_cells = probe_cells;
+        self.probe_position = probe_position;
+        self.probe_rotation = probe_rotation;
+        self.probe_cache_valid = probe_cache_valid;
         self.center_cache = centers_cache;
-        contact_velocity
     }
 }
 fn key(p: Vec3) -> [i32; 3] {
     (p / CELL).floor().as_ivec3().to_array()
+}
+
+const MAX_TOOL_OCCUPANCY_CELLS: usize = 1_000_000;
+
+/// Rebuild a compact exact occupancy mask when the scene's bounded grid is
+/// small enough. A sparse or unusually large scene keeps using the hash map.
+fn refresh_spatial_occupancy(
+    keys: &[[i32; 3]],
+    occupancy: &mut Vec<u64>,
+    minimum: &mut [i32; 3],
+    dimensions: &mut [usize; 3],
+) -> bool {
+    if keys.is_empty() {
+        occupancy.clear();
+        *minimum = [0; 3];
+        *dimensions = [0; 3];
+        return true;
+    }
+
+    let mut low = keys[0];
+    let mut high = keys[0];
+    for key in &keys[1..] {
+        for axis in 0..3 {
+            low[axis] = low[axis].min(key[axis]);
+            high[axis] = high[axis].max(key[axis]);
+        }
+    }
+    let mut next_dimensions = [0usize; 3];
+    for axis in 0..3 {
+        let span = i64::from(high[axis]) - i64::from(low[axis]) + 1;
+        let Ok(dimension) = usize::try_from(span) else {
+            occupancy.clear();
+            *minimum = [0; 3];
+            *dimensions = [0; 3];
+            return false;
+        };
+        next_dimensions[axis] = dimension;
+    }
+    let Some(cell_count) = next_dimensions
+        .into_iter()
+        .try_fold(1usize, usize::checked_mul)
+    else {
+        occupancy.clear();
+        *minimum = [0; 3];
+        *dimensions = [0; 3];
+        return false;
+    };
+    if cell_count > MAX_TOOL_OCCUPANCY_CELLS {
+        occupancy.clear();
+        *minimum = [0; 3];
+        *dimensions = [0; 3];
+        return false;
+    }
+
+    *minimum = low;
+    *dimensions = next_dimensions;
+    let word_count = cell_count.div_ceil(u64::BITS as usize);
+    occupancy.resize(word_count, 0);
+    occupancy.fill(0);
+    for key in keys {
+        let x = (key[0] - low[0]) as usize;
+        let y = (key[1] - low[1]) as usize;
+        let z = (key[2] - low[2]) as usize;
+        let index = (x * next_dimensions[1] + y) * next_dimensions[2] + z;
+        occupancy[index / u64::BITS as usize] |= 1u64 << (index % u64::BITS as usize);
+    }
+    true
+}
+
+#[inline]
+fn clip_spatial_bounds(
+    lo: [i32; 3],
+    hi: [i32; 3],
+    minimum: [i32; 3],
+    dimensions: [usize; 3],
+) -> Option<([i32; 3], [i32; 3])> {
+    let mut clipped_lo = [0i32; 3];
+    let mut clipped_hi = [0i32; 3];
+    for axis in 0..3 {
+        if dimensions[axis] == 0 {
+            return None;
+        }
+        let maximum = minimum[axis] + dimensions[axis] as i32 - 1;
+        if hi[axis] < minimum[axis] || lo[axis] > maximum {
+            return None;
+        }
+        clipped_lo[axis] = lo[axis].max(minimum[axis]);
+        clipped_hi[axis] = hi[axis].min(maximum);
+    }
+    Some((clipped_lo, clipped_hi))
+}
+
+#[inline]
+fn spatial_occupancy_contains(
+    key: [i32; 3],
+    occupancy: &[u64],
+    minimum: [i32; 3],
+    dimensions: [usize; 3],
+) -> bool {
+    let mut local = [0usize; 3];
+    for axis in 0..3 {
+        if key[axis] < minimum[axis] {
+            return false;
+        }
+        local[axis] = (key[axis] - minimum[axis]) as usize;
+        if local[axis] >= dimensions[axis] {
+            return false;
+        }
+    }
+    let index = (local[0] * dimensions[1] + local[1]) * dimensions[2] + local[2];
+    occupancy[index / u64::BITS as usize] & (1u64 << (index % u64::BITS as usize)) != 0
+}
+
+/// Keep the tool's broadphase bins identical to a full scene-position rebuild,
+/// while moving only REV indices whose cell key changed. Sorted bucket indices
+/// preserve the original deterministic contact traversal order.
+fn refresh_spatial_bins(
+    positions: &[Vec3],
+    bins: &mut HashMap<[i32; 3], SmallVec<[usize; 2]>>,
+    keys: &mut Vec<[i32; 3]>,
+) {
+    if keys.len() != positions.len() {
+        bins.clear();
+        keys.clear();
+        keys.reserve(positions.len());
+        for (i, &position) in positions.iter().enumerate() {
+            let cell = key(position);
+            bins.entry(cell).or_default().push(i);
+            keys.push(cell);
+        }
+        return;
+    }
+
+    for (i, &position) in positions.iter().enumerate() {
+        let next = key(position);
+        let previous = keys[i];
+        if next == previous {
+            continue;
+        }
+
+        let mut remove_previous_bin = false;
+        if let Some(indices) = bins.get_mut(&previous) {
+            if let Ok(slot) = indices.binary_search(&i) {
+                indices.remove(slot);
+            }
+            remove_previous_bin = indices.is_empty();
+        }
+        if remove_previous_bin {
+            bins.remove(&previous);
+        }
+
+        let indices = bins.entry(next).or_default();
+        if let Err(slot) = indices.binary_search(&i) {
+            indices.insert(slot, i);
+        }
+        keys[i] = next;
+    }
 }
 
 /// Grid bins intersecting the tool REV's conservative world-space AABB,

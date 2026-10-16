@@ -65,6 +65,12 @@ pub struct Material {
     /// Fracture energy for a bond perpendicular to the material's fiber axis, J/m².
     /// `fracture_energy` is the parallel value; isotropic materials use equal values.
     pub fracture_energy_perp: f32,
+    /// Moisture content on the oven-dry mass basis, kg water / kg dry wood.
+    /// Zero means unspecified for materials that are not hygroscopic solids.
+    pub moisture_content_dry_basis: f32,
+    /// Kelvin–Voigt time coefficient η/E (seconds) for solid viscoelasticity.
+    /// This is calibrated from tan(delta) at a stated reference frequency.
+    pub solid_kelvin_voigt_time_s: f32,
 }
 impl Material {
     /// Resolve a built-in component name to its composition-table index.
@@ -343,6 +349,21 @@ impl Material {
         table[9].thermal_expansion_perpendicular = 100.0e-6;
         table[9].hardening_modulus = 20e6;
         table[9].failure_plastic_strain = 1.0;
+
+        // European oak starter profile (Quercus robur). The sourced values are
+        // density at 12% MC and longitudinal dynamic MOE / loss factor measured
+        // near 11% MC. Other strength and transverse properties still inherit
+        // the illustrative generic-wood estimates above.
+        let mut oak = table[1].clone();
+        oak.name = "oak".into();
+        oak.density = 625.0;
+        oak.young = 12.088e9;
+        oak.moisture_content_dry_basis = 0.12;
+        // tan(delta)=0.0087 at an estimated 2.05 kHz first bending mode.
+        // Kelvin–Voigt η/E = tan(delta)/(2πf_ref), seconds.
+        oak.solid_kelvin_voigt_time_s =
+            0.0087 / (std::f32::consts::TAU * 2_050.0);
+        table.push(oak);
         table
     }
     #[allow(clippy::too_many_arguments)]
@@ -400,6 +421,8 @@ impl Material {
             latent_vaporization,
             fracture_energy,
             fracture_energy_perp,
+            moisture_content_dry_basis: 0.0,
+            solid_kelvin_voigt_time_s: 0.0,
         }
     }
     pub fn mixed(c: &Composition, table: &[Self]) -> Self {
@@ -443,7 +466,9 @@ impl Material {
             latent_fusion,
             latent_vaporization,
             fracture_energy,
-            fracture_energy_perp
+            fracture_energy_perp,
+            moisture_content_dry_basis,
+            solid_kelvin_voigt_time_s
         );
         // Starter mixture estimate: dynamic viscosity is mass-fraction weighted.
         result.dynamic_viscosity_pa_s = c
