@@ -49,12 +49,16 @@ impl GeneratedCellContent {
 }
 
 /// Seed-derived state at one 1 cm world coordinate. This describes generated
-/// content and ecology; physical mass, energy, and material response are added
-/// when this representation is connected to the engine's `Voxel` state.
+/// content, ecology, and the local wood-fiber direction; physical mass, energy,
+/// and material response are added when connected to the engine's `Voxel`
+/// state.
 #[derive(Clone, Copy, Debug)]
 pub struct GeneratedCell {
     pub cell: [i32; 3],
     pub content: GeneratedCellContent,
+    /// Principal wood-fiber axis in world coordinates; absent for non-wood
+    /// cells.
+    pub fiber_direction: Option<Vec3>,
     pub terrain_height_m: f32,
     pub soil_moisture: f32,
     pub fertility: f32,
@@ -263,11 +267,16 @@ impl GeneratedWorld {
         let temperature_kelvin = climate_temperature(self.seed_hash, field_x, field_y, z_m);
 
         let point = Vec3::new(x_m - WORLD_SIDE_M * 0.5, y_m - WORLD_SIDE_M * 0.5, z_m);
-        let vegetation = if z_m <= terrain_height_m {
-            self.root_content_at_point(point)
-                .or_else(|| self.mycelium_content_at_point(point))
+        let (vegetation, fiber_direction) = if z_m <= terrain_height_m {
+            if let Some((content, direction)) = self.root_content_at_point(point) {
+                (Some(content), Some(direction))
+            } else {
+                (self.mycelium_content_at_point(point), None)
+            }
         } else {
-            self.vegetation_at_point(cell, point)
+            let sampled = self.vegetation_at_point(cell, point);
+            let direction = sampled.and_then(|(_, direction)| direction);
+            (sampled.map(|(content, _)| content), direction)
         };
         let generated_soil_content = matches!(
             vegetation,
@@ -287,6 +296,7 @@ impl GeneratedWorld {
         Some(GeneratedCell {
             cell,
             content,
+            fiber_direction,
             terrain_height_m,
             soil_moisture,
             fertility,
@@ -328,7 +338,11 @@ impl GeneratedWorld {
         Some(cells)
     }
 
-    fn vegetation_at_point(&self, cell: [i32; 3], point: Vec3) -> Option<GeneratedCellContent> {
+    fn vegetation_at_point(
+        &self,
+        cell: [i32; 3],
+        point: Vec3,
+    ) -> Option<(GeneratedCellContent, Option<Vec3>)> {
         self.plants
             .iter()
             .zip(&self.plant_branches)
@@ -342,17 +356,20 @@ impl GeneratedWorld {
                     self.season_phase(),
                 )
             })
-            .chain(ground_flora_at_point(
-                self.seed_hash,
-                self.geometry_age_years,
-                self.season_phase(),
-                point,
-                &self.plants,
-            ))
-            .min_by_key(|content| content.priority())
+            .chain(
+                ground_flora_at_point(
+                    self.seed_hash,
+                    self.geometry_age_years,
+                    self.season_phase(),
+                    point,
+                    &self.plants,
+                )
+                .map(|content| (content, None)),
+            )
+            .min_by_key(|(content, _)| content.priority())
     }
 
-    fn root_content_at_point(&self, point: Vec3) -> Option<GeneratedCellContent> {
+    fn root_content_at_point(&self, point: Vec3) -> Option<(GeneratedCellContent, Vec3)> {
         self.plants
             .iter()
             .zip(&self.plant_branches)
@@ -364,7 +381,7 @@ impl GeneratedWorld {
                     branches,
                 )
             })
-            .min_by_key(|content| content.priority())
+            .min_by_key(|(content, _)| content.priority())
     }
 
     fn mycelium_content_at_point(&self, point: Vec3) -> Option<GeneratedCellContent> {
@@ -931,7 +948,7 @@ impl Plant {
         point: Vec3,
         seed: u64,
         branches: &[BranchSegment],
-    ) -> Option<GeneratedCellContent> {
+    ) -> Option<(GeneratedCellContent, Vec3)> {
         let maturity = 0.08 + 0.92 * (age_years / 100.0).clamp(0.0, 1.0).powf(0.72);
         let vigor = self.growth_vigor(seed);
         let (_, lateral_extent, depth_factor) = self.root_profile();
@@ -955,7 +972,7 @@ impl Plant {
             let along = ((point - branch.start).dot(segment) / length_squared).clamp(0.0, 1.0);
             let closest = branch.start + segment * along;
             if point.distance_squared(closest) <= branch.radius_m.powi(2) {
-                return Some(self.species.generated_wood());
+                return Some((self.species.generated_wood(), segment.normalize()));
             }
         }
         None
@@ -1116,7 +1133,7 @@ impl Plant {
         cell: [i32; 3],
         branches: &[BranchSegment],
         season_phase: f32,
-    ) -> Option<GeneratedCellContent> {
+    ) -> Option<(GeneratedCellContent, Option<Vec3>)> {
         let growth = (age_years / 100.0).clamp(0.0, 1.0);
         let maturity = 0.08 + 0.92 * growth.powf(0.72);
         let vigor = self.growth_vigor(seed);
@@ -1150,7 +1167,7 @@ impl Plant {
             let taper = 0.72 + 0.28 * (1.0 - local_z / trunk_height.max(WORLD_REV_M));
             let radius = trunk_radius * taper;
             if local_x * local_x + local_y * local_y <= radius * radius {
-                return Some(self.species.generated_wood());
+                return Some((self.species.generated_wood(), Some(Vec3::Z)));
             }
         }
 
@@ -1163,7 +1180,7 @@ impl Plant {
             let along = ((point - branch.start).dot(segment) / length_squared).clamp(0.0, 1.0);
             let closest = branch.start + segment * along;
             if point.distance_squared(closest) <= branch.radius_m.powi(2) {
-                return Some(self.species.generated_wood());
+                return Some((self.species.generated_wood(), Some(segment.normalize())));
             }
         }
 
@@ -1179,7 +1196,7 @@ impl Plant {
                 ^ 0xD6E8_FEB8_6659_FD93
                 ^ (cell[2] as u32 as u64).wrapping_mul(0x9E37_79B1_85EB_CA87);
             if lattice_hash(canopy_seed, cell[0], cell[1]) % 11 != 0 {
-                return Some(self.species.generated_foliage());
+                return Some((self.species.generated_foliage(), None));
             }
         }
         None
