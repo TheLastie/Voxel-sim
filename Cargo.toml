@@ -38,3 +38,5 @@ libloading = "=0.8.9"
 
 [profile.release]
 debug = 1
+lto = "thin"
+codegen-units = 1

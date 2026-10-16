@@ -9,7 +9,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let coast_steps = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(300usize);
     let force = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(150.0f32);
 
-    let config = SceneConfig::load(scene_path)?;
+    let mut config = SceneConfig::load(scene_path)?;
+    if let Some(substeps) = args.get(5) {
+        config.substeps = substeps.parse()?;
+    }
+    if config.substeps == 0 {
+        return Err("substeps must be greater than zero".into());
+    }
+    eprintln!(
+        "capture config: fixed_dt_s={:.6}, substeps={}, physical_substep_s={:.6}",
+        config.fixed_dt,
+        config.substeps,
+        config.fixed_dt / config.substeps as f32,
+    );
     let mut scene = Scene::new(config.clone());
     let wood_ids: Vec<_> = ["wood", "oak"]
         .into_iter()

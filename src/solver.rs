@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 // serial path than with Rayon (same 177 states and identical solver results).
 // Use the pool for larger zones; keep the threshold overridable for A/B runs.
 const PARALLEL_MIN_VOXELS: usize = 32_768;
+const ROTATION_PARALLEL_MIN_VOXELS: usize = 8_192;
 
 fn parallel_enabled_for(voxel_count: usize) -> bool {
     static THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -98,17 +99,20 @@ fn apply_solid_viscoelastic_damping(
     scene: &mut Scene,
     targets: &[[Option<f32>; 3]],
     dt: f32,
-) {
-    let free_kinetic = |velocity: Vec3, mass: f32, mobility: Vec3| {
-        0.5 * mass
-            * (if mobility.x > 0.0 { velocity.x * velocity.x } else { 0.0 }
-                + if mobility.y > 0.0 { velocity.y * velocity.y } else { 0.0 }
-                + if mobility.z > 0.0 { velocity.z * velocity.z } else { 0.0 })
-    };
-
-    for axis in 0..3 {
-        for i in 0..scene.voxels.len() {
+    constraints: &[Constraint],
+) -> usize {
+    let mut cache_hits = 0;
+    // Constraints are the stable axis-major list of intact bonds with at least
+    // one free translational degree of freedom. Fully fixed bonds have zero
+    // damping mobility, so iterating this sparse list preserves the complete
+    // active damping set while avoiding a 3 * voxel_count topology scan.
+    for constraint in constraints {
+            let axis = constraint.axis;
+            let i = constraint.i;
             let bond = scene.bonds[axis][i];
+            let cached_constraint = (bond.neighbor != EMPTY
+                && constraint.j == bond.neighbor as usize)
+                .then_some(constraint);
             if bond.neighbor == EMPTY {
                 continue;
             }
@@ -122,7 +126,6 @@ fn apply_solid_viscoelastic_damping(
             if !kelvin_voigt_time.is_finite() || kelvin_voigt_time <= 0.0 {
                 continue;
             }
-
             let separation = scene.positions[j] - scene.positions[i];
             let normal = separation.normalize_or_zero();
             if normal == Vec3::ZERO {
@@ -144,8 +147,21 @@ fn apply_solid_viscoelastic_damping(
             // A zero normal rate produces no dashpot force or heat. Test it
             // before evaluating the temperature-dependent bond stiffness.
             let frame = basis(axis, scene.rotations[i].slerp(scene.rotations[j], 0.5));
-            let stiffness = stiffness_matrix(scene, i, j, frame).x_axis.x
-                * (1.0 - bond.damage).clamp(0.0, 1.0);
+            let material_stiffness = cached_constraint
+                .filter(|constraint| {
+                    constraint.rotation_i == scene.rotations[i]
+                        && constraint.rotation_j == scene.rotations[j]
+                        && constraint.thermal_energy_i
+                            == scene.voxels[i].thermal_energy_f32()
+                        && constraint.thermal_energy_j
+                            == scene.voxels[j].thermal_energy_f32()
+                })
+                .map(|constraint| {
+                    cache_hits += 1;
+                    constraint.material_k.x_axis.x
+                })
+                .unwrap_or_else(|| stiffness_matrix(scene, i, j, frame).x_axis.x);
+            let stiffness = material_stiffness * (1.0 - bond.damage).clamp(0.0, 1.0);
             let dashpot = kelvin_voigt_time * stiffness;
             if !dashpot.is_finite() || dashpot <= 0.0 {
                 continue;
@@ -156,7 +172,8 @@ fn apply_solid_viscoelastic_damping(
             if !denominator.is_finite() || denominator <= 0.0 {
                 continue;
             }
-            let impulse_on_j = normal * (-dt * dashpot * relative_speed / denominator);
+            let impulse_scalar = -dt * dashpot * relative_speed / denominator;
+            let impulse_on_j = normal * impulse_scalar;
             let new_velocity_i = velocity_i
                 - Vec3::new(
                     mobility_i.x * impulse_on_j.x,
@@ -170,21 +187,36 @@ fn apply_solid_viscoelastic_damping(
                     mobility_j.z * impulse_on_j.z,
                 );
 
-            let before = free_kinetic(velocity_i, scene.voxels[i].mass, mobility_i)
-                + free_kinetic(velocity_j, scene.voxels[j].mass, mobility_j);
-            let after = free_kinetic(new_velocity_i, scene.voxels[i].mass, mobility_i)
-                + free_kinetic(new_velocity_j, scene.voxels[j].mass, mobility_j);
+            // Compute the exact kinetic-energy change of the free translational
+            // degrees of freedom from the applied impulse. Prescribed axes do
+            // not contribute kinetic energy, even if their target velocity is
+            // nonzero. This is algebraically equivalent to measuring both
+            // kinetic energies before and after the impulse, with fewer vector
+            // squares and mass multiplications.
+            let free_velocity_i = Vec3::new(
+                if mobility_i.x > 0.0 { velocity_i.x } else { 0.0 },
+                if mobility_i.y > 0.0 { velocity_i.y } else { 0.0 },
+                if mobility_i.z > 0.0 { velocity_i.z } else { 0.0 },
+            );
+            let free_velocity_j = Vec3::new(
+                if mobility_j.x > 0.0 { velocity_j.x } else { 0.0 },
+                if mobility_j.y > 0.0 { velocity_j.y } else { 0.0 },
+                if mobility_j.z > 0.0 { velocity_j.z } else { 0.0 },
+            );
+            let kinetic_change = impulse_scalar
+                * (free_velocity_j - free_velocity_i).dot(normal)
+                + 0.5 * impulse_scalar * impulse_scalar * inverse_effective_mass;
             scene.voxels[i].velocity = new_velocity_i;
             scene.voxels[j].velocity = new_velocity_j;
 
-            let heat = (before - after).max(0.0) as f64;
+            let heat = (-kinetic_change).max(0.0) as f64;
             if heat > 0.0 {
                 scene.energy.solid_viscoelastic_heat += heat;
                 scene.voxels[i].add_internal_energy_j(heat * 0.5);
                 scene.voxels[j].add_internal_energy_j(heat * 0.5);
             }
-        }
     }
+    cache_hits
 }
 
 /// Free linear thermal displacement of a bond relative to each REV's
@@ -236,7 +268,49 @@ pub(crate) fn bond_stored_elastic_energy_j(scene: &Scene, i: usize, j: usize, ax
     (0.5 * (1.0 - bond.damage) * displacement.dot(stiffness * displacement)).max(0.0) as f64
 }
 
-pub fn bond_limits(scene: &Scene, i: usize, j: usize, direction: Vec3) -> crate::fracture::Limits {
+#[derive(Clone, Copy, Default)]
+struct PhaseStrengthCache {
+    thermal_energy_bits: u32,
+    solid_fraction: f32,
+    thermal_strength: f32,
+    valid: bool,
+}
+
+fn phase_strength(scene: &Scene, n: usize) -> (f32, f32) {
+    let material = &scene.properties[n];
+    let phase = material.phase_state(scene.voxels[n].mass, scene.voxels[n].thermal_energy_f32());
+    (
+        phase.solid_fraction.clamp(0.0, 1.0),
+        material.thermal_strength_scale(phase.temperature_kelvin),
+    )
+}
+
+fn cached_phase_strength(
+    scene: &Scene,
+    n: usize,
+    cache: &mut [PhaseStrengthCache],
+) -> (f32, f32) {
+    let thermal_energy = scene.voxels[n].thermal_energy_f32();
+    let entry = &mut cache[n];
+    if !entry.valid || entry.thermal_energy_bits != thermal_energy.to_bits() {
+        let (solid_fraction, thermal_strength) = phase_strength(scene, n);
+        *entry = PhaseStrengthCache {
+            thermal_energy_bits: thermal_energy.to_bits(),
+            solid_fraction,
+            thermal_strength,
+            valid: true,
+        };
+    }
+    (entry.solid_fraction, entry.thermal_strength)
+}
+
+fn bond_limits_with_phase_strengths(
+    scene: &Scene,
+    i: usize,
+    j: usize,
+    direction: Vec3,
+    phase_strengths: [(f32, f32); 2],
+) -> crate::fracture::Limits {
     let alignment =
         [i, j].map(|n| direction.dot(scene.rotations[n] * scene.voxels[n].microstructure.fibers()));
     let mut limits = crate::fracture::pair_limits(
@@ -248,16 +322,7 @@ pub fn bond_limits(scene: &Scene, i: usize, j: usize, direction: Vec3) -> crate:
             scene.voxels[j].microstructure.anisotropy,
         ],
     );
-    let (solid, thermal_strength) = [i, j]
-        .map(|n| {
-            let material = &scene.properties[n];
-            let phase =
-                material.phase_state(scene.voxels[n].mass, scene.voxels[n].thermal_energy_f32());
-            (
-                phase.solid_fraction.clamp(0.0, 1.0),
-                material.thermal_strength_scale(phase.temperature_kelvin),
-            )
-        })
+    let (solid, thermal_strength) = phase_strengths
         .into_iter()
         .fold((1.0f32, 1.0f32), |(solid, softening), next| {
             (solid.min(next.0), softening.min(next.1))
@@ -270,6 +335,30 @@ pub fn bond_limits(scene: &Scene, i: usize, j: usize, direction: Vec3) -> crate:
     limits.hardening *= strength_scale;
     limits.fracture_energy *= strength_scale;
     limits
+}
+
+pub fn bond_limits(scene: &Scene, i: usize, j: usize, direction: Vec3) -> crate::fracture::Limits {
+    bond_limits_with_phase_strengths(
+        scene,
+        i,
+        j,
+        direction,
+        [phase_strength(scene, i), phase_strength(scene, j)],
+    )
+}
+
+fn bond_limits_cached(
+    scene: &Scene,
+    i: usize,
+    j: usize,
+    direction: Vec3,
+    cache: &mut [PhaseStrengthCache],
+) -> crate::fracture::Limits {
+    let phase_strengths = [
+        cached_phase_strength(scene, i, cache),
+        cached_phase_strength(scene, j, cache),
+    ];
+    bond_limits_with_phase_strengths(scene, i, j, direction, phase_strengths)
 }
 pub fn fracture_strength(scene: &Scene, i: usize, j: usize, direction: Vec3) -> f32 {
     bond_limits(scene, i, j, direction).tension
@@ -514,7 +603,7 @@ fn fit_rotations(scene: &mut Scene, scratch: &mut SolverScratch) -> f32 {
         }
         2.0 * previous.dot(*q).abs().clamp(0.0, 1.0).acos()
     };
-    if !parallel_enabled_for(n) {
+    if !parallel_enabled_for(n) && n < ROTATION_PARALLEL_MIN_VOXELS {
         scene
             .rotations
             .iter_mut()
@@ -669,12 +758,14 @@ pub fn step_with_axis_targets_and_loads(
     let profile_step = std::env::var_os("VOXEL_PROFILE_STEP").is_some();
     let mut stage_time = [Duration::ZERO; 5];
     let mut total_pcg_iterations = 0usize;
+    let mut damping_cache_hits = 0usize;
     let mut solve_detail_time = [Duration::ZERO; 3];
     let mut contact_finish_time = Duration::ZERO;
     let mut tool_recheck_time = Duration::ZERO;
     let mut release_time = Duration::ZERO;
     let mut damping_time = Duration::ZERO;
     let mut thermal_time = Duration::ZERO;
+    let mut rotation_fit_time = Duration::ZERO;
     // Reuse large solver buffers across substeps and corotation corrections.
     // A failed device solve is unlikely to recover on another corotation
     // iteration/substep of this same fixed step (same device and scene state).
@@ -711,6 +802,9 @@ pub fn step_with_axis_targets_and_loads(
         std::mem::take(&mut solver_scratch.normal_impulses_ns);
     let mut contact_physical_velocities =
         std::mem::take(&mut solver_scratch.contact_physical_velocities);
+    solver_scratch
+        .phase_strength_cache
+        .resize(scene.voxels.len(), PhaseStrengthCache::default());
     for _ in 0..scene.config.substeps {
         let mut phase_start = Instant::now();
         substep_start_positions.clone_from(&scene.positions);
@@ -763,7 +857,11 @@ pub fn step_with_axis_targets_and_loads(
             *p += delta_v * (0.5 * h);
         }
         predicted.clone_from(&scene.positions);
+        let rotation_start = profile_step.then(Instant::now);
         fit_rotations(scene, &mut solver_scratch);
+        if let Some(start) = rotation_start {
+            rotation_fit_time += start.elapsed();
+        }
         stage_time[0] += phase_start.elapsed();
         phase_start = Instant::now();
         for iteration in 0..scene.config.corotation_iterations {
@@ -786,7 +884,11 @@ pub fn step_with_axis_targets_and_loads(
             if iteration + 1 == scene.config.corotation_iterations {
                 break;
             }
+            let rotation_start = profile_step.then(Instant::now);
             let orientation_change = fit_rotations(scene, &mut solver_scratch);
+            if let Some(start) = rotation_start {
+                rotation_fit_time += start.elapsed();
+            }
             if orientation_change <= scene.config.corotation_tolerance
                 && scene.solver_residual <= scene.config.solver_relative_tolerance
             {
@@ -849,6 +951,9 @@ pub fn step_with_axis_targets_and_loads(
         phase_start = Instant::now();
         // Actual converged strain defines elastic energy and constitutive stress.
         // Reading an intermediate lambda would depend on sweep order and convergence.
+        solver_scratch
+            .phase_strength_cache
+            .fill(PhaseStrengthCache::default());
         for constraint in &solver_scratch.constraints {
             let i = constraint.i;
             let j = constraint.j;
@@ -858,7 +963,13 @@ pub fn step_with_axis_targets_and_loads(
             }
             let frame = constraint.frame;
             let k = constraint.material_k;
-            let limits = bond_limits(scene, i, j, frame.x_axis);
+            let limits = bond_limits_cached(
+                scene,
+                i,
+                j,
+                frame.x_axis,
+                &mut solver_scratch.phase_strength_cache,
+            );
             let u = bond_elastic_displacement(scene, i, j, axis, frame);
             scene.workspace[axis][i].last_force = frame
                 * (k * (u - Vec3::from_array(scene.bonds[axis][i].plastic_strain) * CELL))
@@ -947,7 +1058,8 @@ pub fn step_with_axis_targets_and_loads(
             release_time += start.elapsed();
         }
         let damping_start = profile_step.then(Instant::now);
-        apply_solid_viscoelastic_damping(scene, targets, h);
+        damping_cache_hits +=
+            apply_solid_viscoelastic_damping(scene, targets, h, &solver_scratch.constraints);
         if let Some(start) = damping_start {
             damping_time += start.elapsed();
         }
@@ -1016,12 +1128,13 @@ pub fn step_with_axis_targets_and_loads(
     if profile_step {
         let ms = stage_time.map(|duration| duration.as_secs_f64() * 1000.0);
         eprintln!(
-            "profile step ms: predict/tool={:.2} solve={:.2} [assemble={:.2} factor={:.2} pcg={:.2}] collision={:.2} fracture={:.2} finish={:.2} post_contact={:.2} tool_recheck={:.2} releases={:.2} damping={:.2} thermal={:.2} pcg_iters={total_pcg_iterations} residual={:.3e}",
+            "profile step ms: predict/tool={:.2} solve={:.2} [assemble={:.2} factor={:.2} pcg={:.2}] rotation_fit={:.2} collision={:.2} fracture={:.2} finish={:.2} post_contact={:.2} tool_recheck={:.2} releases={:.2} damping={:.2} thermal={:.2} damping_cache_hits={damping_cache_hits} pcg_iters={total_pcg_iterations} residual={:.3e}",
             ms[0],
             ms[1],
             solve_detail_time[0].as_secs_f64() * 1000.0,
             solve_detail_time[1].as_secs_f64() * 1000.0,
             solve_detail_time[2].as_secs_f64() * 1000.0,
+            rotation_fit_time.as_secs_f64() * 1000.0,
             ms[2],
             ms[3],
             ms[4],
@@ -1546,6 +1659,10 @@ struct Constraint {
     material_k: Mat3,
     k: Mat3,
     rest: Vec3,
+    rotation_i: Quat,
+    rotation_j: Quat,
+    thermal_energy_i: f32,
+    thermal_energy_j: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -1597,6 +1714,7 @@ pub(crate) struct SolverScratch {
     preconditioner_work: Vec<Vec3>,
     rhs: Vec<Vec3>,
     constraints: Vec<Constraint>,
+    phase_strength_cache: Vec<PhaseStrengthCache>,
     constraint_slots: Vec<Option<Constraint>>,
     constraint_forces: Vec<Vec3>,
     pcg_rows: Vec<PcgRow>,
@@ -1612,15 +1730,23 @@ pub(crate) struct SolverScratch {
     rotation_gradients: Vec<Mat3>,
     rotation_counts: Vec<Vec3>,
 }
-fn make_constraint(scene: &Scene, i: usize, axis: usize, j: usize) -> Constraint {
-    let frame = basis(axis, scene.rotations[i].slerp(scene.rotations[j], 0.5));
+fn make_constraint(
+    scene: &Scene,
+    i: usize,
+    axis: usize,
+    j: usize,
+) -> Constraint {
+    let rotation_i = scene.rotations[i];
+    let rotation_j = scene.rotations[j];
+    let thermal_energy_i = scene.voxels[i].thermal_energy_f32();
+    let thermal_energy_j = scene.voxels[j].thermal_energy_f32();
+    let frame = basis(axis, rotation_i.slerp(rotation_j, 0.5));
     let material_k = stiffness_matrix(scene, i, j, frame);
     let local = material_k * (1. - scene.bonds[axis][i].damage).max(0.001);
     let k = frame * local * frame.transpose();
     let bond = scene.bonds[axis][i];
-    let thermal_rest = bond_thermal_rest(scene, i, j, frame);
     let rest = frame
-        * (thermal_rest
+        * (bond_thermal_rest(scene, i, j, frame)
             + Vec3::from_array(bond.formation_offset)
             + Vec3::from_array(bond.plastic_strain) * CELL);
     Constraint {
@@ -1631,6 +1757,10 @@ fn make_constraint(scene: &Scene, i: usize, axis: usize, j: usize) -> Constraint
         material_k,
         k,
         rest,
+        rotation_i,
+        rotation_j,
+        thermal_energy_i,
+        thermal_energy_j,
     }
 }
 
@@ -1909,7 +2039,10 @@ fn solve_coupled(
         }
         Some(make_constraint(scene, i, axis, j))
     };
-    if parallel_enabled_for(n) {
+    // The CUDA PCG backend leaves the host free to assemble independent bond
+    // rows in parallel. Keep CPU-PCG's measured serial cutoff unchanged.
+    let parallel_assembly = parallel_enabled_for(n) || (try_cuda && n >= 4_096);
+    if parallel_assembly {
         scratch
             .constraint_slots
             .par_iter_mut()
@@ -1959,7 +2092,7 @@ fn solve_coupled(
         *force = constraint.k
             * (scene.positions[constraint.j] - scene.positions[constraint.i] - constraint.rest);
     };
-    if parallel_enabled_for(n) {
+    if parallel_assembly {
         forces
             .par_iter_mut()
             .enumerate()
@@ -1986,7 +2119,7 @@ fn solve_coupled(
         *rhs = row_rhs;
         *diagonal = row_diagonal;
     };
-    if parallel_enabled_for(n) {
+    if parallel_assembly {
         scratch
             .rhs
             .par_iter_mut()

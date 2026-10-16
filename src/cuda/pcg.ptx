@@ -202,7 +202,7 @@ U_DONE:
     .param .u64 beta_ptr,
     .param .u32 count
 ) {
-    .reg .pred %p<2>;
+    .reg .pred %p<3>;
     .reg .b32 %r<6>;
     .reg .b64 %rd<6>;
     .reg .f32 %f<4>;
@@ -221,11 +221,69 @@ U_DONE:
     mul.wide.u32 %rd3, %r5, 4;
     add.u64 %rd4, %rd1, %rd3;
     add.u64 %rd3, %rd2, %rd3;
+    setp.eq.f32 %p2, %f1, 0f00000000;
+    @%p2 bra D_COPY_PRECONDITIONED;
     ld.global.f32 %f2, [%rd4];
     ld.global.f32 %f3, [%rd3];
     fma.rn.f32 %f2, %f1, %f2, %f3;
     st.global.f32 [%rd4], %f2;
+    bra D_DONE;
+D_COPY_PRECONDITIONED:
+    ld.global.f32 %f3, [%rd3];
+    st.global.f32 [%rd4], %f3;
 D_DONE:
+    ret;
+}
+.visible .entry pcg_update_direction_ratio(
+    .param .u64 p_ptr,
+    .param .u64 z_ptr,
+    .param .u64 rho_next_ptr,
+    .param .u64 rho_ptr,
+    .param .u32 count
+) {
+    .reg .pred %p<3>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<6>;
+    .reg .f32 %f<4>;
+    .reg .f64 %fd<4>;
+    .shared .align 4 .b8 beta_shared[4];
+    ld.param.u64 %rd1, [p_ptr];
+    ld.param.u64 %rd2, [z_ptr];
+    ld.param.u64 %rd3, [rho_next_ptr];
+    ld.param.u64 %rd4, [rho_ptr];
+    mov.u32 %r2, %tid.x;
+    setp.ne.u32 %p2, %r2, 0;
+    @%p2 bra D_RATIO_READY;
+    ld.global.f64 %fd1, [%rd3];
+    ld.global.f64 %fd2, [%rd4];
+    setp.gt.f64 %p1, %fd2, 1.0e-30;
+    @!%p1 bra D_RATIO_ZERO;
+    div.rn.f64 %fd3, %fd1, %fd2;
+    cvt.rn.f32.f64 %f1, %fd3;
+    bra D_RATIO_STORE;
+D_RATIO_ZERO:
+    mov.f32 %f1, 0f00000000;
+D_RATIO_STORE:
+    st.shared.f32 [beta_shared], %f1;
+D_RATIO_READY:
+    bar.sync 0;
+    ld.shared.f32 %f1, [beta_shared];
+    ld.param.u32 %r1, [count];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.u32 %r5, %r2, %r3, %r4;
+    mul.lo.u32 %r1, %r1, 3;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra D_RATIO_DONE;
+    mul.wide.u32 %rd3, %r5, 4;
+    add.u64 %rd4, %rd1, %rd3;
+    add.u64 %rd3, %rd2, %rd3;
+    ld.global.f32 %f2, [%rd4];
+    ld.global.f32 %f3, [%rd3];
+    fma.rn.f32 %f2, %f1, %f2, %f3;
+    st.global.f32 [%rd4], %f2;
+D_RATIO_DONE:
     ret;
 }
 .visible .entry dot_product(
@@ -720,5 +778,124 @@ RATIO_SINGLE_ZERO:
 RATIO_SINGLE_OUTPUT:
     st.global.f32 [%rd4], %f1;
 RATIO_SINGLE_DONE:
+    ret;
+}
+.visible .entry block_color_correction(
+    .param .u64 inverse_ptr,
+    .param .u64 residual_ptr,
+    .param .u64 output_ptr,
+    .param .u64 neighbors_ptr,
+    .param .u64 blocks_ptr,
+    .param .u64 colors_ptr,
+    .param .u32 count,
+    .param .u32 target_color
+) {
+    .reg .pred %p<5>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<24>;
+    ld.param.u64 %rd1, [inverse_ptr];
+    ld.param.u64 %rd2, [residual_ptr];
+    ld.param.u64 %rd3, [output_ptr];
+    ld.param.u64 %rd4, [neighbors_ptr];
+    ld.param.u64 %rd5, [blocks_ptr];
+    ld.param.u64 %rd6, [colors_ptr];
+    ld.param.u32 %r8, [count];
+    ld.param.u32 %r9, [target_color];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    setp.ge.u32 %p1, %r4, %r8;
+    @%p1 bra COLOR_DONE;
+
+    mul.wide.u32 %rd7, %r4, 1;
+    add.u64 %rd7, %rd6, %rd7;
+    ld.global.u8 %r5, [%rd7];
+    setp.ne.u32 %p2, %r5, %r9;
+    @%p2 bra COLOR_DONE;
+
+    mul.wide.u32 %rd8, %r4, 12;
+    add.u64 %rd9, %rd2, %rd8;
+    ld.global.f32 %f0, [%rd9];
+    ld.global.f32 %f1, [%rd9+4];
+    ld.global.f32 %f2, [%rd9+8];
+    mov.f32 %f3, 0f00000000;
+    mov.f32 %f4, 0f00000000;
+    mov.f32 %f5, 0f00000000;
+    mul.wide.u32 %rd10, %r4, 24;
+    add.u64 %rd10, %rd4, %rd10;
+    mul.wide.u32 %rd11, %r4, 216;
+    mov.u32 %r6, 0;
+
+COLOR_EDGE_LOOP:
+    setp.ge.u32 %p3, %r6, 6;
+    @%p3 bra COLOR_EDGE_DONE;
+    mul.wide.u32 %rd12, %r6, 4;
+    add.u64 %rd12, %rd10, %rd12;
+    ld.global.u32 %r7, [%rd12];
+    setp.eq.u32 %p4, %r7, 0xffffffff;
+    @%p4 bra COLOR_NEXT_EDGE;
+
+    mul.wide.u32 %rd12, %r7, 12;
+    add.u64 %rd12, %rd3, %rd12;
+    ld.global.f32 %f6, [%rd12];
+    ld.global.f32 %f7, [%rd12+4];
+    ld.global.f32 %f8, [%rd12+8];
+    mul.wide.u32 %rd13, %r6, 36;
+    add.u64 %rd13, %rd11, %rd13;
+    add.u64 %rd13, %rd5, %rd13;
+    ld.global.f32 %f9, [%rd13];
+    ld.global.f32 %f10, [%rd13+4];
+    ld.global.f32 %f11, [%rd13+8];
+    ld.global.f32 %f12, [%rd13+12];
+    ld.global.f32 %f13, [%rd13+16];
+    ld.global.f32 %f14, [%rd13+20];
+    ld.global.f32 %f15, [%rd13+24];
+    ld.global.f32 %f16, [%rd13+28];
+    ld.global.f32 %f17, [%rd13+32];
+    fma.rn.f32 %f3, %f9, %f6, %f3;
+    fma.rn.f32 %f3, %f10, %f7, %f3;
+    fma.rn.f32 %f3, %f11, %f8, %f3;
+    fma.rn.f32 %f4, %f12, %f6, %f4;
+    fma.rn.f32 %f4, %f13, %f7, %f4;
+    fma.rn.f32 %f4, %f14, %f8, %f4;
+    fma.rn.f32 %f5, %f15, %f6, %f5;
+    fma.rn.f32 %f5, %f16, %f7, %f5;
+    fma.rn.f32 %f5, %f17, %f8, %f5;
+
+COLOR_NEXT_EDGE:
+    add.u32 %r6, %r6, 1;
+    bra COLOR_EDGE_LOOP;
+
+COLOR_EDGE_DONE:
+    sub.f32 %f0, %f0, %f3;
+    sub.f32 %f1, %f1, %f4;
+    sub.f32 %f2, %f2, %f5;
+    mul.wide.u32 %rd12, %r4, 36;
+    add.u64 %rd12, %rd1, %rd12;
+    ld.global.f32 %f9, [%rd12];
+    ld.global.f32 %f10, [%rd12+4];
+    ld.global.f32 %f11, [%rd12+8];
+    ld.global.f32 %f12, [%rd12+12];
+    ld.global.f32 %f13, [%rd12+16];
+    ld.global.f32 %f14, [%rd12+20];
+    ld.global.f32 %f15, [%rd12+24];
+    ld.global.f32 %f16, [%rd12+28];
+    ld.global.f32 %f17, [%rd12+32];
+    mul.f32 %f18, %f9, %f0;
+    fma.rn.f32 %f18, %f10, %f1, %f18;
+    fma.rn.f32 %f18, %f11, %f2, %f18;
+    mul.f32 %f19, %f12, %f0;
+    fma.rn.f32 %f19, %f13, %f1, %f19;
+    fma.rn.f32 %f19, %f14, %f2, %f19;
+    mul.f32 %f20, %f15, %f0;
+    fma.rn.f32 %f20, %f16, %f1, %f20;
+    fma.rn.f32 %f20, %f17, %f2, %f20;
+    add.u64 %rd12, %rd3, %rd8;
+    st.global.f32 [%rd12], %f18;
+    st.global.f32 [%rd12+4], %f19;
+    st.global.f32 [%rd12+8], %f20;
+COLOR_DONE:
     ret;
 }
