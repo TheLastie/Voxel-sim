@@ -28,6 +28,8 @@ pub enum GeneratedCellContent {
     Grass,
     Fern,
     Mushroom,
+    Bolete,
+    Puffball,
 }
 
 impl GeneratedCellContent {
@@ -35,7 +37,7 @@ impl GeneratedCellContent {
         match self {
             Self::OakWood | Self::BirchWood | Self::AcaciaWood => 0,
             Self::OakFoliage | Self::BirchFoliage | Self::AcaciaFoliage => 1,
-            Self::Mushroom => 2,
+            Self::Mushroom | Self::Bolete | Self::Puffball => 2,
             Self::Fern => 3,
             Self::Grass => 4,
             Self::Terrain => 5,
@@ -86,6 +88,17 @@ struct Plant {
     moisture: f32,
     fertility: f32,
     species: TreeSpecies,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FungusForm {
+    content: GeneratedCellContent,
+    height_scale: f32,
+    stem_fraction: f32,
+    stem_radius_m: f32,
+    cap_width_m: f32,
+    cap_thickness_m: f32,
+    cap_color: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -294,6 +307,7 @@ impl GeneratedWorld {
                 self.geometry_age_years,
                 self.season_phase(),
                 point,
+                &self.plants,
             ))
             .min_by_key(|content| content.priority())
     }
@@ -317,6 +331,7 @@ impl GeneratedWorld {
             self.seed_hash,
             self.geometry_age_years,
             season_phase,
+            &self.plants,
         );
         for (plant, branches) in self.plants.iter().zip(&self.plant_branches) {
             candidates.extend(plant.voxels_at_age(
@@ -366,7 +381,12 @@ fn cell_containing_point(point: Vec3) -> Option<[i32; 3]> {
     }
 }
 
-fn make_ground_flora(seed: u64, age_years: f32, season_phase: f32) -> Vec<TerrainVoxel> {
+fn make_ground_flora(
+    seed: u64,
+    age_years: f32,
+    season_phase: f32,
+    plants: &[Plant],
+) -> Vec<TerrainVoxel> {
     let growth = (age_years / 4.0).clamp(0.0, 1.0);
     let mut result = Vec::new();
     // Fixed 0.5 m sampling keeps density seed-locked and cheap to rebuild.
@@ -375,17 +395,15 @@ fn make_ground_flora(seed: u64, age_years: f32, season_phase: f32) -> Vec<Terrai
             let cell_hash = lattice_hash(seed ^ 0xA24B_AED4_963E_E407, gx, gy);
             let x = -4.75 + gx as f32 * 0.5;
             let y = -4.75 + gy as f32 * 0.5;
-            let nx = ((x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M) as usize;
-            let ny = ((y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M) as usize;
+            let nx = (x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M;
+            let ny = (y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M;
             let moisture = (0.5
-                + value_noise(seed ^ 0x8EBC_6AF0_9C88_C6E3, nx as f32 / 27.0, ny as f32 / 27.0)
-                    * 0.38)
+                + value_noise(seed ^ 0x8EBC_6AF0_9C88_C6E3, nx / 27.0, ny / 27.0) * 0.38)
                 .clamp(0.0, 1.0);
             let fertility = (0.55
-                + value_noise(seed ^ 0x5899_65CC_7537_4CC3, nx as f32 / 22.0, ny as f32 / 22.0)
-                    * 0.35)
+                + value_noise(seed ^ 0x5899_65CC_7537_4CC3, nx / 22.0, ny / 22.0) * 0.35)
                 .clamp(0.1, 1.0);
-            let ground_z = terrain_height(seed, nx as f32, ny as f32);
+            let ground_z = terrain_height(seed, nx, ny);
 
             if cell_hash % 5 != 0 {
                 continue;
@@ -421,57 +439,76 @@ fn make_ground_flora(seed: u64, age_years: f32, season_phase: f32) -> Vec<Terrai
         }
     }
 
-    // Fruiting bodies appear only where the seeded soil-moisture field is high.
+    // Seeded fruiting sites select a soil, tree-associated, or open-ground form.
     for gy in 0..25 {
         for gx in 0..25 {
             let x = -4.8 + gx as f32 * 0.4;
             let y = -4.8 + gy as f32 * 0.4;
-            let nx = ((x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M) as usize;
-            let ny = ((y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M) as usize;
+            let nx = (x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M;
+            let ny = (y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M;
             let moisture = (0.5
-                + value_noise(seed ^ 0x8EBC_6AF0_9C88_C6E3, nx as f32 / 27.0, ny as f32 / 27.0)
-                    * 0.38)
+                + value_noise(seed ^ 0x8EBC_6AF0_9C88_C6E3, nx / 27.0, ny / 27.0) * 0.38)
                 .clamp(0.0, 1.0);
+            let fertility = (0.55
+                + value_noise(seed ^ 0x5899_65CC_7537_4CC3, nx / 22.0, ny / 22.0) * 0.35)
+                .clamp(0.1, 1.0);
             let spot = lattice_hash(seed ^ 0xDB4F_0B91_75AE_2165, gx, gy);
-            if moisture < 0.64
-                || spot % 13 != 0
-                || age_years < 1.0
-                || !mushrooms_fruiting(season_phase)
-            {
-                continue;
-            }
-            let height = 0.06 + 0.08 * growth * (0.5 + moisture * 0.5);
-            let ground_z = terrain_height(seed, nx as f32, ny as f32);
-            let stem_height = height * 0.62;
-            result.push(TerrainVoxel {
-                center: Vec3::new(x, y, ground_z + stem_height * 0.5),
-                size: Vec3::new(0.035, 0.035, stem_height),
-                color: [0.82, 0.78, 0.62, 1.0],
-                content: GeneratedCellContent::Mushroom,
+            let has_tree_host = plants.iter().any(|plant| {
+                matches!(plant.species, TreeSpecies::Oak | TreeSpecies::Birch)
+                    && (plant.x - x).powi(2) + (plant.y - y).powi(2) <= 2.5_f32.powi(2)
             });
-            let cap_color = if spot & 1 == 0 {
-                [0.58, 0.20, 0.12, 1.0]
-            } else {
-                [0.48, 0.32, 0.16, 1.0]
+            let Some(form) = fungus_form(
+                spot,
+                moisture,
+                fertility,
+                has_tree_host,
+                age_years,
+                season_phase,
+            ) else {
+                continue;
             };
+            let height = (0.06 + 0.08 * growth * (0.5 + moisture * 0.5)) * form.height_scale;
+            let ground_z = terrain_height(seed, nx, ny);
+            let stem_height = height * form.stem_fraction;
+            if stem_height > 0.0 {
+                result.push(TerrainVoxel {
+                    center: Vec3::new(x, y, ground_z + stem_height * 0.5),
+                    size: Vec3::new(
+                        form.stem_radius_m * 2.0,
+                        form.stem_radius_m * 2.0,
+                        stem_height,
+                    ),
+                    color: [0.82, 0.78, 0.62, 1.0],
+                    content: form.content,
+                });
+            }
             result.push(TerrainVoxel {
-                center: Vec3::new(x, y, ground_z + stem_height + height * 0.12),
-                size: Vec3::new(0.12, 0.12, 0.04),
-                color: cap_color,
-                content: GeneratedCellContent::Mushroom,
+                center: Vec3::new(
+                    x,
+                    y,
+                    ground_z + stem_height + form.cap_thickness_m * 0.5,
+                ),
+                size: Vec3::new(
+                    form.cap_width_m,
+                    form.cap_width_m,
+                    form.cap_thickness_m,
+                ),
+                color: form.cap_color,
+                content: form.content,
             });
         }
     }
     result
 }
 
-/// Evaluate seeded grass, fern, and mushroom geometry directly at a point on
+/// Evaluate seeded grass, fern, and fungal geometry directly at a point on
 /// the REV lattice. This does not inspect or depend on the renderer's LOD list.
 fn ground_flora_at_point(
     seed: u64,
     age_years: f32,
     season_phase: f32,
     point: Vec3,
+    plants: &[Plant],
 ) -> Option<GeneratedCellContent> {
     let mut found = None;
     let mut record = |content: GeneratedCellContent| {
@@ -543,34 +580,99 @@ fn ground_flora_at_point(
             let moisture = (0.5
                 + value_noise(seed ^ 0x8EBC_6AF0_9C88_C6E3, nx / 27.0, ny / 27.0) * 0.38)
                 .clamp(0.0, 1.0);
+            let fertility = (0.55
+                + value_noise(seed ^ 0x5899_65CC_7537_4CC3, nx / 22.0, ny / 22.0) * 0.35)
+                .clamp(0.1, 1.0);
             let spot = lattice_hash(seed ^ 0xDB4F_0B91_75AE_2165, gx, gy);
-            if moisture < 0.64
-                || spot % 13 != 0
-                || age_years < 1.0
-                || !mushrooms_fruiting(season_phase)
-            {
+            let has_tree_host = plants.iter().any(|plant| {
+                matches!(plant.species, TreeSpecies::Oak | TreeSpecies::Birch)
+                    && (plant.x - x).powi(2) + (plant.y - y).powi(2) <= 2.5_f32.powi(2)
+            });
+            let Some(form) = fungus_form(
+                spot,
+                moisture,
+                fertility,
+                has_tree_host,
+                age_years,
+                season_phase,
+            ) else {
                 continue;
-            }
-            let height = 0.06 + 0.08 * (age_years / 4.0).clamp(0.0, 1.0) * (0.5 + moisture * 0.5);
+            };
+            let growth = (age_years / 4.0).clamp(0.0, 1.0);
+            let height = (0.06 + 0.08 * growth * (0.5 + moisture * 0.5)) * form.height_scale;
             let ground_z = terrain_height(seed, nx, ny);
-            let stem_height = height * 0.62;
-            let stem = (point.x - x).abs() <= 0.0175
-                && (point.y - y).abs() <= 0.0175
+            let stem_height = height * form.stem_fraction;
+            let stem = form.stem_fraction > 0.0
+                && (point.x - x).abs() <= form.stem_radius_m
+                && (point.y - y).abs() <= form.stem_radius_m
                 && point.z >= ground_z
                 && point.z <= ground_z + stem_height;
-            let cap = (point.x - x).abs() <= 0.06
-                && (point.y - y).abs() <= 0.06
-                && (point.z - (ground_z + stem_height + height * 0.12)).abs() <= 0.02;
+            let cap = (point.x - x).abs() <= form.cap_width_m * 0.5
+                && (point.y - y).abs() <= form.cap_width_m * 0.5
+                && (point.z
+                    - (ground_z + stem_height + form.cap_thickness_m * 0.5))
+                    .abs()
+                    <= form.cap_thickness_m * 0.5;
             if stem || cap {
-                record(GeneratedCellContent::Mushroom);
+                record(form.content);
             }
         }
     }
     found
 }
 
-fn mushrooms_fruiting(season_phase: f32) -> bool {
+fn fungi_fruiting(season_phase: f32) -> bool {
     (0.55..0.90).contains(&season_phase)
+}
+
+fn fungus_form(
+    site_hash: u64,
+    moisture: f32,
+    fertility: f32,
+    has_tree_host: bool,
+    age_years: f32,
+    season_phase: f32,
+) -> Option<FungusForm> {
+    if moisture < 0.64 || age_years < 1.0 || site_hash % 13 != 0 || !fungi_fruiting(season_phase)
+    {
+        return None;
+    }
+
+    let form = match site_hash % 5 {
+        0 | 1 => FungusForm {
+            content: GeneratedCellContent::Mushroom,
+            height_scale: 1.0,
+            stem_fraction: 0.62,
+            stem_radius_m: 0.0175,
+            cap_width_m: 0.12,
+            cap_thickness_m: 0.04,
+            cap_color: if site_hash & 1 == 0 {
+                [0.58, 0.20, 0.12, 1.0]
+            } else {
+                [0.48, 0.32, 0.16, 1.0]
+            },
+        },
+        2 if has_tree_host && moisture >= 0.68 && fertility >= 0.45 => FungusForm {
+            content: GeneratedCellContent::Bolete,
+            height_scale: 1.15,
+            stem_fraction: 0.68,
+            stem_radius_m: 0.024,
+            cap_width_m: 0.15,
+            cap_thickness_m: 0.055,
+            cap_color: [0.48, 0.32, 0.16, 1.0],
+        },
+        3 if !has_tree_host && fertility >= 0.55 => FungusForm {
+            content: GeneratedCellContent::Puffball,
+            height_scale: 0.75,
+            stem_fraction: 0.0,
+            stem_radius_m: 0.0,
+            cap_width_m: 0.08,
+            cap_thickness_m: 0.075,
+            cap_color: [0.78, 0.75, 0.63, 1.0],
+        },
+        _ => return None,
+    };
+    Some(form)
 }
 
 impl Plant {
