@@ -1,6 +1,10 @@
 use std::collections::HashSet;
 
-use glam::Vec3;
+use crate::{
+    scene::VoxelSpawn,
+    voxel::{Composition, Microstructure},
+};
+use glam::{Quat, Vec3};
 
 pub const WORLD_SIDE_M: f32 = 10.0;
 pub const WORLD_CELL_M: f32 = 0.1;
@@ -63,6 +67,55 @@ pub struct GeneratedCell {
     pub soil_moisture: f32,
     pub fertility: f32,
     pub temperature_kelvin: f32,
+}
+
+impl GeneratedCell {
+    /// Convert this generated 1 cm cell into the engine's physical spawn input.
+    /// Material composition stays explicit: `Scene::from_voxels` derives mass
+    /// and internal energy from that composition and this cell's temperature.
+    /// Kinematic fixation remains a boundary condition, separate from mass.
+    pub fn to_voxel_spawn(
+        self,
+        composition: Composition,
+        anisotropy: f32,
+        velocity: Vec3,
+        kinematic: bool,
+    ) -> Result<VoxelSpawn, &'static str> {
+        if !anisotropy.is_finite() || !(0.0..=1.0).contains(&anisotropy) {
+            return Err("material anisotropy must be finite and between zero and one");
+        }
+        if !velocity.is_finite() {
+            return Err("generated voxel velocity must be finite");
+        }
+        let orientation = if anisotropy == 0.0 {
+            Quat::IDENTITY
+        } else {
+            let direction = self
+                .fiber_direction
+                .ok_or("anisotropic generated cell has no fiber direction")?;
+            if !direction.is_finite() || direction.length_squared() < 1e-8 {
+                return Err("generated fiber direction must be finite and nonzero");
+            }
+            Quat::from_rotation_arc(Vec3::Z, direction.normalize())
+        };
+        let lattice = Vec3::new(
+            (self.cell[0] - WORLD_REV_SIDE / 2) as f32,
+            (self.cell[1] - WORLD_REV_SIDE / 2) as f32,
+            self.cell[2] as f32,
+        );
+        let center = lattice * WORLD_REV_M + Vec3::splat(WORLD_REV_M * 0.5);
+        Ok(VoxelSpawn {
+            center,
+            composition,
+            velocity,
+            microstructure: Microstructure {
+                orientation,
+                anisotropy,
+            },
+            kinematic,
+            temperature_kelvin: self.temperature_kelvin,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
