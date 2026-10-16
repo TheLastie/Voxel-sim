@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use glam::Vec3;
 
 pub const WORLD_SIDE_M: f32 = 10.0;
@@ -13,7 +15,7 @@ const WORLD_SAMPLE_HEIGHT_CELLS: i32 = (WORLD_SAMPLE_HEIGHT_M / WORLD_REV_M) as 
 
 /// Geometric identity of a generated 1 cm cell. These tags distinguish plant
 /// anatomy, but do not claim that matching physical material parameters exist.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GeneratedCellContent {
     Air,
     Terrain,
@@ -68,8 +70,10 @@ pub struct GeneratedWorld {
     pub voxels: Vec<TerrainVoxel>,
     terrain_voxels: Vec<TerrainVoxel>,
     plants: Vec<Plant>,
+    plant_branches: Vec<Vec<BranchSegment>>,
     seed_hash: u64,
     pub age_years: f32,
+    geometry_age_years: f32,
     generated_year: u32,
 }
 
@@ -81,6 +85,13 @@ struct Plant {
     moisture: f32,
     fertility: f32,
     species: TreeSpecies,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BranchSegment {
+    start: Vec3,
+    end: Vec3,
+    radius_m: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -143,8 +154,10 @@ impl GeneratedWorld {
             voxels: Vec::new(),
             terrain_voxels,
             plants: make_plants(seed_hash),
+            plant_branches: Vec::new(),
             seed_hash,
             age_years: 8.0,
+            geometry_age_years: 8.0,
             generated_year: u32::MAX,
         };
         world.rebuild_vegetation();
@@ -254,20 +267,44 @@ impl GeneratedWorld {
     fn vegetation_at_point(&self, cell: [i32; 3], point: Vec3) -> Option<GeneratedCellContent> {
         self.plants
             .iter()
-            .filter_map(|plant| plant.content_at_point(self.age_years, point, self.seed_hash, cell))
-            .chain(ground_flora_at_point(self.seed_hash, self.age_years, point))
+            .zip(&self.plant_branches)
+            .filter_map(|(plant, branches)| {
+                plant.content_at_point(
+                    self.geometry_age_years,
+                    point,
+                    self.seed_hash,
+                    cell,
+                    branches,
+                )
+            })
+            .chain(ground_flora_at_point(
+                self.seed_hash,
+                self.geometry_age_years,
+                point,
+            ))
             .min_by_key(|content| content.priority())
     }
 
     /// Build the displayed LOD from candidate geometry, retaining a preview
     /// voxel only when its center's implicit 1 cm sample has matching content.
     fn rebuild_vegetation(&mut self) {
+        self.geometry_age_years = self.age_years.floor();
+        self.plant_branches = self
+            .plants
+            .iter()
+            .map(|plant| plant.branch_segments(self.geometry_age_years, self.seed_hash))
+            .collect();
         self.voxels.clone_from(&self.terrain_voxels);
-        let mut candidates = make_ground_flora(self.seed_hash, self.age_years);
-        for plant in &self.plants {
-            candidates.extend(plant.voxels_at_age(self.age_years, self.seed_hash));
+        let mut candidates = make_ground_flora(self.seed_hash, self.geometry_age_years);
+        for (plant, branches) in self.plants.iter().zip(&self.plant_branches) {
+            candidates.extend(plant.voxels_at_age(
+                self.geometry_age_years,
+                self.seed_hash,
+                branches,
+            ));
         }
         self.voxels.reserve(candidates.len());
+        let mut seen_preview_cells = HashSet::new();
         for voxel in candidates {
             let Some(cell) = cell_containing_point(voxel.center) else {
                 continue;
@@ -276,7 +313,15 @@ impl GeneratedWorld {
                 continue;
             };
             if sample.content == voxel.content {
-                self.voxels.push(voxel);
+                let key = (
+                    ((voxel.center.x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M).floor() as i32,
+                    ((voxel.center.y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M).floor() as i32,
+                    (voxel.center.z / WORLD_CELL_M).floor() as i32,
+                    voxel.content,
+                );
+                if seen_preview_cells.insert(key) {
+                    self.voxels.push(voxel);
+                }
             }
         }
         self.generated_year = self.age_years.floor() as u32;
@@ -494,6 +539,90 @@ fn ground_flora_at_point(
 }
 
 impl Plant {
+    fn branch_segments(self, age_years: f32, seed: u64) -> Vec<BranchSegment> {
+        let maturity = 0.08 + 0.92 * (age_years / 100.0).clamp(0.0, 1.0).powf(0.72);
+        let (max_height, trunk_radius_factor, crown_radius, tiers, branches_per_tier, slope, width) =
+            match self.species {
+                TreeSpecies::Oak => (
+                    7.0 * (0.82 + self.fertility * 0.36) * (0.90 + self.moisture * 0.20),
+                    0.38,
+                    1.9,
+                    3,
+                    4,
+                    0.22,
+                    0.34,
+                ),
+                TreeSpecies::Birch => (
+                    8.5 * (0.82 + self.fertility * 0.36),
+                    0.16,
+                    0.9,
+                    4,
+                    3,
+                    0.62,
+                    0.40,
+                ),
+                TreeSpecies::Acacia => (
+                    6.0 * (0.85 + self.fertility * 0.30),
+                    0.27,
+                    2.25,
+                    2,
+                    4,
+                    0.04,
+                    0.42,
+                ),
+            };
+        let height = max_height * maturity;
+        let trunk_height = height * 0.76;
+        let trunk_radius = trunk_radius_factor * maturity;
+        let plant_x = ((self.x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M).round() as i32;
+        let plant_y = ((self.y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M).round() as i32;
+        let phase_hash = lattice_hash(seed ^ 0x7F4A_7C15_9E37_79B9, plant_x, plant_y);
+        let phase = (unit_noise(phase_hash) + 1.0) * std::f32::consts::PI;
+        let mut segments = Vec::with_capacity(tiers * branches_per_tier * 3);
+
+        for tier in 0..tiers {
+            let tier_fraction = match self.species {
+                TreeSpecies::Oak => 0.60 + tier as f32 * 0.10,
+                TreeSpecies::Birch => 0.62 + tier as f32 * 0.08,
+                TreeSpecies::Acacia => 0.82 + tier as f32 * 0.065,
+            };
+            let start_z = self.soil_z + trunk_height * tier_fraction;
+            for branch in 0..branches_per_tier {
+                let index = (tier * branches_per_tier + branch) as i32;
+                let hash = lattice_hash(seed ^ phase_hash, index, tier as i32);
+                let jitter = unit_noise(hash) * 0.20;
+                let angle = phase
+                    + std::f32::consts::TAU * branch as f32 / branches_per_tier as f32
+                    + jitter;
+                let length_scale = 0.62 + unit_noise(hash ^ 0xD6E8_FEB8_6659_FD93) * 0.24;
+                let length_m = crown_radius * maturity * length_scale;
+                let start = Vec3::new(self.x, self.y, start_z);
+                let horizontal = Vec3::new(angle.cos(), angle.sin(), 0.0);
+                let end = start + horizontal * length_m + Vec3::Z * (length_m * slope);
+                let radius_m = trunk_radius
+                    * width
+                    * (0.72 + unit_noise(hash.rotate_left(17)).abs() * 0.28);
+                let primary = BranchSegment { start, end, radius_m };
+                segments.push(primary);
+
+                let midpoint = start.lerp(end, 0.58);
+                for side in [-1.0_f32, 1.0] {
+                    let split_angle = angle + side * 0.72;
+                    let secondary_length = length_m * 0.42;
+                    let secondary_end = midpoint
+                        + Vec3::new(split_angle.cos(), split_angle.sin(), slope.max(0.18))
+                            * secondary_length;
+                    segments.push(BranchSegment {
+                        start: midpoint,
+                        end: secondary_end,
+                        radius_m: radius_m * 0.55,
+                    });
+                }
+            }
+        }
+        segments
+    }
+
     /// Sample the tree's species-specific 1 cm geometry independently of the
     /// 10 cm preview voxels. The trunk is tapered and the crown is an ellipsoid.
     fn content_at_point(
@@ -502,6 +631,7 @@ impl Plant {
         point: Vec3,
         seed: u64,
         cell: [i32; 3],
+        branches: &[BranchSegment],
     ) -> Option<GeneratedCellContent> {
         let growth = (age_years / 100.0).clamp(0.0, 1.0);
         let maturity = 0.08 + 0.92 * growth.powf(0.72);
@@ -539,6 +669,19 @@ impl Plant {
             }
         }
 
+        for branch in branches {
+            let segment = branch.end - branch.start;
+            let length_squared = segment.length_squared();
+            if length_squared <= f32::EPSILON {
+                continue;
+            }
+            let along = ((point - branch.start).dot(segment) / length_squared).clamp(0.0, 1.0);
+            let closest = branch.start + segment * along;
+            if point.distance_squared(closest) <= branch.radius_m.powi(2) {
+                return Some(self.species.generated_wood());
+            }
+        }
+
         let crown_center_z = self.soil_z + height * crown_z_fraction;
         let radii = crown_shape * maturity;
         let normalized = Vec3::new(
@@ -557,7 +700,12 @@ impl Plant {
         None
     }
 
-    fn voxels_at_age(self, age_years: f32, seed: u64) -> Vec<TerrainVoxel> {
+    fn voxels_at_age(
+        self,
+        age_years: f32,
+        seed: u64,
+        branches: &[BranchSegment],
+    ) -> Vec<TerrainVoxel> {
         let growth = (age_years / 100.0).clamp(0.0, 1.0);
         let maturity = 0.08 + 0.92 * growth.powf(0.72);
         let (max_height, trunk_radius, crown_shape, bark_color, leaf_color) = match self.species {
@@ -615,6 +763,48 @@ impl Plant {
                         color,
                         content: self.species.generated_wood(),
                     });
+                }
+            }
+        }
+
+        for branch in branches {
+            let segment = branch.end - branch.start;
+            let min = branch.start.min(branch.end) - Vec3::splat(branch.radius_m);
+            let max = branch.start.max(branch.end) + Vec3::splat(branch.radius_m);
+            let min_cell = [
+                ((min.x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M).floor() as i32,
+                ((min.y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M).floor() as i32,
+                (min.z / WORLD_CELL_M).floor() as i32,
+            ];
+            let max_cell = [
+                ((max.x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M).ceil() as i32,
+                ((max.y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M).ceil() as i32,
+                (max.z / WORLD_CELL_M).ceil() as i32,
+            ];
+            let length_squared = segment.length_squared();
+            for z in min_cell[2].max(0)..=max_cell[2].min((WORLD_SAMPLE_HEIGHT_M / WORLD_CELL_M) as i32) {
+                for y in min_cell[1].max(0)..=max_cell[1].min(WORLD_SIDE_CELLS as i32 - 1) {
+                    for x in min_cell[0].max(0)..=max_cell[0].min(WORLD_SIDE_CELLS as i32 - 1) {
+                        let center = Vec3::new(
+                            (x as f32 + 0.5) * WORLD_CELL_M - WORLD_SIDE_M * 0.5,
+                            (y as f32 + 0.5) * WORLD_CELL_M - WORLD_SIDE_M * 0.5,
+                            (z as f32 + 0.5) * WORLD_CELL_M,
+                        );
+                        let along = ((center - branch.start).dot(segment) / length_squared)
+                            .clamp(0.0, 1.0);
+                        let closest = branch.start + segment * along;
+                        let voxel_half_diagonal = WORLD_CELL_M * 0.5 * 3.0_f32.sqrt();
+                        if center.distance_squared(closest)
+                            <= (branch.radius_m + voxel_half_diagonal).powi(2)
+                        {
+                            result.push(TerrainVoxel {
+                                center,
+                                size: Vec3::splat(WORLD_CELL_M),
+                                color: bark_color,
+                                content: self.species.generated_wood(),
+                            });
+                        }
+                    }
                 }
             }
         }
