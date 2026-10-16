@@ -236,14 +236,22 @@ impl GeneratedWorld {
         let (soil_moisture, fertility) = ecology_at(self.seed_hash, field_x, field_y);
         let temperature_kelvin = climate_temperature(self.seed_hash, field_x, field_y, z_m);
 
-        let content = if z_m <= terrain_height_m {
+        let vegetation = self.vegetation_at_point(
+            cell,
+            Vec3::new(x_m - WORLD_SIDE_M * 0.5, y_m - WORLD_SIDE_M * 0.5, z_m),
+        );
+        let wood_in_soil = matches!(
+            vegetation,
+            Some(
+                GeneratedCellContent::OakWood
+                    | GeneratedCellContent::BirchWood
+                    | GeneratedCellContent::AcaciaWood
+            )
+        );
+        let content = if z_m <= terrain_height_m && !wood_in_soil {
             GeneratedCellContent::Terrain
         } else {
-            self.vegetation_at_point(
-                cell,
-                Vec3::new(x_m - WORLD_SIDE_M * 0.5, y_m - WORLD_SIDE_M * 0.5, z_m),
-            )
-            .unwrap_or(GeneratedCellContent::Air)
+            vegetation.unwrap_or(GeneratedCellContent::Air)
         };
 
         Some(GeneratedCell {
@@ -822,6 +830,38 @@ impl Plant {
                     });
                 }
             }
+        }
+
+        // Root architecture varies by species: broad and branched for oak,
+        // shallow and fibrous for birch, deeper with fewer main roots for acacia.
+        let (root_count, lateral_extent, depth_factor) = match self.species {
+            TreeSpecies::Oak => (8, 1.55, 0.46),
+            TreeSpecies::Birch => (10, 1.20, 0.24),
+            TreeSpecies::Acacia => (6, 1.10, 0.90),
+        };
+        let root_extent = lateral_extent * maturity * vigor * (0.85 + self.fertility * 0.25);
+        let root_depth = depth_factor * maturity * vigor * (0.80 + self.moisture * 0.30);
+        let base = Vec3::new(self.x, self.y, self.soil_z);
+        for root in 0..root_count {
+            let root_hash = lattice_hash(seed ^ 0xDB4F_0B91_75AE_2165, plant_x + root as i32, plant_y);
+            let angle = phase
+                + std::f32::consts::TAU * root as f32 / root_count as f32
+                + unit_noise(root_hash) * 0.16;
+            let direction = Vec3::new(angle.cos(), angle.sin(), 0.0);
+            let length = root_extent * (0.72 + unit_noise(root_hash.rotate_left(19)).abs() * 0.28);
+            let depth = root_depth * (0.72 + unit_noise(root_hash.rotate_left(37)).abs() * 0.28);
+            let shoulder = base + direction * (length * 0.48) - Vec3::Z * (depth * 0.28);
+            let tip = base + direction * length - Vec3::Z * depth;
+            segments.push(BranchSegment {
+                start: base,
+                end: shoulder,
+                radius_m: (trunk_radius * 0.20).max(WORLD_REV_M * 0.55),
+            });
+            segments.push(BranchSegment {
+                start: shoulder,
+                end: tip,
+                radius_m: (trunk_radius * 0.085).max(WORLD_REV_M * 0.45),
+            });
         }
         segments
     }
