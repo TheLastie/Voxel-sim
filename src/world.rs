@@ -74,7 +74,8 @@ pub struct GeneratedWorld {
     seed_hash: u64,
     pub age_years: f32,
     geometry_age_years: f32,
-    generated_year: u32,
+    season_phase_offset: f32,
+    generated_growth_quarter: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,6 +118,13 @@ impl TreeSpecies {
             Self::Acacia => GeneratedCellContent::AcaciaFoliage,
         }
     }
+
+    fn has_leaves(self, season_phase: f32) -> bool {
+        match self {
+            Self::Oak | Self::Birch => (0.25..0.82).contains(&season_phase),
+            Self::Acacia => true,
+        }
+    }
 }
 
 impl GeneratedWorld {
@@ -124,6 +132,8 @@ impl GeneratedWorld {
     /// These coarse visual voxels are not attached to the centimeter physics lattice.
     pub fn from_seed(seed: &str) -> Self {
         let seed_hash = hash_seed(seed);
+        // A seed-derived calendar epoch keeps the initial season reproducible.
+        let season_phase_offset = (unit_noise(seed_hash ^ 0x6A09_E667_F3BC_C909) + 1.0) * 0.5;
         let mut terrain_voxels = Vec::with_capacity(WORLD_SIDE_CELLS * WORLD_SIDE_CELLS);
         for y in 0..WORLD_SIDE_CELLS {
             for x in 0..WORLD_SIDE_CELLS {
@@ -158,7 +168,8 @@ impl GeneratedWorld {
             seed_hash,
             age_years: 8.0,
             geometry_age_years: 8.0,
-            generated_year: u32::MAX,
+            season_phase_offset,
+            generated_growth_quarter: u32::MAX,
         };
         world.rebuild_vegetation();
         world
@@ -168,8 +179,8 @@ impl GeneratedWorld {
     /// procedural growth year; physics remains paused and is not time-scaled.
     pub fn advance_growth(&mut self, elapsed_seconds: f32) {
         self.age_years = (self.age_years + elapsed_seconds.max(0.0)).min(100.0);
-        let year = self.age_years.floor() as u32;
-        if year != self.generated_year {
+        let growth_quarter = (self.age_years * 4.0).floor() as u32;
+        if growth_quarter != self.generated_growth_quarter {
             self.rebuild_vegetation();
         }
     }
@@ -275,27 +286,38 @@ impl GeneratedWorld {
                     self.seed_hash,
                     cell,
                     branches,
+                    self.season_phase(),
                 )
             })
             .chain(ground_flora_at_point(
                 self.seed_hash,
                 self.geometry_age_years,
+                self.season_phase(),
                 point,
             ))
             .min_by_key(|content| content.priority())
     }
 
+    fn season_phase(&self) -> f32 {
+        (self.geometry_age_years + self.season_phase_offset).fract()
+    }
+
     /// Build the displayed LOD from candidate geometry, retaining a preview
     /// voxel only when its center's implicit 1 cm sample has matching content.
     fn rebuild_vegetation(&mut self) {
-        self.geometry_age_years = self.age_years.floor();
+        self.geometry_age_years = (self.age_years * 4.0).floor() * 0.25;
+        let season_phase = self.season_phase();
         self.plant_branches = self
             .plants
             .iter()
             .map(|plant| plant.branch_segments(self.geometry_age_years, self.seed_hash))
             .collect();
         self.voxels.clone_from(&self.terrain_voxels);
-        let mut candidates = make_ground_flora(self.seed_hash, self.geometry_age_years);
+        let mut candidates = make_ground_flora(
+            self.seed_hash,
+            self.geometry_age_years,
+            season_phase,
+        );
         for (plant, branches) in self.plants.iter().zip(&self.plant_branches) {
             candidates.extend(plant.voxels_at_age(
                 self.geometry_age_years,
@@ -324,7 +346,7 @@ impl GeneratedWorld {
                 }
             }
         }
-        self.generated_year = self.age_years.floor() as u32;
+        self.generated_growth_quarter = (self.age_years * 4.0).floor() as u32;
     }
 }
 
@@ -344,7 +366,7 @@ fn cell_containing_point(point: Vec3) -> Option<[i32; 3]> {
     }
 }
 
-fn make_ground_flora(seed: u64, age_years: f32) -> Vec<TerrainVoxel> {
+fn make_ground_flora(seed: u64, age_years: f32, season_phase: f32) -> Vec<TerrainVoxel> {
     let growth = (age_years / 4.0).clamp(0.0, 1.0);
     let mut result = Vec::new();
     // Fixed 0.5 m sampling keeps density seed-locked and cheap to rebuild.
@@ -411,7 +433,11 @@ fn make_ground_flora(seed: u64, age_years: f32) -> Vec<TerrainVoxel> {
                     * 0.38)
                 .clamp(0.0, 1.0);
             let spot = lattice_hash(seed ^ 0xDB4F_0B91_75AE_2165, gx, gy);
-            if moisture < 0.64 || spot % 13 != 0 || age_years < 1.0 {
+            if moisture < 0.64
+                || spot % 13 != 0
+                || age_years < 1.0
+                || !mushrooms_fruiting(season_phase)
+            {
                 continue;
             }
             let height = 0.06 + 0.08 * growth * (0.5 + moisture * 0.5);
@@ -444,6 +470,7 @@ fn make_ground_flora(seed: u64, age_years: f32) -> Vec<TerrainVoxel> {
 fn ground_flora_at_point(
     seed: u64,
     age_years: f32,
+    season_phase: f32,
     point: Vec3,
 ) -> Option<GeneratedCellContent> {
     let mut found = None;
@@ -517,7 +544,11 @@ fn ground_flora_at_point(
                 + value_noise(seed ^ 0x8EBC_6AF0_9C88_C6E3, nx / 27.0, ny / 27.0) * 0.38)
                 .clamp(0.0, 1.0);
             let spot = lattice_hash(seed ^ 0xDB4F_0B91_75AE_2165, gx, gy);
-            if moisture < 0.64 || spot % 13 != 0 || age_years < 1.0 {
+            if moisture < 0.64
+                || spot % 13 != 0
+                || age_years < 1.0
+                || !mushrooms_fruiting(season_phase)
+            {
                 continue;
             }
             let height = 0.06 + 0.08 * (age_years / 4.0).clamp(0.0, 1.0) * (0.5 + moisture * 0.5);
@@ -536,6 +567,10 @@ fn ground_flora_at_point(
         }
     }
     found
+}
+
+fn mushrooms_fruiting(season_phase: f32) -> bool {
+    (0.55..0.90).contains(&season_phase)
 }
 
 impl Plant {
@@ -632,6 +667,7 @@ impl Plant {
         seed: u64,
         cell: [i32; 3],
         branches: &[BranchSegment],
+        season_phase: f32,
     ) -> Option<GeneratedCellContent> {
         let growth = (age_years / 100.0).clamp(0.0, 1.0);
         let maturity = 0.08 + 0.92 * growth.powf(0.72);
@@ -689,7 +725,7 @@ impl Plant {
             local_y / radii.y,
             (point.z - crown_center_z) / radii.z,
         );
-        if normalized.length_squared() <= 1.0 {
+        if normalized.length_squared() <= 1.0 && self.species.has_leaves(season_phase) {
             let canopy_seed = seed
                 ^ 0xD6E8_FEB8_6659_FD93
                 ^ (cell[2] as u32 as u64).wrapping_mul(0x9E37_79B1_85EB_CA87);
