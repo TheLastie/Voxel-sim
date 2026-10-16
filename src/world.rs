@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use glam::Vec3;
 
 pub const WORLD_SIDE_M: f32 = 10.0;
@@ -10,7 +8,6 @@ pub const WORLD_SIDE_CELLS: usize = (WORLD_SIDE_M / WORLD_CELL_M) as usize;
 pub const WORLD_REV_M: f32 = 0.01;
 pub const WORLD_REV_SIDE: i32 = (WORLD_SIDE_M / WORLD_REV_M) as i32;
 pub const MAX_WORLD_SAMPLE_CELLS: usize = 65_536;
-const VEGETATION_BIN_M: f32 = WORLD_CELL_M;
 const WORLD_SAMPLE_HEIGHT_M: f32 = 16.0;
 const WORLD_SAMPLE_HEIGHT_CELLS: i32 = (WORLD_SAMPLE_HEIGHT_M / WORLD_REV_M) as i32;
 
@@ -64,7 +61,6 @@ pub struct TerrainVoxel {
 pub struct GeneratedWorld {
     pub voxels: Vec<TerrainVoxel>,
     terrain_voxels: Vec<TerrainVoxel>,
-    vegetation_bins: HashMap<[i32; 3], Vec<usize>>,
     plants: Vec<Plant>,
     seed_hash: u64,
     pub age_years: f32,
@@ -132,7 +128,6 @@ impl GeneratedWorld {
         let mut world = Self {
             voxels: Vec::new(),
             terrain_voxels,
-            vegetation_bins: HashMap::new(),
             plants: make_plants(seed_hash),
             seed_hash,
             age_years: 8.0,
@@ -191,9 +186,9 @@ impl GeneratedWorld {
         let content = if z_m <= terrain_height_m {
             GeneratedCellContent::Terrain
         } else {
-            self.vegetation_at_cell(
+            self.vegetation_at_point(
                 cell,
-                [x_m - WORLD_SIDE_M * 0.5, y_m - WORLD_SIDE_M * 0.5, z_m],
+                Vec3::new(x_m - WORLD_SIDE_M * 0.5, y_m - WORLD_SIDE_M * 0.5, z_m),
             )
             .unwrap_or(GeneratedCellContent::Air)
         };
@@ -242,30 +237,11 @@ impl GeneratedWorld {
         Some(cells)
     }
 
-    fn vegetation_at_cell(
-        &self,
-        cell: [i32; 3],
-        center: [f32; 3],
-    ) -> Option<GeneratedCellContent> {
-        let bin = [
-            cell[0] / (WORLD_CELL_M / WORLD_REV_M) as i32,
-            cell[1] / (WORLD_CELL_M / WORLD_REV_M) as i32,
-            cell[2] / (WORLD_CELL_M / WORLD_REV_M) as i32,
-        ];
-        let Some(indices) = self.vegetation_bins.get(&bin) else {
-            return None;
-        };
-        indices
+    fn vegetation_at_point(&self, cell: [i32; 3], point: Vec3) -> Option<GeneratedCellContent> {
+        self.plants
             .iter()
-            .filter_map(|&index| {
-                let voxel = &self.voxels[index];
-                let delta = Vec3::from_array(center) - voxel.center;
-                delta
-                    .abs()
-                    .cmple(voxel.size * 0.5)
-                    .all()
-                    .then_some(voxel.content)
-            })
+            .filter_map(|plant| plant.content_at_point(self.age_years, point, self.seed_hash, cell))
+            .chain(ground_flora_at_point(self.seed_hash, self.age_years, point))
             .min_by_key(|content| content.priority())
     }
 
@@ -277,34 +253,7 @@ impl GeneratedWorld {
             self.voxels
                 .extend(plant.voxels_at_age(self.age_years, self.seed_hash));
         }
-        self.rebuild_vegetation_bins();
         self.generated_year = self.age_years.floor() as u32;
-    }
-
-    fn rebuild_vegetation_bins(&mut self) {
-        self.vegetation_bins.clear();
-        for index in self.terrain_voxels.len()..self.voxels.len() {
-            let voxel = &self.voxels[index];
-            let min = voxel.center - voxel.size * 0.5;
-            let max = voxel.center + voxel.size * 0.5;
-            let min_bin = [
-                ((min.x + WORLD_SIDE_M * 0.5) / VEGETATION_BIN_M).floor() as i32,
-                ((min.y + WORLD_SIDE_M * 0.5) / VEGETATION_BIN_M).floor() as i32,
-                (min.z / VEGETATION_BIN_M).floor() as i32,
-            ];
-            let max_bin = [
-                ((max.x + WORLD_SIDE_M * 0.5) / VEGETATION_BIN_M).floor() as i32,
-                ((max.y + WORLD_SIDE_M * 0.5) / VEGETATION_BIN_M).floor() as i32,
-                (max.z / VEGETATION_BIN_M).floor() as i32,
-            ];
-            for z in min_bin[2].max(0)..=max_bin[2].min((WORLD_SAMPLE_HEIGHT_M / VEGETATION_BIN_M) as i32) {
-                for y in min_bin[1].max(0)..=max_bin[1].min(WORLD_SIDE_CELLS as i32 - 1) {
-                    for x in min_bin[0].max(0)..=max_bin[0].min(WORLD_SIDE_CELLS as i32 - 1) {
-                        self.vegetation_bins.entry([x, y, z]).or_default().push(index);
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -403,7 +352,169 @@ fn make_ground_flora(seed: u64, age_years: f32) -> Vec<TerrainVoxel> {
     result
 }
 
+/// Evaluate seeded grass, fern, and mushroom geometry directly at a point on
+/// the REV lattice. This does not inspect or depend on the renderer's LOD list.
+fn ground_flora_at_point(
+    seed: u64,
+    age_years: f32,
+    point: Vec3,
+) -> Option<GeneratedCellContent> {
+    let mut found = None;
+    let mut record = |content: GeneratedCellContent| {
+        if found.is_none_or(|current: GeneratedCellContent| {
+            content.priority() < current.priority()
+        }) {
+            found = Some(content);
+        }
+    };
+
+    let gx0 = ((point.x + 4.75) / 0.5).floor() as i32;
+    let gy0 = ((point.y + 4.75) / 0.5).floor() as i32;
+    for gy in (gy0 - 1).max(0)..=(gy0 + 1).min(19) {
+        for gx in (gx0 - 1).max(0)..=(gx0 + 1).min(19) {
+            let cell_hash = lattice_hash(seed ^ 0xA24B_AED4_963E_E407, gx, gy);
+            if cell_hash % 5 != 0 {
+                continue;
+            }
+            let x = -4.75 + gx as f32 * 0.5;
+            let y = -4.75 + gy as f32 * 0.5;
+            if (point.x - x).abs() > 0.155 || (point.y - y).abs() > 0.155 {
+                continue;
+            }
+            let nx = (x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M;
+            let ny = (y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M;
+            let moisture = (0.5
+                + value_noise(seed ^ 0x8EBC_6AF0_9C88_C6E3, nx / 27.0, ny / 27.0) * 0.38)
+                .clamp(0.0, 1.0);
+            let fertility = (0.55
+                + value_noise(seed ^ 0x5899_65CC_7537_4CC3, nx / 22.0, ny / 22.0) * 0.35)
+                .clamp(0.1, 1.0);
+            let ground_z = terrain_height(seed, nx, ny);
+            let height = (0.12 + fertility * 0.24)
+                * (0.12 + (age_years / 4.0).clamp(0.0, 1.0) * 0.88);
+            let plant_count = 2 + ((cell_hash >> 12) % 4) as usize;
+            let content = if moisture > 0.58 {
+                GeneratedCellContent::Fern
+            } else {
+                GeneratedCellContent::Grass
+            };
+            for blade in 0..plant_count {
+                let blade_hash = lattice_hash(cell_hash, blade as i32, gy - gx);
+                let angle = (blade_hash >> 40) as f32 / 16_777_215.0 * std::f32::consts::TAU;
+                let radius = 0.035 + ((blade_hash >> 20) & 0xff) as f32 / 255.0 * 0.12;
+                let center_x = x + angle.cos() * radius;
+                let center_y = y + angle.sin() * radius;
+                if (point.x - center_x).abs() <= 0.0175
+                    && (point.y - center_y).abs() <= 0.0175
+                    && point.z >= ground_z
+                    && point.z <= ground_z + height
+                {
+                    record(content);
+                }
+            }
+        }
+    }
+
+    let mx0 = ((point.x + 4.8) / 0.4).floor() as i32;
+    let my0 = ((point.y + 4.8) / 0.4).floor() as i32;
+    for gy in (my0 - 1).max(0)..=(my0 + 1).min(24) {
+        for gx in (mx0 - 1).max(0)..=(mx0 + 1).min(24) {
+            let x = -4.8 + gx as f32 * 0.4;
+            let y = -4.8 + gy as f32 * 0.4;
+            if (point.x - x).abs() > 0.06 || (point.y - y).abs() > 0.06 {
+                continue;
+            }
+            let nx = (x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M;
+            let ny = (y + WORLD_SIDE_M * 0.5) / WORLD_CELL_M;
+            let moisture = (0.5
+                + value_noise(seed ^ 0x8EBC_6AF0_9C88_C6E3, nx / 27.0, ny / 27.0) * 0.38)
+                .clamp(0.0, 1.0);
+            let spot = lattice_hash(seed ^ 0xDB4F_0B91_75AE_2165, gx, gy);
+            if moisture < 0.64 || spot % 13 != 0 || age_years < 1.0 {
+                continue;
+            }
+            let height = 0.06 + 0.08 * (age_years / 4.0).clamp(0.0, 1.0) * (0.5 + moisture * 0.5);
+            let ground_z = terrain_height(seed, nx, ny);
+            let stem_height = height * 0.62;
+            let stem = (point.x - x).abs() <= 0.0175
+                && (point.y - y).abs() <= 0.0175
+                && point.z >= ground_z
+                && point.z <= ground_z + stem_height;
+            let cap = (point.x - x).abs() <= 0.06
+                && (point.y - y).abs() <= 0.06
+                && (point.z - (ground_z + stem_height + height * 0.12)).abs() <= 0.02;
+            if stem || cap {
+                record(GeneratedCellContent::Mushroom);
+            }
+        }
+    }
+    found
+}
+
 impl Plant {
+    /// Sample the tree's species-specific 1 cm geometry independently of the
+    /// 10 cm preview voxels. The trunk is tapered and the crown is an ellipsoid.
+    fn content_at_point(
+        self,
+        age_years: f32,
+        point: Vec3,
+        seed: u64,
+        cell: [i32; 3],
+    ) -> Option<GeneratedCellContent> {
+        let growth = (age_years / 100.0).clamp(0.0, 1.0);
+        let maturity = 0.08 + 0.92 * growth.powf(0.72);
+        let (max_height, radius_base, crown_shape, crown_z_fraction) = match self.species {
+            TreeSpecies::Oak => (
+                7.0 * (0.82 + self.fertility * 0.36) * (0.90 + self.moisture * 0.20),
+                0.38,
+                Vec3::new(1.9, 1.75, 1.35),
+                0.78,
+            ),
+            TreeSpecies::Birch => (
+                8.5 * (0.82 + self.fertility * 0.36),
+                0.16,
+                Vec3::new(0.9, 0.95, 1.9),
+                0.78,
+            ),
+            TreeSpecies::Acacia => (
+                6.0 * (0.85 + self.fertility * 0.30),
+                0.27,
+                Vec3::new(2.25, 1.95, 0.65),
+                0.90,
+            ),
+        };
+        let height = max_height * maturity;
+        let trunk_height = height * 0.76;
+        let trunk_radius = radius_base * maturity;
+        let local_z = point.z - self.soil_z;
+        let local_x = point.x - self.x;
+        let local_y = point.y - self.y;
+        if (0.0..trunk_height).contains(&local_z) {
+            let taper = 0.72 + 0.28 * (1.0 - local_z / trunk_height.max(WORLD_REV_M));
+            let radius = trunk_radius * taper;
+            if local_x * local_x + local_y * local_y <= radius * radius {
+                return Some(self.species.generated_content());
+            }
+        }
+
+        let crown_center_z = self.soil_z + height * crown_z_fraction;
+        let radii = crown_shape * maturity;
+        let normalized = Vec3::new(
+            local_x / radii.x,
+            local_y / radii.y,
+            (point.z - crown_center_z) / radii.z,
+        );
+        if normalized.length_squared() <= 1.0 {
+            let canopy_seed = seed
+                ^ 0xD6E8_FEB8_6659_FD93
+                ^ (cell[2] as u32 as u64).wrapping_mul(0x9E37_79B1_85EB_CA87);
+            if lattice_hash(canopy_seed, cell[0], cell[1]) % 11 != 0 {
+                return Some(self.species.generated_content());
+            }
+        }
+        None
+    }
+
     fn voxels_at_age(self, age_years: f32, seed: u64) -> Vec<TerrainVoxel> {
         let growth = (age_years / 100.0).clamp(0.0, 1.0);
         let maturity = 0.08 + 0.92 * growth.powf(0.72);
