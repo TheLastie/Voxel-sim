@@ -1,5 +1,7 @@
 # Voxel Physics Lab
 
+[Русский](README.ru.md) | **English**
+
 An experimental Rust voxel mechanics sandbox. Matter is represented as 1 cm
 representative volumes joined by directional bonds. The project explores how
 contact, material orientation, deformation, and bond failure can produce cutting
