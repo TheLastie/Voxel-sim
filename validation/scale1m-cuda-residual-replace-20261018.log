@@ -1,0 +1,15 @@
+step,revs,active,wall_ms,residual,broken,mass_kg,kinetic_j,true_residual,applied_residual,position_rounding_l2_m,max_audited_residual
+mechanics scale: side=100 revs=1000000 active=990000 fixed_dt_s=0.001 substeps=4 cpu_preconditioner=IncompleteCholesky0 tolerance=0.00001 setup_s=0.995
+CUDA PCG preconditioner: symmetric red-black, active=990000
+CUDA PCG graph captured: active=990000 iterations=48
+CUDA PCG graph captured: active=990000 iterations=32
+CUDA PCG unavailable; using CPU PCG: CUDA PCG did not converge: iterations=320, relative residual=1.001e-5, tolerance=1.000e-5
+PCG residual audit: backend=cpu reported=7.011131856e-6 true=7.011131851e-6 applied=7.011131900e-6 position_rounding_l2_m=3.433929421e-14
+CPU PCG solve: active=990000 preconditioner=IncompleteCholesky0 iterations=95 residual=7.011e-6 elapsed=7478.81ms
+PCG residual audit: backend=cpu reported=7.644716788e-6 true=7.644716456e-6 applied=7.644716771e-6 position_rounding_l2_m=3.419560907e-14
+CPU PCG solve: active=990000 preconditioner=IncompleteCholesky0 iterations=95 residual=7.645e-6 elapsed=8353.10ms
+PCG residual audit: backend=cpu reported=7.477801773e-6 true=7.477801922e-6 applied=7.477802230e-6 position_rounding_l2_m=3.408322523e-14
+CPU PCG solve: active=990000 preconditioner=IncompleteCholesky0 iterations=95 residual=7.478e-6 elapsed=8848.22ms
+PCG residual audit: backend=cpu reported=7.125147931e-6 true=7.125147941e-6 applied=7.125148262e-6 position_rounding_l2_m=3.407681932e-14
+CPU PCG solve: active=990000 preconditioner=IncompleteCholesky0 iterations=95 residual=7.125e-6 elapsed=9389.24ms
+1,1000000,990000,44279.474,7.125147931e-6,0,7.869998924e3,6.773376877e-6,7.125147941e-6,7.125148262e-6,3.407681932e-14,7.644716771e-6

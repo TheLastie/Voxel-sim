@@ -3139,6 +3139,11 @@ fn solve_coupled(
     }
     let active_count = scratch.active.len();
     let backend = std::env::var("VOXEL_SOLVER_BACKEND").unwrap_or_else(|_| "auto".into());
+    let cuda_iterations = std::env::var("VOXEL_CUDA_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(scene.config.cuda_iterations);
     let try_cuda = *cuda_enabled_for_step
         && match backend.as_str() {
             "cpu" => false,
@@ -3672,7 +3677,7 @@ fn solve_coupled(
             &scratch.cuda_diagonal,
             &scratch.cuda_blocks,
             &scratch.cuda_inverse,
-            scene.config.cuda_iterations,
+            cuda_iterations,
             if warm_start && residual_norm > 0.0 {
                 (scene.config.solver_relative_tolerance as f64 * rhs_norm / residual_norm)
                     .min(1.0) as f32
@@ -3709,7 +3714,7 @@ fn solve_coupled(
                     eprintln!(
                         "CUDA PCG fallback: active={} max_iterations={} tolerance={:.3e} elapsed={:.2} ms reason={error}",
                         active_count,
-                        scene.config.cuda_iterations,
+                        cuda_iterations,
                         scene.config.solver_relative_tolerance,
                         pcg_start.elapsed().as_secs_f64() * 1_000.0,
                     );

@@ -153,6 +153,39 @@ DONE:
 J_DONE:
     ret;
 }
+.visible .entry pcg_residual_replace(
+    .param .u64 rhs_ptr,
+    .param .u64 applied_ptr,
+    .param .u64 residual_ptr,
+    .param .u32 count
+) {
+    .reg .pred %p<2>;
+    .reg .b32 %r<7>;
+    .reg .b64 %rd<9>;
+    .reg .f32 %f<4>;
+    ld.param.u64 %rd1, [rhs_ptr];
+    ld.param.u64 %rd2, [applied_ptr];
+    ld.param.u64 %rd3, [residual_ptr];
+    ld.param.u32 %r1, [count];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.u32 %r5, %r2, %r3, %r4;
+    mul.lo.u32 %r1, %r1, 3;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra RR_DONE;
+    mul.wide.u32 %rd4, %r5, 4;
+    add.u64 %rd5, %rd1, %rd4;
+    add.u64 %rd6, %rd2, %rd4;
+    add.u64 %rd7, %rd3, %rd4;
+    ld.global.f32 %f1, [%rd5];
+    ld.global.f32 %f2, [%rd6];
+    sub.rn.f32 %f3, %f1, %f2;
+    st.global.f32 [%rd7], %f3;
+RR_DONE:
+    ret;
+}
+
 .visible .entry pcg_update(
     .param .u64 dx_ptr,
     .param .u64 r_ptr,

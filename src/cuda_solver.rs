@@ -102,7 +102,7 @@ struct CudaSolver {
     driver: Driver,
     context: Handle,
     module: Handle,
-    kernels: [Handle; 13],
+    kernels: [Handle; 14],
     buffers: HashMap<&'static str, (DevicePtr, usize)>,
     cached_neighbors: Vec<[u32; 6]>,
     cached_colors: Option<Vec<u8>>,
@@ -233,7 +233,7 @@ impl CudaSolver {
                     "cuModuleLoadData(PCG PTX) failed with CUDA status {status}"
                 ));
             }
-            let mut kernels = [0; 13];
+            let mut kernels = [0; 14];
             for (slot, name) in [
                 b"block_sparse_matvec\0".as_slice(),
                 b"block_jacobi\0".as_slice(),
@@ -248,6 +248,7 @@ impl CudaSolver {
                 b"dot_reduce_ratio_single\0".as_slice(),
                 b"pcg_update_direction_ratio\0".as_slice(),
                 b"block_color_correction\0".as_slice(),
+                b"pcg_residual_replace\0".as_slice(),
             ]
             .into_iter()
             .enumerate()
@@ -712,6 +713,15 @@ fn check(status: Status, operation: &str) -> Result<(), String> {
     }
 }
 
+fn residual_replacement_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VOXEL_CUDA_RESIDUAL_REPLACEMENT")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// Solve the engine's assembled block sparse system with CUDA PCG and a
 /// block-Jacobi preconditioner. Matrix and RHS layouts are supplied by the
 /// engine; output is a correction vector in meters.
@@ -801,6 +811,19 @@ pub(crate) fn solve_pcg(
     let diagonal_ptr = cuda.upload("diagonal", diagonal)?;
     let block_ptr = cuda.upload("blocks", blocks)?;
     let inverse_ptr = cuda.upload("inverse", inverse_diagonal)?;
+    let residual_replacement = residual_replacement_enabled();
+    let rhs_exact = if residual_replacement {
+        let pointer = cuda.buffer("rhs_exact", rhs_len * 4)?;
+        check(
+            unsafe {
+                (cuda.driver.copy_htod)(pointer, cuda.host_rhs.as_ptr().cast(), rhs_len * 4)
+            },
+            "upload exact PCG RHS",
+        )?;
+        Some(pointer)
+    } else {
+        None
+    };
     let dx = cuda.buffer("dx", rhs_len * 4)?;
     let r = cuda.buffer("r", rhs_len * 4)?;
     let z = cuda.buffer("z", rhs_len * 4)?;
@@ -918,6 +941,71 @@ pub(crate) fn solve_pcg(
             }
         }
         iterations += batch_iterations;
+        if let Some(rhs_exact) = rhs_exact {
+            // Rebuild r=b-Ax from the current solution, then restart the Krylov
+            // direction. This controls the finite-precision residual gap that
+            // can otherwise make the recursive GPU residual overstate accuracy.
+            let mut diagonal_arg = diagonal_ptr;
+            let mut x_arg = dx;
+            let mut neighbors_arg = neighbor_ptr;
+            let mut blocks_arg = block_ptr;
+            let mut ap_arg = ap;
+            let mut count_arg = count;
+            let mut matvec_params = [
+                (&mut diagonal_arg as *mut DevicePtr).cast(),
+                (&mut x_arg as *mut DevicePtr).cast(),
+                (&mut neighbors_arg as *mut DevicePtr).cast(),
+                (&mut blocks_arg as *mut DevicePtr).cast(),
+                (&mut ap_arg as *mut DevicePtr).cast(),
+                (&mut count_arg as *mut u32).cast(),
+            ];
+            cuda.launch(0, grid, &mut matvec_params)?;
+
+            let mut rhs_arg = rhs_exact;
+            let mut applied_arg = ap;
+            let mut residual_arg = r;
+            let mut count_arg = count;
+            let mut residual_params = [
+                (&mut rhs_arg as *mut DevicePtr).cast(),
+                (&mut applied_arg as *mut DevicePtr).cast(),
+                (&mut residual_arg as *mut DevicePtr).cast(),
+                (&mut count_arg as *mut u32).cast(),
+            ];
+            cuda.launch(13, vector_grid, &mut residual_params)?;
+
+            let mut inverse_arg = inverse_ptr;
+            let mut residual_arg = r;
+            let mut preconditioned_arg = z;
+            let mut count_arg = count;
+            let mut precondition_params = [
+                (&mut inverse_arg as *mut DevicePtr).cast(),
+                (&mut residual_arg as *mut DevicePtr).cast(),
+                (&mut preconditioned_arg as *mut DevicePtr).cast(),
+                (&mut count_arg as *mut u32).cast(),
+            ];
+            cuda.launch(1, grid, &mut precondition_params)?;
+            if color_ptr != 0 {
+                launch_color_correction(
+                    &mut cuda, count, grid, inverse_ptr, r, z, neighbor_ptr, block_ptr, color_ptr, 1,
+                )?;
+                launch_color_correction(
+                    &mut cuda, count, grid, inverse_ptr, r, z, neighbor_ptr, block_ptr, color_ptr, 0,
+                )?;
+            }
+            cuda.launch_dot(r, z, count, rho)?;
+
+            let mut p_arg = p;
+            let mut z_arg = z;
+            let mut beta_arg = beta_zero;
+            let mut count_arg = count;
+            let mut restart_params = [
+                (&mut p_arg as *mut DevicePtr).cast(),
+                (&mut z_arg as *mut DevicePtr).cast(),
+                (&mut beta_arg as *mut DevicePtr).cast(),
+                (&mut count_arg as *mut u32).cast(),
+            ];
+            cuda.launch(3, vector_grid, &mut restart_params)?;
+        }
         if iterations % 16 == 0 || iterations == max_iterations {
             cuda.launch_dot(r, r, count, residual_squared)?;
             cuda.download(
