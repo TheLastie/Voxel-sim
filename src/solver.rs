@@ -353,6 +353,15 @@ fn phase_strength(scene: &Scene, n: usize) -> (f32, f32) {
     )
 }
 
+fn reuse_assembly_phase_strengths_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VOXEL_REUSE_PHASE_STRENGTHS")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
 fn bond_limits_with_phase_strengths(
     scene: &Scene,
     i: usize,
@@ -1252,11 +1261,20 @@ pub fn step_with_axis_targets_and_loads(
         // state. Heat is reduced afterward in stable constraint order, avoiding
         // an axis/index-order bias where one bond's heat softens the next bond
         // before the same substep has finished.
-        solver_scratch.fracture_phase_strengths.resize(voxel_count, (1.0, 1.0));
-        for (i, strength) in solver_scratch.fracture_phase_strengths.iter_mut().enumerate() {
-            *strength = phase_strength(scene, i);
-        }
-        let phase_strengths = &solver_scratch.fracture_phase_strengths;
+        // `solve_coupled` just evaluated the equation of state for this same
+        // pre-fracture thermal state. Reuse its derived strength cache instead
+        // of evaluating every REV's phase state a second time. The opt-out is
+        // retained for reproducible A/B profiling.
+        let phase_strengths = if reuse_assembly_phase_strengths_enabled() {
+            debug_assert_eq!(solver_scratch.assembly_phase_strengths.len(), voxel_count);
+            &solver_scratch.assembly_phase_strengths
+        } else {
+            solver_scratch.fracture_phase_strengths.resize(voxel_count, (1.0, 1.0));
+            for (i, strength) in solver_scratch.fracture_phase_strengths.iter_mut().enumerate() {
+                *strength = phase_strength(scene, i);
+            }
+            &solver_scratch.fracture_phase_strengths
+        };
         let constraints = &solver_scratch.constraints;
         let outcomes = &mut solver_scratch.fracture_outcomes;
         outcomes.resize(constraints.len(), None);
@@ -2358,6 +2376,7 @@ pub(crate) struct SolverScratch {
     preconditioner_work: Vec<Vec3>,
     rhs: Vec<Vec3>,
     constraints: Vec<Constraint>,
+    assembly_phase_strengths: Vec<(f32, f32)>,
     fracture_phase_strengths: Vec<(f32, f32)>,
     fracture_outcomes: Vec<Option<FractureOutcome>>,
     assembly_phases: Vec<crate::material::PhaseState>,
@@ -3176,8 +3195,15 @@ fn solve_coupled(
     // incident bonds and by stiffness/thermal expansion. Rebuilt on every
     // assembly so heat, composition and mass changes cannot leave stale data.
     scratch.assembly_phases.clear();
-    scratch.assembly_phases.extend(scene.voxels.iter().zip(&scene.properties)
-        .map(|(voxel,material)|material.phase_state(voxel.mass,voxel.thermal_energy_f32())));
+    scratch.assembly_phase_strengths.clear();
+    for (voxel, material) in scene.voxels.iter().zip(&scene.properties) {
+        let phase = material.phase_state(voxel.mass, voxel.thermal_energy_f32());
+        scratch.assembly_phase_strengths.push((
+            phase.solid_fraction.clamp(0.0, 1.0),
+            material.thermal_strength_scale(phase.temperature_kelvin),
+        ));
+        scratch.assembly_phases.push(phase);
+    }
     scratch.stiffness_inputs.truncate(n);
     scratch.stiffness_revisions.truncate(n);
     for i in 0..n {
