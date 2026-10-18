@@ -13,6 +13,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(substeps) = args.get(5) {
         config.substeps = substeps.parse()?;
     }
+    if let Some(preconditioner) = args.get(6) {
+        config.cpu_preconditioner = match preconditioner.as_str() {
+            "ic0" => voxel_physics_lab::scene::CpuPreconditioner::IncompleteCholesky0,
+            "multigrid" => voxel_physics_lab::scene::CpuPreconditioner::AggregationMultigrid,
+            "jacobi" => voxel_physics_lab::scene::CpuPreconditioner::BlockJacobi,
+            _ => return Err("preconditioner must be ic0, multigrid, or jacobi".into()),
+        };
+    }
     if config.substeps == 0 {
         return Err("substeps must be greater than zero".into());
     }
@@ -31,9 +39,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .filter(|(_, voxel)| voxel.composition.components.iter()
             .any(|&(component, fraction)| wood_ids.contains(&component) && fraction > 0.0))
         .map(|(index, _)| index).collect();
-    if let Some(lowest_z) = wood.iter().map(|&i| scene.positions[i].z).min_by(f32::total_cmp) {
+    if let Some(lowest_z) = wood.iter().map(|&i| scene.positions[i].z).min_by(f64::total_cmp) {
         let base: Vec<_> = wood.into_iter()
-            .filter(|&i| (scene.positions[i].z - lowest_z).abs() <= voxel_physics_lab::scene::CELL * 0.1)
+            .filter(|&i| (scene.positions[i].z - lowest_z).abs() <= voxel_physics_lab::scene::DCELL * 0.1)
             .collect();
         scene.fix_voxels(&base)?;
     }
@@ -64,7 +72,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let active = tool.as_ref().unwrap();
             let tool_kinetic = 0.5 * active.mass as f64 * active.velocity.length_squared() as f64;
             println!("{phase},{step},{},{},{:.6},{:.6},{:.6},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e}",
-                scene.broken, scene.cluster_count, active.position.dot(direction), active.velocity.length(), wood_max_speed,
+                scene.broken, scene.cluster_count, active.position.dot(direction.as_dvec3()), active.velocity.length(), wood_max_speed,
                 tool_kinetic, wood_kinetic,
                 scene.energy.pending_release, scene.energy.kinetic_release, scene.energy.damage_heat,
                 scene.energy.surface_work, scene.energy.plastic_heat, scene.energy.contact_friction_heat,

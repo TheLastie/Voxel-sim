@@ -149,7 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         scene.tick();
         for i in 0..scene.voxels.len() {
             external_work_j +=
-                (scene.external_forces[i].dot(scene.positions[i] - positions_before[i])) as f64;
+                scene.external_forces[i].as_dvec3().dot(scene.positions[i] - positions_before[i]);
         }
         if formed_step.is_none() && scene.bonds[0][0].neighbor == 1 {
             formed_step = Some(step);

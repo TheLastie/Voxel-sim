@@ -1,10 +1,10 @@
 //! Reproducible loading fixtures. They use the production solver, not tool rules.
 use crate::{
-    scene::{Scene, SceneConfig, AREA, CELL},
+    scene::{Scene, SceneConfig, AREA, DCELL as CELL},
     solver,
     tool::{Shape, Tool},
 };
-use glam::{Mat3, Quat, Vec3};
+use glam::{DVec3, Mat3, Quat, Vec3};
 
 pub struct TestResult {
     pub name: String,
@@ -22,13 +22,13 @@ fn wood_fragment_sizes(scene: &Scene) -> Vec<usize> {
     sizes.sort_unstable_by(|a, b| b.cmp(a));
     sizes
 }
-fn blade_trailing_face_x(tool: &Tool) -> f32 {
+fn blade_trailing_face_x(tool: &Tool) -> f64 {
     tool.position.x
         + tool
             .cells
             .iter()
-            .map(|&p| (tool.rotation * p).x)
-            .fold(f32::NEG_INFINITY, f32::max)
+            .map(|&p| (tool.rotation * p).x as f64)
+            .fold(f64::NEG_INFINITY, f64::max)
 }
 fn specimen(dimensions: [usize; 3], fiber: Vec3) -> Scene {
     let mut c = SceneConfig::load("scenes/wood_chop.ron").unwrap();
@@ -42,7 +42,7 @@ fn specimen(dimensions: [usize; 3], fiber: Vec3) -> Scene {
     c.iterations = 300;
     let mut s = Scene::new(c);
     for i in 0..s.positions.len() {
-        s.positions[i] += Vec3::Z;
+        s.positions[i] += DVec3::Z;
         s.previous[i] = s.positions[i];
         s.rest_positions[i] = s.positions[i];
     }
@@ -73,12 +73,12 @@ fn axial(fiber: Vec3, sign: f32) -> (f32, usize) {
         .rest_positions
         .iter()
         .map(|p| p.x)
-        .fold(f32::INFINITY, f32::min);
+        .fold(f64::INFINITY, f64::min);
     let max = s
         .rest_positions
         .iter()
         .map(|p| p.x)
-        .fold(f32::NEG_INFINITY, f32::max);
+        .fold(f64::NEG_INFINITY, f64::max);
     let left: Vec<_> = s
         .rest_positions
         .iter()
@@ -93,12 +93,12 @@ fn axial(fiber: Vec3, sign: f32) -> (f32, usize) {
     let mut peak = 0f32;
     // Displacement controlled, slow monotonic ramp. Stop on first physical failure.
     for n in 1..=500 {
-        let displacement = sign * (max - min) * 0.12 * n as f32 / 500.;
+        let displacement = sign as f64 * (max - min) * 0.12 * n as f64 / 500.;
         for i in 0..targets.len() {
             targets[i] = if left[i] {
                 Some(s.rest_positions[i])
             } else if right[i] {
-                Some(s.rest_positions[i] + Vec3::X * displacement)
+                Some(s.rest_positions[i] + DVec3::X * displacement)
             } else {
                 None
             };
@@ -134,24 +134,24 @@ pub fn bending() -> TestResult {
     s.config.fixed_dt = 1.0;
     s.config.iterations = 500;
     let initial = s.rest_positions.clone();
-    let min = initial.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+    let min = initial.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
     let max = initial
         .iter()
         .map(|p| p.x)
-        .fold(f32::NEG_INFINITY, f32::max);
+        .fold(f64::NEG_INFINITY, f64::max);
     let middle = (min + max) * 0.5;
-    let y_mid = initial.iter().map(|p| p.y).sum::<f32>() / initial.len() as f32;
-    let z_min = initial.iter().map(|p| p.z).fold(f32::INFINITY, f32::min);
+    let y_mid = initial.iter().map(|p| p.y).sum::<f64>() / initial.len() as f64;
+    let z_min = initial.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
     let z_max = initial
         .iter()
         .map(|p| p.z)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let y_min = initial.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+        .fold(f64::NEG_INFINITY, f64::max);
+    let y_min = initial.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
     let y_max = initial
         .iter()
         .map(|p| p.y)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let closest = |x: f32| {
+        .fold(f64::NEG_INFINITY, f64::max);
+    let closest = |x: f64| {
         (0..initial.len())
             .min_by(|&a, &b| {
                 let da = (initial[a].x - x).abs()
@@ -182,7 +182,7 @@ pub fn bending() -> TestResult {
     let max_moment = 4.0 * 80e6 * width * height * height / 6.0;
     let span = max - min;
     let max_total_force = 4.0 * max_moment / span;
-    let max_force_per_node = max_total_force / (ny * nose_weight_sum);
+    let max_force_per_node = (max_total_force / (ny * nose_weight_sum as f64)) as f32;
     let center_index = ((middle - min) / CELL).round() as isize;
     let mut targets = vec![[None; 3]; s.voxels.len()];
     let mut loads = vec![Vec3::ZERO; s.voxels.len()];
@@ -231,7 +231,7 @@ pub fn bending() -> TestResult {
             if count > max_cut.1 {
                 max_cut = (plane, count);
             }
-            let cut_x = min + (plane as f32 + 0.5) * CELL;
+            let cut_x = min + (plane as f64 + 0.5) * CELL;
             let is_central = (cut_x - middle).abs() < span * 0.25;
             // Nine X-axis bonds cross each plane; require at least 75% to sever.
             if is_central && count * 4 >= 9 * 3 {
@@ -240,7 +240,7 @@ pub fn bending() -> TestResult {
                     passed: true,
                     detail: format!(
                         "load={:.1} kN cut={count}/9 at x={cut_x:.3} m residual={:.3e}",
-                        force * ny * nose_weight_sum / 1000.0,
+                        force * ny as f32 * nose_weight_sum / 1000.0,
                         s.solver_residual
                     ),
                 };
@@ -257,7 +257,7 @@ pub fn bending() -> TestResult {
         let q = s.rotations[i].slerp(s.rotations[j], 0.5);
         let frame = Mat3::from_cols(q * Vec3::X, q * Vec3::Y, q * Vec3::Z);
         let k = solver::stiffness_matrix(&s, i, j, frame);
-        let u = frame.transpose() * (s.positions[j] - s.positions[i]) - Vec3::X * CELL;
+        let u = (frame.as_dmat3().transpose() * (s.positions[j] - s.positions[i]) - DVec3::X * CELL).as_vec3();
         max_axial = max_axial.max((k * u / crate::scene::AREA).x.abs());
     }
     TestResult {
@@ -266,7 +266,7 @@ pub fn bending() -> TestResult {
         detail: format!(
             "No central cross-section cut; max broken axial bonds in any plane={}/9 at x={:.3} m; max longitudinal bond stress={:.2} MPa",
             max_cut.1,
-            min + (max_cut.0 as f32 + 0.5) * CELL,
+            min + (max_cut.0 as f64 + 0.5) * CELL,
             max_axial / 1e6
         ),
     }
@@ -291,7 +291,7 @@ pub fn wedge_split() -> TestResult {
         .positions
         .iter()
         .map(|p| p.z)
-        .fold(f32::INFINITY, f32::min);
+        .fold(f64::INFINITY, f64::min);
     // Constrain only the rooted bottom layer vertically. The REV bonds remain
     // intact, so the trunk transfers the axe load into its support.
     let root_targets = scene
@@ -404,27 +404,27 @@ pub fn knife_cut() -> TestResult {
         .positions
         .iter()
         .map(|p| p.x)
-        .fold(f32::INFINITY, f32::min);
+        .fold(f64::INFINITY, f64::min);
     let x_max = scene
         .positions
         .iter()
         .map(|p| p.x)
-        .fold(f32::NEG_INFINITY, f32::max);
+        .fold(f64::NEG_INFINITY, f64::max);
     let y_min = scene
         .positions
         .iter()
         .map(|p| p.y)
-        .fold(f32::INFINITY, f32::min);
+        .fold(f64::INFINITY, f64::min);
     let y_max = scene
         .positions
         .iter()
         .map(|p| p.y)
-        .fold(f32::NEG_INFINITY, f32::max);
+        .fold(f64::NEG_INFINITY, f64::max);
     let z_min = scene
         .positions
         .iter()
         .map(|p| p.z)
-        .fold(f32::INFINITY, f32::min);
+        .fold(f64::INFINITY, f64::min);
     let targets = scene
         .positions
         .iter()
@@ -438,7 +438,7 @@ pub fn knife_cut() -> TestResult {
         .rest_positions
         .iter()
         .map(|p| p.x)
-        .fold(f32::INFINITY, f32::min);
+        .fold(f64::INFINITY, f64::min);
     // Require the rear of the blade to clear the far face as well as two large
     // connected components. A contact shock that merely cracks the coupon is
     // not accepted as a through-cut.
@@ -577,7 +577,7 @@ fn capture_knife_internal(
         .positions
         .iter()
         .map(|p| p.x)
-        .fold(f32::NEG_INFINITY, f32::max);
+        .fold(f64::NEG_INFINITY, f64::max);
     let mut tool = Some(Tool::new(
         Shape::Blade,
         &scene,
@@ -602,8 +602,8 @@ fn capture_knife_internal(
         // `leading_extent` is measured between cell centers. Add one REV so
         // the blade edge starts at first contact instead of sharing centers
         // with the outer wood layer and being depenetrated before the strike.
-        t.position.x = specimen_x_max + leading_extent + CELL;
-        t.position -= t.velocity * approach_seconds;
+        t.position.x = specimen_x_max + leading_extent as f64 + CELL;
+        t.position -= t.velocity.as_dvec3() * approach_seconds as f64;
         if let Some(force) = guided_force_newtons {
             t.mount_base(Vec3::ZERO, -Vec3::X)
                 .map_err(std::io::Error::other)?;
@@ -615,27 +615,27 @@ fn capture_knife_internal(
         .positions
         .iter()
         .map(|p| p.x)
-        .fold(f32::INFINITY, f32::min);
+        .fold(f64::INFINITY, f64::min);
     let x_max = scene
         .positions
         .iter()
         .map(|p| p.x)
-        .fold(f32::NEG_INFINITY, f32::max);
+        .fold(f64::NEG_INFINITY, f64::max);
     let y_min = scene
         .positions
         .iter()
         .map(|p| p.y)
-        .fold(f32::INFINITY, f32::min);
+        .fold(f64::INFINITY, f64::min);
     let y_max = scene
         .positions
         .iter()
         .map(|p| p.y)
-        .fold(f32::NEG_INFINITY, f32::max);
+        .fold(f64::NEG_INFINITY, f64::max);
     let z_min = scene
         .positions
         .iter()
         .map(|p| p.z)
-        .fold(f32::INFINITY, f32::min);
+        .fold(f64::INFINITY, f64::min);
     let targets = scene
         .positions
         .iter()
@@ -695,7 +695,7 @@ fn capture_knife_internal(
                 .set_external_force(drive_direction * force)?;
             solver::step_with_targets(&mut scene, &mut tool, &targets);
             drive_work +=
-                (drive_direction * force).dot(tool.as_ref().unwrap().position - before) as f64;
+                (drive_direction * force).as_dvec3().dot(tool.as_ref().unwrap().position - before);
             if guided_force_newtons.is_some() && cut_frame.is_none() {
                 let sizes = wood_fragment_sizes(&scene);
                 let rear_x = blade_trailing_face_x(tool.as_ref().unwrap());
@@ -752,9 +752,9 @@ fn capture_knife_internal(
                     q * axes[(axis + 2) % 3],
                 );
                 let k = solver::stiffness_matrix(&scene, i, j, basis);
-                let u = basis.transpose() * (scene.positions[j] - scene.positions[i])
-                    - Vec3::X * CELL
-                    - Vec3::from_array(b.plastic_strain) * CELL;
+                let u = (basis.as_dmat3().transpose() * (scene.positions[j] - scene.positions[i])
+                    - DVec3::X * CELL
+                    - DVec3::from_array(b.plastic_strain.map(f64::from)) * CELL).as_vec3();
                 elastic_energy += (0.5 * (1.0 - b.damage) * u.dot(k * u)).max(0.0) as f64;
             }
         }

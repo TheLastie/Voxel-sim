@@ -41,7 +41,7 @@ fn frame(
     let material = &scene.properties[0];
     let phase = material.phase_state(scene.voxels[0].mass, scene.voxels[0].thermal_energy_f32());
     let limits = solver::bond_limits(scene, 0, 1, Vec3::X);
-    let strain = (scene.positions[1].x - scene.positions[0].x - CELL) / CELL;
+    let strain = ((scene.positions[1].x - scene.positions[0].x - CELL as f64) / CELL as f64) as f32;
     let stress_ratio = if limits.tension > 0.0 {
         strain.abs() * material.young / limits.tension
     } else {
@@ -103,14 +103,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             initial_position[0].to_array().map(Some),
             initial_position[1].to_array().map(Some),
         ];
-        targets[1][0] = Some(initial_position[1].x + extension);
+        targets[1][0] = Some(initial_position[1].x + extension as f64);
         solver::step_with_axis_targets(&mut scene, &mut tool, &targets);
         if fracture_step.is_none() && scene.bonds[0][0].neighbor == EMPTY {
             fracture_step = Some(step);
             writeln!(out, "E,{step},1,thermal_strength_fracture")?;
             let temperature = scene.temperature_kelvin(0).unwrap_or(0.0);
             let limits = solver::bond_limits(&scene, 0, 1, Vec3::X);
-            let strain = (scene.positions[1].x - scene.positions[0].x - CELL) / CELL;
+            let strain = ((scene.positions[1].x - scene.positions[0].x - CELL as f64) / CELL as f64) as f32;
             let ratio = if limits.tension > 0.0 {
                 strain.abs() * scene.properties[0].young / limits.tension
             } else {

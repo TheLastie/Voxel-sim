@@ -1,4 +1,4 @@
-use glam::Vec3;
+use glam::{DVec3, Vec3};
 use voxel_physics_lab::{
     material::Material,
     scene::{CpuPreconditioner, Scene, SceneBuilder, VoxelSpawn},
@@ -37,7 +37,7 @@ fn loaded_lattice(preconditioner: CpuPreconditioner) -> Scene {
     scene
 }
 
-fn run(preconditioner: CpuPreconditioner) -> (Vec<Vec3>, f32, f32) {
+fn run(preconditioner: CpuPreconditioner) -> (Vec<DVec3>, f32, f64) {
     let mut scene = loaded_lattice(preconditioner);
     let fixed_x = scene.axis_targets[7][0].expect("X axis remains fixed");
     let loaded_start = scene.positions[11];
@@ -71,7 +71,7 @@ fn block_jacobi_and_ic0_solve_the_same_partially_constrained_scene() {
         .iter()
         .zip(jacobi_positions)
         .map(|(ic, jacobi)| ic.distance(jacobi))
-        .fold(0.0_f32, f32::max);
+        .fold(0.0_f64, f64::max);
     assert!(
         max_position_delta < 2e-5,
         "preconditioners disagree by {max_position_delta} m"

@@ -184,18 +184,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .zip(old_positions.iter().zip(&old_velocities))
             {
-                let next = position + velocity * DT;
-                let exit = if next.x < -bounds {
+                let next = position + velocity.as_dvec3() * DT as f64;
+                let exit = if next.x < -(bounds as f64) {
                     Some((0, "x_min"))
-                } else if next.x > bounds {
+                } else if next.x > bounds as f64 {
                     Some((1, "x_max"))
-                } else if next.y < -bounds {
+                } else if next.y < -(bounds as f64) {
                     Some((2, "y_min"))
-                } else if next.y > bounds {
+                } else if next.y > bounds as f64 {
                     Some((3, "y_max"))
-                } else if next.z < -bounds {
+                } else if next.z < -(bounds as f64) {
                     Some((4, "z_min"))
-                } else if next.z > bounds {
+                } else if next.z > bounds as f64 {
                     Some((5, "z_max"))
                 } else {
                     None

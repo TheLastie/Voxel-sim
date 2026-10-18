@@ -2,7 +2,7 @@
 use glam::Vec3;
 use voxel_physics_lab::{
     bond::EMPTY,
-    scene::{Scene, SceneConfig, CELL},
+    scene::{Scene, SceneConfig, DCELL as CELL},
     solver,
     tool::{Shape, Tool},
 };
@@ -41,7 +41,7 @@ fn free_fall() -> Check {
         solver::step(&mut s, &mut tool);
     }
     // The integrator applies gravity before advancing position (semi-implicit Euler).
-    let expected = start.z + 0.1 + gravity.z * dt * dt * (frames * (frames + 1)) as f32 * 0.5;
+    let expected = start.z + 0.1 + gravity.z as f64 * dt as f64 * dt as f64 * (frames * (frames + 1)) as f64 * 0.5;
     let actual = s.positions[0].z;
     let actual_velocity = s.voxels[0].velocity.z;
     let expected_velocity = gravity.z * dt * frames as f32;
@@ -62,7 +62,7 @@ fn ground_support() -> Check {
         solver::step(&mut s, &mut tool);
     }
     let bottom = s.positions[0].z - CELL * 0.5;
-    let penetration = (s.ground_top - bottom).max(0.0);
+    let penetration = (s.ground_top as f64 - bottom).max(0.0);
     Check {
         name: "ground_support_250ms",
         passed: penetration <= 1e-6 && s.voxels[0].velocity.z.abs() < 1e-4,

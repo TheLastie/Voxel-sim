@@ -1,9 +1,21 @@
-use crate::scene::{Scene, CELL};
-use glam::Vec3;
+use crate::scene::{Scene, CELL, DCELL};
+use glam::{DVec3, Vec3};
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::time::Instant;
 
-const COLLISION_BIN_SCALE: f32 = 2.0;
+const COLLISION_BIN_SCALE: f32 = 1.05;
+
+fn collision_bin_scale() -> f32 {
+    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("VOXEL_COLLISION_BIN_SCALE")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.25 && *value <= 8.0)
+            .unwrap_or(COLLISION_BIN_SCALE)
+    })
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Contact {
@@ -16,20 +28,18 @@ pub struct Contact {
 
 #[derive(Default)]
 pub(crate) struct CollisionScratch {
-    starts: Vec<Vec3>,
+    starts: Vec<DVec3>,
     bins: FxHashMap<[i32; 3], Vec<usize>>,
     bin_pool: Vec<Vec<usize>>,
     static_bins: FxHashMap<[i32; 3], Vec<usize>>,
     static_indices: Vec<usize>,
-    static_positions: Vec<Vec3>,
+    static_positions: Vec<DVec3>,
     dynamic_lower_by_index: Vec<[i32; 3]>,
     dynamic_bounds_by_index: Vec<Option<([i32; 3], [i32; 3])>>,
     static_lower_by_index: Vec<[i32; 3]>,
     static_ready: bool,
     candidate_pairs_valid: bool,
     pairs: Vec<(usize, usize)>,
-    filtered_pairs_valid: bool,
-    filtered_pairs: Vec<(usize, usize)>,
     adjacency: Vec<[u32; 6]>,
     adjacency_topology: [Vec<u32>; 3],
 }
@@ -39,7 +49,7 @@ pub(crate) struct CollisionScratch {
 /// Treating its edge/corner neighbors as independent AABBs creates artificial
 /// strain under rigid rotation. Broken face neighbors and nonlocal folded
 /// regions still use REV-sized contact bounds.
-pub fn project(scene: &mut Scene, targets: &[[Option<f32>; 3]]) -> Vec<Contact> {
+pub fn project(scene: &mut Scene, targets: &[[Option<f64>; 3]]) -> Vec<Contact> {
     let mut contacts = Vec::new();
     project_into(scene, targets, &mut contacts);
     contacts
@@ -47,7 +57,7 @@ pub fn project(scene: &mut Scene, targets: &[[Option<f32>; 3]]) -> Vec<Contact> 
 
 pub(crate) fn project_into(
     scene: &mut Scene,
-    targets: &[[Option<f32>; 3]],
+    targets: &[[Option<f64>; 3]],
     contacts: &mut Vec<Contact>,
 ) {
     let profiling = std::env::var_os("VOXEL_PROFILE_COLLISION").is_some();
@@ -62,27 +72,15 @@ pub(crate) fn project_into(
     );
     let setup_time = phase_start.elapsed();
     phase_start = Instant::now();
-    let candidates_changed = candidate_pairs(scene, &starts, &mut scratch);
+    candidate_pairs(scene, &starts, &mut scratch, topology_changed);
     let candidate_time = phase_start.elapsed();
     let candidate_count = scratch.pairs.len();
-    phase_start = Instant::now();
-    if candidates_changed || topology_changed || !scratch.filtered_pairs_valid {
-        scratch.filtered_pairs.clear();
-        for &(i, j) in &scratch.pairs {
-            if !local_continuum_pair(scene, &scratch.adjacency, i, j) {
-                scratch.filtered_pairs.push((i, j));
-            }
-        }
-        scratch.filtered_pairs_valid = true;
-    }
-    let pair_filter_time = phase_start.elapsed();
-    let pair_count = scratch.filtered_pairs.len();
     contacts.clear();
-    contacts.reserve(pair_count);
+    contacts.reserve(candidate_count);
     phase_start = Instant::now();
     for _ in 0..6 {
         let mut changed = false;
-        for &(i, j) in &scratch.filtered_pairs {
+        for &(i, j) in &scratch.pairs {
             let sweep = swept_normal(
                 &starts[i],
                 &starts[j],
@@ -90,16 +88,16 @@ pub(crate) fn project_into(
                 &scene.positions[j],
             );
             if let Some(normal) = sweep {
-                let separation = (scene.positions[j] - scene.positions[i]).dot(normal);
-                if separation < CELL {
-                    let correction = CELL - separation + 1e-6;
+                let separation = (scene.positions[j] - scene.positions[i]).dot(normal.as_dvec3());
+                if separation < DCELL {
+                    let correction = (DCELL - separation + 1e-6) as f32;
                     changed |= separate(scene, i, j, normal, correction, targets);
                 }
                 contacts.push(Contact {
                     i,
                     j,
                     normal,
-                    new_impact: (starts[j] - starts[i]).dot(normal) > CELL + 2e-6,
+                    new_impact: (starts[j] - starts[i]).dot(normal.as_dvec3()) > DCELL + 2e-6,
                 });
                 continue;
             }
@@ -113,7 +111,7 @@ pub(crate) fn project_into(
                     i,
                     j,
                     normal,
-                    new_impact: (starts[j] - starts[i]).dot(normal) > CELL + 2e-6,
+                    new_impact: (starts[j] - starts[i]).dot(normal.as_dvec3()) > DCELL + 2e-6,
                 });
                 continue;
             }
@@ -122,7 +120,7 @@ pub(crate) fn project_into(
                     i,
                     j,
                     normal,
-                    new_impact: false,
+                    new_impact: (starts[j] - starts[i]).dot(normal.as_dvec3()) > DCELL + 2e-6,
                 });
             }
         }
@@ -136,13 +134,11 @@ pub(crate) fn project_into(
     contacts.dedup_by_key(|c| (c.i, c.j));
     if profiling {
         eprintln!(
-            "collision profile ms: setup={:.2} broadphase={:.2} local_filter={:.2} project={:.2} dedup={:.2} candidates={candidate_count} pairs={} contacts={}",
+            "collision profile ms: setup={:.2} broadphase_and_filter={:.2} project={:.2} dedup={:.2} candidates={candidate_count} contacts={}",
             setup_time.as_secs_f64() * 1000.0,
             candidate_time.as_secs_f64() * 1000.0,
-            pair_filter_time.as_secs_f64() * 1000.0,
             projection_time.as_secs_f64() * 1000.0,
             phase_start.elapsed().as_secs_f64() * 1000.0,
-            pair_count,
             contacts.len()
         );
     }
@@ -155,7 +151,7 @@ pub(crate) fn project_into(
 pub fn resolve_velocities(
     scene: &mut Scene,
     contacts: &[Contact],
-    targets: &[[Option<f32>; 3]],
+    targets: &[[Option<f64>; 3]],
 ) -> Vec<f32> {
     let pre_contact_velocities: Vec<_> = scene.voxels.iter().map(|voxel| voxel.velocity).collect();
     resolve_velocities_with_precontact(scene, contacts, targets, &pre_contact_velocities)
@@ -164,7 +160,7 @@ pub fn resolve_velocities(
 pub(crate) fn resolve_velocities_with_precontact(
     scene: &mut Scene,
     contacts: &[Contact],
-    targets: &[[Option<f32>; 3]],
+    targets: &[[Option<f64>; 3]],
     pre_contact_velocities: &[Vec3],
 ) -> Vec<f32> {
     let mut normal_impulses = Vec::with_capacity(contacts.len());
@@ -183,7 +179,7 @@ pub(crate) fn resolve_velocities_with_precontact(
 pub(crate) fn resolve_velocities_with_precontact_into(
     scene: &mut Scene,
     contacts: &[Contact],
-    targets: &[[Option<f32>; 3]],
+    targets: &[[Option<f64>; 3]],
     pre_contact_velocities: &[Vec3],
     normal_impulses: &mut Vec<f32>,
     physical_velocities: &mut Vec<Vec3>,
@@ -199,12 +195,11 @@ pub(crate) fn resolve_velocities_with_precontact_into(
             let wi = inverse_mass(scene, c.i, axis, targets);
             let wj = inverse_mass(scene, c.j, axis, targets);
             let denom = wi + wj;
-            if denom <= 0.0 {
-                continue;
-            }
             let closing = (scene.voxels[c.j].velocity - scene.voxels[c.i].velocity).dot(c.normal);
+            let physical_closing =
+                (physical_velocities[c.j] - physical_velocities[c.i]).dot(c.normal);
             let mut normal_impulse = 0.0;
-            if closing < -1e-6 {
+            if denom > 0.0 && closing < -1e-6 {
                 // A resting manifold must not bounce on each new gravity step.
                 // Restitution applies only if this pair started with a gap.
                 let restitution = if c.new_impact && iteration == 0 {
@@ -214,8 +209,6 @@ pub(crate) fn resolve_velocities_with_precontact_into(
                 };
                 normal_impulse = -(1.0 + restitution) * closing / denom;
                 normal_impulses[contact_index] += normal_impulse;
-                let physical_closing =
-                    (physical_velocities[c.j] - physical_velocities[c.i]).dot(c.normal);
                 let physical_impulse = if c.new_impact {
                     normal_impulse
                 } else if physical_closing < -1e-6 {
@@ -262,7 +255,31 @@ pub(crate) fn resolve_velocities_with_precontact_into(
             // Ground and voxel contacts use the same Coulomb friction rule as
             // tool contacts. The normal impulse bounds the tangential impulse;
             // per-axis inverse masses respect partially fixed scene constraints.
-            if normal_impulse > 0.0 && scene.config.fracture.friction > 0.0 {
+            let pair_friction = scene.config.fracture.friction
+                * (scene.properties[c.i].surface_friction_coefficient
+                    + scene.properties[c.j].surface_friction_coefficient);
+            let mut friction_normal_impulse = normal_impulse;
+            if friction_normal_impulse <= 0.0 && physical_closing < -1e-6 {
+                // A resting floor contact is position constrained by the
+                // mechanical solve. That removes its normal velocity before
+                // this impulse pass, but gravity still creates a real support
+                // load for Coulomb friction. Estimate only that load here;
+                // the normal velocity is already constrained and must not be
+                // corrected a second time.
+                let unconstrained_inverse_mass = |voxel: usize| {
+                    if scene.voxels[voxel].kinematic {
+                        0.0
+                    } else {
+                        scene.voxels[voxel].mass.recip()
+                    }
+                };
+                let support_denom =
+                    unconstrained_inverse_mass(c.i) + unconstrained_inverse_mass(c.j);
+                if support_denom > 0.0 {
+                    friction_normal_impulse = -physical_closing / support_denom;
+                }
+            }
+            if friction_normal_impulse > 0.0 && pair_friction > 0.0 {
                 let relative = scene.voxels[c.j].velocity - scene.voxels[c.i].velocity;
                 let tangent = relative - c.normal * relative.dot(c.normal);
                 let tangent_response: [f32; 3] = std::array::from_fn(|axis| {
@@ -296,7 +313,7 @@ pub(crate) fn resolve_velocities_with_precontact_into(
                         .sum::<f32>();
                     if tangent_weight > 0.0 {
                         let impulse_magnitude = (tangent_speed / tangent_weight)
-                            .min(scene.config.fracture.friction * normal_impulse);
+                            .min(pair_friction * friction_normal_impulse);
                         // The relative tangential velocity is v_j - v_i, so
                         // the contact impulse on j points opposite that motion.
                         let impulse = -direction * impulse_magnitude;
@@ -344,7 +361,7 @@ pub(crate) fn resolve_velocities_with_precontact_into(
 pub(crate) fn resolve_liquid_viscosity(
     scene: &mut Scene,
     contacts: &[Contact],
-    targets: &[[Option<f32>; 3]],
+    targets: &[[Option<f64>; 3]],
     elapsed_seconds: f32,
 ) {
     if elapsed_seconds <= 0.0 || !elapsed_seconds.is_finite() {
@@ -381,7 +398,7 @@ pub(crate) fn resolve_liquid_viscosity(
             (false, false) => continue,
         };
         let normal_axis = normal_axis(contact.normal);
-        let delta = scene.positions[j] - scene.positions[i];
+        let delta = (scene.positions[j] - scene.positions[i]).as_vec3();
         let area = (0..3)
             .filter(|&axis| axis != normal_axis)
             .map(|axis| (CELL - delta[axis].abs()).clamp(0.0, CELL))
@@ -439,7 +456,12 @@ pub(crate) fn resolve_liquid_viscosity(
     }
 }
 
-fn candidate_pairs(scene: &Scene, starts: &[Vec3], scratch: &mut CollisionScratch) -> bool {
+fn candidate_pairs(
+    scene: &Scene,
+    starts: &[DVec3],
+    scratch: &mut CollisionScratch,
+    topology_changed: bool,
+) {
     let static_changed = ensure_static_bins(scene, starts, scratch);
     let bounds_len_changed = scratch.dynamic_bounds_by_index.len() != scene.voxels.len();
     scratch
@@ -453,8 +475,8 @@ fn candidate_pairs(scene: &Scene, starts: &[Vec3], scratch: &mut CollisionScratc
         let bounds = if scene.voxels[i].kinematic {
             None
         } else {
-            let a = starts[i].min(scene.positions[i]) / CELL;
-            let b = starts[i].max(scene.positions[i]) / CELL;
+            let a = starts[i].min(scene.positions[i]) / DCELL;
+            let b = starts[i].max(scene.positions[i]) / DCELL;
             Some(bin_bounds(a, b))
         };
         if scratch.dynamic_bounds_by_index[i] != bounds {
@@ -463,8 +485,12 @@ fn candidate_pairs(scene: &Scene, starts: &[Vec3], scratch: &mut CollisionScratc
         scratch.dynamic_bounds_by_index[i] = bounds;
         scratch.dynamic_lower_by_index[i] = bounds.map_or([0; 3], |(lo, _)| lo);
     }
-    if scratch.candidate_pairs_valid && !static_changed && !dynamic_bounds_changed {
-        return false;
+    if scratch.candidate_pairs_valid
+        && !static_changed
+        && !dynamic_bounds_changed
+        && !topology_changed
+    {
+        return;
     }
 
     for (_, mut ids) in scratch.bins.drain() {
@@ -488,70 +514,83 @@ fn candidate_pairs(scene: &Scene, starts: &[Vec3], scratch: &mut CollisionScratc
             }
         }
     }
-    let lower_by_index = &scratch.dynamic_lower_by_index;
-    let pairs = &mut scratch.pairs;
-    let static_bins = &scratch.static_bins;
-    for (key, ids) in bins.iter() {
-        for a in 0..ids.len() {
-            for b in (a + 1)..ids.len() {
-                let i = ids[a].min(ids[b]);
-                let j = ids[a].max(ids[b]);
-                let lo_i = lower_by_index[i];
-                let lo_j = lower_by_index[j];
-                let canonical = [
-                    lo_i[0].max(lo_j[0]),
-                    lo_i[1].max(lo_j[1]),
-                    lo_i[2].max(lo_j[2]),
-                ];
-                if *key == canonical {
-                    pairs.push((i, j));
-                }
-            }
-        }
-        if let Some(fixed_ids) = static_bins.get(key) {
-            for &dynamic_index in ids {
-                for &static_index in fixed_ids {
-                    let (i, j) = (
-                        dynamic_index.min(static_index),
-                        dynamic_index.max(static_index),
-                    );
-                    // Keep source arrays associated with voxel classes even
-                    // after sorting the emitted pair by scene index.
-                    let lo_i = lower_by_index[dynamic_index];
-                    let lo_j = scratch.static_lower_by_index[static_index];
-                    let canonical = [
-                        lo_i[0].max(lo_j[0]),
-                        lo_i[1].max(lo_j[1]),
-                        lo_i[2].max(lo_j[2]),
-                    ];
-                    if *key == canonical {
-                        pairs.push((i, j));
+    let generated_pairs = {
+        let lower_by_index = &scratch.dynamic_lower_by_index;
+        let static_lower_by_index = &scratch.static_lower_by_index;
+        let adjacent = &scratch.adjacency;
+        let static_bins = &scratch.static_bins;
+        bins.par_iter()
+            .fold(Vec::new, |mut local_pairs, (key, ids)| {
+                for a in 0..ids.len() {
+                    for b in (a + 1)..ids.len() {
+                        let i = ids[a].min(ids[b]);
+                        let j = ids[a].max(ids[b]);
+                        let lo_i = lower_by_index[i];
+                        let lo_j = lower_by_index[j];
+                        let canonical = [
+                            lo_i[0].max(lo_j[0]),
+                            lo_i[1].max(lo_j[1]),
+                            lo_i[2].max(lo_j[2]),
+                        ];
+                        if *key == canonical && !local_continuum_pair(scene, adjacent, i, j) {
+                            local_pairs.push((i, j));
+                        }
                     }
                 }
-            }
-        }
-    }
-    pairs.sort_unstable();
+                if let Some(fixed_ids) = static_bins.get(key) {
+                    for &dynamic_index in ids {
+                        for &static_index in fixed_ids {
+                            let (i, j) = (
+                                dynamic_index.min(static_index),
+                                dynamic_index.max(static_index),
+                            );
+                            // Keep source arrays associated with voxel classes even
+                            // after sorting the emitted pair by scene index.
+                            let lo_i = lower_by_index[dynamic_index];
+                            let lo_j = static_lower_by_index[static_index];
+                            let canonical = [
+                                lo_i[0].max(lo_j[0]),
+                                lo_i[1].max(lo_j[1]),
+                                lo_i[2].max(lo_j[2]),
+                            ];
+                            if *key == canonical
+                                && !local_continuum_pair(scene, adjacent, i, j)
+                            {
+                                local_pairs.push((i, j));
+                            }
+                        }
+                    }
+                }
+                local_pairs
+            })
+            .reduce(Vec::new, |mut a, mut b| {
+                a.append(&mut b);
+                a
+            })
+    };
+    scratch.pairs.clear();
+    scratch.pairs.extend(generated_pairs);
+    scratch.pairs.sort_unstable();
     scratch.candidate_pairs_valid = true;
-    true
 }
 
-fn bin_bounds(a: Vec3, b: Vec3) -> ([i32; 3], [i32; 3]) {
+fn bin_bounds(a: DVec3, b: DVec3) -> ([i32; 3], [i32; 3]) {
     // Expand each swept voxel by the same micrometre-scale shell used to
     // retain resting contacts after positional projection.
     let margin = 2e-4;
-    let lo = ((a - Vec3::splat(0.5 + margin)) * COLLISION_BIN_SCALE)
+    let scale = collision_bin_scale() as f64;
+    let lo = ((a - DVec3::splat(0.5 + margin)) * scale)
         .floor()
         .as_ivec3();
-    let hi = ((b + Vec3::splat(0.5 + margin)) * COLLISION_BIN_SCALE)
+    let hi = ((b + DVec3::splat(0.5 + margin)) * scale)
         .floor()
         .as_ivec3();
     (lo.to_array(), hi.to_array())
 }
 
-fn touching_normal(a: Vec3, b: Vec3) -> Option<Vec3> {
+fn touching_normal(a: DVec3, b: DVec3) -> Option<Vec3> {
     const CONTACT_SLOP: f32 = 2.0e-6;
-    let delta = b - a;
+    let delta = (b - a).as_vec3();
     let gaps = delta.abs() - Vec3::splat(CELL);
     let axis = if gaps.x >= gaps.y && gaps.x >= gaps.z {
         0
@@ -570,7 +609,7 @@ fn touching_normal(a: Vec3, b: Vec3) -> Option<Vec3> {
     Some(normal)
 }
 
-fn ensure_static_bins(scene: &Scene, starts: &[Vec3], scratch: &mut CollisionScratch) -> bool {
+fn ensure_static_bins(scene: &Scene, starts: &[DVec3], scratch: &mut CollisionScratch) -> bool {
     let mut changed = !scratch.static_ready;
     let mut fixed_slot = 0;
     for (i, voxel) in scene.voxels.iter().enumerate() {
@@ -604,8 +643,8 @@ fn ensure_static_bins(scene: &Scene, starts: &[Vec3], scratch: &mut CollisionScr
         }
         scratch.static_indices.push(i);
         scratch.static_positions.push(scene.positions[i]);
-        let a = starts[i].min(scene.positions[i]) / CELL;
-        let b = starts[i].max(scene.positions[i]) / CELL;
+        let a = starts[i].min(scene.positions[i]) / DCELL;
+        let b = starts[i].max(scene.positions[i]) / DCELL;
         let (lo, hi) = bin_bounds(a, b);
         scratch.static_lower_by_index[i] = lo;
         for z in lo[2]..=hi[2] {
@@ -655,7 +694,7 @@ fn adjacency(
 }
 
 fn local_continuum_pair(scene: &Scene, adjacent: &[[u32; 6]], i: usize, j: usize) -> bool {
-    let delta = (scene.rest_positions[j] - scene.rest_positions[i]) / CELL;
+    let delta = (scene.rest_positions[j] - scene.rest_positions[i]) / DCELL;
     let steps = delta.round();
     if (delta - steps).abs().max_element() > 1e-3 || steps.abs().max_element() > 1.0 {
         return false;
@@ -683,13 +722,13 @@ fn local_continuum_pair(scene: &Scene, adjacent: &[[u32; 6]], i: usize, j: usize
         }
         false
     }
-    connected(adjacent, i, j, steps)
+    connected(adjacent, i, j, steps.as_vec3())
 }
 
-fn swept_normal(start_i: &Vec3, start_j: &Vec3, end_i: &Vec3, end_j: &Vec3) -> Option<Vec3> {
-    let d0 = *start_j - *start_i;
-    let di = *end_i - *start_i;
-    let dj = *end_j - *start_j;
+fn swept_normal(start_i: &DVec3, start_j: &DVec3, end_i: &DVec3, end_j: &DVec3) -> Option<Vec3> {
+    let d0 = (*start_j - *start_i).as_vec3();
+    let di = (*end_i - *start_i).as_vec3();
+    let dj = (*end_j - *start_j).as_vec3();
     let relative_step = dj - di;
     if d0.abs().cmple(Vec3::splat(CELL - 1e-6)).all() {
         return None;
@@ -726,14 +765,22 @@ fn swept_normal(start_i: &Vec3, start_j: &Vec3, end_i: &Vec3, end_j: &Vec3) -> O
     if exit < 0.0 || enter > 1.0 {
         return None;
     }
+    // A pair that is exactly touching on an edge at t=0 but immediately
+    // separating along that axis has no swept overlap interval. Treating the
+    // zero-duration graze as a hit makes adjacent fixed floor REVs behave like
+    // vertical walls and blocks horizontal sliding across the tiled surface.
+    let interval_start = enter.max(0.0);
+    if exit <= interval_start + 1e-6 {
+        return None;
+    }
     let axis = hit_axis?;
     let mut normal = Vec3::ZERO;
     normal[axis] = hit_sign;
     Some(normal)
 }
 
-fn overlap_normal(a: Vec3, b: Vec3, fallback: Vec3) -> Option<(Vec3, f32)> {
-    let delta = b - a;
+fn overlap_normal(a: DVec3, b: DVec3, fallback: DVec3) -> Option<(Vec3, f32)> {
+    let delta = (b - a).as_vec3();
     let overlap = Vec3::splat(CELL) - delta.abs();
     if overlap.min_element() <= 0.0 {
         return None;
@@ -748,7 +795,7 @@ fn overlap_normal(a: Vec3, b: Vec3, fallback: Vec3) -> Option<(Vec3, f32)> {
     let sign_source = if delta[axis].abs() > 1e-8 {
         delta[axis]
     } else if fallback[axis].abs() > 1e-8 {
-        fallback[axis]
+        fallback[axis] as f32
     } else {
         1.0
     };
@@ -767,7 +814,7 @@ fn normal_axis(normal: Vec3) -> usize {
     }
 }
 
-fn inverse_mass(scene: &Scene, i: usize, axis: usize, targets: &[[Option<f32>; 3]]) -> f32 {
+fn inverse_mass(scene: &Scene, i: usize, axis: usize, targets: &[[Option<f64>; 3]]) -> f32 {
     let v = &scene.voxels[i];
     if v.kinematic || targets.get(i).and_then(|t| t[axis]).is_some() {
         0.0
@@ -782,7 +829,7 @@ fn separate(
     j: usize,
     normal: Vec3,
     amount: f32,
-    targets: &[[Option<f32>; 3]],
+    targets: &[[Option<f64>; 3]],
 ) -> bool {
     let axis = normal_axis(normal);
     let wi = inverse_mass(scene, i, axis, targets);
@@ -793,18 +840,18 @@ fn separate(
     }
     let di = -normal * (amount * wi / denom);
     let dj = normal * (amount * wj / denom);
-    scene.positions[i] += di;
-    scene.positions[j] += dj;
+    scene.positions[i] += di.as_dvec3();
+    scene.positions[j] += dj.as_dvec3();
     // Split positional correction from velocity so it cannot create energy.
-    scene.previous[i] += di;
-    scene.previous[j] += dj;
+    scene.previous[i] += di.as_dvec3();
+    scene.previous[j] += dj.as_dvec3();
     true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{bond::EMPTY, scene::SceneConfig, solver};
+    use crate::{bond::EMPTY, scene::{SceneConfig, VoxelSpawn}, solver};
 
     #[test]
     fn rigidly_rotated_continuum_has_no_internal_box_contacts() {
@@ -815,7 +862,7 @@ mod tests {
         let mut scene = Scene::new(config);
         let rotation = glam::Quat::from_rotation_z(0.37);
         for p in &mut scene.positions {
-            *p = rotation * *p;
+            *p = rotation.as_dquat() * *p;
         }
         scene.previous.clone_from(&scene.positions);
         let before = scene.positions.clone();
@@ -844,7 +891,7 @@ mod tests {
         assert!(project(&mut scene, &[])
             .iter()
             .any(|c| c.i == 0 && c.j == 1));
-        scene.positions[1] = scene.positions[0] + Vec3::X * (CELL * 0.5);
+        scene.positions[1] = scene.positions[0] + DVec3::X * (DCELL * 0.5);
         scene.previous.clone_from(&scene.positions);
         assert!(project(&mut scene, &[])
             .iter()
@@ -883,11 +930,11 @@ mod tests {
         scene.set_voxel_kinematic(1, true).unwrap();
         scene.previous.clone_from(&scene.positions);
         let wall = scene.positions[1];
-        scene.positions[0].x += 3.0 * CELL;
+        scene.positions[0].x += 3.0 * DCELL;
         let contacts = project(&mut scene, &[]);
         assert!(!contacts.is_empty());
         assert_eq!(scene.positions[1], wall);
-        assert!(wall.x - scene.positions[0].x >= CELL - 1e-6);
+        assert!(wall.x - scene.positions[0].x >= DCELL - 1e-6);
     }
 
     #[test]
@@ -933,17 +980,22 @@ mod tests {
             .iter_mut()
             .for_each(|bond| bond.neighbor = EMPTY);
         scene.previous.clone_from(&scene.positions);
-        scene.positions[2] += Vec3::X * (CELL * 4.0);
+        scene.positions[2] += DVec3::X * (DCELL * 4.0);
         let starts = scene.previous.clone();
         let mut scratch = CollisionScratch::default();
 
-        assert!(candidate_pairs(&scene, &starts, &mut scratch));
+        adjacency(&scene, &mut scratch.adjacency, &mut scratch.adjacency_topology);
+        candidate_pairs(&scene, &starts, &mut scratch, true);
 
-        assert_eq!(scratch.pairs, vec![(0, 1), (1, 2)]);
-        assert!(!candidate_pairs(&scene, &starts, &mut scratch));
-        assert_eq!(scratch.pairs, vec![(0, 1), (1, 2)]);
-        scene.positions[2].x += CELL * 0.5;
-        assert!(candidate_pairs(&scene, &starts, &mut scratch));
+        assert!(scratch.pairs.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(scratch.pairs.contains(&(0, 1)));
+        assert!(scratch.pairs.contains(&(1, 2)));
+        candidate_pairs(&scene, &starts, &mut scratch, false);
+        assert!(scratch.pairs.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(scratch.pairs.contains(&(0, 1)));
+        assert!(scratch.pairs.contains(&(1, 2)));
+        scene.positions[2].x += DCELL * 0.5;
+        candidate_pairs(&scene, &starts, &mut scratch, false);
     }
 
     #[test]
@@ -957,11 +1009,12 @@ mod tests {
         scene.bonds[0][0].neighbor = EMPTY;
         scene.set_voxel_kinematic(1, true).unwrap();
         scene.previous.clone_from(&scene.positions);
-        scene.positions[0].x += 3.0 * CELL;
+        scene.positions[0].x += 3.0 * DCELL;
         let starts = scene.previous.clone();
         let mut scratch = CollisionScratch::default();
 
-        candidate_pairs(&scene, &starts, &mut scratch);
+        adjacency(&scene, &mut scratch.adjacency, &mut scratch.adjacency_topology);
+        candidate_pairs(&scene, &starts, &mut scratch, true);
 
         assert_eq!(scratch.pairs, vec![(0, 1)]);
     }
@@ -987,8 +1040,8 @@ mod tests {
                 let b_max = b0.max(b1);
                 let geometrically_overlaps = a_min - 0.5 - 2e-4 <= b_max + 0.5 + 2e-4
                     && b_min - 0.5 - 2e-4 <= a_max + 0.5 + 2e-4;
-                let (a_lo, a_hi) = bin_bounds(Vec3::splat(a_min), Vec3::splat(a_max));
-                let (b_lo, b_hi) = bin_bounds(Vec3::splat(b_min), Vec3::splat(b_max));
+                let (a_lo, a_hi) = bin_bounds(DVec3::splat(a_min as f64), DVec3::splat(a_max as f64));
+                let (b_lo, b_hi) = bin_bounds(DVec3::splat(b_min as f64), DVec3::splat(b_max as f64));
                 let bins_overlap =
                     (0..3).all(|axis| a_lo[axis] <= b_hi[axis] && b_lo[axis] <= a_hi[axis]);
                 assert!(
@@ -1012,7 +1065,7 @@ mod tests {
         scene.set_voxel_kinematic(1, true).unwrap();
         scene.previous.clone_from(&scene.positions);
         scene.voxels[0].velocity = Vec3::new(1.0, 2.0, 5.0);
-        scene.positions[0].x += CELL * 0.2;
+        scene.positions[0].x += DCELL * 0.2;
         let targets = [[None, None, Some(scene.positions[0].z)], [None; 3]];
         let contacts = project(&mut scene, &targets);
         assert!(contacts
@@ -1041,6 +1094,47 @@ mod tests {
     }
 
     #[test]
+    fn oak_voxel_sliding_on_concrete_floor_loses_speed_and_heats() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [1; 3];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [1; 3];
+        config.gravity = [0.0, 0.0, -9.81];
+        config.fixed_dt = 0.001;
+        config.substeps = 1;
+        config.iterations = 40;
+        config.fracture.friction = 0.45;
+        let oak = crate::material::Material::component_id("oak").unwrap();
+        let concrete = crate::material::Material::component_id("concrete").unwrap();
+        let mut spawns = vec![VoxelSpawn::at_cell([0, 0, 0], oak).with_velocity(Vec3::X * 0.05)];
+        for y in -1..=1 {
+            for x in -1..=1 {
+                spawns.push(VoxelSpawn::at_cell([x, y, -1], concrete).fixed());
+            }
+        }
+        let mut scene = Scene::from_voxels(config, spawns).unwrap();
+        let initial_speed = scene.voxels[0].velocity.x;
+        let initial_kinetic =
+            0.5 * f64::from(scene.voxels[0].mass) * f64::from(initial_speed).powi(2);
+        let initial_internal = scene.voxels[0].total_internal_energy_j();
+        let pair_mu = scene.config.fracture.friction
+            * (scene.properties[0].surface_friction_coefficient
+                + scene.properties[1].surface_friction_coefficient);
+        assert!((pair_mu - 0.45).abs() < 1e-6);
+        for _ in 0..50 {
+            solver::step(&mut scene, &mut None);
+        }
+        let final_speed = scene.voxels[0].velocity.x;
+        let final_kinetic = 0.5 * f64::from(scene.voxels[0].mass) * f64::from(final_speed).powi(2);
+        assert!(final_speed < initial_speed * 0.95, "speed {initial_speed} -> {final_speed}");
+        assert!(scene.energy.contact_friction_heat > 0.0);
+        assert!((initial_kinetic - final_kinetic - scene.energy.contact_friction_heat).abs()
+            < initial_kinetic * 0.02);
+        assert!((scene.voxels[0].total_internal_energy_j() - initial_internal
+            - scene.energy.contact_friction_heat).abs() < 1e-12);
+    }
+
+    #[test]
     fn resting_contact_under_compression_does_not_accumulate_impact_heat() {
         let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
         config.dimensions = [2, 1, 1];
@@ -1063,7 +1157,7 @@ mod tests {
         for _ in 0..20 {
             solver::step(&mut scene, &mut None);
         }
-        assert!((scene.positions[1] - scene.positions[0]).length() <= CELL + 2e-6);
+        assert!((scene.positions[1] - scene.positions[0]).length() <= DCELL + 2e-6);
         assert_eq!(scene.energy.contact_restitution_heat, 0.0);
     }
 
@@ -1150,7 +1244,7 @@ mod tests {
         let mut tool = None;
         solver::step(&mut scene, &mut tool);
         assert!(
-            scene.positions[1].x - scene.positions[0].x >= CELL - 1e-5,
+            scene.positions[1].x - scene.positions[0].x >= DCELL - 1e-5,
             "positions {:?} {:?}, velocities {:?} {:?}",
             scene.positions[0],
             scene.positions[1],
@@ -1187,7 +1281,7 @@ mod tests {
         let resting = project(&mut scene, &targets);
         assert_eq!(resting.len(), 1);
         assert!(!resting[0].new_impact);
-        assert!((scene.positions[1] - scene.positions[0]).length() <= CELL + 2e-6);
+        assert!((scene.positions[1] - scene.positions[0]).length() <= DCELL + 2e-6);
     }
 
     #[test]
@@ -1355,6 +1449,6 @@ mod tests {
         scene.previous.clone_from(&scene.positions);
         let mut tool = None;
         solver::step(&mut scene, &mut tool);
-        assert!(scene.positions[1].x - scene.positions[0].x >= CELL - 1e-5);
+        assert!(scene.positions[1].x - scene.positions[0].x >= DCELL - 1e-5);
     }
 }

@@ -2,6 +2,7 @@ use crate::tool::Shape;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 const MAX_PUSH_FORCE_N: f32 = 15_000.0;
+const MAX_SIMULATION_TIME_SCALE: f32 = 31_557_600.0;
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Rect {
@@ -19,11 +20,22 @@ pub struct Ui {
     pub seed_text: String,
     pub seed_editing: bool,
     pub world_active: bool,
+    pub menu_open: bool,
+    pub settings_open: bool,
+    /// Simulation seconds per wall-clock second. 1.0 is real time.
+    pub simulation_time_scale: f32,
+    pub walk_speed_mps: f32,
+    pub look_sensitivity: f32,
+    paused_before_menu: bool,
 }
 
 pub enum UiAction {
     Shape(Shape),
     GenerateWorld(String),
+    Resume,
+    Settings,
+    Back,
+    Exit,
 }
 
 impl Ui {
@@ -39,6 +51,12 @@ impl Ui {
             seed_text: "1001".to_owned(),
             seed_editing: false,
             world_active: false,
+            menu_open: false,
+            settings_open: false,
+            simulation_time_scale: 1.0,
+            walk_speed_mps: 4.5,
+            look_sensitivity: 0.005,
+            paused_before_menu: false,
         }
     }
     pub fn direction(&self) -> Vec3 {
@@ -48,11 +66,45 @@ impl Ui {
         self.start
     }
     pub fn click(&mut self, x: f32, y: f32) -> Option<UiAction> {
-        if (20.0..=280.0).contains(&x) && (615.0..=644.0).contains(&y) {
+        if self.world_active && !self.menu_open {
+            return None;
+        }
+        if self.menu_open {
+            if self.settings_open {
+                if (470.0..=810.0).contains(&x) && (570.0..=626.0).contains(&y) {
+                    self.settings_open = false;
+                    return Some(UiAction::Back);
+                }
+                if (480.0..=800.0).contains(&x) {
+                    for (top, center) in [(298.0, 310.0), (378.0, 390.0), (458.0, 470.0)] {
+                        if (top..=top + 38.0).contains(&y) {
+                            self.pointer(x, center);
+                            return None;
+                        }
+                    }
+                }
+                return None;
+            }
+            if (470.0..=810.0).contains(&x) {
+                if (318.0..=370.0).contains(&y) {
+                    self.close_menu();
+                    return Some(UiAction::Resume);
+                }
+                if (382.0..=434.0).contains(&y) {
+                    self.settings_open = true;
+                    return Some(UiAction::Settings);
+                }
+                if (446.0..=498.0).contains(&y) {
+                    return Some(UiAction::Exit);
+                }
+            }
+            return None;
+        }
+        if (20.0..=280.0).contains(&x) && (646.0..=666.0).contains(&y) {
             self.seed_editing = true;
             return None;
         }
-        if (20.0..=280.0).contains(&x) && (650.0..=678.0).contains(&y) {
+        if (20.0..=280.0).contains(&x) && (670.0..=694.0).contains(&y) {
             self.seed_editing = false;
             return Some(UiAction::GenerateWorld(self.seed_text.clone()));
         }
@@ -77,7 +129,39 @@ impl Ui {
             self.seed_text.pop();
         }
     }
+    pub fn toggle_pause_menu(&mut self) {
+        if self.menu_open {
+            if self.settings_open {
+                self.settings_open = false;
+            } else {
+                self.close_menu();
+            }
+        } else {
+            self.seed_editing = false;
+            self.paused_before_menu = self.paused;
+            self.paused = true;
+            self.menu_open = true;
+        }
+    }
+    pub fn close_menu(&mut self) {
+        self.menu_open = false;
+        self.settings_open = false;
+        self.paused = self.paused_before_menu;
+    }
     pub fn pointer(&mut self, x: f32, y: f32) -> Option<Shape> {
+        if self.menu_open {
+            if self.settings_open && (480.0..=800.0).contains(&x) {
+                let t = ((x - 490.0) / 300.0).clamp(0.0, 1.0);
+                if (298.0..=336.0).contains(&y) {
+                    self.simulation_time_scale = MAX_SIMULATION_TIME_SCALE.powf(t);
+                } else if (378.0..=416.0).contains(&y) {
+                    self.walk_speed_mps = 1.0 + 9.0 * t;
+                } else if (458.0..=496.0).contains(&y) {
+                    self.look_sensitivity = 0.001 + 0.011 * t;
+                }
+            }
+            return None;
+        }
         if !(20.0..=280.0).contains(&x) {
             return None;
         }
@@ -106,6 +190,7 @@ impl Ui {
         world_age_years: Option<f32>,
     ) -> Vec<Rect> {
         let mut r = Vec::new();
+        if !self.world_active {
         rect(
             &mut r,
             [10.0, 10.0, 285.0, 710.0],
@@ -164,14 +249,20 @@ impl Ui {
             &format!("FPS {:.1} STEP {:.1} MS", fps, sim_ms),
             1.2,
         );
-        text(&mut r, 24., 530., "SPACE PAUSE   R RESET", 1.2);
-        text(&mut r, 24., 548., "B BONDS  RMB ORBIT  WHEEL ZOOM", 1.);
-        text(&mut r, 24., 572., "P START / STOP RECORDING", 1.);
-        text(&mut r, 24., 590., "REPLAY LOOPS AT 1X", 1.);
-        text(&mut r, 24., 612., "WORLD SEED (100 M2)", 1.3);
+        if self.world_active {
+            text(&mut r, 24., 530., "ESC MENU  P PAUSE  R RESET", 1.1);
+            text(&mut r, 24., 548., "WASD WALK  SPACE JUMP  SHIFT RUN", 0.85);
+            text(&mut r, 24., 566., "MOUSE LOOK  F FREE CAMERA", 0.9);
+        } else {
+            text(&mut r, 24., 530., "SPACE PAUSE   R RESET", 1.2);
+            text(&mut r, 24., 548., "WASD FLY  SPACE/CTRL UP/DOWN  RMB LOOK", 0.8);
+        }
+        text(&mut r, 24., 590., "P START / STOP RECORDING", 1.);
+        text(&mut r, 24., 608., "REPLAY LOOPS AT 1X", 1.);
+        text(&mut r, 24., 626., "MAP 10 KM2 | REV 1 CM | LOAD 1 KM", 1.1);
         rect(
             &mut r,
-            [20., 632., 260., 24.],
+            [20., 646., 260., 20.],
             if self.seed_editing {
                 [0.13, 0.22, 0.25, 1.]
             } else {
@@ -179,14 +270,14 @@ impl Ui {
             },
         );
         let seed_display = self.seed_text.to_ascii_uppercase();
-        text(&mut r, 28., 640., &seed_display, 1.5);
+        text(&mut r, 28., 652., &seed_display, 1.3);
         if self.seed_editing {
             let cursor_x = (28. + seed_display.len() as f32 * 9.0).min(270.0);
-            rect(&mut r, [cursor_x, 638., 2., 15.], [0.3, 0.85, 0.65, 1.]);
+            rect(&mut r, [cursor_x, 650., 2., 15.], [0.3, 0.85, 0.65, 1.]);
         }
         rect(
             &mut r,
-            [20., 660., 260., 26.],
+            [20., 670., 260., 24.],
             if self.world_active {
                 [0.12, 0.38, 0.33, 1.]
             } else {
@@ -196,7 +287,7 @@ impl Ui {
         text(
             &mut r,
             50.,
-            667.,
+            676.,
             if self.world_active { "REGENERATE WORLD" } else { "GENERATE WORLD" },
             1.4,
         );
@@ -204,13 +295,61 @@ impl Ui {
             text(
                 &mut r,
                 24.,
-                691.,
-                &format!("GROWTH PREVIEW: {age:.0} Y; 1 Y/SEC"),
+                699.,
+                &format!("AGE {age:.0} Y | SIM {:.2}X", self.simulation_time_scale),
                 1.0,
             );
         }
+        }
+        if self.menu_open {
+            rect(&mut r, [0., 0., 1280., 720.], [0.015, 0.025, 0.04, 0.78]);
+            rect(&mut r, [430., 125., 420., 520.], [0.055, 0.085, 0.105, 0.99]);
+            rect(&mut r, [430., 145., 420., 4.], [0.22, 0.68, 0.57, 1.]);
+            if self.settings_open {
+                text(&mut r, 482., 184., "WORLD SETTINGS", 2.0);
+                text(&mut r, 490., 262., &format!("SIM SPEED {:.2}X", self.simulation_time_scale), 1.15);
+                settings_slider(
+                    &mut r,
+                    (self.simulation_time_scale.ln() / MAX_SIMULATION_TIME_SCALE.ln())
+                        .clamp(0.0, 1.0),
+                    310.,
+                );
+                text(&mut r, 490., 324., "1X = REAL TIME", 0.9);
+                text(&mut r, 653., 324., "MAX = 1 YEAR / SEC", 0.9);
+                text(&mut r, 490., 342., "WALK SPEED M/S", 1.15);
+                text(&mut r, 700., 342., &format!("{:.1}", self.walk_speed_mps), 1.15);
+                settings_slider(&mut r, (self.walk_speed_mps - 1.0) / 9.0, 390.);
+                text(&mut r, 490., 422., "LOOK SENSITIVITY", 1.15);
+                text(&mut r, 700., 422., &format!("{:.3}", self.look_sensitivity), 1.15);
+                settings_slider(&mut r, (self.look_sensitivity - 0.001) / 0.011, 470.);
+                menu_button(&mut r, 470., 570., 340., 52., "BACK", false);
+            } else {
+                text(&mut r, 482., 202., "PAUSED", 2.4);
+                text(&mut r, 482., 246., "WORLD STATE IS PRESERVED", 1.1);
+                menu_button(&mut r, 470., 318., 340., 52., "RESUME", true);
+                menu_button(&mut r, 470., 382., 340., 52., "SETTINGS", false);
+                menu_button(&mut r, 470., 446., 340., 52., "EXIT", false);
+                text(&mut r, 482., 530., "ESC TO RESUME", 1.0);
+                text(&mut r, 482., 552., "CTRL CROUCH", 1.0);
+                text(&mut r, 482., 574., "F6 20M PHYSICS EXPERIMENT", 1.0);
+            }
+        }
         r
     }
+}
+fn menu_button(out: &mut Vec<Rect>, x: f32, y: f32, w: f32, h: f32, label: &str, primary: bool) {
+    rect(
+        out,
+        [x, y, w, h],
+        if primary { [0.15, 0.52, 0.44, 1.] } else { [0.12, 0.19, 0.23, 1.] },
+    );
+    text(out, x + 24., y + 16., label, 1.5);
+}
+fn settings_slider(out: &mut Vec<Rect>, fraction: f32, y: f32) {
+    let t = fraction.clamp(0.0, 1.0);
+    rect(out, [490., y, 300., 8.], [0.18, 0.26, 0.29, 1.]);
+    rect(out, [490., y, 300. * t, 8.], [0.18, 0.65, 0.56, 1.]);
+    rect(out, [486. + 300. * t, y - 5., 8., 18.], [0.5, 0.9, 0.75, 1.]);
 }
 fn rect(out: &mut Vec<Rect>, rect: [f32; 4], color: [f32; 4]) {
     out.push(Rect { rect, color });

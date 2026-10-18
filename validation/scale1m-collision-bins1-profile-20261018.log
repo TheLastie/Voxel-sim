@@ -1,0 +1,12 @@
+step,revs,active,wall_ms,residual,broken,mass_kg,kinetic_j,true_residual,applied_residual,position_rounding_l2_m,max_audited_residual
+mechanics scale: side=100 revs=1000000 active=990000 fixed_dt_s=0.001 substeps=4 cpu_preconditioner=IncompleteCholesky0 tolerance=0.00001 setup_s=1.001
+collision profile ms: setup=36.51 broadphase_and_filter=7488.00 project=1306.29 dedup=1.48 candidates=47056284 contacts=19999
+collision profile ms: setup=14.14 broadphase_and_filter=28.14 project=1376.38 dedup=1.44 candidates=47056284 contacts=19999
+collision profile ms: setup=14.05 broadphase_and_filter=29.22 project=737.78 dedup=0.03 candidates=47056284 contacts=10000
+collision profile ms: setup=14.79 broadphase_and_filter=27.85 project=941.44 dedup=0.03 candidates=47056284 contacts=10000
+collision profile ms: setup=13.91 broadphase_and_filter=27.60 project=1884.56 dedup=0.77 candidates=47056284 contacts=10000
+collision profile ms: setup=14.63 broadphase_and_filter=29.87 project=1900.77 dedup=1.99 candidates=47056284 contacts=18400
+collision profile ms: setup=14.29 broadphase_and_filter=28.64 project=940.21 dedup=0.03 candidates=47056284 contacts=10000
+collision profile ms: setup=13.79 broadphase_and_filter=27.80 project=1009.80 dedup=0.03 candidates=47056284 contacts=10000
+profile step ms: predict/tool=13060.48 [snapshot=46.58 drift=103.05 tool=7.05 projection=12565.89] solve=16124.72 [assemble=2699.55 factor=460.49 pcg=11884.49] rotation_fit=652.65 collision=5430.40 fracture=1084.62 finish=654.36 post_contact=0.01 tool_recheck=0.00 releases=0.01 damping=310.22 thermal=231.47 aggregation_scan=0.00 auto_aggregated_revs=0 damping_cache_hits=0 pcg_iters=259 residual=7.138e-6
+1,1000000,990000,36464.849,7.137991361e-6,0,7.869998924e3,6.772421827e-6,,,,

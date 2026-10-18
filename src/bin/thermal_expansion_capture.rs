@@ -22,7 +22,7 @@ fn write_state(
     scene: &Scene,
     step: usize,
     heater_energy_j: f64,
-    initial_span_m: f32,
+    initial_span_m: f64,
 ) -> std::io::Result<()> {
     writeln!(out, "S,{step}")?;
     for (i, position) in scene.positions.iter().enumerate() {
@@ -34,7 +34,7 @@ fn write_state(
         )?;
     }
     let target_t = INITIAL_TEMPERATURE_K + RISE_K * (step as f32 / RAMP_STEPS as f32).min(1.0);
-    let free_span = initial_span_m * (1.0 + ALPHA_PER_K * (target_t - INITIAL_TEMPERATURE_K));
+    let free_span = initial_span_m * (1.0 + ALPHA_PER_K * (target_t - INITIAL_TEMPERATURE_K)) as f64;
     let actual_span = (scene.positions[2] - scene.positions[0]).length();
     let force_n = scene.workspace[0][1].last_force.x.abs() as f64;
     let stress_pa = force_n / 1.0e-4;
@@ -104,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let actual_span_m = (scene.positions[2] - scene.positions[0]).length();
-    let expected_free_span_m = initial_span_m * (1.0 + ALPHA_PER_K * RISE_K);
+    let expected_free_span_m = initial_span_m * (1.0 + ALPHA_PER_K * RISE_K) as f64;
     let stress_pa = scene.workspace[0][1].last_force.x.abs() / 1.0e-4;
     eprintln!(
         "thermal_expansion complete steps={STEPS} states={FRAME_COUNT} simulated_s={:.3} alpha={ALPHA_PER_K:.3e} 1/K delta_T={RISE_K:.2} K free_span={expected_free_span_m:.9} m restrained_span={actual_span_m:.9} m reaction_stress={:.6} MPa heater={heater_energy_j:.9} J broken={} clusters={} ",

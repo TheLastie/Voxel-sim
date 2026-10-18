@@ -39,7 +39,7 @@ fn elastic_energy(scene: &Scene) -> f64 {
                 q * axes[(axis + 2) % 3],
             );
             let k = stiffness_matrix(scene, i, j, frame);
-            let u = frame.transpose() * (scene.positions[j] - scene.positions[i])
+            let u = frame.transpose() * (scene.positions[j] - scene.positions[i]).as_vec3()
                 - Vec3::X * 0.01
                 - Vec3::from_array(bond.plastic_strain) * 0.01;
             energy += (0.5 * (1.0 - bond.damage) * u.dot(k * u)).max(0.0) as f64;

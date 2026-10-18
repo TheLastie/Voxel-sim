@@ -1,9 +1,9 @@
 use crate::{
     material::Material,
-    scene::{Scene, AREA, CELL},
+    scene::{Scene, AREA, CELL, DCELL},
     voxel::Composition,
 };
-use glam::{Quat, Vec3};
+use glam::{DVec3, Quat, Vec3};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 
@@ -19,7 +19,7 @@ pub enum Shape {
 #[derive(Clone, Copy, Debug)]
 pub struct GuideMount {
     pub local_base: Vec3,
-    pub world_base: Vec3,
+    pub world_base: DVec3,
     pub direction: Vec3,
     pub rotation: Quat,
 }
@@ -37,13 +37,18 @@ pub struct Tool {
     spatial_occupancy_enabled: bool,
     probe_bins: Vec<[i32; 3]>,
     probe_cells: Vec<Vec3>,
-    probe_position: Vec3,
+    probe_position: DVec3,
     probe_rotation: Quat,
     probe_cache_valid: bool,
-    center_cache: Vec<Vec3>,
+    center_cache: Vec<DVec3>,
+    /// REV nodes touched during the most recent advance, including resting
+    /// contacts that produce no impulse. Used to wake coarse bodies before the
+    /// mechanical solve consumes their interaction.
+    pub(crate) contacted_voxels: Vec<usize>,
     pub composition: Composition,
+    surface_friction_coefficient: f32,
     pub mass: f32,
-    pub position: Vec3,
+    pub position: DVec3,
     pub rotation: Quat,
     pub velocity: Vec3,
     pub angular_velocity: Vec3,
@@ -55,7 +60,7 @@ pub struct Tool {
     pub mount: Option<GuideMount>,
 }
 impl Tool {
-    pub fn new(shape: Shape, scene: &Scene, position: Vec3, direction: Vec3, speed: f32) -> Self {
+    pub fn new(shape: Shape, scene: &Scene, position: impl Into<DVec3>, direction: Vec3, speed: f32) -> Self { let position = position.into();
         let d = scene.config.tool_dimensions;
         let (dims, component, color) = match shape {
             Shape::Wedge => (d, 2, [0.65, 0.68, 0.72, 1.0]),
@@ -131,13 +136,15 @@ impl Tool {
             spatial_occupancy_enabled: false,
             probe_bins: Vec::new(),
             probe_cells: Vec::new(),
-            probe_position: Vec3::ZERO,
+            probe_position: DVec3::ZERO,
             probe_rotation: Quat::IDENTITY,
             probe_cache_valid: false,
             center_cache: Vec::new(),
+            contacted_voxels: Vec::new(),
             composition,
+            surface_friction_coefficient: material.surface_friction_coefficient,
             mass,
-            position: position + rotation * centroid,
+            position: position + (rotation * centroid).as_dvec3(),
             rotation,
             velocity: direction.normalize() * speed,
             angular_velocity: Vec3::ZERO,
@@ -174,7 +181,7 @@ impl Tool {
         let direction = direction.try_normalize().unwrap_or(Vec3::ZERO);
         self.mount = Some(GuideMount {
             local_base,
-            world_base: self.position + self.rotation * local_base,
+            world_base: self.position + (self.rotation * local_base).as_dvec3(),
             direction,
             rotation: self.rotation,
         });
@@ -195,9 +202,9 @@ impl Tool {
     fn constrain_pose(&mut self) {
         if let Some(m) = self.mount {
             self.rotation = m.rotation;
-            let base = self.position + self.rotation * m.local_base;
+            let base = self.position + (self.rotation * m.local_base).as_dvec3();
             self.position +=
-                m.world_base + m.direction * (base - m.world_base).dot(m.direction) - base;
+                m.world_base + m.direction.as_dvec3() * (base - m.world_base).dot(m.direction.as_dvec3()) - base;
             self.velocity = self.project_translation(self.velocity);
             self.angular_velocity = Vec3::ZERO;
         }
@@ -211,10 +218,10 @@ impl Tool {
             Vec3::ZERO
         }
     }
-    pub fn world_cells(&self) -> impl Iterator<Item = Vec3> + '_ {
+    pub fn world_cells(&self) -> impl Iterator<Item = DVec3> + '_ {
         self.cells
             .iter()
-            .map(|&p| self.position + self.rotation * p)
+            .map(|&p| self.position + (self.rotation * p).as_dvec3())
     }
     fn angular_response(&self, torque: Vec3) -> Vec3 {
         if self.mount.is_some() {
@@ -259,7 +266,7 @@ impl Tool {
         &mut self,
         scene: &mut Scene,
         dt: f32,
-        targets: &[[Option<f32>; 3]],
+        targets: &[[Option<f64>; 3]],
     ) -> Vec<Vec3> {
         let mut contact_velocity = Vec::with_capacity(scene.positions.len());
         self.advance_into(scene, dt, targets, &mut contact_velocity);
@@ -270,15 +277,27 @@ impl Tool {
         &mut self,
         scene: &mut Scene,
         dt: f32,
-        targets: &[[Option<f32>; 3]],
+        targets: &[[Option<f64>; 3]],
         contact_velocity: &mut Vec<Vec3>,
     ) {
         self.constrain_pose();
+        let track_contact_voxels = scene.has_registered_rigid_candidates();
+        let mut contacted_voxels = std::mem::take(&mut self.contacted_voxels);
+        contacted_voxels.clear();
         contact_velocity.resize(scene.positions.len(), Vec3::ZERO);
         contact_velocity.fill(Vec3::ZERO);
         let tool_radius = self.collision_radius;
         let gravity = Vec3::from_array(scene.config.gravity);
-        let (initial_air_force, initial_air_torque) = self.atmospheric_wrench(scene);
+        // Reuse the initial air wrench for the first motion substep below.
+        // Tool and scene state are unchanged between the swept-step estimate
+        // and the first integration pass, so evaluating the same scene-wide
+        // drag sum twice would be redundant. A zero-duration recheck cannot
+        // apply aerodynamic work or impulse.
+        let (initial_air_force, initial_air_torque) = if dt == 0.0 {
+            (Vec3::ZERO, Vec3::ZERO)
+        } else {
+            self.atmospheric_wrench(scene)
+        };
         let linear_acceleration = self.project_translation(
             gravity + (self.external_force + initial_air_force) / self.mass,
         );
@@ -304,8 +323,12 @@ impl Tool {
         let mut probe_rotation = self.probe_rotation;
         let mut probe_cache_valid = self.probe_cache_valid;
         let mut centers_cache = std::mem::take(&mut self.center_cache);
-        for _ in 0..steps {
-            let (air_force, air_torque) = self.atmospheric_wrench(scene);
+        for step_index in 0..steps {
+            let (air_force, air_torque) = if step_index == 0 {
+                (initial_air_force, initial_air_torque)
+            } else {
+                self.atmospheric_wrench(scene)
+            };
             let linear_acceleration = self.project_translation(
                 gravity + (self.external_force + air_force) / self.mass,
             );
@@ -315,7 +338,7 @@ impl Tool {
             let old_angular_velocity = self.angular_velocity;
             self.velocity += linear_acceleration * h;
             self.angular_velocity += angular_acceleration * h;
-            self.position += self.velocity * h;
+            self.position += self.velocity.as_dvec3() * h as f64;
             let angle = self.angular_velocity.length() * h;
             if angle > 1e-8 {
                 self.rotation = (Quat::from_axis_angle(self.angular_velocity.normalize(), angle)
@@ -323,7 +346,7 @@ impl Tool {
                     .normalize();
             }
             scene.energy.external_work += ((air_force + self.external_force)
-                .dot(self.position - old_position)
+                .dot((self.position - old_position).as_vec3())
                 + (air_torque + self.external_torque)
                     .dot((old_angular_velocity + self.angular_velocity) * (0.5 * h)))
                 as f64;
@@ -438,10 +461,13 @@ impl Tool {
                                 else {
                                     continue;
                                 };
+                                if track_contact_voxels {
+                                    contacted_voxels.push(i);
+                                }
                                 // The scene REV carries linear momentum at its node.
                                 // Use that same point for the rigid reaction, otherwise
                                 // the equal/opposite pair creates angular momentum.
-                                let arm = p - self.position;
+                                let arm = (p - self.position).as_vec3();
                                 let rel = self.velocity + self.angular_velocity.cross(arm)
                                     - scene.voxels[i].velocity;
                                 let closing = rel.dot(n);
@@ -541,8 +567,11 @@ impl Tool {
                                                 .cross(arm),
                                         );
                                     if tangent_speed > 1e-6 && tangent_denom > 1e-9 {
+                                        let pair_friction = scene.config.fracture.friction
+                                            * (scene.properties[i].surface_friction_coefficient
+                                                + self.surface_friction_coefficient);
                                         let friction_magnitude = (tangent_speed / tangent_denom)
-                                            .min(scene.config.fracture.friction * normal_impulse);
+                                            .min(pair_friction * normal_impulse);
                                         let friction = tangent_dir * friction_magnitude;
                                         let friction_voxel_delta =
                                             friction * free / scene.voxels[i].mass;
@@ -575,7 +604,7 @@ impl Tool {
             }
             // Keep projection separate from momentum. The contact impulses
             // carry the load into the bonded material; this only removes overlap.
-            self.position += correction;
+            self.position += correction.as_dvec3();
             self.constrain_pose();
             // Multiple nearby surface contacts can constrain different axes.
             // Reproject the rigid shape as a whole until every sampled OBB/AABB
@@ -597,6 +626,9 @@ impl Tool {
                                     else {
                                         continue;
                                     };
+                                    if track_contact_voxels {
+                                        contacted_voxels.push(i);
+                                    }
                                     if penetration > max_penetration {
                                         max_penetration = penetration;
                                         correction = self.contact_correction(normal, penetration);
@@ -609,7 +641,7 @@ impl Tool {
                 if max_penetration <= 1e-6 {
                     break;
                 }
-                self.position += correction;
+                self.position += correction.as_dvec3();
                 self.constrain_pose();
             }
         }
@@ -625,10 +657,17 @@ impl Tool {
         self.probe_rotation = probe_rotation;
         self.probe_cache_valid = probe_cache_valid;
         self.center_cache = centers_cache;
+        if track_contact_voxels {
+            contacted_voxels.sort_unstable();
+            contacted_voxels.dedup();
+        } else {
+            contacted_voxels.clear();
+        }
+        self.contacted_voxels = contacted_voxels;
     }
 }
-fn key(p: Vec3) -> [i32; 3] {
-    (p / CELL).floor().as_ivec3().to_array()
+fn key(p: impl Into<DVec3>) -> [i32; 3] { let p = p.into();
+    (p / DCELL).floor().as_ivec3().to_array()
 }
 
 const MAX_TOOL_OCCUPANCY_CELLS: usize = 1_000_000;
@@ -746,7 +785,7 @@ fn spatial_occupancy_contains(
 /// while moving only REV indices whose cell key changed. Sorted bucket indices
 /// preserve the original deterministic contact traversal order.
 fn refresh_spatial_bins(
-    positions: &[Vec3],
+    positions: &[DVec3],
     bins: &mut HashMap<[i32; 3], SmallVec<[usize; 2]>>,
     keys: &mut Vec<[i32; 3]>,
 ) {
@@ -790,19 +829,19 @@ fn refresh_spatial_bins(
 
 /// Grid bins intersecting the tool REV's conservative world-space AABB,
 /// expanded by the scene REV half-width and contact tolerance.
-fn obb_bin_bounds(center: Vec3, axes: [Vec3; 3]) -> ([i32; 3], [i32; 3]) {
+fn obb_bin_bounds(center: DVec3, axes: [Vec3; 3]) -> ([i32; 3], [i32; 3]) {
     let half = CELL * 0.5;
     let extent = (axes[0].abs() + axes[1].abs() + axes[2].abs()) * half + Vec3::splat(half + 1e-6);
-    (key(center - extent), key(center + extent))
+    (key(center - extent.as_dvec3()), key(center + extent.as_dvec3()))
 }
 
 /// Separating axis test for a rotated tool REV against an axis-aligned scene
 /// REV. The 15 SAT axes give a tight contact shell without rounding every tool
 /// cell into an over-sized sphere (which blocks wedge entry).
-fn obb_aabb_contact(center: Vec3, axes: [Vec3; 3], voxel: Vec3) -> Option<(Vec3, f32, Vec3)> {
+fn obb_aabb_contact(center: DVec3, axes: [Vec3; 3], voxel: DVec3) -> Option<(Vec3, f32, DVec3)> {
     let half = CELL * 0.5;
     let world_axes = [Vec3::X, Vec3::Y, Vec3::Z];
-    let delta = voxel - center;
+    let delta = (voxel - center).as_vec3();
     let mut best_overlap = f32::INFINITY;
     let mut best_normal = Vec3::ZERO;
     for mut axis in axes.into_iter().chain(world_axes).chain(
@@ -832,7 +871,7 @@ fn obb_aabb_contact(center: Vec3, axes: [Vec3; 3], voxel: Vec3) -> Option<(Vec3,
         return None;
     }
     let closest = axes.into_iter().fold(center, |point, axis| {
-        point + axis * delta.dot(axis).clamp(-half, half)
+        point + (axis * delta.dot(axis).clamp(-half, half)).as_dvec3()
     });
     Some((best_normal, best_overlap, closest))
 }
@@ -854,7 +893,7 @@ mod tests {
         let expected_min_x = -(dims[0] as f32 - 1.0) * CELL * 0.5;
         let min_x = tool
             .world_cells()
-            .map(|p| (tool.rotation.conjugate() * (p - origin)).x)
+            .map(|p| (tool.rotation.conjugate() * (p - origin.as_dvec3()).as_vec3()).x)
             .fold(f32::INFINITY, f32::min);
         assert!((min_x - expected_min_x).abs() < 1e-6);
         let cell_mass = tool.mass / tool.cells.len() as f32;
@@ -933,7 +972,7 @@ mod tests {
         tool.advance(&mut scene, 0.0, &[]);
         let after = momentum(&scene, &tool);
         let orbital =
-            (scene.positions[0] - com).cross(scene.voxels[0].velocity * scene.voxels[0].mass);
+            (scene.positions[0] - com).cross((scene.voxels[0].velocity * scene.voxels[0].mass).as_dvec3()).as_vec3();
         assert!((after.0 - before.0).length() < 1e-7);
         assert!((after.1 + orbital - before.1).length() < 1e-8);
         assert!(scene.voxels[0].velocity.length() > 0.0);

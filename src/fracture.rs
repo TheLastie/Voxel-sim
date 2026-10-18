@@ -20,6 +20,8 @@ pub struct FractureConfig {
     pub plastic_heat_fraction: f32,
     pub fragment_min_size: usize,
     pub cluster_interval: u64,
+    /// Global scale applied to the sum of the two contacting materials'
+    /// surface-friction contributions. Zero disables contact friction.
     pub friction: f32,
     pub restitution: f32,
 }

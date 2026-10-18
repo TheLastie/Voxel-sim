@@ -54,12 +54,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in probe_start..probe_end {
         // Keep the coupon over the platform interior and clear of the axe's
         // swept volume; the previous y=0 offset made it overlap the tool.
-        scene.positions[i] += Vec3::new(-0.25, 0.25, -0.13);
+        scene.positions[i] += glam::DVec3::new(-0.25, 0.25, -0.13);
         scene.previous[i] = scene.positions[i];
         scene.rest_positions[i] = scene.positions[i];
     }
     let trunk_base: Vec<_> = (0..probe_start)
-        .filter(|&i| scene.positions[i].z <= CELL * 0.5 + 1e-6)
+        .filter(|&i| scene.positions[i].z <= CELL as f64 * 0.5 + 1e-6)
         .collect();
     scene.fix_voxels(&trunk_base)?;
     solver::rebuild_clusters(&mut scene);
@@ -109,12 +109,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             solver::step(&mut scene, &mut tool);
         }
         let t = tool.as_ref().unwrap();
-        let base = t.position + t.rotation * mount.local_base;
+        let base = t.position + (t.rotation * mount.local_base).as_dvec3();
         drift = drift.max(
             Vec3::new(
                 0.0,
-                base.y - mount.world_base.y,
-                base.z - mount.world_base.z,
+                (base.y - mount.world_base.y) as f32,
+                (base.z - mount.world_base.z) as f32,
             )
             .length(),
         );

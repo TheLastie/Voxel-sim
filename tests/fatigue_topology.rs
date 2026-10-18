@@ -37,13 +37,13 @@ fn fatigue_failure_splits_clusters_and_released_rev_keeps_mass_and_motion() {
         let targets = [
             base.to_array().map(Some),
             [
-                Some(end.x + displacement * phase.sin()),
+                Some(end.x + (displacement * phase.sin()) as f64),
                 Some(end.y),
                 Some(end.z),
             ],
         ];
         solver::step_with_axis_targets(&mut scene, &mut tool, &targets);
-        let strain = (scene.positions[1].x - scene.positions[0].x - CELL) / CELL;
+        let strain = ((scene.positions[1].x - scene.positions[0].x - CELL as f64) / CELL as f64) as f32;
         max_stress_ratio = max_stress_ratio.max((strain * young / strength).abs());
         if scene.bonds[0][0].neighbor == EMPTY {
             break_step = Some(step);
@@ -158,7 +158,7 @@ fn fatigue_generated_fragments_collide_through_solver_contact() {
             base.to_array().map(Some),
             [None; 3],
             [
-                Some(end.x + displacement * phase.sin()),
+                Some(end.x + (displacement * phase.sin()) as f64),
                 Some(end.y),
                 Some(end.z),
             ],

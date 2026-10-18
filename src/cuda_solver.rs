@@ -870,7 +870,7 @@ pub(crate) fn solve_pcg(
     let mut iterations = 0;
     let mut residual_squared_host = f64::INFINITY;
     while iterations < max_iterations {
-        let batch_iterations = (max_iterations - iterations).min(16);
+        let batch_iterations = (max_iterations - iterations).min(48);
         let graph_key = PcgGraphKey {
             count,
             iterations: batch_iterations as u32,

@@ -1,0 +1,26 @@
+warning: method `thermal_cell_energy_at` is never used
+   --> src\voxel.rs:150:19
+    |
+ 31 | impl Voxel {
+    | ---------- method in this implementation
+...
+150 |     pub(crate) fn thermal_cell_energy_at(&self, index: usize) -> f64 {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `voxel-physics-lab` (lib) generated 1 warning
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.30s
+     Running `target\release\mechanics_scale_capture.exe 100 1 ic0`
+mechanics scale: side=100 revs=1000000 active=990000 fixed_dt_s=0.001 substeps=4 cpu_preconditioner=IncompleteCholesky0 tolerance=0.00001 setup_s=1.161
+step,revs,active,wall_ms,residual,broken,mass_kg,kinetic_j,true_residual,applied_residual,position_rounding_l2_m,max_audited_residual
+collision profile ms: setup=35.36 broadphase_and_filter=1273.85 project=5.84 dedup=2.08 candidates=88804 contacts=19999
+collision profile ms: setup=13.81 broadphase_and_filter=29.00 project=4.12 dedup=1.48 candidates=88804 contacts=19999
+collision profile ms: setup=17.03 broadphase_and_filter=29.83 project=1.97 dedup=0.04 candidates=88804 contacts=10000
+collision profile ms: setup=13.97 broadphase_and_filter=28.22 project=2.87 dedup=0.02 candidates=88804 contacts=10000
+collision profile ms: setup=13.66 broadphase_and_filter=27.90 project=5.84 dedup=0.74 candidates=88804 contacts=10000
+collision profile ms: setup=14.06 broadphase_and_filter=27.94 project=5.67 dedup=1.41 candidates=88804 contacts=18400
+collision profile ms: setup=17.96 broadphase_and_filter=29.21 project=2.68 dedup=0.02 candidates=88804 contacts=10000
+collision profile ms: setup=18.00 broadphase_and_filter=35.55 project=3.88 dedup=0.03 candidates=88804 contacts=10000
+profile step ms: predict/tool=2021.22 [snapshot=54.25 drift=113.03 tool=7.07 projection=1508.04] solve=16057.60 [assemble=2720.95 factor=454.75 pcg=11777.04] rotation_fit=652.50 collision=227.09 fracture=1242.67 finish=669.97 post_contact=0.01 tool_recheck=0.00 releases=0.00 damping=307.88 thermal=243.98 aggregation_scan=0.00 auto_aggregated_revs=0 damping_cache_hits=0 pcg_iters=259 residual=7.138e-6
+1,1000000,990000,20326.674,7.137991361e-6,0,7.869998924e3,6.772421827e-6,,,,

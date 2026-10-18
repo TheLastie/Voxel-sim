@@ -4,7 +4,7 @@ pub const EMPTY: u32 = u32::MAX;
 pub struct Bond {
     pub neighbor: u32,
     /// Local-frame stress-free offset established when an adhesive bond forms (m).
-    pub formation_offset: [f32; 3],
+    pub formation_offset: [f64; 3],
     pub plastic_strain: [f32; 3],
     pub damage: f32,
     pub equivalent_plastic_strain: f32,

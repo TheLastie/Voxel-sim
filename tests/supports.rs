@@ -19,7 +19,7 @@ fn scene(floor: bool) -> Scene {
 #[test]
 fn persistent_axis_constraints_allow_gravity_and_floor_support() {
     let mut s = scene(true);
-    let start = s.positions[0] + Vec3::Z * 0.03;
+    let start = s.positions[0] + glam::DVec3::Z * 0.03;
     solver::fix_voxel_at(&mut s, 0, start).unwrap();
     solver::fix_voxel_axis(&mut s, 0, 2, None).unwrap();
     solver::set_force(&mut s, 0, Vec3::new(100.0, -100.0, 0.0)).unwrap();
@@ -30,7 +30,7 @@ fn persistent_axis_constraints_allow_gravity_and_floor_support() {
     assert_eq!(s.positions[0].x, start.x);
     assert_eq!(s.positions[0].y, start.y);
     assert!(s.positions[0].z < start.z - 0.02);
-    assert!((s.positions[0].z - CELL * 0.5).abs() < 2e-6);
+    assert!((s.positions[0].z - CELL as f64 * 0.5).abs() < 2e-6);
     assert!(s.voxels[0].velocity.length() < 1e-4);
     assert_eq!(s.positions[1..], floor);
     solver::release_voxel(&mut s, 0).unwrap();
@@ -43,7 +43,7 @@ fn constraint_inputs_are_atomic_and_impulses_respect_fixed_axes() {
     let mut s = scene(false);
     solver::fix_voxel(&mut s, 0, [true, false, true]).unwrap();
     let old = s.axis_targets[0];
-    assert!(solver::fix_voxel_axes(&mut s, 0, [Some(1.0), Some(f32::NAN), None]).is_err());
+    assert!(solver::fix_voxel_axes(&mut s, 0, [Some(1.0), Some(f64::NAN), None]).is_err());
     assert_eq!(s.axis_targets[0], old);
     assert!(solver::fix_voxel_axis(&mut s, 0, 3, None).is_err());
     assert!(solver::fix_voxel(&mut s, 100, [true; 3]).is_err());
@@ -69,7 +69,7 @@ fn axe_guide_carries_lateral_gravity_torque_and_contact_reactions() {
         solver::step(&mut s, &mut tool);
     }
     let t = tool.unwrap();
-    let final_base = t.position + t.rotation * base;
+    let final_base = t.position + (t.rotation * base).as_dvec3();
     assert!((final_base.y - mount.world_base.y).abs() < 1e-7);
     assert!((final_base.z - mount.world_base.z).abs() < 1e-7);
     assert_eq!(t.rotation, mount.rotation);
@@ -110,7 +110,7 @@ fn default_scene_has_explicit_floor_and_gravity() {
         .iter()
         .zip(&s.voxels)
         .filter(|(_, v)| v.kinematic)
-        .all(|(p, _)| (p.z + CELL * 0.5).abs() < 1e-7));
+        .all(|(p, _)| (p.z + CELL as f64 * 0.5).abs() < 1e-7));
 }
 
 #[test]
@@ -125,8 +125,8 @@ fn oblique_guide_preserves_its_line_and_projected_force() {
     t.set_external_force(Vec3::X * t.mass * 4.0).unwrap();
     t.advance(&mut s, 0.05, &[]);
     assert!((t.velocity - Vec3::new(0.1, 0.1, 0.0)).length() < 1e-6);
-    let displacement = t.position + t.rotation * base - mount.world_base;
-    assert!(displacement.cross(direction).length() < 2e-7);
+    let displacement = t.position + (t.rotation * base).as_dvec3() - mount.world_base;
+    assert!(displacement.cross(direction.as_dvec3()).length() < 2e-7);
     let previous_mount = t.mount;
     assert!(t.mount_base(Vec3::splat(f32::NAN), direction).is_err());
     assert_eq!(

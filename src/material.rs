@@ -39,6 +39,9 @@ pub struct Material {
     pub thermal_cond: f32,
     /// Dynamic viscosity for the liquid phase, pascal-seconds (Pa·s).
     pub dynamic_viscosity_pa_s: f32,
+    /// Material-side contribution to dry Coulomb friction at a surface.
+    /// Contact friction adds the two mixed material contributions.
+    pub surface_friction_coefficient: f32,
     /// Reference temperature for the liquid viscosity model, kelvin (K).
     pub viscosity_reference_temperature_kelvin: f32,
     /// Liquid viscosity activation energy, joules per mole (J/mol).
@@ -286,6 +289,26 @@ impl Material {
                 0.0,
             ),
         ];
+        // Illustrative dry-surface contributions. A pair's coefficient is
+        // their sum; moisture, lubrication, and wear can refine these later.
+        for (name, coefficient) in [
+            ("air", 0.0),
+            ("wood", 0.50),
+            ("iron", 0.35),
+            ("stone", 0.45),
+            ("water", 0.0),
+            ("aluminum", 0.30),
+            ("copper", 0.30),
+            ("glass", 0.10),
+            ("concrete", 0.50),
+            ("rubber", 0.85),
+        ] {
+            let material = table
+                .iter_mut()
+                .find(|material| material.name.eq_ignore_ascii_case(name))
+                .expect("surface-friction entry names a built-in material");
+            material.surface_friction_coefficient = coefficient;
+        }
         table[1].fracture_mode = FractureMode::Mixed;
         table[1].electrical_conductivity = 1.0e-4;
         table[1].relative_permittivity = 3.0;
@@ -408,6 +431,7 @@ impl Material {
             heat_capacity,
             thermal_cond,
             dynamic_viscosity_pa_s: 0.0,
+            surface_friction_coefficient: 0.0,
             viscosity_reference_temperature_kelvin: 293.15,
             viscosity_activation_energy_j_mol: 0.0,
             electrical_conductivity: 1.0e-14,
@@ -456,6 +480,7 @@ impl Material {
             hardness,
             heat_capacity,
             thermal_cond,
+            surface_friction_coefficient,
             viscosity_reference_temperature_kelvin,
             viscosity_activation_energy_j_mol,
             thermal_expansion_parallel,
