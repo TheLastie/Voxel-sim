@@ -101,6 +101,149 @@ NEXT:
 DONE:
     ret;
 }
+.visible .entry block_sparse_matvec_dot(
+    .param .u64 diagonal_ptr,
+    .param .u64 x_ptr,
+    .param .u64 neighbors_ptr,
+    .param .u64 blocks_ptr,
+    .param .u64 y_ptr,
+    .param .u64 partial_ptr,
+    .param .u32 count
+) {
+    .reg .pred %p<5>;
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<18>;
+    .reg .f32 %f<32>;
+    .reg .f64 %fd<5>;
+    .shared .align 8 .b8 dot_shared[2048];
+    ld.param.u64 %rd1, [diagonal_ptr];
+    ld.param.u64 %rd2, [x_ptr];
+    ld.param.u64 %rd3, [neighbors_ptr];
+    ld.param.u64 %rd4, [blocks_ptr];
+    ld.param.u64 %rd5, [y_ptr];
+    ld.param.u64 %rd6, [partial_ptr];
+    ld.param.u32 %r8, [count];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    setp.ge.u32 %p1, %r4, %r8;
+    @%p1 bra MVD_ZERO;
+
+    mul.wide.u32 %rd8, %r4, 12;
+    add.u64 %rd9, %rd2, %rd8;
+    ld.global.f32 %f2, [%rd9];
+    ld.global.f32 %f3, [%rd9+4];
+    ld.global.f32 %f4, [%rd9+8];
+    mul.wide.u32 %rd10, %r4, 36;
+    add.u64 %rd11, %rd1, %rd10;
+    ld.global.f32 %f5, [%rd11];
+    ld.global.f32 %f6, [%rd11+4];
+    ld.global.f32 %f7, [%rd11+8];
+    ld.global.f32 %f8, [%rd11+12];
+    ld.global.f32 %f9, [%rd11+16];
+    ld.global.f32 %f10, [%rd11+20];
+    ld.global.f32 %f11, [%rd11+24];
+    ld.global.f32 %f12, [%rd11+28];
+    ld.global.f32 %f13, [%rd11+32];
+    mul.f32 %f26, %f5, %f2;
+    fma.rn.f32 %f26, %f6, %f3, %f26;
+    fma.rn.f32 %f26, %f7, %f4, %f26;
+    mul.f32 %f27, %f8, %f2;
+    fma.rn.f32 %f27, %f9, %f3, %f27;
+    fma.rn.f32 %f27, %f10, %f4, %f27;
+    mul.f32 %f28, %f11, %f2;
+    fma.rn.f32 %f28, %f12, %f3, %f28;
+    fma.rn.f32 %f28, %f13, %f4, %f28;
+    mul.lo.u32 %r5, %r4, 6;
+    mov.u32 %r6, 0;
+MVD_LOOP:
+    add.u32 %r7, %r5, %r6;
+    mul.wide.u32 %rd12, %r7, 4;
+    add.u64 %rd13, %rd3, %rd12;
+    ld.global.u32 %r9, [%rd13];
+    setp.eq.u32 %p2, %r9, 0xffffffff;
+    @%p2 bra MVD_NEXT;
+    mul.wide.u32 %rd14, %r9, 12;
+    add.u64 %rd15, %rd2, %rd14;
+    ld.global.f32 %f14, [%rd15];
+    ld.global.f32 %f15, [%rd15+4];
+    ld.global.f32 %f16, [%rd15+8];
+    mul.lo.u32 %r10, %r7, 9;
+    mul.wide.u32 %rd16, %r10, 4;
+    add.u64 %rd17, %rd4, %rd16;
+    ld.global.f32 %f17, [%rd17];
+    ld.global.f32 %f18, [%rd17+4];
+    ld.global.f32 %f19, [%rd17+8];
+    ld.global.f32 %f20, [%rd17+12];
+    ld.global.f32 %f21, [%rd17+16];
+    ld.global.f32 %f22, [%rd17+20];
+    ld.global.f32 %f23, [%rd17+24];
+    ld.global.f32 %f24, [%rd17+28];
+    ld.global.f32 %f25, [%rd17+32];
+    fma.rn.f32 %f26, %f17, %f14, %f26;
+    fma.rn.f32 %f26, %f18, %f15, %f26;
+    fma.rn.f32 %f26, %f19, %f16, %f26;
+    fma.rn.f32 %f27, %f20, %f14, %f27;
+    fma.rn.f32 %f27, %f21, %f15, %f27;
+    fma.rn.f32 %f27, %f22, %f16, %f27;
+    fma.rn.f32 %f28, %f23, %f14, %f28;
+    fma.rn.f32 %f28, %f24, %f15, %f28;
+    fma.rn.f32 %f28, %f25, %f16, %f28;
+MVD_NEXT:
+    add.u32 %r6, %r6, 1;
+    setp.lt.u32 %p3, %r6, 6;
+    @%p3 bra MVD_LOOP;
+    add.u64 %rd12, %rd5, %rd8;
+    st.global.f32 [%rd12], %f26;
+    st.global.f32 [%rd12+4], %f27;
+    st.global.f32 [%rd12+8], %f28;
+    cvt.f64.f32 %fd1, %f2;
+    cvt.f64.f32 %fd2, %f26;
+    mul.f64 %fd3, %fd1, %fd2;
+    cvt.f64.f32 %fd1, %f3;
+    cvt.f64.f32 %fd2, %f27;
+    fma.rn.f64 %fd3, %fd1, %fd2, %fd3;
+    cvt.f64.f32 %fd1, %f4;
+    cvt.f64.f32 %fd2, %f28;
+    fma.rn.f64 %fd3, %fd1, %fd2, %fd3;
+    bra MVD_STORE;
+MVD_ZERO:
+    mov.f64 %fd3, 0d0000000000000000;
+MVD_STORE:
+    mul.wide.u32 %rd12, %r3, 8;
+    mov.u64 %rd13, dot_shared;
+    add.u64 %rd13, %rd13, %rd12;
+    st.shared.f64 [%rd13], %fd3;
+    bar.sync 0;
+    mov.u32 %r11, 128;
+MVD_REDUCE:
+    setp.ge.u32 %p4, %r3, %r11;
+    @%p4 bra MVD_SKIP_ADD;
+    mul.wide.u32 %rd12, %r3, 8;
+    mov.u64 %rd13, dot_shared;
+    add.u64 %rd13, %rd13, %rd12;
+    mul.wide.u32 %rd14, %r11, 8;
+    add.u64 %rd14, %rd13, %rd14;
+    ld.shared.f64 %fd1, [%rd13];
+    ld.shared.f64 %fd2, [%rd14];
+    add.f64 %fd3, %fd1, %fd2;
+    st.shared.f64 [%rd13], %fd3;
+MVD_SKIP_ADD:
+    bar.sync 0;
+    shr.u32 %r11, %r11, 1;
+    setp.ne.u32 %p4, %r11, 0;
+    @%p4 bra MVD_REDUCE;
+    setp.ne.u32 %p4, %r3, 0;
+    @%p4 bra MVD_DONE;
+    mov.u64 %rd13, dot_shared;
+    ld.shared.f64 %fd3, [%rd13];
+    mul.wide.u32 %rd12, %r1, 8;
+    add.u64 %rd13, %rd6, %rd12;
+    st.global.f64 [%rd13], %fd3;
+MVD_DONE:
+    ret;
+}
 .visible .entry block_jacobi(
     .param .u64 inverse_ptr,
     .param .u64 residual_ptr,

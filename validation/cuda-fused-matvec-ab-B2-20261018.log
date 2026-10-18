@@ -1,0 +1,9 @@
+mechanics scale: side=100 revs=1000000 active=990000 fixed_dt_s=0.001 substeps=4 cpu_preconditioner=IncompleteCholesky0 tolerance=0.00001 setup_s=1.461
+step,revs,active,wall_ms,residual,broken,mass_kg,kinetic_j,true_residual,applied_residual,position_rounding_l2_m,max_audited_residual
+CUDA PCG preconditioner: symmetric red-black, active=990000
+CUDA PCG graph captured: active=990000 iterations=48
+PCG residual audit: backend=cuda reported=7.684863704e-6 true=7.684863529e-6 applied=7.684863574e-6 position_rounding_l2_m=3.434063610e-14
+PCG residual audit: backend=cuda reported=6.038191714e-6 true=6.038191869e-6 applied=6.038192245e-6 position_rounding_l2_m=3.410891669e-14
+PCG residual audit: backend=cuda reported=9.217903425e-6 true=9.217903102e-6 applied=9.217903422e-6 position_rounding_l2_m=3.408229638e-14
+PCG residual audit: backend=cuda reported=4.672430805e-6 true=4.672430920e-6 applied=4.672431384e-6 position_rounding_l2_m=3.412292361e-14
+1,1000000,990000,22231.910,4.672430805e-6,0,7.869998924e3,6.821475434e-6,4.672430920e-6,4.672431384e-6,3.412292361e-14,9.217903422e-6

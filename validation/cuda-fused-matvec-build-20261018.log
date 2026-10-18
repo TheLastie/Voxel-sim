@@ -1,0 +1,14 @@
+   Compiling voxel-physics-lab v0.2.0 (E:\Projects\gpt\voxel-sim\Voxel-sim-guided-knife-validation)
+warning: method `thermal_cell_energy_at` is never used
+   --> src\voxel.rs:150:19
+    |
+ 31 | impl Voxel {
+    | ---------- method in this implementation
+...
+150 |     pub(crate) fn thermal_cell_energy_at(&self, index: usize) -> f64 {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `voxel-physics-lab` (lib) generated 1 warning
+    Finished `release` profile [optimized + debuginfo] target(s) in 45.77s

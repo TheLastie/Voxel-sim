@@ -102,7 +102,7 @@ struct CudaSolver {
     driver: Driver,
     context: Handle,
     module: Handle,
-    kernels: [Handle; 14],
+    kernels: [Handle; 15],
     buffers: HashMap<&'static str, (DevicePtr, usize)>,
     cached_neighbors: Vec<[u32; 6]>,
     cached_colors: Option<Vec<u8>>,
@@ -233,7 +233,7 @@ impl CudaSolver {
                     "cuModuleLoadData(PCG PTX) failed with CUDA status {status}"
                 ));
             }
-            let mut kernels = [0; 14];
+            let mut kernels = [0; 15];
             for (slot, name) in [
                 b"block_sparse_matvec\0".as_slice(),
                 b"block_jacobi\0".as_slice(),
@@ -249,6 +249,7 @@ impl CudaSolver {
                 b"pcg_update_direction_ratio\0".as_slice(),
                 b"block_color_correction\0".as_slice(),
                 b"pcg_residual_replace\0".as_slice(),
+                b"block_sparse_matvec_dot\0".as_slice(),
             ]
             .into_iter()
             .enumerate()
@@ -573,6 +574,53 @@ impl CudaSolver {
         self.launch(10, 1, &mut params)
     }
 
+    /// Compute the fine sparse matvec and its PCG denominator partials in one
+    /// pass. The final reduction still accumulates in f64 and produces alpha
+    /// against the current rho.
+    fn launch_matvec_dot_ratio(
+        &mut self,
+        diagonal: DevicePtr,
+        x: DevicePtr,
+        neighbors: DevicePtr,
+        blocks: DevicePtr,
+        applied: DevicePtr,
+        count: u32,
+        rho: DevicePtr,
+        alpha: DevicePtr,
+    ) -> Result<(), String> {
+        let partial_count = count.div_ceil(256);
+        let partials = self.buffer("dot_partials", partial_count as usize * 8)?;
+        let mut diagonal = diagonal;
+        let mut x = x;
+        let mut neighbors = neighbors;
+        let mut blocks = blocks;
+        let mut applied = applied;
+        let mut partials_arg = partials;
+        let mut count_arg = count;
+        let mut params = [
+            (&mut diagonal as *mut DevicePtr).cast(),
+            (&mut x as *mut DevicePtr).cast(),
+            (&mut neighbors as *mut DevicePtr).cast(),
+            (&mut blocks as *mut DevicePtr).cast(),
+            (&mut applied as *mut DevicePtr).cast(),
+            (&mut partials_arg as *mut DevicePtr).cast(),
+            (&mut count_arg as *mut u32).cast(),
+        ];
+        self.launch(14, partial_count, &mut params)?;
+
+        let mut partials_arg = partials;
+        let mut rho = rho;
+        let mut alpha = alpha;
+        let mut partial_count_arg = partial_count;
+        let mut reduce_params = [
+            (&mut partials_arg as *mut DevicePtr).cast(),
+            (&mut rho as *mut DevicePtr).cast(),
+            (&mut alpha as *mut DevicePtr).cast(),
+            (&mut partial_count_arg as *mut u32).cast(),
+        ];
+        self.launch(6, 1, &mut reduce_params)
+    }
+
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -609,8 +657,14 @@ fn launch_pcg_iteration(
         (&mut y_arg as *mut DevicePtr).cast(),
         (&mut count_arg as *mut u32).cast(),
     ];
-    cuda.launch(0, grid, &mut matvec_params)?;
-    cuda.launch_dot_ratio(p, ap, count, rho, alpha)?;
+    if fused_matvec_dot_enabled() && count > SINGLE_CTA_REDUCTION_MAX_REVS {
+        cuda.launch_matvec_dot_ratio(
+            diagonal, p, neighbors, blocks, ap, count, rho, alpha,
+        )?;
+    } else {
+        cuda.launch(0, grid, &mut matvec_params)?;
+        cuda.launch_dot_ratio(p, ap, count, rho, alpha)?;
+    }
 
     let mut inverse_arg = inverse;
     let mut dx_arg = dx;
@@ -717,6 +771,15 @@ fn residual_replacement_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("VOXEL_CUDA_RESIDUAL_REPLACEMENT")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    })
+}
+
+fn fused_matvec_dot_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VOXEL_CUDA_FUSED_MATVEC_DOT")
             .map(|value| value == "1")
             .unwrap_or(false)
     })
