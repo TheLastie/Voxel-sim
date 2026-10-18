@@ -1,0 +1,8 @@
+mechanics scale: side=100 revs=1000000 active=990000 fixed_dt_s=0.001 substeps=4 cpu_preconditioner=IncompleteCholesky0 tolerance=0.00001 setup_s=1.014
+step,revs,active,wall_ms,residual,broken,mass_kg,kinetic_j,true_residual,applied_residual,position_rounding_l2_m,max_audited_residual
+CPU PCG solve: active=990000 preconditioner=IncompleteCholesky0 iterations=95 residual=7.011e-6 elapsed=4216.16ms
+CPU PCG solve: active=990000 preconditioner=IncompleteCholesky0 iterations=59 residual=8.573e-6 elapsed=2670.04ms
+CPU PCG solve: active=990000 preconditioner=IncompleteCholesky0 iterations=50 residual=7.398e-6 elapsed=2290.12ms
+CPU PCG solve: active=990000 preconditioner=IncompleteCholesky0 iterations=55 residual=7.138e-6 elapsed=2501.70ms
+profile step ms: predict/tool=2123.01 [snapshot=46.26 drift=106.00 tool=7.52 projection=1621.76] solve=15901.64 [assemble=2690.57 factor=455.36 pcg=11678.03] rotation_fit=653.81 collision=229.50 fracture=1213.97 finish=660.09 post_contact=0.00 tool_recheck=0.00 releases=0.00 damping=310.38 thermal=237.49 aggregation_scan=0.00 auto_aggregated_revs=0 damping_cache_hits=0 pcg_iters=259 residual=7.138e-6
+1,1000000,990000,20235.726,7.137991361e-6,0,7.869998924e3,6.772421827e-6,,,,

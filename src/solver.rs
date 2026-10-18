@@ -30,6 +30,15 @@ fn parallel_enabled_for(voxel_count: usize) -> bool {
     voxel_count >= *threshold
 }
 
+fn fused_pcg_reductions_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VOXEL_PCG_FUSED_REDUCTIONS")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
 fn bipartite_ic0_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -2032,9 +2041,10 @@ struct StiffnessInput {
 #[derive(Clone, Copy)]
 struct PcgRow {
     neighbors: [u32; 6],
-    // Compact row-major 3×3 blocks avoid Mat3's per-column padding in the
-    // repeatedly traversed sparse operator.
-    off_diagonal: [[f32; 9]; 6],
+    edge_ids: [u32; 6],
+    // Each constitutive block is stored once per bond in pcg_edge_blocks.
+    // The bit marks rows whose block is the transpose of the canonical i→j block.
+    transpose_mask: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -2048,7 +2058,8 @@ impl Default for PcgRow {
     fn default() -> Self {
         Self {
             neighbors: [u32::MAX; 6],
-            off_diagonal: [[0.0; 9]; 6],
+            edge_ids: [u32::MAX; 6],
+            transpose_mask: 0,
         }
     }
 }
@@ -2078,6 +2089,20 @@ fn apply_pcg_block(matrix: [f32; 9], value: Vec3) -> Vec3 {
 }
 
 #[inline]
+fn transpose_pcg_block(matrix: [f32; 9]) -> [f32; 9] {
+    [matrix[0], matrix[3], matrix[6], matrix[1], matrix[4], matrix[7], matrix[2], matrix[5], matrix[8]]
+}
+
+#[inline]
+fn apply_pcg_block_transpose(matrix: [f32; 9], value: Vec3) -> Vec3 {
+    Vec3::new(
+        matrix[0] * value.x + matrix[3] * value.y + matrix[6] * value.z,
+        matrix[1] * value.x + matrix[4] * value.y + matrix[7] * value.z,
+        matrix[2] * value.x + matrix[5] * value.y + matrix[8] * value.z,
+    )
+}
+
+#[inline]
 fn apply_pcg_block_f64(a: [f32;9], x: DVec3) -> DVec3 {
     DVec3::new(
         a[0] as f64*x.x + a[1] as f64*x.y + a[2] as f64*x.z,
@@ -2086,10 +2111,24 @@ fn apply_pcg_block_f64(a: [f32;9], x: DVec3) -> DVec3 {
     )
 }
 
+#[inline]
+fn apply_pcg_block_f64_oriented(a: [f32; 9], x: DVec3, transpose: bool) -> DVec3 {
+    if transpose {
+        DVec3::new(
+            a[0] as f64*x.x + a[3] as f64*x.y + a[6] as f64*x.z,
+            a[1] as f64*x.x + a[4] as f64*x.y + a[7] as f64*x.z,
+            a[2] as f64*x.x + a[5] as f64*x.y + a[8] as f64*x.z,
+        )
+    } else {
+        apply_pcg_block_f64(a, x)
+    }
+}
+
 /// Replace the recurrence residual by an independent b-Ax evaluation. The
 /// returned norm uses f64 before residual components are stored for a restart.
-fn recompute_pcg_residual(diagonal: &[Mat3], rows: &[PcgRow], active: &[usize],
-    incidence_len: &[u8], rhs: &[Vec3], dx: &[Vec3], residual: &mut [Vec3]) -> f64 {
+fn recompute_pcg_residual(diagonal: &[Mat3], rows: &[PcgRow], edge_blocks: &[[f32; 9]],
+    active: &[usize], incidence_len: &[u8], rhs: &[Vec3],
+    dx: &[Vec3], residual: &mut [Vec3]) -> f64 {
     let mut norm_squared = 0.0;
     let mut rhs_squared = 0.0;
     for (slot,&i) in active.iter().enumerate() {
@@ -2097,7 +2136,9 @@ fn recompute_pcg_residual(diagonal: &[Mat3], rows: &[PcgRow], active: &[usize],
         for edge in 0..incidence_len[i] as usize {
             let neighbor = rows[slot].neighbors[edge];
             if neighbor != u32::MAX {
-                ax += apply_pcg_block_f64(rows[slot].off_diagonal[edge],dx[neighbor as usize].as_dvec3());
+                let block = edge_blocks[rows[slot].edge_ids[edge] as usize];
+                ax += apply_pcg_block_f64_oriented(block,dx[neighbor as usize].as_dvec3(),
+                    rows[slot].transpose_mask & (1 << edge) != 0);
             }
         }
         let b = rhs[i].as_dvec3();
@@ -2114,7 +2155,8 @@ fn recompute_pcg_residual(diagonal: &[Mat3], rows: &[PcgRow], active: &[usize],
 /// and preconditioner. Also measure the actual correction retained by scene
 /// coordinates. This is an opt-in diagnostic; it does not change the trajectory.
 fn audit_pcg_residual(
-    diagonal: &[Mat3], rows: &[PcgRow], active: &[usize], incidence_len: &[u8],
+    diagonal: &[Mat3], rows: &[PcgRow], edge_blocks: &[[f32; 9]],
+    active: &[usize], incidence_len: &[u8],
     rhs: &[Vec3], dx: &[Vec3], positions: &[DVec3],
 ) -> crate::scene::SolverResidualAudit {
     let applied = |slot: usize| {
@@ -2134,9 +2176,10 @@ fn audit_pcg_residual(
         for edge in 0..incidence_len[i] as usize {
             let neighbor = rows[slot].neighbors[edge];
             if neighbor == u32::MAX { continue; }
-            let block = rows[slot].off_diagonal[edge];
-            ax += apply_pcg_block_f64(block,dx[neighbor as usize].as_dvec3());
-            ax_rounded += apply_pcg_block_f64(block,applied(neighbor as usize));
+            let block = edge_blocks[rows[slot].edge_ids[edge] as usize];
+            let transpose = rows[slot].transpose_mask & (1 << edge) != 0;
+            ax += apply_pcg_block_f64_oriented(block,dx[neighbor as usize].as_dvec3(),transpose);
+            ax_rounded += apply_pcg_block_f64_oriented(block,applied(neighbor as usize),transpose);
         }
         let b = rhs[i].as_dvec3();
         rhs_squared += b.length_squared();
@@ -2173,21 +2216,43 @@ mod residual_audit_tests {
     use super::*;
 
     #[test]
+    fn shared_symmetric_edge_block_matches_both_projected_row_orientations() {
+        let raw = Mat3::from_cols(
+            Vec3::new(7.0, 1.5, -0.25),
+            Vec3::new(0.5, 5.0, 0.75),
+            Vec3::new(-1.25, 0.25, 3.0),
+        );
+        let k = (raw + raw.transpose()) * 0.5;
+        let pi = Mat3::from_diagonal(Vec3::new(1.0, 0.0, 1.0));
+        let pj = Mat3::from_diagonal(Vec3::new(0.0, 1.0, 1.0));
+        let forward = pack_pcg_block(-pi * k * pj);
+        let reverse = pack_pcg_block(-pj * k * pi);
+        let shared_reverse = transpose_pcg_block(forward);
+        for index in 0..9 {
+            assert!((reverse[index] - shared_reverse[index]).abs() <= 1e-6);
+        }
+        let x = Vec3::new(0.25, -1.5, 2.0);
+        assert!((apply_pcg_block(shared_reverse, x) - apply_pcg_block(reverse, x)).length() <= 1e-6);
+    }
+
+    #[test]
     fn independent_audit_distinguishes_solved_vector_from_rounded_coordinates() {
         let diagonal = [Mat3::from_diagonal(Vec3::new(4.0,5.0,6.0)),
             Mat3::from_diagonal(Vec3::new(3.0,4.0,5.0))];
         let mut rows = [PcgRow::default();2];
+        let edge_blocks = [pack_pcg_block(-Mat3::IDENTITY)];
         rows[0].neighbors[0] = 1;
         rows[1].neighbors[0] = 0;
-        rows[0].off_diagonal[0] = pack_pcg_block(-Mat3::IDENTITY);
-        rows[1].off_diagonal[0] = pack_pcg_block(-Mat3::IDENTITY);
+        rows[0].edge_ids[0] = 0;
+        rows[1].edge_ids[0] = 0;
         let rhs = [Vec3::new(0.0,1.0,2.875),Vec3::new(1.375,0.75,0.125)];
         let dx = [Vec3::new(0.125,0.25,0.5),Vec3::new(0.5,0.25,0.125)];
-        let local = audit_pcg_residual(&diagonal,&rows,&[0,1],&[1,1],&rhs,&dx,&[DVec3::ZERO;2]);
+        let local = audit_pcg_residual(&diagonal,&rows,&edge_blocks,&[0,1],&[1,1],
+            &rhs,&dx,&[DVec3::ZERO;2]);
         assert_eq!(local.correction_relative,0.0);
         assert_eq!(local.applied_relative,0.0);
         assert_eq!(local.position_rounding_l2_m,0.0);
-        let far = audit_pcg_residual(&diagonal,&rows,&[0,1],&[1,1],&rhs,&dx,
+        let far = audit_pcg_residual(&diagonal,&rows,&edge_blocks,&[0,1],&[1,1],&rhs,&dx,
             &[DVec3::splat(1e18);2]);
         assert_eq!(far.correction_relative,0.0);
         assert_eq!(far.applied_relative,1.0);
@@ -2196,7 +2261,7 @@ mod residual_audit_tests {
 
     #[test]
     fn independent_audit_handles_empty_system_without_nan() {
-        let audit = audit_pcg_residual(&[],&[],&[],&[],&[],&[],&[]);
+        let audit = audit_pcg_residual(&[],&[],&[],&[],&[],&[],&[],&[]);
         assert_eq!(audit.correction_relative,0.0);
         assert_eq!(audit.applied_relative,0.0);
         assert_eq!(audit.position_rounding_l2_m,0.0);
@@ -2301,6 +2366,7 @@ pub(crate) struct SolverScratch {
     constraint_slots: Vec<Option<Constraint>>,
     constraint_forces: Vec<Vec3>,
     pcg_rows: Vec<PcgRow>,
+    pcg_edge_blocks: Vec<[f32; 9]>,
     cuda_neighbors: Vec<[u32; 6]>,
     cuda_blocks: Vec<[f32; 54]>,
     cuda_diagonal: Vec<[f32; 9]>,
@@ -2345,6 +2411,10 @@ fn make_constraint_at_phases(scene: &Scene, i: usize, axis: usize, j: usize,
     };
     let local = material_k * (1. - scene.bonds[axis][i].damage).max(0.001);
     let k = frame * local * frame.transpose();
+    // The constitutive tensor is symmetric by construction. Remove roundoff
+    // asymmetry once so the shared edge block can represent its reverse row by
+    // an exact transpose and the global PCG operator remains symmetric.
+    let k = (k + k.transpose()) * 0.5;
     let bond = scene.bonds[axis][i];
     let rest = frame.as_dmat3()
         * (bond_thermal_rest_at_temperatures(scene, i, j, frame,
@@ -3375,9 +3445,15 @@ fn solve_coupled(
     let incidence_len = &scratch.incidence_len;
     let constraints = &scratch.constraints;
     scratch.pcg_rows.resize(active.len(), PcgRow::default());
+    scratch.pcg_edge_blocks.resize(constraints.len(), [0.0; 9]);
+    for (edge, constraint) in constraints.iter().enumerate() {
+        let row_projection = Mat3::from_diagonal(free[constraint.i]);
+        let column_projection = Mat3::from_diagonal(free[constraint.j]);
+        scratch.pcg_edge_blocks[edge] =
+            pack_pcg_block(-row_projection * constraint.k * column_projection);
+    }
     for (slot, &i) in active.iter().enumerate() {
         let row = &mut scratch.pcg_rows[slot];
-        let row_projection = Mat3::from_diagonal(free[i]);
         for (edge_slot, &edge) in incidence[i][..incidence_len[i] as usize].iter().enumerate() {
             let constraint = &constraints[edge as usize];
             let neighbor = if constraint.i == i {
@@ -3387,16 +3463,14 @@ fn solve_coupled(
             };
             let neighbor_index = active_index[neighbor];
             row.neighbors[edge_slot] = neighbor_index;
-            if neighbor_index == u32::MAX {
-                row.off_diagonal[edge_slot] = [0.0; 9];
-            } else {
-                let column_projection = Mat3::from_diagonal(free[neighbor]);
-                row.off_diagonal[edge_slot] =
-                    pack_pcg_block(-row_projection * constraint.k * column_projection);
+            row.edge_ids[edge_slot] = edge;
+            if constraint.i != i {
+                row.transpose_mask |= 1 << edge_slot;
             }
         }
     }
     let pcg_rows = &scratch.pcg_rows;
+    let pcg_edge_blocks = &scratch.pcg_edge_blocks;
     if scene.config.cpu_preconditioner == CpuPreconditioner::AggregationMultigrid
         && !try_cuda
         && (rebuild_cpu_preconditioner || scratch.multigrid.is_none())
@@ -3412,33 +3486,53 @@ fn solve_coupled(
         }
         factor_time += start.elapsed();
     }
-    let apply = |v: &[Vec3], out: &mut [Vec3]| {
-        let apply_one = |(slot, out): (usize, &mut Vec3)| {
+    let apply_one = |v: &[Vec3], slot: usize| {
             let i = active[slot];
             let vi = v[slot];
             let row = &pcg_rows[slot];
             let mut value = scratch.diagonal[i] * vi;
-            for (edge_slot, &neighbor) in row.neighbors[..incidence_len[i] as usize]
-                .iter()
-                .enumerate()
-            {
+            for edge_slot in 0..incidence_len[i] as usize {
+                let neighbor = row.neighbors[edge_slot];
                 if neighbor != u32::MAX {
-                    value += apply_pcg_block(
-                        row.off_diagonal[edge_slot],
-                        v[neighbor as usize],
-                    );
+                    let block = pcg_edge_blocks[row.edge_ids[edge_slot] as usize];
+                    let transpose = row.transpose_mask & (1 << edge_slot) != 0;
+                    value += if transpose {
+                        apply_pcg_block_transpose(block, v[neighbor as usize])
+                    } else {
+                        apply_pcg_block(block, v[neighbor as usize])
+                    };
                 }
             }
-            *out = value;
-        };
+            value
+    };
+    let apply = |v: &[Vec3], out: &mut [Vec3]| {
         if !parallel_enabled_for(active.len()) {
             out.iter_mut()
                 .enumerate()
-                .for_each(|(slot, out)| apply_one((slot, out)));
+                .for_each(|(slot, out)| *out = apply_one(v, slot));
         } else {
             out.par_iter_mut()
                 .enumerate()
-                .for_each(|(slot, out)| apply_one((slot, out)));
+                .for_each(|(slot, out)| *out = apply_one(v, slot));
+        }
+    };
+    let apply_and_dot = |v: &[Vec3], out: &mut [Vec3], lhs: &[Vec3]| -> f64 {
+        if !parallel_enabled_for(active.len()) {
+            out.iter_mut()
+                .enumerate()
+                .map(|(slot, out)| {
+                    *out = apply_one(v, slot);
+                    lhs[slot].dot(*out) as f64
+                })
+                .sum()
+        } else {
+            out.par_iter_mut()
+                .enumerate()
+                .map(|(slot, out)| {
+                    *out = apply_one(v, slot);
+                    lhs[slot].dot(*out) as f64
+                })
+                .sum()
         }
     };
     let dot = |a: &[Vec3], b: &[Vec3]| -> f64 {
@@ -3448,6 +3542,30 @@ fn solve_coupled(
             a.par_iter()
                 .zip(b.par_iter())
                 .map(|(x, y)| x.dot(*y) as f64)
+                .sum()
+        }
+    };
+    let update_and_norm = |dx: &mut [Vec3],
+                           r: &mut [Vec3],
+                           p: &[Vec3],
+                           ap: &[Vec3],
+                           alpha: f32|
+     -> f64 {
+        if !parallel_enabled_for(active_count) {
+            for i in 0..active_count {
+                dx[i] += alpha * p[i];
+                r[i] -= alpha * ap[i];
+            }
+            r.iter().map(|value| value.dot(*value) as f64).sum()
+        } else {
+            dx.par_iter_mut()
+                .zip(r.par_iter_mut())
+                .zip(p.par_iter().zip(ap.par_iter()))
+                .map(|((dx, r), (p, ap))| {
+                    *dx += alpha * *p;
+                    *r -= alpha * *ap;
+                    r.dot(*r) as f64
+                })
                 .sum()
         }
     };
@@ -3513,8 +3631,15 @@ fn solve_coupled(
         for (slot, &i) in active.iter().enumerate() {
             scratch.cuda_neighbors[slot] = scratch.pcg_rows[slot].neighbors;
             for edge_slot in 0..incidence_len[i] as usize {
+                let edge = scratch.pcg_rows[slot].edge_ids[edge_slot] as usize;
+                let block = scratch.pcg_edge_blocks[edge];
+                let packed_block = if scratch.pcg_rows[slot].transpose_mask & (1 << edge_slot) != 0 {
+                    transpose_pcg_block(block)
+                } else {
+                    block
+                };
                 let packed = &mut scratch.cuda_blocks[slot][edge_slot * 9..edge_slot * 9 + 9];
-                packed.copy_from_slice(&scratch.pcg_rows[slot].off_diagonal[edge_slot]);
+                packed.copy_from_slice(&packed_block);
             }
             let diagonal = scratch.diagonal[i];
             scratch.cuda_diagonal[slot] = [
@@ -3599,7 +3724,8 @@ fn solve_coupled(
     let cuda_time = cuda_solution.map(|_| pcg_start.elapsed());
     if cuda_solution.is_some() {
         let verified = recompute_pcg_residual(&scratch.diagonal,&scratch.pcg_rows,
-            active,incidence_len,&scratch.rhs,&scratch.dx,&mut scratch.r);
+            &scratch.pcg_edge_blocks,active,incidence_len,&scratch.rhs,
+            &scratch.dx,&mut scratch.r);
         scene.solver_residual = verified as f32;
         if !verified.is_finite() || verified > scene.config.solver_relative_tolerance as f64 {
             // Keep the GPU correction as an initial iterate for CPU refinement.
@@ -3613,7 +3739,8 @@ fn solve_coupled(
     if let Some(iterations) = cuda_solution {
         if std::env::var_os("VOXEL_AUDIT_PCG_RESIDUAL").is_some() {
             let audit = audit_pcg_residual(&scratch.diagonal, &scratch.pcg_rows,
-                active, incidence_len, &scratch.rhs, &scratch.dx, &scene.positions);
+                &scratch.pcg_edge_blocks,active,incidence_len,&scratch.rhs,
+                &scratch.dx,&scene.positions);
             report_residual_audit("cuda",scene.solver_residual,audit);
             scene.solver_max_audited_residual =
                 Some(worst_audited_residual(scene.solver_max_audited_residual,audit));
@@ -3714,7 +3841,8 @@ fn solve_coupled(
     }
     if scene.solver_residual < scene.config.solver_relative_tolerance {
         scene.solver_residual = recompute_pcg_residual(&scratch.diagonal,&scratch.pcg_rows,
-            active,incidence_len,&scratch.rhs,&scratch.dx,&mut scratch.r) as f32;
+            &scratch.pcg_edge_blocks,active,incidence_len,&scratch.rhs,
+            &scratch.dx,&mut scratch.r) as f32;
     }
     apply_preconditioner(
         scene.config.cpu_preconditioner,
@@ -3746,37 +3874,47 @@ fn solve_coupled(
     } else { 0.0 };
     let mut iterations = 0;
     let mut verified_solution = false;
+    let fuse_reductions = fused_pcg_reductions_enabled();
     for _ in 0..scene.config.iterations {
         if initial == 0.0 || scene.solver_residual < scene.config.solver_relative_tolerance {
             verified_solution = true;
             break;
         }
-        apply(p, ap);
+        let denom = if fuse_reductions {
+            apply_and_dot(p, ap, p)
+        } else {
+            apply(p, ap);
+            dot(&p, &ap)
+        };
         iterations += 1;
-        let denom = dot(&p, &ap);
         if denom <= 1e-30 {
             break;
         }
         let alpha = (rz / denom) as f32;
-        if !parallel_enabled_for(active_count) {
-            for i in 0..active_count {
-                dx[i] += alpha * p[i];
-                r[i] -= alpha * ap[i];
-            }
+        let residual_squared = if fuse_reductions {
+            update_and_norm(dx, r, p, ap, alpha)
         } else {
-            dx.par_iter_mut()
-                .zip(r.par_iter_mut())
-                .zip(p.par_iter().zip(ap.par_iter()))
-                .for_each(|((dx, r), (p, ap))| {
-                    *dx += alpha * *p;
-                    *r -= alpha * *ap;
-                });
-        }
-        scene.solver_residual = (dot(&r, &r).sqrt() / initial) as f32;
+            if !parallel_enabled_for(active_count) {
+                for i in 0..active_count {
+                    dx[i] += alpha * p[i];
+                    r[i] -= alpha * ap[i];
+                }
+            } else {
+                dx.par_iter_mut()
+                    .zip(r.par_iter_mut())
+                    .zip(p.par_iter().zip(ap.par_iter()))
+                    .for_each(|((dx, r), (p, ap))| {
+                        *dx += alpha * *p;
+                        *r -= alpha * *ap;
+                    });
+            }
+            dot(&r, &r)
+        };
+        scene.solver_residual = (residual_squared.sqrt() / initial) as f32;
         let mut restart = false;
         if scene.solver_residual < scene.config.solver_relative_tolerance {
             scene.solver_residual = recompute_pcg_residual(&scratch.diagonal,&scratch.pcg_rows,
-                active,incidence_len,&scratch.rhs,dx,r) as f32;
+                &scratch.pcg_edge_blocks,active,incidence_len,&scratch.rhs,dx,r) as f32;
             if scene.solver_residual < scene.config.solver_relative_tolerance {
                 verified_solution = true;
                 break;
@@ -3820,12 +3958,13 @@ fn solve_coupled(
     }
     if !verified_solution {
         scene.solver_residual = recompute_pcg_residual(&scratch.diagonal,&scratch.pcg_rows,
-            active,incidence_len,&scratch.rhs,dx,r) as f32;
+            &scratch.pcg_edge_blocks,active,incidence_len,&scratch.rhs,dx,r) as f32;
     }
     let pcg_time = cpu_pcg_start.elapsed();
     if std::env::var_os("VOXEL_AUDIT_PCG_RESIDUAL").is_some() {
         let audit = audit_pcg_residual(&scratch.diagonal, &scratch.pcg_rows,
-            active, incidence_len, &scratch.rhs, dx, &scene.positions);
+            &scratch.pcg_edge_blocks,active,incidence_len,&scratch.rhs,dx,
+            &scene.positions);
         report_residual_audit("cpu",scene.solver_residual,audit);
         scene.solver_max_audited_residual =
             Some(worst_audited_residual(scene.solver_max_audited_residual,audit));

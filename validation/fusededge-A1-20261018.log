@@ -1,0 +1,3 @@
+step,revs,active,wall_ms,residual,broken,mass_kg,kinetic_j,true_residual,applied_residual,position_rounding_l2_m,max_audited_residual
+mechanics scale: side=100 revs=1000000 active=990000 fixed_dt_s=0.001 substeps=4 cpu_preconditioner=IncompleteCholesky0 tolerance=0.00001 setup_s=1.029
+1,1000000,990000,20378.616,7.137991361e-6,0,7.869998924e3,6.772421827e-6,,,,
