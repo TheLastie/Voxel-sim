@@ -772,7 +772,7 @@ fn residual_replacement_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("VOXEL_CUDA_RESIDUAL_REPLACEMENT")
             .map(|value| value == "1")
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 

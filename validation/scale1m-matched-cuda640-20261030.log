@@ -1,0 +1,10 @@
+step,revs,active,wall_ms,residual,broken,mass_kg,kinetic_j,true_residual,applied_residual,position_rounding_l2_m,max_audited_residual
+mechanics scale: side=100 revs=1000000 active=990000 fixed_dt_s=0.001 substeps=4 cpu_preconditioner=IncompleteCholesky0 tolerance=0.00001 setup_s=1.242
+CUDA PCG preconditioner: symmetric red-black, active=990000
+CUDA PCG graph captured: active=990000 iterations=48
+CUDA PCG: active=990000 iterations=336 residual=7.685e-6 elapsed=1581.18 ms
+CUDA PCG: active=990000 iterations=288 residual=6.038e-6 elapsed=915.07 ms
+CUDA PCG: active=990000 iterations=288 residual=9.218e-6 elapsed=901.45 ms
+CUDA PCG: active=990000 iterations=336 residual=4.672e-6 elapsed=1074.81 ms
+profile step ms: predict/tool=2144.82 [snapshot=47.82 drift=106.83 tool=7.07 projection=1613.20] solve=8820.29 [assemble=3076.48 factor=0.01 pcg=4472.51] rotation_fit=725.49 collision=228.88 fracture=1250.35 finish=714.75 post_contact=0.01 tool_recheck=0.00 releases=0.00 damping=326.89 thermal=260.38 aggregation_scan=0.00 auto_aggregated_revs=0 damping_cache_hits=0 pcg_iters=1248 residual=4.672e-6
+1,1000000,990000,13265.027,4.672430805e-6,0,7.869998924e3,6.821475434e-6,,,,

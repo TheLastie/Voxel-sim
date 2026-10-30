@@ -410,7 +410,7 @@ impl SceneConfig {
 }
 
 fn default_cuda_iterations() -> usize {
-    320
+    640
 }
 fn default_tool_direction() -> [f32; 3] {
     [1.0, 0.0, 0.0]

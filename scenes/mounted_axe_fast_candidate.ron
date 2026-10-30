@@ -11,7 +11,7 @@
     fixed_dt: 0.001,
     substeps: 2,
     iterations: 80,
-    cuda_iterations: 320,
+    cuda_iterations: 640,
     solver_relative_tolerance: 0.00001,
     corotation_tolerance: 0.00001,
     corotation_iterations: 2,
