@@ -1620,6 +1620,39 @@ pub fn rebuild_clusters(scene: &mut Scene) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geometric_multigrid_eligibility_uses_rest_cells_and_rejects_non_face_edges() {
+        let constraint = Constraint {
+            i: 0,
+            j: 1,
+            axis: 0,
+            frame: Mat3::IDENTITY,
+            material_k: Mat3::IDENTITY,
+            k: Mat3::IDENTITY,
+            rest: DVec3::ZERO,
+            rotation_i: Quat::IDENTITY,
+            rotation_j: Quat::IDENTITY,
+            thermal_energy_i: 0.0,
+            thermal_energy_j: 0.0,
+            stiffness_revisions: [0; 2],
+        };
+        let incidence = [[0_u32; 6]; 2];
+        let incidence_len = [1_u8; 2];
+        let active = [0_usize, 1];
+        let active_index = [0_u32, 1];
+        let rest = [DVec3::splat(DCELL * 0.5), DVec3::splat(DCELL * 0.5) + DVec3::X * DCELL];
+        let coordinates = geometric_multigrid_coordinates(
+            &active, &active_index, &incidence, &incidence_len, &[constraint], &rest,
+        ).unwrap();
+        assert_eq!(coordinates, [[0, 0, 0], [1, 0, 0]]);
+
+        let diagonal_neighbor = [rest[0], rest[0] + DVec3::new(DCELL, DCELL, 0.0)];
+        assert!(geometric_multigrid_coordinates(
+            &active, &active_index, &incidence, &incidence_len, &[constraint], &diagonal_neighbor,
+        ).is_err());
+    }
+
     #[test]
     fn fracture_release_respects_fixed_axes_and_accounts_for_heat() {
         let mut s = scene();
@@ -3088,7 +3121,20 @@ fn apply_preconditioner(
 fn build_multigrid_preconditioner(
     free: &[Vec3], active: &[usize], active_index: &[u32], diagonal: &[Mat3],
     incidence: &[[u32; 6]], incidence_len: &[u8], constraints: &[Constraint],
+    rest_positions: &[DVec3],
 ) -> Result<crate::multigrid::Multigrid, &'static str> {
+    let coarsening = std::env::var("VOXEL_MULTIGRID_COARSENING")
+        .unwrap_or_default();
+    let geometric = coarsening.eq_ignore_ascii_case("geometric")
+        || coarsening.eq_ignore_ascii_case("geometric_q1");
+    let geometric_q1 = coarsening.eq_ignore_ascii_case("geometric_q1");
+    let coordinates = if geometric {
+        Some(geometric_multigrid_coordinates(
+            active, active_index, incidence, incidence_len, constraints, rest_positions,
+        )?)
+    } else {
+        None
+    };
     let diagonal = active.iter().map(|&i| {
         let d = diagonal[i];
         (d + d.transpose()) * 0.5
@@ -3111,7 +3157,67 @@ fn build_multigrid_preconditioner(
         }
         offsets.push(columns.len());
     }
-    crate::multigrid::Multigrid::build(diagonal, masks, offsets, columns, blocks)
+    crate::multigrid::Multigrid::build(
+        diagonal, masks, offsets, columns, blocks, coordinates, geometric_q1,
+    )
+}
+
+/// Return stable cell-centred integer coordinates for active rows, rejecting
+/// scenes whose reference lattice or active bond graph is not a face-neighbor
+/// REV grid. This opt-in preconditioner hint never reads current/deformed
+/// positions and never changes physical REV coordinates.
+fn geometric_multigrid_coordinates(
+    active: &[usize],
+    active_index: &[u32],
+    incidence: &[[u32; 6]],
+    incidence_len: &[u8],
+    constraints: &[Constraint],
+    rest_positions: &[DVec3],
+) -> Result<Vec<[i64; 3]>, &'static str> {
+    if incidence.len() != incidence_len.len() || active_index.len() != rest_positions.len() {
+        return Err("invalid multigrid incidence dimensions");
+    }
+    let mut coordinates = Vec::with_capacity(active.len());
+    let mut unique = rustc_hash::FxHashSet::default();
+    for &voxel in active {
+        let position = *rest_positions.get(voxel)
+            .ok_or("missing stable rest position for geometric multigrid")?;
+        let mut cell = [0_i64; 3];
+        for axis in 0..3 {
+            let lattice = position[axis] / DCELL - 0.5;
+            let nearest = lattice.round();
+            if !nearest.is_finite()
+                || nearest < i64::MIN as f64
+                || nearest >= -(i64::MIN as f64)
+                || (lattice - nearest).abs() > 1e-5
+            {
+                return Err("geometric multigrid requires cell-centred reference positions");
+            }
+            cell[axis] = nearest as i64;
+        }
+        if !unique.insert(cell) {
+            return Err("geometric multigrid requires unique REV lattice coordinates");
+        }
+        coordinates.push(cell);
+    }
+    for (slot, &voxel) in active.iter().enumerate() {
+        for &edge in &incidence[voxel][..incidence_len[voxel] as usize] {
+            let constraint = &constraints[edge as usize];
+            let neighbor = if constraint.i == voxel { constraint.j } else { constraint.i };
+            let neighbor_slot = active_index[neighbor];
+            if neighbor_slot == u32::MAX {
+                continue;
+            }
+            let neighbor_cell = coordinates[neighbor_slot as usize];
+            let manhattan: i128 = (0..3)
+                .map(|axis| (coordinates[slot][axis] as i128 - neighbor_cell[axis] as i128).abs())
+                .sum();
+            if manhattan != 1 {
+                return Err("geometric multigrid requires face-adjacent active constraints");
+            }
+        }
+    }
+    Ok(coordinates)
 }
 
 /// Primal form of the coupled vector XPBD system for a frozen corotational frame.
@@ -3508,7 +3614,7 @@ fn solve_coupled(
     {
         let start = Instant::now();
         match build_multigrid_preconditioner(free, active, active_index, &scratch.diagonal,
-            incidence, incidence_len, constraints) {
+            incidence, incidence_len, constraints, &scene.rest_positions) {
             Ok(hierarchy) => scratch.multigrid = Some(hierarchy),
             Err(reason) => {
                 scratch.multigrid = None;
@@ -3864,7 +3970,7 @@ fn solve_coupled(
     {
         let start = Instant::now();
         match build_multigrid_preconditioner(free, active, active_index, &scratch.diagonal,
-            incidence, incidence_len, constraints) {
+            incidence, incidence_len, constraints, &scene.rest_positions) {
             Ok(hierarchy) => scratch.multigrid = Some(hierarchy),
             Err(reason) => eprintln!("multigrid unavailable; using block Jacobi: {reason}"),
         }
