@@ -27,3 +27,4 @@
 /*.res
 /*.cdtor.c
 /*.cdtor.o
+/validation/live-tests/

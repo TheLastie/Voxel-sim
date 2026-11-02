@@ -440,17 +440,15 @@ impl Camera {
     }
     fn matrix(&self, aspect: f32) -> Mat4 {
         let offset = self.offset_direction() * self.radius;
-        // The overview camera can sit several kilometres from the map. Keep
-        // the near plane proportional to camera distance for depth precision,
-        // and include the whole seeded map in the far plane.
+        // Floating-point reverse Z retains precision on centimetre surfaces
+        // while the same camera also sees the kilometre-scale world.
         let near = (self.radius * 0.00001).clamp(0.01, 0.5);
-        let far = (self.radius + WORLD_SIDE_M * 2.0).max(100.0);
         let (eye, target) = match self.free_position {
             Some(position) => (position, position - self.offset_direction()),
             None if self.first_person => (self.target, self.target + self.forward()),
             None => (self.target + offset, self.target),
         };
-        Mat4::perspective_rh(50f32.to_radians(), aspect, near, far)
+        Mat4::perspective_infinite_reverse_rh(50f32.to_radians(), aspect, near)
             * Mat4::look_at_rh(eye, target, Vec3::Z)
     }
 }
@@ -710,7 +708,7 @@ impl Renderer {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_compare: wgpu::CompareFunction::Greater,
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -748,7 +746,7 @@ impl Renderer {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_compare: wgpu::CompareFunction::GreaterEqual,
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -1117,7 +1115,7 @@ impl Renderer {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        load: wgpu::LoadOp::Clear(0.0),
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
@@ -1203,5 +1201,34 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::Camera;
+    use glam::Vec3;
+
+    #[test]
+    fn reverse_depth_preserves_near_and_distant_surfaces_in_every_camera_mode() {
+        for mode in 0..3 {
+            let mut camera = Camera::new();
+            if mode == 1 {
+                camera.set_first_person(Vec3::new(0.0, 0.0, 1.7));
+            } else if mode == 2 {
+                camera.enable_freecam();
+            }
+            let matrix = camera.matrix(16.0 / 9.0);
+            let depth = |distance: f32| {
+                let point = camera.position() + camera.forward() * distance;
+                let clip = matrix * point.extend(1.0);
+                clip.z / clip.w
+            };
+            let close = depth(0.02);
+            let middle = depth(10.0);
+            let horizon = depth(10_000.0);
+            assert!(close <= 1.0 && close > middle);
+            assert!(middle > horizon && horizon > 0.0);
+        }
     }
 }
