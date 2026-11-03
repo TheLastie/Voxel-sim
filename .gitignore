@@ -6,6 +6,8 @@
 /video_work/
 /validation/__pycache__/
 /validation/live-tests/
+/.voxel-runtime.json
+/.voxel-runtime.*.tmp
 /validation/*_frames*/
 /validation/*-frames/
 /validation/.library_upload_helpers_current/

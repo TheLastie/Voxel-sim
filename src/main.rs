@@ -3058,6 +3058,18 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
     let mut fps = 0.0;
     let mut frames = 0;
     let mut fps_time = Instant::now();
+    let runtime_project_root = editor_settings::settings_path().parent()
+        .unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let mut runtime_metrics_server = if editor_settings.mcp_enabled {
+        match voxel_physics_lab::runtime_metrics::start_server(&runtime_project_root) {
+            Ok(server) => Some(server),
+            Err(error) => { eprintln!("Live MCP metrics unavailable: {error}"); None }
+        }
+    } else { None };
+    let mut last_runtime_publish = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+    let mut last_authoring_metrics_key = None;
+    let mut previous_runtime_simulated = 0.0;
+    let mut previous_runtime_generation = None;
     event_loop.run(move |event, target| {
         target.set_control_flow(ControlFlow::Poll);
         match event {
@@ -5143,11 +5155,21 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                                 let previous = editor_settings.mcp_enabled;
                                 editor_settings.mcp_enabled = enabled;
                                 match editor_settings::save(&editor_settings) {
-                                    Ok(()) => ui.set_status_message(if enabled {
-                                        "Voxel Editor MCP enabled in settings. Restart the MCP companion to apply."
-                                    } else {
-                                        "Voxel Editor MCP disabled in settings. Restart the MCP companion to apply."
-                                    }),
+                                    Ok(()) => {
+                                        runtime_metrics_server = None;
+                                        if enabled {
+                                            match voxel_physics_lab::runtime_metrics::start_server(&runtime_project_root) {
+                                                Ok(server) => {
+                                                    runtime_metrics_server = Some(server);
+                                                    last_authoring_metrics_key = None;
+                                                    ui.set_status_message("MCP enabled; live metrics are available immediately.");
+                                                }
+                                                Err(error) => ui.set_status_message(format!("Saved-file MCP enabled; live metrics could not start: {error}")),
+                                            }
+                                        } else {
+                                            ui.set_status_message("MCP disabled; the live metrics endpoint is closed.");
+                                        }
+                                    }
                                     Err(error) => {
                                         editor_settings.mcp_enabled = previous;
                                         ui.settings_mcp_enabled = previous;
@@ -6429,6 +6451,39 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                         Err(wgpu::SurfaceError::Timeout) => {}
                     }
                     frames += 1;
+                    if runtime_metrics_server.is_some() && last_runtime_publish.elapsed() >= Duration::from_millis(250) {
+                        let physics = authored_physics.as_ref().or(world_physics.as_ref());
+                        let simulated = physics.map_or(scene.simulated_seconds, |worker| worker.frame.simulated_seconds);
+                        let elapsed_wall = last_runtime_publish.elapsed().as_secs_f64();
+                        let generation = physics.map(|worker| worker.frame.generation);
+                        let rate_valid = previous_runtime_generation == generation && simulated >= previous_runtime_simulated;
+                        let speed = if rate_valid {
+                            (simulated-previous_runtime_simulated)/elapsed_wall.max(1.0e-9)
+                        } else { 0.0 };
+                        voxel_physics_lab::runtime_metrics::publish("app", serde_json::json!({
+                            "scene_name":active_scene_document.as_ref().map(|doc| &doc.name),
+                            "scene_path":active_scene_document_path,
+                            "fps":fps,"fps_sample_valid":fps>0.0,"paused":ui.paused,
+                            "requested_time_scale":ui.simulation_time_scale,
+                            "simulated_seconds":simulated,"measured_simulated_seconds_per_wall_second":speed,
+                            "simulation_rate_sample_valid":rate_valid,"generation":generation,
+                            "backlog_seconds":physics.map_or(0.0,PhysicsWorker::backlog_seconds),
+                            "backlog_scope":"pending_plus_unacknowledged_requested_time",
+                            "worker_failure":physics.and_then(PhysicsWorker::failure_message),
+                            "camera_position_m":camera.position().to_array(),
+                            "physics_mode":if physics.is_some(){"worker"}else{"authoring"},
+                        }));
+                        if physics.is_none() {
+                            let key=(scene.positions.as_ptr() as usize,scene.render_revision);
+                            if last_authoring_metrics_key!=Some(key) {
+                                world_physics::publish_scene_diagnostics(&scene,serde_json::json!({"source":"authoring"}));
+                                last_authoring_metrics_key=Some(key);
+                            }
+                        } else { last_authoring_metrics_key=None; }
+                        previous_runtime_simulated=simulated;
+                        previous_runtime_generation=generation;
+                        last_runtime_publish=Instant::now();
+                    }
                     if fps_time.elapsed() >= Duration::from_secs(1) {
                         fps = frames as f32 / fps_time.elapsed().as_secs_f32();
                         frames = 0;

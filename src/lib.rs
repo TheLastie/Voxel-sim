@@ -10,6 +10,7 @@ pub mod fracture;
 pub mod impact_experiment;
 pub mod live_test_feed;
 pub mod live_tests;
+pub mod runtime_metrics;
 pub mod material;
 pub mod material_asset;
 mod multigrid;
@@ -24,6 +25,7 @@ pub mod voxel;
 pub mod voxel_surface;
 pub mod world;
 pub mod world_physics;
+pub mod physics_metrics;
 
 pub mod documents;
 pub mod experiments;

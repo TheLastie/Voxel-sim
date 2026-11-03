@@ -1340,6 +1340,7 @@ fn advance_step_with_axis_targets_and_loads(
     assert!(targets.is_empty() || targets.len() == scene.voxels.len());
     assert!(loads.is_empty() || loads.len() == scene.voxels.len());
     scene.solver_residual_audit = None;
+    scene.last_step_diagnostics = None;
     scene.solver_max_audited_residual = None;
     // Keep the large per-step and per-substep work arrays alive across calls.
     let mut solver_scratch = std::mem::take(&mut scene.solver_scratch);
@@ -1457,7 +1458,10 @@ fn advance_step_with_axis_targets_and_loads(
     };
     scene.last_mechanical_substeps = effective_substeps;
     let h = scene.config.fixed_dt / effective_substeps as f32;
-    let profile_step = std::env::var_os("VOXEL_PROFILE_STEP").is_some();
+    let log_profile_step = std::env::var_os("VOXEL_PROFILE_STEP").is_some();
+    let profile_step = log_profile_step || crate::runtime_metrics::is_active();
+    let mut contacts_peak = 0usize;
+    let mut new_impact_observations = 0usize;
     let mut stage_time = [Duration::ZERO; 5];
     let mut total_pcg_iterations = 0usize;
     let mut damping_cache_hits = 0usize;
@@ -2108,6 +2112,8 @@ fn advance_step_with_axis_targets_and_loads(
             contact_work_mode[contact.j] = contact_work_mode[contact.j].max(mode);
         }
         impact_energies_j.clear();
+        contacts_peak = contacts_peak.max(contacts.len());
+        new_impact_observations += contacts.iter().filter(|contact| contact.new_impact).count();
         let (free_implicit_total, free_implicit_deficit) = if coarse_clear { (0.0, 0.0) } else {
             free_implicit_dissipation(scene, &solver_scratch, &substep_mechanical_energy,
                 &substep_start_positions, &substep_start_velocities, &solved_positions,
@@ -2476,8 +2482,34 @@ fn advance_step_with_axis_targets_and_loads(
     solver_scratch
         .adaptive_energies
         .extend(scene.voxels.iter().map(|v| v.thermal_energy_f32()));
-    scene.solver_scratch = solver_scratch;
     if profile_step {
+        scene.last_step_diagnostics = Some(crate::scene::StepDiagnostics {
+            scope: "last_fixed_step",
+            fixed_dt_seconds: f64::from(scene.config.fixed_dt),
+            mechanical_substeps: effective_substeps,
+            active_fine_revs_last_solve: solver_scratch.active.len(),
+            pcg_iterations_total: total_pcg_iterations,
+            relative_solver_residual: scene.solver_residual,
+            contacts_peak,
+            new_impact_observations,
+            timings_ms: [
+                ("prediction_tool", stage_time[0]),
+                ("mechanics_total", stage_time[1]),
+                ("matrix_assembly", solve_detail_time[0]),
+                ("factorization", solve_detail_time[1]),
+                ("pcg", solve_detail_time[2]),
+                ("rotation_fit", rotation_fit_time),
+                ("collision", stage_time[2]),
+                ("fracture", stage_time[3]),
+                ("finish_total", stage_time[4]),
+                ("thermal", thermal_time),
+                ("damping", damping_time),
+                ("aggregation_scan", aggregate_scan_time),
+            ].into_iter().map(|(name, time)| (name, time.as_secs_f64()*1000.0)).collect(),
+        });
+    }
+    scene.solver_scratch = solver_scratch;
+    if log_profile_step {
         let ms = stage_time.map(|duration| duration.as_secs_f64() * 1000.0);
         eprintln!(
             "profile step ms: predict/tool={:.2} [snapshot={:.2} drift={:.2} tool={:.2} projection={:.2}] solve={:.2} [assemble={:.2} factor={:.2} pcg={:.2}] rotation_fit={:.2} collision={:.2} fracture={:.2} finish={:.2} post_contact={:.2} tool_recheck={:.2} releases={:.2} damping={:.2} thermal={:.2} aggregation_scan={:.2} auto_aggregated_revs={auto_aggregated_revs} damping_cache_hits={damping_cache_hits} pcg_iters={total_pcg_iterations} residual={:.3e}",

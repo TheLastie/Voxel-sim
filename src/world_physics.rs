@@ -14,11 +14,45 @@ use std::{any::Any, thread::JoinHandle};
 const GRAB_STIFFNESS_N_PER_M: f32 = 1_200.0;
 const GRAB_DAMPING_N_S_PER_M: f32 = 24.0;
 const GRAB_MAX_FORCE_N: f32 = 150.0;
+const MAX_WORKER_BATCH_WALL_TIME: std::time::Duration = std::time::Duration::from_millis(8);
 
 static NEXT_PHYSICS_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+/// Publish bounded measurements from a real scene. Geometry never crosses MCP.
+/// Observer time is reported separately from the solver's per-step time.
+pub fn publish_scene_diagnostics(scene: &Scene, context: serde_json::Value) {
+    if !crate::runtime_metrics::is_active() {
+        return;
+    }
+    let start = std::time::Instant::now();
+    let mut metrics = crate::physics_metrics::collect_runtime_metrics(scene, 32);
+    let components = metrics
+        .as_object_mut()
+        .and_then(|data| data.remove("components"));
+    crate::runtime_metrics::publish(
+        "objects",
+        serde_json::json!({
+            "context": context,
+            "simulated_seconds": scene.simulated_seconds,
+            "topology": metrics["topology"],
+            "component_count": metrics["topology"]["component_count"],
+            "components": components.unwrap_or_else(|| serde_json::json!([])),
+            "identity_scope": "current_material_connectivity_not_authored_model_ids",
+        }),
+    );
+    metrics["context"] = context;
+    metrics["simulated_seconds"] = serde_json::json!(scene.simulated_seconds);
+    metrics["fixed_dt_seconds"] = serde_json::json!(scene.config.fixed_dt);
+    metrics["configured_substeps"] = serde_json::json!(scene.config.substeps);
+    metrics["solver_tolerance"] = serde_json::json!(scene.config.solver_relative_tolerance);
+    metrics["last_fixed_step"] =
+        serde_json::to_value(&scene.last_step_diagnostics).unwrap_or_default();
+    metrics["collection_ms"] = serde_json::json!(start.elapsed().as_secs_f64() * 1000.0);
+    crate::runtime_metrics::publish("physics", metrics);
+}
+
 enum PhysicsWorkerRequest {
-    Step,
+    Steps(usize),
     ReturnScene,
 }
 
@@ -81,6 +115,8 @@ pub struct GrabTarget {
 
 #[derive(Clone, Debug, Default)]
 pub struct PhysicsFrame {
+    /// Acknowledged fixed steps in this publication, not rendered frames.
+    pub completed_steps: usize,
     pub cells: Vec<PhysicalCellPose>,
     /// Thermal snapshots for fixed REVs, which conduct heat but have no dynamic pose.
     pub fixed_thermal: Vec<PhysicalCellThermalState>,
@@ -94,7 +130,8 @@ pub struct PhysicsFrame {
 }
 
 /// Ordered clock increments are retained even when the solver runs slower
-/// than real time. At most one solver step is outstanding on the worker.
+/// than real time. At most one time-budgeted batch is outstanding. Several
+/// fixed steps can finish between redraws, without uploading a pose each step.
 pub struct PhysicsWorker {
     requests: Sender<PhysicsWorkerRequest>,
     frames: Receiver<PhysicsFrame>,
@@ -102,6 +139,7 @@ pub struct PhysicsWorker {
     pending_seconds: f64,
     fixed_dt: f64,
     in_flight: bool,
+    in_flight_steps: usize,
     failure: Option<String>,
     grab_target: Arc<Mutex<Option<GrabTarget>>>,
     pub frame: PhysicsFrame,
@@ -158,6 +196,7 @@ impl PhysicsFrame {
                 .collect(),
             generation,
             revision,
+            completed_steps: 0,
             simulated_seconds,
             step_ms,
             broken: scene.broken,
@@ -269,58 +308,134 @@ impl PhysicsWorker {
                 let mut revision = 0u64;
                 let mut tool = None;
                 let mut applied_grab: Option<(usize, Vec3)> = None;
+                let mut remaining_batch_steps = 0usize;
+                let mut performance = crate::physics_metrics::PerformanceWindow::default();
+                let mut previous_observer_ms = 0.0;
+                let mut last_metrics = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1)).unwrap();
                 loop {
                     match input.recv() {
-                        Ok(PhysicsWorkerRequest::Step) => {
+                        Ok(PhysicsWorkerRequest::Steps(requested_steps)) => {
                             let start = std::time::Instant::now();
-                            if let Some((index, force)) = applied_grab.take() {
-                                if let Some(applied) = scene.external_forces.get_mut(index) {
-                                    *applied -= force;
+                            let broken_before = scene.broken;
+                            let mut batch_contacts_peak = 0usize;
+                            let mut batch_impacts = 0usize;
+                            let mut batch_pcg_iterations = 0usize;
+                            let mut batch_residual_max = 0.0_f32;
+                            let mut batch_non_finite_residuals = 0usize;
+                            let mut batch_active_fine_peak = 0usize;
+                            let mut completed_steps = 0usize;
+                            for _ in 0..requested_steps {
+                                if let Some((index, force)) = applied_grab.take() {
+                                    if let Some(applied) = scene.external_forces.get_mut(index) {
+                                        *applied -= force;
+                                    }
                                 }
-                            }
-                            let requested_grab = worker_grab_target
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .to_owned();
-                            if let Some(grab) = requested_grab {
-                                let index = match grab.source_cell {
-                                    Some(cell) => scene
-                                        .source_cells
-                                        .iter()
-                                        .position(|source| *source == Some(cell)),
-                                    None => Some(grab.scene_index),
-                                };
-                                if let Some(index) = index.filter(|&index| {
-                                    index < scene.voxels.len() && !scene.voxels[index].kinematic
-                                }) {
-                                    let position = scene.positions[index] + origin_world_m;
-                                    let displacement = (grab.target_world_m - position).as_vec3();
-                                    let force = displacement * GRAB_STIFFNESS_N_PER_M
-                                        - scene.voxels[index].velocity * GRAB_DAMPING_N_S_PER_M;
-                                    let force = if force.length() > GRAB_MAX_FORCE_N {
-                                        force.normalize() * GRAB_MAX_FORCE_N
-                                    } else {
-                                        force
+                                let requested_grab = worker_grab_target
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .to_owned();
+                                if let Some(grab) = requested_grab {
+                                    let index = match grab.source_cell {
+                                        Some(cell) => scene
+                                            .source_cells
+                                            .iter()
+                                            .position(|source| *source == Some(cell)),
+                                        None => Some(grab.scene_index),
                                     };
-                                    scene.external_forces[index] += force;
-                                    applied_grab = Some((index, force));
+                                    if let Some(index) = index.filter(|&index| {
+                                        index < scene.voxels.len() && !scene.voxels[index].kinematic
+                                    }) {
+                                        let position = scene.positions[index] + origin_world_m;
+                                        let displacement = (grab.target_world_m - position).as_vec3();
+                                        let force = displacement * GRAB_STIFFNESS_N_PER_M
+                                            - scene.voxels[index].velocity * GRAB_DAMPING_N_S_PER_M;
+                                        let force = if force.length() > GRAB_MAX_FORCE_N {
+                                            force.normalize() * GRAB_MAX_FORCE_N
+                                        } else {
+                                            force
+                                        };
+                                        scene.external_forces[index] += force;
+                                        applied_grab = Some((index, force));
+                                    }
                                 }
+                                solver::step(&mut scene, &mut tool);
+                                if !scene.solver_residual.is_finite() {
+                                    batch_non_finite_residuals += 1;
+                                }
+                                if let Some(diagnostics) = &scene.last_step_diagnostics {
+                                    batch_contacts_peak = batch_contacts_peak.max(diagnostics.contacts_peak);
+                                    batch_impacts += diagnostics.new_impact_observations;
+                                    batch_pcg_iterations += diagnostics.pcg_iterations_total;
+                                    batch_residual_max = batch_residual_max.max(diagnostics.relative_solver_residual);
+                                    batch_active_fine_peak = batch_active_fine_peak.max(diagnostics.active_fine_revs_last_solve);
+                                }
+                                time += fixed_dt;
+                                revision = revision.wrapping_add(1);
+                                completed_steps += 1;
+                                if start.elapsed() >= MAX_WORKER_BATCH_WALL_TIME { break; }
                             }
-                            solver::step(&mut scene, &mut tool);
-                            time += fixed_dt;
-                            revision = revision.wrapping_add(1);
-                            if output
-                                .send(PhysicsFrame::capture(
+                            remaining_batch_steps = requested_steps - completed_steps;
+                            let batch_ms = start.elapsed().as_secs_f64()*1000.0;
+                            let capture_start = std::time::Instant::now();
+                            let mut frame = PhysicsFrame::capture(
                                     &scene,
                                     origin_world_m,
                                     time,
-                                    start.elapsed().as_secs_f64() * 1_000.0,
+                                    batch_ms / completed_steps.max(1) as f64,
                                     generation,
                                     revision,
-                                ))
-                                .is_err()
-                            {
+                                );
+                            frame.completed_steps = completed_steps;
+                            let pose_capture_ms = capture_start.elapsed().as_secs_f64()*1000.0;
+                            let new_broken = scene.broken.saturating_sub(broken_before);
+                            let interesting = new_broken>0 || batch_impacts>0
+                                || batch_non_finite_residuals > 0
+                                || batch_residual_max > scene.config.solver_relative_tolerance*10.0;
+                            if interesting && crate::runtime_metrics::is_active() {
+                                crate::runtime_metrics::publish("event", serde_json::json!({
+                                    "generation":generation,"revision":revision,"simulated_seconds":time,
+                                    "new_broken_bonds":new_broken,"new_impact_observations":batch_impacts,
+                                    "contacts_peak":batch_contacts_peak,"solver_residual_max":batch_residual_max,
+                                    "solver_residual_is_finite":scene.solver_residual.is_finite(),
+                                    "non_finite_solver_residual_steps_in_batch":batch_non_finite_residuals,
+                                    "fixed_dt_seconds":fixed_dt,"configured_substeps":scene.config.substeps,
+                                }));
+                            }
+                            // Keep full-scene aggregation bounded even during impact storms.
+                            if last_metrics.elapsed() >= std::time::Duration::from_millis(100)
+                                && crate::runtime_metrics::is_active() {
+                                let observer_start = std::time::Instant::now();
+                                publish_scene_diagnostics(&scene, serde_json::json!({
+                                    "source":"worker", "generation":generation, "revision":revision,
+                                    "completed_steps":completed_steps,
+                                    "requested_steps":requested_steps,
+                                    "remaining_requested_steps":remaining_batch_steps,
+                                    "batch_wall_ms":batch_ms,
+                                    "mean_step_ms":frame.step_ms,
+                                    "pose_capture_ms":pose_capture_ms,
+                                    "performance":performance.to_json(),
+                                    "performance_scope":"previous_completed_batches; includes_observer_and_pose_capture",
+                                    "observer_collection_and_publish_ms_previous":previous_observer_ms,
+                                    "worker_cost_scope":"performance_includes_observer; batch_wall_ms_is_solver_only",
+                                    "active_count_scope":"peak_of_last_solve_in_each_completed_step; quiescent_fast_path_is_zero",
+                                    "wall_budget_ms":MAX_WORKER_BATCH_WALL_TIME.as_secs_f64()*1000.0,
+                                    "contacts_peak_in_batch":batch_contacts_peak,
+                                    "new_impact_observations_in_batch":batch_impacts,
+                                    "pcg_iterations_in_batch":batch_pcg_iterations,
+                                    "solver_residual_max_in_batch":batch_residual_max,
+                                    "non_finite_solver_residual_steps_in_batch":batch_non_finite_residuals,
+                                    "new_broken_bonds_in_batch":new_broken,
+                                }));
+                                previous_observer_ms = observer_start.elapsed().as_secs_f64()*1000.0;
+                                last_metrics = std::time::Instant::now();
+                            }
+                            if output.send(frame).is_err() {
                                 break;
+                            }
+                            if crate::runtime_metrics::is_active() {
+                                performance.push_batch(batch_active_fine_peak, completed_steps as f64 * fixed_dt,
+                                    batch_ms, start.elapsed().as_secs_f64()*1000.0);
                             }
                         }
                         Ok(PhysicsWorkerRequest::ReturnScene) | Err(_) => {
@@ -333,7 +448,7 @@ impl PhysicsWorker {
                                 origin_cell,
                                 origin_world_m,
                                 simulated_seconds: time,
-                                pending_seconds: 0.0,
+                                pending_seconds: remaining_batch_steps as f64 * fixed_dt,
                                 scene,
                             };
                         }
@@ -343,7 +458,7 @@ impl PhysicsWorker {
                     origin_cell,
                     origin_world_m,
                     simulated_seconds: time,
-                    pending_seconds: 0.0,
+                    pending_seconds: remaining_batch_steps as f64 * fixed_dt,
                     scene,
                 }
             })?;
@@ -354,6 +469,7 @@ impl PhysicsWorker {
             pending_seconds,
             fixed_dt,
             in_flight: false,
+            in_flight_steps: 0,
             failure: None,
             grab_target,
             frame,
@@ -397,6 +513,7 @@ impl PhysicsWorker {
 
     fn mark_worker_failed(&mut self, message: &str) {
         self.in_flight = false;
+        self.in_flight_steps = 0;
         self.pending_seconds = 0.0;
         self.failure.get_or_insert_with(|| message.to_owned());
         // `is_finished` makes this join nonblocking on the UI thread.
@@ -410,8 +527,13 @@ impl PhysicsWorker {
         }
         match self.frames.try_recv() {
             Ok(frame) => {
+                if self.in_flight {
+                    let remaining = self.in_flight_steps.saturating_sub(frame.completed_steps);
+                    self.pending_seconds += remaining as f64 * self.fixed_dt;
+                }
                 self.frame = frame;
                 self.in_flight = false;
+                self.in_flight_steps = 0;
             }
             Err(TryRecvError::Disconnected) => {
                 self.mark_worker_failed("physics worker stopped without publishing a frame");
@@ -423,9 +545,15 @@ impl PhysicsWorker {
             self.pending_seconds += elapsed;
         }
         if !paused && !self.in_flight && self.pending_seconds >= self.fixed_dt {
-            if self.requests.send(PhysicsWorkerRequest::Step).is_ok() {
-                self.pending_seconds -= self.fixed_dt;
+            let steps = (self.pending_seconds / self.fixed_dt).floor() as usize;
+            if self
+                .requests
+                .send(PhysicsWorkerRequest::Steps(steps))
+                .is_ok()
+            {
+                self.pending_seconds -= steps as f64 * self.fixed_dt;
                 self.in_flight = true;
+                self.in_flight_steps = steps;
             } else {
                 self.mark_worker_failed("physics worker request channel disconnected");
             }
@@ -433,10 +561,10 @@ impl PhysicsWorker {
     }
 
     pub fn backlog_seconds(&self) -> f64 {
-        self.pending_seconds + if self.in_flight { self.fixed_dt } else { 0.0 }
+        self.pending_seconds + self.in_flight_steps as f64 * self.fixed_dt
     }
 
-    /// Stop this worker after any already queued fixed step, returning the
+    /// Stop this worker after its bounded batch, returning the
     /// authoritative runtime scene for a later reactivation without copying it.
     pub fn into_snapshot(mut self) -> Result<PhysicalSceneSnapshot, std::io::Error> {
         self.requests
@@ -452,7 +580,14 @@ impl PhysicsWorker {
             .map_err(|_| {
                 std::io::Error::other("physics worker panicked before returning its scene")
             })?;
-        snapshot.pending_seconds = self.pending_seconds;
+        // Unfinished requested steps live on the worker until their frame is
+        // collected; otherwise they have already returned to pending_seconds.
+        snapshot.pending_seconds = self.pending_seconds
+            + if self.in_flight {
+                snapshot.pending_seconds
+            } else {
+                0.0
+            };
         Ok(snapshot)
     }
 }
@@ -521,6 +656,92 @@ mod tests {
     use super::*;
     use crate::{voxel::Composition, world::GeneratedCellPhysics};
 
+    fn mock_worker_clock(
+        fixed_dt: f64,
+    ) -> (
+        PhysicsWorker,
+        Receiver<PhysicsWorkerRequest>,
+        Sender<PhysicsFrame>,
+    ) {
+        let (requests, input) = mpsc::channel();
+        let (output, frames) = mpsc::channel();
+        (
+            PhysicsWorker {
+                requests,
+                frames,
+                worker: None,
+                pending_seconds: 0.0,
+                fixed_dt,
+                in_flight: false,
+                in_flight_steps: 0,
+                failure: None,
+                grab_target: Arc::new(Mutex::new(None)),
+                frame: PhysicsFrame::default(),
+            },
+            input,
+            output,
+        )
+    }
+
+    #[test]
+    fn redraw_requests_all_due_fixed_steps_instead_of_one() {
+        let (mut worker, input, _output) = mock_worker_clock(0.001);
+        worker.advance(0.016, false);
+        assert!(matches!(
+            input.try_recv().unwrap(),
+            PhysicsWorkerRequest::Steps(16)
+        ));
+        assert_eq!(worker.in_flight_steps, 16);
+        assert!((worker.backlog_seconds() - 0.016).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn incomplete_batch_returns_time_to_backlog_and_pause_queues_nothing() {
+        let (mut worker, input, output) = mock_worker_clock(0.001);
+        worker.advance(0.016, false);
+        input.try_recv().unwrap();
+        output
+            .send(PhysicsFrame {
+                completed_steps: 3,
+                simulated_seconds: 0.003,
+                ..PhysicsFrame::default()
+            })
+            .unwrap();
+        worker.advance(30.0, true);
+        assert!(!worker.in_flight);
+        assert!((worker.backlog_seconds() - 0.013).abs() < 1.0e-12);
+        assert!(input.try_recv().is_err());
+        worker.advance(0.0, false);
+        assert!(matches!(input.try_recv().unwrap(),PhysicsWorkerRequest::Steps(steps) if steps>1));
+        assert!((worker.backlog_seconds() - 0.013).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn returning_scene_preserves_completed_and_unfinished_batch_time() {
+        let mut scene = one_rev_scene();
+        scene.voxels[0].velocity = Vec3::X;
+        let mut worker = PhysicsWorker::new(scene).unwrap();
+        let requested = worker.fixed_dt * 20.0;
+        worker.advance(requested, false);
+        let snapshot = worker.into_snapshot().unwrap();
+        assert!(snapshot.simulated_seconds > 0.0);
+        assert!(
+            (snapshot.simulated_seconds + snapshot.pending_seconds - requested).abs() < 1.0e-12
+        );
+        let steps = (snapshot.simulated_seconds / f64::from(snapshot.scene.config.fixed_dt)).round()
+            as usize;
+        let mut reference = one_rev_scene();
+        reference.voxels[0].velocity = Vec3::X;
+        for _ in 0..steps {
+            reference.tick();
+        }
+        assert_eq!(snapshot.scene.positions, reference.positions);
+        assert_eq!(
+            snapshot.scene.voxels[0].velocity,
+            reference.voxels[0].velocity
+        );
+    }
+
     fn one_rev_scene() -> Scene {
         let material = crate::material::Material::component_id("oak").unwrap();
         let mut config = SceneConfig::default();
@@ -537,12 +758,9 @@ mod tests {
             .unwrap();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 
-        let error = PhysicsWorker::with_loads(
-            one_rev_scene(),
-            vec![Vec3::new(f32::NAN, 0.0, 0.0)],
-        )
-        .err()
-        .unwrap();
+        let error = PhysicsWorker::with_loads(one_rev_scene(), vec![Vec3::new(f32::NAN, 0.0, 0.0)])
+            .err()
+            .unwrap();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
@@ -625,9 +843,8 @@ mod tests {
         let (requests, _input) = mpsc::channel();
         let (output, frames) = mpsc::channel();
         drop(output);
-        let worker = std::thread::spawn(|| -> PhysicalSceneSnapshot {
-            panic!("test panic payload")
-        });
+        let worker =
+            std::thread::spawn(|| -> PhysicalSceneSnapshot { panic!("test panic payload") });
         while !worker.is_finished() {
             std::thread::yield_now();
         }
@@ -638,6 +855,7 @@ mod tests {
             pending_seconds: 0.75,
             fixed_dt: 0.1,
             in_flight: true,
+            in_flight_steps: 1,
             failure: None,
             grab_target: Arc::new(Mutex::new(None)),
             frame: PhysicsFrame {
@@ -651,7 +869,10 @@ mod tests {
         worker.advance(10.0, false);
 
         assert!(worker.has_failure());
-        assert!(worker.failure_message().unwrap().contains("test panic payload"));
+        assert!(worker
+            .failure_message()
+            .unwrap()
+            .contains("test panic payload"));
         assert!(!worker.in_flight);
         assert_eq!(worker.backlog_seconds(), 0.0);
         assert_eq!(worker.frame.revision, 9);

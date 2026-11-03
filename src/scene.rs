@@ -417,10 +417,26 @@ fn default_cuda_iterations() -> usize {
 fn default_tool_direction() -> [f32; 3] {
     [1.0, 0.0, 0.0]
 }
+/// Runtime observations, never part of an authored scene's positional codec.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct StepDiagnostics {
+    pub scope: &'static str,
+    pub fixed_dt_seconds: f64,
+    pub mechanical_substeps: usize,
+    pub active_fine_revs_last_solve: usize,
+    pub pcg_iterations_total: usize,
+    pub relative_solver_residual: f32,
+    pub contacts_peak: usize,
+    pub new_impact_observations: usize,
+    /// Timings overlap: assembly/factor/PCG are parts of mechanics_total.
+    pub timings_ms: std::collections::BTreeMap<&'static str, f64>,
+}
+
 /// Positions are separate arrays; material identity exists only in composition.
 pub struct Scene {
     /// Physical time advanced by the fixed-step solver; never wall-clock time.
     pub simulated_seconds: f64,
+    pub last_step_diagnostics: Option<StepDiagnostics>,
     /// Runtime scheduler policy; kept out of the positional document format.
     pub(crate) adaptive_substeps: bool,
     pub(crate) last_mechanical_substeps: usize,
@@ -1058,6 +1074,7 @@ impl Scene {
         let mut scene = Self {
             config,
             simulated_seconds: 0.0,
+            last_step_diagnostics: None,
             solver_scratch: Default::default(),
             adaptive_substeps: false,
             last_mechanical_substeps: 0,
@@ -2961,6 +2978,7 @@ impl Scene {
             config,
             solver_scratch: Default::default(),
             simulated_seconds: 0.0,
+            last_step_diagnostics: None,
             adaptive_substeps: false,
             last_mechanical_substeps: 0,
             thermal_scratch: Default::default(),

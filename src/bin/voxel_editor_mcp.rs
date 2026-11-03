@@ -34,8 +34,6 @@ struct Settings {
 
 struct App {
     root: PathBuf,
-    enabled: bool,
-    settings_error: Option<String>,
 }
 
 fn main() {
@@ -51,12 +49,10 @@ fn main() {
         eprintln!("voxel-editor-mcp: project root is not a directory");
         std::process::exit(2);
     }
-    let (enabled, settings_error) = read_settings(&root);
-    let app = App {
-        root,
-        enabled,
-        settings_error,
-    };
+    if let (_, Some(error)) = read_settings(&root) {
+        eprintln!("voxel-editor-mcp: {error}");
+    }
+    let app = App { root };
     if let Err(error) = serve(app) {
         eprintln!("voxel-editor-mcp: {error}");
         std::process::exit(1);
@@ -205,7 +201,7 @@ fn dispatch_method(
         "server/discover" if modern => Ok(json!({
             "supportedVersions":[MODERN_PROTOCOL_VERSION],
             "capabilities":{"tools":{"listChanged":false}},
-            "instructions":"Use voxel tools to create, inspect, edit, animate, import, export, and arrange saved native assets beneath the configured project root. Mutations create new files and refuse overwrite. The live editor window is not controlled by this file-backed server.",
+            "instructions":"Use voxel tools to create, inspect, edit, animate, import, export, and arrange saved native assets beneath the configured project root. File mutation tools create new files and refuse overwrite. Read-only live telemetry tools query the running native engine; they do not edit live state.",
             "ttlMs":60000,
             "cacheScope":"private",
             "resultType":"complete"
@@ -221,8 +217,8 @@ fn dispatch_method(
             json!({})
         }),
         "tools/list" => {
-            let mut result =
-                json!({"tools": if app.enabled { tool_definitions() } else { vec![] }});
+            let (enabled, _) = read_settings(&app.root);
+            let mut result = json!({"tools": if enabled { tool_definitions() } else { vec![] }});
             if modern {
                 result["ttlMs"] = json!(60000);
                 result["cacheScope"] = json!("private");
@@ -257,13 +253,16 @@ fn initialize(params: &Value) -> Result<Value, (i64, String)> {
         "protocolVersion": LEGACY_PROTOCOL_VERSION,
         "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {"name":"voxel-editor-local","version":env!("CARGO_PKG_VERSION")},
-        "instructions":"Tools operate on saved .vxm/.vxscene/.obj/.glb files beneath the configured project root. Mutating tools write a new output file and refuse overwrite. MCP does not access unsaved/live GUI editor state."
+        "instructions":"File tools operate on saved .vxm/.vxscene/.obj/.glb files beneath the configured project root; mutations write new files and refuse overwrite. get_runtime_status, read_runtime_metrics, and get_runtime_objects are read-only queries to the running native engine and do not edit live state."
     }))
 }
 
 fn tool_definitions() -> Vec<Value> {
     vec![
         tool_definition("list_documents", "List saved .vxm and .vxscene assets beneath the project root.", json!({"type":"object","properties":{},"additionalProperties":false}), true),
+        tool_definition("get_runtime_status", "Read the running native engine's status, session identity, and telemetry freshness. Read-only; errors clearly when the runtime is absent or stale.", json!({"type":"object","properties":{},"additionalProperties":false}), true),
+        tool_definition("read_runtime_metrics", "Read a bounded batch of live engine telemetry after a sequence cursor. Returns explicit freshness, session identity, and sequence-gap markers. Read-only.", json!({"type":"object","properties":{"after_sequence":{"type":"integer","minimum":0,"default":0},"max_samples":{"type":"integer","minimum":1,"maximum":64,"default":16},"wait_ms":{"type":"integer","minimum":0,"maximum":10000,"default":0},"topic":{"type":"string","enum":["app","physics"]}},"additionalProperties":false}), true),
+        tool_definition("get_runtime_objects", "Read a snapshot of objects currently known to the native runtime. Read-only.", json!({"type":"object","properties":{},"additionalProperties":false}), true),
         tool_definition("inspect_document", "Validate and summarize a .vxm or .vxscene, including its materials, groups, constraints, skeleton, keyframes, and referenced assets.", json!({"type":"object","properties":{"path":{"type":"string","description":"Project-relative document path"}},"required":["path"],"additionalProperties":false}), true),
         tool_definition("voxelize_mesh", "Convert an OBJ or GLB mesh inside the project root into a native .vxm shell or filled voxel model.", json!({"type":"object","properties":{"source_path":{"type":"string"},"output_path":{"type":"string"},"model_name":{"type":"string"},"scale":{"type":"number","minimum":0.01,"maximum":100},"mode":{"type":"string","enum":["shell","filled"]}},"required":["source_path","output_path"],"additionalProperties":false}), false),
         tool_definition("export_model_obj", "Export exposed faces of a saved .vxm as a watertight OBJ mesh. OBJ coordinates are metres; the native model remains unchanged.", json!({"type":"object","properties":{"source_path":{"type":"string"},"output_path":{"type":"string"}},"required":["source_path","output_path"],"additionalProperties":false}), false),
@@ -308,9 +307,9 @@ fn call_tool(app: &App, params: &Value) -> Result<Value, (i64, String)> {
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    if !app.enabled {
-        let reason = app
-            .settings_error
+    let (enabled, settings_error) = read_settings(&app.root);
+    if !enabled {
+        let reason = settings_error
             .as_deref()
             .unwrap_or("MCP is disabled in .voxel_editor_settings.json");
         return Ok(tool_error(reason));
@@ -320,6 +319,9 @@ fn call_tool(app: &App, params: &Value) -> Result<Value, (i64, String)> {
     }
     let result = match name {
         "list_documents" => list_documents(app),
+        "get_runtime_status" => runtime_query(app, "status", json!({})),
+        "read_runtime_metrics" => runtime_query(app, "metrics", args.clone()),
+        "get_runtime_objects" => runtime_query(app, "objects", json!({})),
         "inspect_document" => inspect_document(app, &args),
         "voxelize_mesh" => voxelize_mesh(app, &args),
         "export_model_obj" => export_model_obj(app, &args),
@@ -337,6 +339,14 @@ fn call_tool(app: &App, params: &Value) -> Result<Value, (i64, String)> {
         Ok(value) => tool_result(value),
         Err(error) => tool_error(&error),
     })
+}
+
+fn runtime_query(app: &App, command: &str, mut request: Value) -> Result<Value, String> {
+    let object = request
+        .as_object_mut()
+        .ok_or("runtime request arguments must be an object")?;
+    object.insert("command".into(), json!(command));
+    voxel_physics_lab::runtime_metrics::query_runtime(&app.root, &request)
 }
 
 fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
@@ -1576,6 +1586,119 @@ fn ensure_under(root: &Path, path: &Path) -> Result<(), String> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod runtime_mcp_tests {
+    use super::*;
+
+    fn app(enabled: bool) -> App {
+        let root = PathBuf::from(format!(
+            "E:/runtime-mcp-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(SETTINGS_FILE),
+            json!({"version":1,"mcp_enabled":enabled}).to_string(),
+        )
+        .unwrap();
+        App { root }
+    }
+
+    #[test]
+    fn runtime_tools_are_listed_as_read_only_and_have_strict_schemas() {
+        let tools = tool_definitions();
+        for name in ["get_runtime_status", "read_runtime_metrics", "get_runtime_objects"] {
+            let definition = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .expect("runtime tool definition");
+            assert_eq!(definition["annotations"]["readOnlyHint"], true);
+            assert_eq!(definition["inputSchema"]["additionalProperties"], false);
+        }
+
+        assert!(validate_tool_arguments("get_runtime_status", &json!({})).is_ok());
+        assert!(validate_tool_arguments("read_runtime_metrics", &json!({})).is_ok());
+        assert!(validate_tool_arguments(
+            "read_runtime_metrics",
+            &json!({"after_sequence":0,"max_samples":64,"wait_ms":10000})
+        )
+        .is_ok());
+        assert!(validate_tool_arguments(
+            "read_runtime_metrics",
+            &json!({"max_samples":65})
+        )
+        .unwrap_err()
+        .contains("above its maximum"));
+        assert!(validate_tool_arguments(
+            "read_runtime_metrics",
+            &json!({"unexpected":true})
+        )
+        .unwrap_err()
+        .contains("unknown argument"));
+    }
+
+    #[test]
+    fn runtime_tools_route_when_enabled_and_fail_closed_when_disabled() {
+        let enabled = app(true);
+        let listed = dispatch_method(&enabled, "tools/list", &json!({}), false).unwrap();
+        assert!(listed["tools"].as_array().unwrap().iter().any(|tool| {
+            tool["name"] == "read_runtime_metrics"
+        }));
+
+        fs::write(enabled.root.join(SETTINGS_FILE), json!({"version":1,"mcp_enabled":false}).to_string()).unwrap();
+        let listed = dispatch_method(&enabled, "tools/list", &json!({}), false).unwrap();
+        assert_eq!(listed["tools"], json!([]));
+        let result = call_tool(
+            &enabled,
+            &json!({"name":"read_runtime_metrics","arguments":{}}),
+        )
+        .unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("disabled"));
+
+        fs::write(enabled.root.join(SETTINGS_FILE), json!({"version":1,"mcp_enabled":true}).to_string()).unwrap();
+        let listed = dispatch_method(&enabled, "tools/list", &json!({}), false).unwrap();
+        assert!(listed["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "read_runtime_metrics"));
+        let _ = fs::remove_dir_all(enabled.root);
+    }
+
+    #[test]
+    fn runtime_tools_query_a_mock_loopback_runtime() {
+        let root = PathBuf::from(format!(
+            "E:/voxel-editor-mcp-runtime-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let server = voxel_physics_lab::runtime_metrics::start_server(&root).unwrap();
+        let initial = voxel_physics_lab::runtime_metrics::query_runtime(&root, &json!({"command":"status"})).unwrap();
+        let cursor = initial["latest_sequence"].as_u64().unwrap();
+        let session = initial["session_id"].clone();
+        voxel_physics_lab::runtime_metrics::publish("physics", json!({"step_count":7,"objects":[{"id":2}]}));
+        let app = App { root: root.clone() };
+
+        let status = call_tool(&app, &json!({"name":"get_runtime_status","arguments":{}})).unwrap();
+        assert_eq!(status["structuredContent"]["session_id"], session);
+        let metrics = call_tool(&app, &json!({"name":"read_runtime_metrics","arguments":{"after_sequence":cursor,"max_samples":8,"topic":"physics"}})).unwrap();
+        assert_eq!(metrics["structuredContent"]["samples"][0]["data"]["step_count"], 7);
+        let objects = call_tool(&app, &json!({"name":"get_runtime_objects","arguments":{}})).unwrap();
+        assert_eq!(objects["structuredContent"]["objects"][0]["id"], 2);
+
+        drop(server);
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
 fn extension(path: &Path) -> Option<String> {
     path.extension()
         .and_then(|s| s.to_str())
