@@ -7,9 +7,9 @@ use crate::{
 use bytemuck::{Pod, Zeroable};
 use glam::{DQuat, DVec3, Mat4, Quat, Vec3};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use voxel_physics_lab::documents::{
     BoneMaterialLimits, BoneSkinTransform, SkeletonDocument, VoxelBoneWeightDocument,
@@ -36,6 +36,7 @@ struct Instance {
     rotation: [f32; 4],
     surface: f32,
     skin_index: u32,
+    thermal_emission: [f32; 3],
 }
 
 /// Lightweight render metadata retained while the authored `Scene` is owned
@@ -49,9 +50,11 @@ pub struct AuthoredPhysicsRenderSource {
 
 #[derive(Clone, Copy)]
 struct AuthoredKinematicPose {
+    scene_index: usize,
     position: DVec3,
     rotation: Quat,
     color: [f32; 4],
+    thermal_emission: [f32; 3],
 }
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -235,6 +238,7 @@ fn build_bone_gizmos(
             rotation: Quat::IDENTITY.to_array(),
             surface: 0.0,
             skin_index: u32::MAX,
+            thermal_emission: [0.0; 3],
         });
         if let Some(parent) = bone
             .parent
@@ -257,6 +261,7 @@ fn build_bone_gizmos(
                     rotation: Quat::from_rotation_arc(Vec3::Z, direction / length).to_array(),
                     surface: 0.0,
                     skin_index: u32::MAX,
+                    thermal_emission: [0.0; 3],
                 });
             }
         }
@@ -273,7 +278,10 @@ fn surface_kind(content: GeneratedCellContent) -> f32 {
 
 fn material_display_color(name: &str) -> [f32; 3] {
     let name = name.to_ascii_lowercase();
-    if ["wood", "oak", "timber"].iter().any(|part| name.contains(part)) {
+    if ["wood", "oak", "timber"]
+        .iter()
+        .any(|part| name.contains(part))
+    {
         [0.55, 0.32, 0.14]
     } else if ["iron", "steel", "metal", "aluminum", "aluminium"]
         .iter()
@@ -287,11 +295,17 @@ fn material_display_color(name: &str) -> [f32; 3] {
         [0.47, 0.49, 0.52]
     } else if ["water", "ice"].iter().any(|part| name.contains(part)) {
         [0.16, 0.48, 0.86]
-    } else if ["flesh", "skin", "meat"].iter().any(|part| name.contains(part)) {
+    } else if ["flesh", "skin", "meat"]
+        .iter()
+        .any(|part| name.contains(part))
+    {
         [0.86, 0.43, 0.43]
     } else if name.contains("glass") {
         [0.48, 0.78, 0.84]
-    } else if ["sand", "soil", "dirt"].iter().any(|part| name.contains(part)) {
+    } else if ["sand", "soil", "dirt"]
+        .iter()
+        .any(|part| name.contains(part))
+    {
         [0.66, 0.52, 0.32]
     } else {
         [0.68, 0.70, 0.73]
@@ -325,6 +339,100 @@ fn voxel_display_color(scene: &Scene, voxel_index: usize) -> [f32; 4] {
     [color[0], color[1], color[2], 1.0]
 }
 
+/// Display-only blackbody color fit, based on the Planckian locus. The fit
+/// approximates the chromaticity of a blackbody in sRGB without evaluating a
+/// spectrum per voxel. Its output is a visible-light color, not calibrated
+/// radiative power; `thermal_emission` applies the viewer exposure and a
+/// generic greybody phase factor.
+fn blackbody_srgb_sample(temperature_kelvin: f32) -> [f32; 3] {
+    let temperature = (temperature_kelvin / 100.0).clamp(1.0, 400.0);
+    if temperature <= 10.0 {
+        return [1.0, 0.0, 0.0];
+    }
+    let red;
+    let green;
+    let blue;
+    if temperature <= 66.0 {
+        red = 255.0;
+        green = (99.470_8 * temperature.ln() - 161.119_57).clamp(0.0, 255.0);
+        blue = if temperature <= 19.0 {
+            0.0
+        } else {
+            (138.517_73 * (temperature - 10.0).ln() - 305.044_8).clamp(0.0, 255.0)
+        };
+    } else {
+        red = (329.698_73 * (temperature - 60.0).powf(-0.133_204_76)).clamp(0.0, 255.0);
+        green = (288.122_16 * (temperature - 60.0).powf(-0.075_514_85)).clamp(0.0, 255.0);
+        blue = 255.0;
+    }
+    [red / 255.0, green / 255.0, blue / 255.0]
+}
+
+/// A cached 100 K table keeps per-REV updates to one lookup and one linear
+/// interpolation; the Planckian RGB fit is evaluated only once per process.
+fn blackbody_linear(temperature_kelvin: f32) -> [f32; 3] {
+    const LAST_INDEX: usize = 400;
+    static LUT: OnceLock<Vec<[f32; 3]>> = OnceLock::new();
+    let lut = LUT.get_or_init(|| {
+        (0..=LAST_INDEX)
+            .map(|index| {
+                let temperature = index as f32 * 100.0;
+                // Planck radiance at 650 nm relative to 1300 K sets a fixed
+                // viewer exposure. Cache it with the chromaticity so a frame
+                // update performs no logarithms or exponentials per voxel.
+                const C2_OVER_WAVELENGTH: f32 = 14_387_769.0 / 650.0;
+                let exposure = if temperature <= 650.0 { 0.0 } else {
+                    (C2_OVER_WAVELENGTH / 1_300.0).exp_m1()
+                        / (C2_OVER_WAVELENGTH / temperature).exp_m1()
+                };
+                blackbody_srgb_sample(temperature).map(|channel| {
+                    let linear = if channel <= 0.04045 {
+                        channel / 12.92
+                    } else {
+                        ((channel + 0.055) / 1.055).powf(2.4)
+                    };
+                    linear * exposure
+                })
+            })
+            .collect()
+    });
+    let position = (temperature_kelvin / 100.0).clamp(0.0, LAST_INDEX as f32);
+    let lower = position.floor() as usize;
+    let upper = (lower + 1).min(LAST_INDEX);
+    let mix = position - lower as f32;
+    std::array::from_fn(|channel| lut[lower][channel] * (1.0 - mix) + lut[upper][channel] * mix)
+}
+
+/// Convert the actual voxel temperature and phase fractions into linear
+/// display emission. Cold albedo stays untouched; thermal light is additive.
+/// Fixed exposure makes the first visible glow faint red, while the
+/// Planckian color fit progresses through orange/yellow to blue-white.
+fn thermal_emission(temperature_kelvin: f32, liquid_fraction: f32, gas_fraction: f32) -> [f32; 3] {
+    if !temperature_kelvin.is_finite() || temperature_kelvin <= 650.0 {
+        return [0.0; 3];
+    }
+    let liquid = if liquid_fraction.is_finite() {
+        liquid_fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let gas = if gas_fraction.is_finite() {
+        gas_fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let solid = (1.0 - liquid - gas).clamp(0.0, 1.0);
+    // Generic, non-material-calibrated greybody emissivity. The vapor factor
+    // only changes visible emission; it does not imply gas transport/pressure.
+    let emissivity = (0.82 * solid + 0.96 * liquid + 0.48 * gas).clamp(0.0, 1.0);
+    let color = blackbody_linear(temperature_kelvin);
+    [
+        color[0] * emissivity,
+        color[1] * emissivity,
+        color[2] * emissivity,
+    ]
+}
+
 impl AuthoredPhysicsRenderSource {
     pub fn from_scene(scene: &Scene) -> Self {
         let mut dynamic_scene_indices = Vec::new();
@@ -332,12 +440,24 @@ impl AuthoredPhysicsRenderSource {
         let mut kinematic_poses = Vec::new();
         for (index, voxel) in scene.voxels.iter().enumerate() {
             let color = voxel_display_color(scene, index);
+            let emission = scene
+                .phase_state(index)
+                .map(|phase| {
+                    thermal_emission(
+                        phase.temperature_kelvin,
+                        phase.liquid_fraction,
+                        phase.gas_fraction,
+                    )
+                })
+                .unwrap_or([0.0; 3]);
             material_colors.push(color);
             if voxel.kinematic {
                 kinematic_poses.push(AuthoredKinematicPose {
+                    scene_index: index,
                     position: scene.positions[index],
                     rotation: scene.rotations[index],
                     color,
+                    thermal_emission: emission,
                 });
             } else {
                 dynamic_scene_indices.push(index);
@@ -347,6 +467,11 @@ impl AuthoredPhysicsRenderSource {
         dynamic_scene_indices.hash(&mut hasher);
         for color in &material_colors {
             for channel in color {
+                channel.to_bits().hash(&mut hasher);
+            }
+        }
+        for emission in kinematic_poses.iter().map(|pose| pose.thermal_emission) {
+            for channel in emission {
                 channel.to_bits().hash(&mut hasher);
             }
         }
@@ -436,10 +561,7 @@ fn local_face_mask(world_mask: u8, rotation: Quat) -> u8 {
     local_mask
 }
 
-fn apply_surface_culling(
-    instances: &mut [Instance],
-    pose_at: impl FnMut(usize) -> (DVec3, Quat),
-) {
+fn apply_surface_culling(instances: &mut [Instance], pose_at: impl FnMut(usize) -> (DVec3, Quat)) {
     let poses: Vec<_> = (0..instances.len()).map(pose_at).collect();
     let masks = compute_surface_masks(&poses);
     apply_surface_masks(instances, &masks, |index| poses[index].1);
@@ -512,6 +634,7 @@ impl Instance {
             rotation: rotation.to_array(),
             surface: 0.0,
             skin_index: u32::MAX,
+            thermal_emission: [0.0; 3],
         }
     }
 }
@@ -543,6 +666,7 @@ fn push_box_outline(instances: &mut Vec<Instance>, bounds: (Vec3, Vec3), color: 
                 rotation: Quat::IDENTITY.to_array(),
                 surface: 0.0,
                 skin_index: u32::MAX,
+                thermal_emission: [0.0; 3],
             });
         }
     }
@@ -573,6 +697,7 @@ fn push_plant_lod(
             rotation: Quat::IDENTITY.to_array(),
             surface: surface_kind(voxel.content),
             skin_index: u32::MAX,
+            thermal_emission: [0.0; 3],
         });
         return;
     }
@@ -616,6 +741,7 @@ fn push_plant_lod(
         rotation: Quat::IDENTITY.to_array(),
         surface: surface_kind(voxel.content),
         skin_index: u32::MAX,
+        thermal_emission: [0.0; 3],
     });
 }
 type WorldCacheKey = (u64, u64, i32, i32, i32);
@@ -685,6 +811,7 @@ impl WorldGeometryCache {
                 rotation: Quat::IDENTITY.to_array(),
                 surface: surface_kind(voxel.content),
                 skin_index: u32::MAX,
+                thermal_emission: [0.0; 3],
             })
             .collect();
         let mut cache = Self {
@@ -713,6 +840,7 @@ impl WorldGeometryCache {
                 rotation: Quat::IDENTITY.to_array(),
                 surface: surface_kind(voxel.content),
                 skin_index: u32::MAX,
+                thermal_emission: [0.0; 3],
             };
             if voxel.color[3] < 0.999 {
                 cache.world_transition_cache.push(instance);
@@ -822,6 +950,7 @@ impl WorldGeometryCache {
                     rotation: Quat::IDENTITY.to_array(),
                     surface: surface_kind(voxel.content),
                     skin_index: u32::MAX,
+                    thermal_emission: [0.0; 3],
                 });
             }
         }
@@ -847,6 +976,7 @@ impl WorldGeometryCache {
                 rotation: Quat::IDENTITY.to_array(),
                 surface: surface_kind(voxel.content),
                 skin_index: u32::MAX,
+                thermal_emission: [0.0; 3],
             });
         }
         cache.restrict_to_bounds(world);
@@ -1202,16 +1332,38 @@ impl Renderer {
                     rotation: cell.rotation.to_array(),
                     surface: 0.0,
                     skin_index: u32::MAX,
+                    thermal_emission: thermal_emission(
+                        cell.temperature_kelvin,
+                        cell.liquid_fraction,
+                        cell.gas_fraction,
+                    ),
                 }
             }));
         // Build one combined pose list so exact face contacts are classified
         // consistently across dynamic and constrained authored REVs.
         let dynamic_count = self.authored_physics_instances.len();
-        self.authored_physics_instances.extend(source.kinematic_poses.iter().map(|pose| {
-            let mut instance = Instance::cube(pose.position.as_vec3(), pose.rotation, pose.color);
-            instance.skin_index = u32::MAX;
-            instance
-        }));
+        let fixed_thermal: HashMap<_, _> = frame
+            .fixed_thermal
+            .iter()
+            .map(|state| (state.scene_index, state))
+            .collect();
+        self.authored_physics_instances
+            .extend(source.kinematic_poses.iter().map(|pose| {
+                let mut instance =
+                    Instance::cube(pose.position.as_vec3(), pose.rotation, pose.color);
+                instance.skin_index = u32::MAX;
+                instance.thermal_emission = fixed_thermal
+                    .get(&pose.scene_index)
+                    .map(|state| {
+                        thermal_emission(
+                            state.temperature_kelvin,
+                            state.liquid_fraction,
+                            state.gas_fraction,
+                        )
+                    })
+                    .unwrap_or(pose.thermal_emission);
+                instance
+            }));
         apply_surface_culling(&mut self.authored_physics_instances, |index| {
             if index < dynamic_count {
                 let cell = &frame.cells[index];
@@ -1359,7 +1511,7 @@ impl Renderer {
             push_constant_ranges: &[],
         });
         let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
-        let instance_attrs = wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x4, 5 => Float32x4, 6 => Float32, 7 => Uint32];
+        let instance_attrs = wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x4, 5 => Float32x4, 6 => Float32, 7 => Uint32, 8 => Float32x3];
         let ui_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
         let target = Some(wgpu::ColorTargetState {
             format,
@@ -1759,6 +1911,11 @@ impl Renderer {
                         rotation: cell.rotation.to_array(),
                         surface: 2.0,
                         skin_index: u32::MAX,
+                        thermal_emission: thermal_emission(
+                            cell.temperature_kelvin,
+                            cell.liquid_fraction,
+                            cell.gas_fraction,
+                        ),
                     }));
                 if self.physics_instance_cache.len() > self.physics_capacity {
                     self.physics_capacity = self.physics_instance_cache.len().next_power_of_two();
@@ -1956,6 +2113,13 @@ impl Renderer {
                         ]
                     };
                     let mut instance = Instance::cube(p.as_vec3(), scene.rotations[i], color);
+                    if let Some(phase) = scene.phase_state(i) {
+                        instance.thermal_emission = thermal_emission(
+                            phase.temperature_kelvin,
+                            phase.liquid_fraction,
+                            phase.gas_fraction,
+                        );
+                    }
                     if !show_bonds {
                         instance.size = [CELL; 3];
                         if let Some(Some(world_mask)) = self.scene_surface_masks.get(i) {
@@ -1998,6 +2162,7 @@ impl Renderer {
                         rotation: Quat::from_rotation_arc(Vec3::X, direction).to_array(),
                         surface: 0.0,
                         skin_index: u32::MAX,
+                        thermal_emission: [0.0; 3],
                     });
                     let base = t.position + (t.rotation * m.local_base).as_dvec3();
                     instances.push(Instance::cube(
@@ -2030,6 +2195,7 @@ impl Renderer {
                             surface: 0.0,
                             color: [b.damage, 1. - b.damage, 0.2, 1.],
                             skin_index: u32::MAX,
+                            thermal_emission: [0.0; 3],
                         });
                     }
                 }
@@ -2050,6 +2216,7 @@ impl Renderer {
                         rotation: Quat::from_rotation_arc(Vec3::Z, normal).to_array(),
                         surface: 0.0,
                         skin_index: u32::MAX,
+                        thermal_emission: [0.0; 3],
                     });
                 }
             }
@@ -2067,6 +2234,7 @@ impl Renderer {
                     rotation: Quat::IDENTITY.to_array(),
                     surface: 0.0,
                     skin_index: u32::MAX,
+                    thermal_emission: [0.0; 3],
                 });
             }
             if sculpt_preview_cells.is_empty() {
@@ -2410,6 +2578,45 @@ mod material_palette_tests {
     }
 
     #[test]
+    fn thermal_emission_preserves_cold_albedo_and_tracks_blackbody_hue() {
+        use super::thermal_emission;
+
+        assert_eq!(thermal_emission(293.15, 0.0, 0.0), [0.0; 3]);
+        let onset = thermal_emission(900.0, 0.0, 0.0);
+        let orange = thermal_emission(2_400.0, 0.0, 0.0);
+        let blue_white = thermal_emission(9_000.0, 0.0, 0.0);
+        assert!(onset[0] > onset[1] && onset[2] == 0.0);
+        assert!(onset[0] < orange[0]);
+        assert!(orange[1] > 0.0 && orange[0] > orange[1]);
+        assert!(blue_white[2] > blue_white[0]);
+        assert!(blue_white.iter().sum::<f32>() > orange.iter().sum::<f32>());
+    }
+
+    #[test]
+    fn visible_incandescence_dominates_neutral_albedo_at_red_heat() {
+        let emission = super::thermal_emission(1_500.0, 0.0, 0.0);
+        let peak = emission.into_iter().fold(0.0_f32, f32::max);
+        let displayed = emission.map(|channel| (0.4 + channel) / (1.0 + peak));
+        assert!(displayed[0] > displayed[1] * 1.5);
+        assert!(displayed[1] > displayed[2]);
+        for temperature in [f32::NAN, f32::INFINITY, -1.0, 1.0e20] {
+            assert!(super::thermal_emission(temperature, 0.0, 0.0)
+                .iter().all(|channel| channel.is_finite() && *channel >= 0.0));
+        }
+    }
+
+    #[test]
+    fn thermal_emission_responds_to_phase_fraction() {
+        use super::thermal_emission;
+
+        let solid = thermal_emission(2_500.0, 0.0, 0.0);
+        let liquid = thermal_emission(2_500.0, 1.0, 0.0);
+        let gas = thermal_emission(2_500.0, 0.0, 1.0);
+        assert!(liquid[0] > solid[0]);
+        assert!(solid[0] > gas[0]);
+    }
+
+    #[test]
     fn authored_material_mapping_requires_same_dynamic_rev_indices() {
         let source = AuthoredPhysicsRenderSource {
             dynamic_scene_indices: vec![0, 2],
@@ -2422,6 +2629,9 @@ mod material_palette_tests {
             source_cell: None,
             world_position_m: DVec3::ZERO,
             rotation: Quat::IDENTITY,
+            temperature_kelvin: 293.15,
+            liquid_fraction: 0.0,
+            gas_fraction: 0.0,
         };
 
         assert!(authored_frame_indices_match(&source, &[cell(0), cell(2)]));
@@ -2448,7 +2658,10 @@ mod material_palette_tests {
             Instance::cube(Vec3::X * CELL, Quat::IDENTITY, [1.0; 4]),
         ];
         apply_surface_culling(&mut touching, |index| {
-            (DVec3::new(index as f64 * f64::from(CELL), 0.0, 0.0), Quat::IDENTITY)
+            (
+                DVec3::new(index as f64 * f64::from(CELL), 0.0, 0.0),
+                Quat::IDENTITY,
+            )
         });
         assert_eq!(touching.len(), 2);
         assert_eq!(touching[0].size, [CELL; 3]);
@@ -2518,7 +2731,9 @@ mod material_palette_tests {
         assert_eq!(physics_count, 27);
         assert_eq!(render_count, 26);
         assert_eq!(render_instances.len(), 26);
-        assert!(render_instances.iter().all(|instance| instance.surface != -1.0));
+        assert!(render_instances
+            .iter()
+            .all(|instance| instance.surface != -1.0));
         assert_eq!(74_usize.pow(3) - 72_usize.pow(3), 31_976);
     }
 }

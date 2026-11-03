@@ -154,8 +154,7 @@ fn explicit_force_refines_adaptive_body_before_integration() {
     assert!((momentum_x - 1e-5).abs() < 1e-7, "momentum={momentum_x}");
 }
 
-#[test]
-fn adaptive_fall_reaches_static_floor_without_losing_voxels() {
+fn falling_cube_over_floor(adaptive: bool) -> Scene {
     let stone = Material::component_id("stone").unwrap();
     let oak = Material::component_id("oak").unwrap();
     let build = || {
@@ -172,9 +171,39 @@ fn adaptive_fall_reaches_static_floor_without_losing_voxels() {
         }
         builder.build().unwrap()
     };
-    let mut fine = build();
     let mut scene = build();
-    scene.set_adaptive_substeps(true);
+    scene.set_adaptive_substeps(adaptive);
+    scene
+}
+
+#[test]
+fn adaptive_fall_keeps_velocity_before_contact_when_static_bins_overlap() {
+    let mut fine = falling_cube_over_floor(false);
+    let mut adaptive = falling_cube_over_floor(true);
+    for _ in 0..11 {
+        solver::step(&mut fine, &mut None);
+        solver::step(&mut adaptive, &mut None);
+        assert_eq!(adaptive.last_mechanical_substeps(), 1);
+        for ((position, reference), (voxel, reference_voxel)) in adaptive.positions.iter()
+            .zip(&fine.positions).zip(adaptive.voxels.iter().zip(&fine.voxels))
+        {
+            assert!((*position - *reference).length() < 1e-6);
+            assert!((voxel.velocity - reference_voxel.velocity).length() < 1e-4,
+                "coarse broadphase must not stop free fall: actual {:?}, reference {:?}",
+                voxel.velocity, reference_voxel.velocity);
+        }
+        let reference_kinetic = kinetic(&fine);
+        assert!((kinetic(&adaptive) - reference_kinetic).abs() <= 1e-4 * reference_kinetic,
+            "precontact motion lost kinetic energy");
+        assert_eq!(adaptive.energy.implicit_solver_heat, 0.0);
+        assert_eq!(adaptive.energy.contact_restitution_heat, 0.0);
+    }
+}
+
+#[test]
+fn adaptive_fall_reaches_static_floor_without_losing_voxels() {
+    let mut fine = falling_cube_over_floor(false);
+    let mut scene = falling_cube_over_floor(true);
     let internal = |scene: &Scene| {
         scene
             .voxels
@@ -183,11 +212,50 @@ fn adaptive_fall_reaches_static_floor_without_losing_voxels() {
             .sum::<f64>()
     };
     let initial_internal = internal(&scene);
+    let trace = std::env::var_os("VOXEL_TRACE_ADAPTIVE_HEAT").is_some();
+    let trace_state = |label: &str, step: usize, state: &Scene, initial_internal: f64| {
+        let dynamic = state.voxels.iter().zip(&state.positions).filter(|(v, _)| !v.kinematic);
+        let mut count = 0usize;
+        let mut dynamic_mass = 0.0;
+        let mut min_z = f64::INFINITY;
+        let mut com_z = 0.0;
+        let mut mean_vz = 0.0;
+        let mut max_speed = 0.0_f32;
+        for (voxel, position) in dynamic {
+            count += 1;
+            dynamic_mass += f64::from(voxel.mass);
+            min_z = min_z.min(position.z);
+            com_z += f64::from(voxel.mass) * position.z;
+            mean_vz += f64::from(voxel.velocity.z);
+            max_speed = max_speed.max(voxel.velocity.length());
+        }
+        let heat_delta = internal(state) - initial_internal;
+        eprintln!(
+            "ADAPTIVE_HEAT_TRACE label={label} step={step} t={:.6} min_dynamic_z={:.9e} com_z={:.9e} mean_vz={:.9e} kinetic={:.9e} recoverable_elastic={:.9e} heat_delta={:.9e} implicit_solver_heat={:.9e} restitution_heat={:.9e} solid_viscoelastic_heat={:.9e} mechanical_substeps={} max_speed={:.9e}",
+            state.simulated_seconds,
+            min_z,
+            com_z / dynamic_mass,
+            mean_vz / count as f64,
+            kinetic(state),
+            state.elastic_bond_energy_j(),
+            heat_delta,
+            state.energy.implicit_solver_heat,
+            state.energy.contact_restitution_heat,
+            state.energy.solid_viscoelastic_heat,
+            state.last_mechanical_substeps(),
+            max_speed,
+        );
+    };
     let mass = scene.total_mass_kg();
     let mut fine_steps = 0;
-    for _ in 0..60 {
+    for fixed_step in 0..60 {
         solver::step(&mut fine, &mut None);
         solver::step(&mut scene, &mut None);
+        if trace {
+            let step = fixed_step + 1;
+            trace_state("fine", step, &fine, initial_internal);
+            trace_state("adaptive", step, &scene, initial_internal);
+        }
         fine_steps += usize::from(scene.last_mechanical_substeps() == 40);
         assert_eq!(scene.total_mass_kg(), mass);
         assert_eq!(scene.voxels.len(), 80);

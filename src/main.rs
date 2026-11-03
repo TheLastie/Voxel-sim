@@ -346,20 +346,27 @@ fn apply_scene_instance_edit(
         .as_ref()
         .cloned()
         .ok_or_else(|| "no authored scene is open".to_owned())?;
-    let index = ui
+    let selected_index = ui
         .selected_scene_model
-        .filter(|&index| index < updated.models.len())
-        .ok_or_else(|| "select a model instance first".to_owned())?;
+        .filter(|&index| index < updated.models.len());
+    let index = if matches!(&edit, SceneInstanceEdit::ThermalBonding(_)) {
+        selected_index
+    } else {
+        Some(selected_index.ok_or_else(|| "select a model instance first".to_owned())?)
+    };
     let selected = match edit {
         SceneInstanceEdit::Translate(delta_cells) => {
+            let index = index.expect("object edits require a selected model");
             updated.translate_model_cells(index, delta_cells)?;
             Some(index)
         }
         SceneInstanceEdit::RotateQuarterTurn { axis, direction } => {
+            let index = index.expect("object edits require a selected model");
             updated.rotate_model_quarter_turn(index, axis, direction)?;
             Some(index)
         }
         SceneInstanceEdit::Duplicate => {
+            let index = index.expect("object edits require a selected model");
             let bounds = authored_instance_bounds(&updated, scene_path, index)?;
             let width_cells = ((bounds.max.x - bounds.min.x)
                 / voxel_physics_lab::coordinates::CELL_M as f32)
@@ -368,43 +375,50 @@ fn apply_scene_instance_edit(
             Some(updated.duplicate_model_cells(index, IVec3::new(width_cells + 1, 0, 0))?)
         }
         SceneInstanceEdit::Remove => {
+            let index = index.expect("object edits require a selected model");
             updated.remove_model(index)?;
             (!updated.models.is_empty()).then_some(index.min(updated.models.len() - 1))
         }
         SceneInstanceEdit::Position(position) => {
+            let index = index.expect("object edits require a selected model");
             updated.models[index].translation_m = position;
             Some(index)
         }
         SceneInstanceEdit::Rotation(degrees) => {
+            let index = index.expect("object edits require a selected model");
             let radians = degrees * std::f32::consts::PI / 180.0;
             updated.models[index].rotation =
                 Quat::from_euler(glam::EulerRot::XYZ, radians.x, radians.y, radians.z);
             Some(index)
         }
         SceneInstanceEdit::Velocity(velocity) => {
+            let index = index.expect("object edits require a selected model");
             let mut settings = updated.object_settings(index);
             settings.initial_velocity_m_s = Some(velocity);
             updated.set_object_settings(index, settings)?;
             Some(index)
         }
         SceneInstanceEdit::Force(force) => {
+            let index = index.expect("object edits require a selected model");
             let mut settings = updated.object_settings(index);
             settings.force_n = force;
             updated.set_object_settings(index, settings)?;
             Some(index)
         }
         SceneInstanceEdit::InitialTemperature(kelvin) => {
+            let index = index.expect("object edits require a selected model");
             updated.set_object_initial_temperature(index, kelvin)?;
             Some(index)
         }
         SceneInstanceEdit::ThermalBonding(settings) => {
             updated.set_thermal_bonding(settings)?;
-            Some(index)
+            selected_index
         }
         SceneInstanceEdit::Material {
             path,
             voxel_indices,
         } => {
+            let index = index.expect("object edits require a selected model");
             let mut settings = updated.object_settings(index);
             if voxel_indices.is_empty() {
                 settings.material_asset = Some(path);
@@ -439,6 +453,73 @@ fn apply_scene_instance_edit(
     ui.show_bonds = false;
     ui.editor_tool = EditorTool::Select;
     Ok(())
+}
+
+#[cfg(test)]
+mod scene_instance_edit_tests {
+    use super::*;
+
+    fn welding_settings() -> ThermalBondingSettings {
+        ThermalBondingSettings {
+            material_name: "iron".into(),
+            minimum_mass_fraction: 0.5,
+            minimum_temperature_kelvin: 800.0,
+            minimum_impact_energy_j: 0.0,
+            minimum_contact_pressure_pa: 0.0,
+            minimum_dwell_seconds: 0.0,
+        }
+    }
+
+    fn paused_ui() -> Ui {
+        let mut ui = Ui::new(1.0, Vec3::ZERO, Vec3::Z);
+        ui.paused = true;
+        ui
+    }
+
+    #[test]
+    fn thermal_bonding_edit_succeeds_without_selection_in_empty_authored_scene() {
+        let mut scene = Scene::new(SceneConfig::default());
+        let mut document = Some(
+            SceneDocument::new("empty", SceneConfig::default()).expect("valid empty document"),
+        );
+        let mut ui = paused_ui();
+
+        let result = apply_scene_instance_edit(
+            &mut scene,
+            &mut document,
+            Some(Path::new("empty.vxscene")),
+            &mut ui,
+            0.0,
+            SceneInstanceEdit::ThermalBonding(Some(welding_settings())),
+        );
+
+        assert!(result.is_ok(), "global welding edit failed: {result:?}");
+        assert_eq!(ui.selected_scene_model, None);
+        assert_eq!(
+            document.unwrap().simulation_settings.thermal_bonding,
+            Some(welding_settings())
+        );
+    }
+
+    #[test]
+    fn object_edit_still_requires_selection() {
+        let mut scene = Scene::new(SceneConfig::default());
+        let mut document = Some(
+            SceneDocument::new("empty", SceneConfig::default()).expect("valid empty document"),
+        );
+        let mut ui = paused_ui();
+
+        let result = apply_scene_instance_edit(
+            &mut scene,
+            &mut document,
+            Some(Path::new("empty.vxscene")),
+            &mut ui,
+            0.0,
+            SceneInstanceEdit::Position(DVec3::X),
+        );
+
+        assert_eq!(result.unwrap_err(), "select a model instance first");
+    }
 }
 
 fn run_scene_instance_edit(
@@ -2684,7 +2765,11 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
         ui.show_bonds = false;
         ui.editor_tool = EditorTool::Select;
         ui.set_active_scene_document(Some(document.name.clone()), scene_model_names(document));
-        ui.set_status_message("Untitled Scene — add a voxel model or import an OBJ/GLB mesh.");
+        ui.set_status_message(if document.models.is_empty() {
+            "Empty scene — add a voxel model or import an OBJ/GLB mesh.".to_owned()
+        } else {
+            format!("Opened scene: {}", document.name)
+        });
     } else if let Some(document) = initial_model_document.as_ref() {
         ui.world_active = true;
         ui.editor_mode = true;

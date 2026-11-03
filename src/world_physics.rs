@@ -58,6 +58,17 @@ pub struct PhysicalCellPose {
     /// Kept in f64 world coordinates until the render boundary.
     pub world_position_m: DVec3,
     pub rotation: Quat,
+    pub temperature_kelvin: f32,
+    pub liquid_fraction: f32,
+    pub gas_fraction: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PhysicalCellThermalState {
+    pub scene_index: usize,
+    pub temperature_kelvin: f32,
+    pub liquid_fraction: f32,
+    pub gas_fraction: f32,
 }
 
 /// A hand anchor acting on one REV through the ordinary external-force path.
@@ -71,6 +82,8 @@ pub struct GrabTarget {
 #[derive(Clone, Debug, Default)]
 pub struct PhysicsFrame {
     pub cells: Vec<PhysicalCellPose>,
+    /// Thermal snapshots for fixed REVs, which conduct heat but have no dynamic pose.
+    pub fixed_thermal: Vec<PhysicalCellThermalState>,
     /// Distinguishes a restarted worker from an earlier frame at the same step.
     pub generation: u64,
     /// Advances only when the worker publishes a new solver state.
@@ -111,11 +124,36 @@ impl PhysicsFrame {
                 .zip(&scene.voxels)
                 .enumerate()
                 .filter(|(_, (_, voxel))| !voxel.kinematic)
-                .map(|(index, ((&position, &rotation), _))| PhysicalCellPose {
-                    scene_index: index,
-                    source_cell: scene.source_cells.get(index).copied().flatten(),
-                    world_position_m: position + origin,
-                    rotation,
+                .map(|(index, ((&position, &rotation), _))| {
+                    let phase = scene
+                        .phase_state(index)
+                        .expect("captured voxel must have a phase state");
+                    PhysicalCellPose {
+                        scene_index: index,
+                        source_cell: scene.source_cells.get(index).copied().flatten(),
+                        world_position_m: position + origin,
+                        rotation,
+                        temperature_kelvin: phase.temperature_kelvin,
+                        liquid_fraction: phase.liquid_fraction,
+                        gas_fraction: phase.gas_fraction,
+                    }
+                })
+                .collect(),
+            fixed_thermal: scene
+                .voxels
+                .iter()
+                .enumerate()
+                .filter(|(_, voxel)| voxel.kinematic)
+                .map(|(scene_index, _)| {
+                    let phase = scene
+                        .phase_state(scene_index)
+                        .expect("captured voxel must have a phase state");
+                    PhysicalCellThermalState {
+                        scene_index,
+                        temperature_kelvin: phase.temperature_kelvin,
+                        liquid_fraction: phase.liquid_fraction,
+                        gas_fraction: phase.gas_fraction,
+                    }
                 })
                 .collect(),
             generation,
@@ -521,6 +559,65 @@ mod tests {
         let velocity_x = snapshot.scene.voxels[0].velocity.x;
         assert!(velocity_x > 0.0);
         assert!((velocity_x - dt).abs() < dt * 0.1);
+    }
+
+    #[test]
+    fn captured_frame_contains_current_iron_temperature_and_phase_fractions() {
+        let iron = crate::material::Material::component_id("iron").unwrap();
+        let mut config = SceneConfig::default();
+        config.gravity = [0.0; 3];
+        let mut scene =
+            Scene::from_voxels(config, vec![VoxelSpawn::at_cell([0, 0, 0], iron)]).unwrap();
+
+        let cold = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 1, 1);
+        assert_eq!(cold.cells.len(), 1);
+        assert!(cold.cells[0].temperature_kelvin < 9000.0);
+        assert_eq!(cold.cells[0].liquid_fraction, 0.0);
+        assert_eq!(cold.cells[0].gas_fraction, 0.0);
+
+        let material =
+            crate::material::Material::mixed(&scene.voxels[0].composition, &scene.materials);
+        let target_energy = material.energy_at_temperature(scene.voxels[0].mass, 9000.0);
+        let current_energy = scene.voxels[0].total_internal_energy_j() as f32;
+        assert!(scene.add_heat_joules(0, target_energy - current_energy));
+        let hot_phase = scene.phase_state(0).unwrap();
+        assert!((hot_phase.temperature_kelvin - 9000.0).abs() < 0.1);
+
+        let hot = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 1, 2);
+        assert!((hot.cells[0].temperature_kelvin - 9000.0).abs() < 0.1);
+        assert_eq!(hot.cells[0].liquid_fraction, hot_phase.liquid_fraction);
+        assert_eq!(hot.cells[0].gas_fraction, hot_phase.gas_fraction);
+        assert!(hot.cells[0].temperature_kelvin > cold.cells[0].temperature_kelvin);
+        assert!(hot.cells[0].gas_fraction > cold.cells[0].gas_fraction);
+    }
+
+    #[test]
+    fn captured_frame_includes_heated_fixed_iron_without_dynamic_pose() {
+        let iron = crate::material::Material::component_id("iron").unwrap();
+        let mut config = SceneConfig::default();
+        config.gravity = [0.0; 3];
+        let mut scene =
+            Scene::from_voxels(config, vec![VoxelSpawn::at_cell([0, 0, 0], iron).fixed()]).unwrap();
+        let material =
+            crate::material::Material::mixed(&scene.voxels[0].composition, &scene.materials);
+        let target_energy = material.energy_at_temperature(scene.voxels[0].mass, 9000.0);
+        let current_energy = scene.voxels[0].total_internal_energy_j() as f32;
+        assert!(scene.add_heat_joules(0, target_energy - current_energy));
+
+        let frame = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 1, 1);
+
+        assert!(frame.cells.is_empty());
+        assert_eq!(frame.fixed_thermal.len(), 1);
+        assert_eq!(frame.fixed_thermal[0].scene_index, 0);
+        assert!((frame.fixed_thermal[0].temperature_kelvin - 9000.0).abs() < 0.1);
+        assert_eq!(
+            frame.fixed_thermal[0].liquid_fraction,
+            scene.phase_state(0).unwrap().liquid_fraction
+        );
+        assert_eq!(
+            frame.fixed_thermal[0].gas_fraction,
+            scene.phase_state(0).unwrap().gas_fraction
+        );
     }
 
     #[test]

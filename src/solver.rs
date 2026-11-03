@@ -1831,7 +1831,12 @@ fn advance_step_with_axis_targets_and_loads(
                 }
                 // Discover contacts from the coupled iterate without modifying
                 // it. New blocking pairs become constraints on the SAME solve.
-                collision::detect_into(scene, targets, &mut contacts);
+                // A certified coarse step has no coupled fine iterate. The
+                // looser REV-bin query can otherwise refine a body after its
+                // rigid drift, leaving its fine velocity buffers uninitialized.
+                if !coarse_clear {
+                    collision::detect_into(scene, targets, &mut contacts);
+                }
                 let mut blocked_pair = false;
                 for c in &contacts {
                     let axis = if c.normal.x.abs() > 0.5 {0} else if c.normal.y.abs() > 0.5 {1} else {2};
@@ -6130,11 +6135,27 @@ fn resolve_coupled_restitution(
 }
 
 fn solve_projected_contact(scene: &mut Scene, h: f32, scratch: &mut SolverScratch) -> usize {
+    let trace = std::env::var_os("VOXEL_TRACE_CONTACT_SOLVE").is_some();
+    let elastic_before = trace.then(|| scene.elastic_bond_energy_j());
     let rhs: Vec<_> = scratch.active.iter().map(|&i| scratch.rhs[i]).collect();
+    // New CCD projections may move a REV that already belongs to another
+    // active contact. Re-establish each normal gap in the same coupled solve;
+    // a homogeneous increment would preserve the newly introduced overlap.
+    let gap_targets: Vec<_> = scratch.pair_contacts.iter().map(|pair| {
+        if pair.active {
+            DCELL - (scene.positions[pair.j][pair.axis]
+                - scene.positions[pair.i][pair.axis]) * pair.sign
+        } else { 0.0 }
+    }).collect();
     let (dx, iterations, residual) = solve_contact_increment(
-        scene, h, scratch, &scratch.pair_contacts, &vec![0.0; scratch.pair_contacts.len()], &rhs);
+        scene, h, scratch, &scratch.pair_contacts, &gap_targets, &rhs);
     scene.solver_residual = residual;
     for (slot, &i) in scratch.active.iter().enumerate() { scene.positions[i] += dx[slot].as_dvec3(); }
+    if let Some(elastic_before) = elastic_before {
+        eprintln!("CONTACT_SOLVE step={} h={h:.6e} active={} pairs={} iterations={iterations} residual={residual:.6e} max_dx={:.6e} elastic_before={elastic_before:.6e} elastic_after={:.6e}",
+            scene.substep_index, scratch.active.len(), scratch.pair_contacts.len(),
+            dx.iter().map(|d| d.length()).fold(0.0_f32, f32::max), scene.elastic_bond_energy_j());
+    }
     scratch.dx = dx;
     for c in &scratch.constraints {
         let force = c.k * (scene.positions[c.j] - scene.positions[c.i] - c.rest).as_vec3();

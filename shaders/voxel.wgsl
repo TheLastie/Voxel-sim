@@ -19,6 +19,7 @@ struct Input {
     @location(5) rotation: vec4<f32>,
     @location(6) surface: f32,
     @location(7) skin_index: u32,
+    @location(8) thermal_emission: vec3<f32>,
 };
 struct Output {
     @builtin(position) position: vec4<f32>,
@@ -26,6 +27,7 @@ struct Output {
     @location(1) world_position: vec3<f32>,
     @location(2) normal: vec3<f32>,
     @location(3) @interpolate(flat) surface: f32,
+    @location(4) thermal_emission: vec3<f32>,
 };
 fn rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
     return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
@@ -93,6 +95,7 @@ fn multiply_quaternions(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
     o.world_position = world_position;
     o.surface = i.surface;
     o.color = i.color;
+    o.thermal_emission = i.thermal_emission;
     return o;
 }
 fn hash(p: vec2<f32>) -> f32 {
@@ -134,5 +137,9 @@ fn noise(p: vec2<f32>) -> f32 {
     }
     let light = 0.35 + 0.65 * max(dot(normalize(i.normal),
         normalize(vec3<f32>(-0.4,-0.6,1.0))),0.0);
-    return vec4<f32>(color*light,i.color.a);
+    // A fixed exposure with highlight compression keeps the chromaticity of
+    // white-hot emission instead of clipping every hot channel to white.
+    let peak_emission = max(i.thermal_emission.r, max(i.thermal_emission.g, i.thermal_emission.b));
+    let radiance = (color*light+i.thermal_emission) / (1.0+peak_emission);
+    return vec4<f32>(radiance,i.color.a);
 }
