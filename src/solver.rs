@@ -422,6 +422,137 @@ pub(crate) fn bond_stored_elastic_energy_at_positions_j(
     (0.5 * (1.0 - bond.damage) * displacement.dot(stiffness * displacement)).max(0.0) as f64
 }
 
+/// Capture mechanical energy before changing material frames or positions.
+/// Half of each bond's stored energy belongs to each endpoint.
+fn capture_nodal_mechanical_energy(scene: &Scene, energy: &mut Vec<f64>) -> f64 {
+    energy.clear();
+    energy.extend(scene.voxels.iter().map(|v| {
+        if v.kinematic { 0.0 } else {
+            0.5 * f64::from(v.mass) * v.velocity.as_dvec3().length_squared()
+        }
+    }));
+    let mut elastic = 0.0;
+    for axis in 0..3 {
+        for (i, bond) in scene.bonds[axis].iter().enumerate() {
+            if bond.neighbor == EMPTY { continue; }
+            let j = bond.neighbor as usize;
+            let stored = bond_stored_elastic_energy_j(scene, i, j, axis);
+            elastic += stored;
+            energy[i] += stored * 0.5;
+            energy[j] += stored * 0.5;
+        }
+    }
+    elastic
+}
+
+#[derive(Clone, Copy, Default)]
+struct FreeImplicitEnergyBudget {
+    before: f64,
+    after: f64,
+    correction: f64,
+    heat: f64,
+    excluded: bool,
+}
+
+/// Backward Euler damps a free elastic wave even after its contact ends.
+/// For fixed linear stiffness its exact loss is
+/// 1/2 sum(m |dv|²) + 1/2 sum(duᵀ K du). Return only a measured mechanical
+/// deficit, capped by that local positive quadratic: no energy compensation.
+/// Contacted, driven, constrained and coarse components use their own work
+/// accounting and are excluded. In particular, an unrelated impact cannot
+/// receive the heat of a freely vibrating component elsewhere in the scene.
+fn free_implicit_dissipation(
+    scene: &Scene,
+    scratch: &SolverScratch,
+    before: &[f64],
+    start_positions: &[DVec3],
+    start_velocities: &[Vec3],
+    solved: &[DVec3],
+    predicted: &[DVec3],
+    drift: &[Vec3],
+    tool_delta: &[Vec3],
+    loads: &[Vec3],
+    targets: &[[Option<f64>; 3]],
+    contacts: &[collision::Contact],
+    gravity: Vec3,
+    h: f32,
+    budgets: &mut Vec<FreeImplicitEnergyBudget>,
+    components: &mut Vec<usize>,
+    nodal_heat: &mut Vec<f64>,
+) -> (f64, f64) {
+    // Cluster labels are rebuilt at a fixed-step boundary. A bond may already
+    // have broken in an earlier substep, so derive the current material graph.
+    fn root(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+    components.clear();
+    components.extend(0..scene.voxels.len());
+    for constraint in &scratch.constraints {
+        let i = root(components, constraint.i);
+        let j = root(components, constraint.j);
+        components[j] = i;
+    }
+    for i in 0..components.len() { components[i] = root(components, i); }
+    budgets.clear();
+    budgets.resize(scene.voxels.len(), FreeImplicitEnergyBudget::default());
+    nodal_heat.clear();
+    nodal_heat.resize(scene.voxels.len(), 0.0);
+    for (i, voxel) in scene.voxels.iter().enumerate() {
+        let budget = &mut budgets[components[i]];
+        budget.before += before[i];
+        budget.excluded |= voxel.kinematic || scene.aggregate_of[i].is_some()
+            || loads[i] != Vec3::ZERO || tool_delta[i] != Vec3::ZERO
+            || targets[i].iter().any(Option::is_some);
+        let correction = ((solved[i] - predicted[i]) / f64::from(h)).as_vec3();
+        let velocity = drift[i] + tool_delta[i] + correction;
+        budget.after += 0.5 * f64::from(voxel.mass) * velocity.as_dvec3().length_squared();
+        budget.before += f64::from((gravity * voxel.mass).dot(
+            (start_velocities[i] + velocity) * (0.5 * h)));
+        nodal_heat[i] = 0.5 * f64::from(voxel.mass) * correction.as_dvec3().length_squared();
+    }
+    for contact in contacts {
+        budgets[components[contact.i]].excluded = true;
+        budgets[components[contact.j]].excluded = true;
+    }
+    for pair in scratch.pair_contacts.iter().filter(|pair| pair.active) {
+        budgets[components[pair.i]].excluded = true;
+        budgets[components[pair.j]].excluded = true;
+    }
+    for constraint in &scratch.constraints {
+        let (i, j) = (constraint.i, constraint.j);
+        let cluster = components[i];
+        if budgets[cluster].excluded { continue; }
+        budgets[cluster].after += bond_stored_elastic_energy_j(scene, i, j, constraint.axis);
+        let displacement = ((solved[j] - start_positions[j])
+            - (solved[i] - start_positions[i])).as_vec3();
+        let loss = 0.5 * displacement.as_dvec3().dot(
+            constraint.k.as_dmat3() * displacement.as_dvec3());
+        nodal_heat[i] += loss.max(0.0) * 0.5;
+        nodal_heat[j] += loss.max(0.0) * 0.5;
+    }
+    for (i, &weight) in nodal_heat.iter().enumerate() {
+        budgets[components[i]].correction += weight;
+    }
+    for budget in budgets.iter_mut().filter(|budget| !budget.excluded) {
+        budget.heat = (budget.before - budget.after).max(0.0).min(budget.correction);
+    }
+    let mut total = 0.0;
+    for (i, heat) in nodal_heat.iter_mut().enumerate() {
+        let budget = budgets[components[i]];
+        *heat = if budget.correction > 0.0 && !budget.excluded {
+            *heat * (budget.heat / budget.correction)
+        } else { 0.0 };
+        total += *heat;
+    }
+    let free_deficit = budgets.iter().filter(|budget| !budget.excluded)
+        .map(|budget| budget.before - budget.after).sum();
+    (total, free_deficit)
+}
+
 fn phase_strength(scene: &Scene, n: usize) -> (f32, f32) {
     let material = &scene.properties[n];
     let phase = material.phase_state(scene.voxels[n].mass, scene.voxels[n].thermal_energy_f32());
@@ -1372,6 +1503,10 @@ fn advance_step_with_axis_targets_and_loads(
     let mut contact_physical_velocities =
         std::mem::take(&mut solver_scratch.contact_physical_velocities);
     let mut contact_targets = targets.to_vec();
+    let mut substep_mechanical_energy = std::mem::take(&mut solver_scratch.substep_mechanical_energy);
+    let mut free_implicit_budgets = std::mem::take(&mut solver_scratch.free_implicit_budgets);
+    let mut free_implicit_components = std::mem::take(&mut solver_scratch.free_implicit_components);
+    let mut free_implicit_heat = std::mem::take(&mut solver_scratch.free_implicit_heat);
     for _ in 0..effective_substeps {
         let mut phase_start = Instant::now();
         let mut detail_start = profile_step.then(Instant::now);
@@ -1384,7 +1519,7 @@ fn advance_step_with_axis_targets_and_loads(
         let substep_elastic_energy_before = if coarse_clear {
             0.0
         } else {
-            scene.elastic_bond_energy_j()
+            capture_nodal_mechanical_energy(scene, &mut substep_mechanical_energy)
         };
         scene.previous.clone_from(&scene.positions);
         if let Some(start) = detail_start {
@@ -1939,8 +2074,8 @@ fn advance_step_with_axis_targets_and_loads(
                 applied_work += f64::from(force.dot(displacement));
             }
             let elastic_after = scene.elastic_bond_energy_j();
-            (kinetic_before + elastic_before + applied_work
-                - kinetic_after - elastic_after).max(0.0)
+            kinetic_before + elastic_before + applied_work
+                - kinetic_after - elastic_after
         });
         if coarse_clear {
             contacts.clear();
@@ -1973,6 +2108,17 @@ fn advance_step_with_axis_targets_and_loads(
             contact_work_mode[contact.j] = contact_work_mode[contact.j].max(mode);
         }
         impact_energies_j.clear();
+        let (free_implicit_total, free_implicit_deficit) = if coarse_clear { (0.0, 0.0) } else {
+            free_implicit_dissipation(scene, &solver_scratch, &substep_mechanical_energy,
+                &substep_start_positions, &substep_start_velocities, &solved_positions,
+                &predicted, &drift_velocity, &tool_contact_velocity, &applied_loads,
+                targets, &contacts, gravity, h, &mut free_implicit_budgets, &mut free_implicit_components,
+                &mut free_implicit_heat)
+        };
+        // Remove the entire independent free-body deficit from the contact
+        // pool, including any portion that the local quadratic cannot explain.
+        // Such a residual stays an accuracy error; it cannot fund another hit.
+        let implicit_contact_heat = (implicit_contact_heat - free_implicit_deficit).max(0.0);
         impact_energies_j.reserve(contacts.len());
         for contact in &contacts {
             let impact_energy = if !contact.new_impact {
@@ -2166,6 +2312,12 @@ fn advance_step_with_axis_targets_and_loads(
             &mut normal_impulses_ns, implicit_contact_heat,
         );
         let heat = implicit_contact_heat + restitution_heat;
+        if free_implicit_total > 0.0 {
+            for (voxel, &heat) in scene.voxels.iter_mut().zip(&free_implicit_heat) {
+                if heat > 0.0 { voxel.add_internal_energy_j(heat); }
+            }
+            scene.energy.implicit_solver_heat += free_implicit_total;
+        }
         if heat > 0.0 {
             let mut receivers = Vec::new();
             for pair in solver_scratch.pair_contacts.iter().filter(|pair| pair.active) {
@@ -2295,6 +2447,10 @@ fn advance_step_with_axis_targets_and_loads(
     solver_scratch.applied_loads = applied_loads;
     solver_scratch.substep_start_positions = substep_start_positions;
     solver_scratch.substep_start_velocities = substep_start_velocities;
+    solver_scratch.substep_mechanical_energy = substep_mechanical_energy;
+    solver_scratch.free_implicit_budgets = free_implicit_budgets;
+    solver_scratch.free_implicit_components = free_implicit_components;
+    solver_scratch.free_implicit_heat = free_implicit_heat;
     solver_scratch.load_integrated_velocities = load_integrated_velocities;
     solver_scratch.contact_work_mode = contact_work_mode;
     solver_scratch.tool_contact_velocity = tool_contact_velocity;
@@ -4172,6 +4328,10 @@ pub(crate) struct SolverScratch {
     applied_loads: Vec<Vec3>,
     substep_start_positions: Vec<DVec3>,
     substep_start_velocities: Vec<Vec3>,
+    substep_mechanical_energy: Vec<f64>,
+    free_implicit_budgets: Vec<FreeImplicitEnergyBudget>,
+    free_implicit_components: Vec<usize>,
+    free_implicit_heat: Vec<f64>,
     load_integrated_velocities: Vec<Vec3>,
     contact_work_mode: Vec<u8>,
     tool_contact_velocity: Vec<Vec3>,

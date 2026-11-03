@@ -179,8 +179,8 @@ pub struct EnergyLedger {
     pub liquid_viscous_heat: f64,
     /// Solid viscoelastic energy converted from bond-relative motion to heat (J).
     pub solid_viscoelastic_heat: f64,
-    /// Impact energy dissipated by implicit time integration and returned to
-    /// the contacting REVs as internal heat.
+    /// Impact or free elastic-wave energy dissipated by implicit time
+    /// integration and returned locally to the affected REVs as internal heat.
     pub implicit_solver_heat: f64,
     /// Relative kinetic energy converted to heat during REV fusion (J).
     pub fusion_heat: f64,
