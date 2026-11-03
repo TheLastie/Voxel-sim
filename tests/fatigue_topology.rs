@@ -43,7 +43,8 @@ fn fatigue_failure_splits_clusters_and_released_rev_keeps_mass_and_motion() {
             ],
         ];
         solver::step_with_axis_targets(&mut scene, &mut tool, &targets);
-        let strain = ((scene.positions[1].x - scene.positions[0].x - CELL as f64) / CELL as f64) as f32;
+        let strain =
+            ((scene.positions[1].x - scene.positions[0].x - CELL as f64) / CELL as f64) as f32;
         max_stress_ratio = max_stress_ratio.max((strain * young / strength).abs());
         if scene.bonds[0][0].neighbor == EMPTY {
             break_step = Some(step);

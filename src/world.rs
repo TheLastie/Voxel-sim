@@ -6,7 +6,7 @@ use crate::{
     scene::{Scene, SceneConfig, VoxelSpawn},
     voxel::{Composition, Microstructure},
 };
-use glam::{Quat, Vec3};
+use glam::{DVec3, Quat, Vec3};
 
 /// A square 10 km² map. The centimeter REV field is generated on demand from
 /// the seed; the full map is never expanded into an in-memory voxel array.
@@ -21,9 +21,13 @@ pub const WORLD_REV_M: f32 = 0.01;
 pub const WORLD_REV_SIDE: i32 = (WORLD_SIDE_M / WORLD_REV_M) as i32;
 const WORLD_REVS_PER_RENDER_CELL: i32 = 10;
 pub const MAX_WORLD_SAMPLE_CELLS: usize = 65_536;
+/// Maximum fine REVs accepted in one independently allocated physical patch.
+pub const MAX_PHYSICAL_PATCH_REVS: usize = 1_000_000;
 const WORLD_SAMPLE_HEIGHT_M: f32 = 512.0;
 const WORLD_SAMPLE_HEIGHT_CELLS: i32 = (WORLD_SAMPLE_HEIGHT_M / WORLD_REV_M) as i32;
 const SIMULATION_YEAR_SECONDS: f32 = 365.25 * 24.0 * 60.0 * 60.0;
+const PLANT_QUERY_BUCKET_M: f32 = 4.0;
+const LEAF_CLUSTER_RADIUS_M: f32 = 0.42;
 
 /// Geometric identity of a generated 1 cm cell. These tags distinguish plant
 /// anatomy, but do not claim that matching physical material parameters exist.
@@ -119,13 +123,77 @@ pub struct GeneratedCellPhysics {
     pub kinematic: bool,
 }
 
+/// A bounded physical world region whose solver coordinates are local to an
+/// integer-aligned world-cell origin. Global identity is retained separately,
+/// so REV spacing does not depend on distance from the world origin.
+pub struct PhysicalWorldPatch {
+    pub origin_cell: [i32; 3],
+    pub origin_world_m: DVec3,
+    /// Stable generated-world identity aligned with `scene.voxels` and
+    /// retained even after those physical cells move.
+    pub source_cells: Vec<[i32; 3]>,
+    pub scene: Scene,
+}
+
+impl PhysicalWorldPatch {
+    pub fn world_position(&self, local_position_m: DVec3) -> DVec3 {
+        self.origin_world_m + local_position_m
+    }
+
+    pub fn local_position(&self, world_position_m: DVec3) -> DVec3 {
+        world_position_m - self.origin_world_m
+    }
+}
+
 impl GeneratedCell {
-    /// Convert this generated 1 cm cell into the engine's physical spawn input.
-    /// Material composition stays explicit: `Scene::from_voxels` derives mass
-    /// and internal energy from that composition and this cell's temperature.
-    /// Kinematic fixation remains a boundary condition, separate from mass.
+    /// Convert this generated 1 cm cell into a world-coordinate spawn input.
+    /// The map origin is not aligned to the engine's global REV lattice, so use
+    /// `to_local_voxel_spawn` when constructing a solver scene. Composition is
+    /// explicit; the scene derives mass and internal energy from it and the
+    /// sampled temperature.
     pub fn to_voxel_spawn(
         self,
+        composition: Composition,
+        anisotropy: f32,
+        velocity: Vec3,
+        kinematic: bool,
+    ) -> Result<VoxelSpawn, &'static str> {
+        let cell_size = crate::coordinates::CELL_M;
+        let half_map_m = f64::from(WORLD_SIDE_M) * 0.5;
+        let center = DVec3::new(
+            (f64::from(self.cell[0]) + 0.5) * cell_size - half_map_m,
+            (f64::from(self.cell[1]) + 0.5) * cell_size - half_map_m,
+            f64::from(self.cell[2]) * cell_size + cell_size * 0.5,
+        );
+        self.to_voxel_spawn_at(center, composition, anisotropy, velocity, kinematic)
+    }
+
+    /// Convert a generated cell to a REV position relative to an integer cell
+    /// origin. Subtracting cell indices before converting to floating point
+    /// preserves adjacent-centimetre coordinates at any supported world offset.
+    pub fn to_local_voxel_spawn(
+        self,
+        origin_cell: [i32; 3],
+        composition: Composition,
+        anisotropy: f32,
+        velocity: Vec3,
+        kinematic: bool,
+    ) -> Result<VoxelSpawn, &'static str> {
+        let cell_size = crate::coordinates::CELL_M;
+        let delta = std::array::from_fn::<_, 3, _>(|axis| {
+            i64::from(self.cell[axis]) - i64::from(origin_cell[axis])
+        });
+        let center = DVec3::new(
+            delta[0] as f64 * cell_size + cell_size * 0.5,
+            delta[1] as f64 * cell_size + cell_size * 0.5,
+            delta[2] as f64 * cell_size + cell_size * 0.5,
+        );
+        self.to_voxel_spawn_at(center, composition, anisotropy, velocity, kinematic)
+    }
+
+    fn to_voxel_spawn_at(
+        self,
+        center: DVec3,
         composition: Composition,
         anisotropy: f32,
         velocity: Vec3,
@@ -148,14 +216,8 @@ impl GeneratedCell {
             }
             Quat::from_rotation_arc(Vec3::Z, direction.normalize())
         };
-        let lattice = Vec3::new(
-            (self.cell[0] - WORLD_REV_SIDE / 2) as f32,
-            (self.cell[1] - WORLD_REV_SIDE / 2) as f32,
-            self.cell[2] as f32,
-        );
-        let center = lattice * WORLD_REV_M + Vec3::splat(WORLD_REV_M * 0.5);
         Ok(VoxelSpawn {
-            center: center.as_dvec3(),
+            center,
             composition,
             velocity,
             microstructure: Microstructure {
@@ -166,6 +228,82 @@ impl GeneratedCell {
             temperature_kelvin: self.temperature_kelvin,
         })
     }
+}
+
+fn world_cell_origin_m(cell: [i32; 3]) -> DVec3 {
+    let cell_size = crate::coordinates::CELL_M;
+    let half_map_m = f64::from(WORLD_SIDE_M) * 0.5;
+    DVec3::new(
+        f64::from(cell[0]) * cell_size - half_map_m,
+        f64::from(cell[1]) * cell_size - half_map_m,
+        f64::from(cell[2]) * cell_size,
+    )
+}
+
+fn build_physical_spawns<F>(
+    cells: Vec<GeneratedCell>,
+    local_origin: Option<[i32; 3]>,
+    mut physics_for_cell: F,
+) -> Result<(Vec<VoxelSpawn>, Vec<[i32; 3]>), String>
+where
+    F: FnMut(GeneratedCell) -> Result<Option<GeneratedCellPhysics>, String>,
+{
+    let mut spawns = Vec::with_capacity(cells.len());
+    let mut source_cells = Vec::with_capacity(cells.len());
+    for cell in cells {
+        let Some(state) = physics_for_cell(cell).map_err(|reason| {
+            format!(
+                "material policy rejected {:?} at {:?}: {reason}",
+                cell.content, cell.cell
+            )
+        })?
+        else {
+            continue;
+        };
+        let spawn = match local_origin {
+            Some(origin) => cell.to_local_voxel_spawn(
+                origin,
+                state.composition,
+                state.anisotropy,
+                state.velocity,
+                state.kinematic,
+            ),
+            None => cell.to_voxel_spawn(
+                state.composition,
+                state.anisotropy,
+                state.velocity,
+                state.kinematic,
+            ),
+        }
+        .map_err(|reason| {
+            format!(
+                "cannot create physical {:?} at {:?}: {reason}",
+                cell.content, cell.cell
+            )
+        })?;
+        spawns.push(spawn);
+        source_cells.push(cell.cell);
+    }
+    Ok((spawns, source_cells))
+}
+
+fn assemble_physical_patch<F>(
+    config: SceneConfig,
+    origin_cell: [i32; 3],
+    cells: Vec<GeneratedCell>,
+    physics_for_cell: F,
+) -> Result<PhysicalWorldPatch, String>
+where
+    F: FnMut(GeneratedCell) -> Result<Option<GeneratedCellPhysics>, String>,
+{
+    let (spawns, source_cells) = build_physical_spawns(cells, Some(origin_cell), physics_for_cell)?;
+    let scene = Scene::from_voxels(config, spawns)?;
+    Ok(PhysicalWorldPatch {
+        origin_cell,
+        origin_world_m: world_cell_origin_m(origin_cell),
+        source_cells,
+        scene,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -189,6 +327,7 @@ pub struct GeneratedWorld {
     morphotypes: Vec<Morphotype>,
     plant_growth: Vec<PlantGrowth>,
     plant_branches: Vec<Vec<BranchSegment>>,
+    plant_spatial_index: PlantSpatialIndex,
     mycelium_segments: Vec<MyceliumSegment>,
     mycelium_buckets: Vec<Vec<usize>>,
     seed_hash: u64,
@@ -213,8 +352,12 @@ pub struct GrowthScheduler {
 
 impl GrowthScheduler {
     fn key(world: &GeneratedWorld) -> (u64, u64, u32, u64) {
-        (world.seed_hash, world.geometry_revision, world.age_years.to_bits(),
-            world.calendar_years.to_bits())
+        (
+            world.seed_hash,
+            world.geometry_revision,
+            world.age_years.to_bits(),
+            world.calendar_years.to_bits(),
+        )
     }
 
     pub fn is_busy(&self) -> bool {
@@ -262,10 +405,12 @@ impl GrowthScheduler {
             }
             let mut snapshot = world.clone();
             let (sender, receiver) = std::sync::mpsc::channel();
-            match std::thread::Builder::new().name("world-growth".into()).spawn(move || {
-                snapshot.advance_growth(elapsed);
-                let _ = sender.send(snapshot);
-            }) {
+            match std::thread::Builder::new()
+                .name("world-growth".into())
+                .spawn(move || {
+                    snapshot.advance_growth(elapsed);
+                    let _ = sender.send(snapshot);
+                }) {
                 Ok(_) => self.in_flight = Some((receiver, elapsed)),
                 Err(error) => {
                     self.queued.push_front(elapsed);
@@ -318,7 +463,11 @@ impl WorldCharacter {
     }
 
     pub fn height(self) -> f32 {
-        if self.crouched { Self::CROUCH_HEIGHT_M } else { Self::HEIGHT_M }
+        if self.crouched {
+            Self::CROUCH_HEIGHT_M
+        } else {
+            Self::HEIGHT_M
+        }
     }
 
     /// Release Ctrl to stand only when the complete standing volume is clear.
@@ -332,9 +481,11 @@ impl WorldCharacter {
     }
 
     fn inside_bounds(world: &GeneratedWorld, x: f32, y: f32) -> bool {
-        if let Some((min,max)) = world.view_bounds {
-            return x >= min.x + Self::RADIUS_M && x <= max.x - Self::RADIUS_M
-                && y >= min.y + Self::RADIUS_M && y <= max.y - Self::RADIUS_M;
+        if let Some((min, max)) = world.view_bounds {
+            return x >= min.x + Self::RADIUS_M
+                && x <= max.x - Self::RADIUS_M
+                && y >= min.y + Self::RADIUS_M
+                && y <= max.y - Self::RADIUS_M;
         }
         let limit = WORLD_SIDE_M * 0.5 - Self::RADIUS_M;
         x.abs() <= limit && y.abs() <= limit
@@ -366,7 +517,14 @@ impl WorldCharacter {
         let forward = Vec3::new(-camera_yaw.cos(), -camera_yaw.sin(), 0.0);
         let right = Vec3::new(forward.y, -forward.x, 0.0);
         let planar = (right * move_input.x + forward * move_input.y).normalize_or_zero();
-        let speed = speed_mps.max(0.0) * if self.crouched { 0.45 } else if sprint { 1.7 } else { 1.0 };
+        let speed = speed_mps.max(0.0)
+            * if self.crouched {
+                0.45
+            } else if sprint {
+                1.7
+            } else {
+                1.0
+            };
 
         for _ in 0..steps {
             if jump && self.grounded {
@@ -398,11 +556,12 @@ impl WorldCharacter {
                     // Slide along a trunk or steep rise when one movement axis
                     // remains clear, as standard capsule controllers do.
                     for axis in [Vec3::X, Vec3::Y] {
-                        let partial = Vec3::new(displacement.x * axis.x, displacement.y * axis.y, 0.0);
+                        let partial =
+                            Vec3::new(displacement.x * axis.x, displacement.y * axis.y, 0.0);
                         let candidate = self.position + partial;
                         if Self::inside_bounds(world, candidate.x, candidate.y)
                             && world.terrain_height_at(candidate.x, candidate.y)
-                            <= self.position.z + Self::MAX_STEP_UP_M
+                                <= self.position.z + Self::MAX_STEP_UP_M
                             && !world.character_overlaps_wood(
                                 Vec3::new(candidate.x, candidate.y, self.position.z),
                                 Self::RADIUS_M,
@@ -424,8 +583,13 @@ impl WorldCharacter {
             }
             self.vertical_velocity_mps -= Self::GRAVITY_MPS2 * dt;
             let next_z = self.position.z + self.vertical_velocity_mps * dt;
-            if self.vertical_velocity_mps > 0.0 && world.character_overlaps_wood(
-                Vec3::new(self.position.x,self.position.y,next_z),Self::RADIUS_M,self.height()) {
+            if self.vertical_velocity_mps > 0.0
+                && world.character_overlaps_wood(
+                    Vec3::new(self.position.x, self.position.y, next_z),
+                    Self::RADIUS_M,
+                    self.height(),
+                )
+            {
                 self.vertical_velocity_mps = 0.0;
             } else {
                 self.position.z = next_z;
@@ -517,6 +681,140 @@ struct BranchSegment {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum PlantSpatialRef {
+    Trunk(usize),
+    Branch {
+        plant_index: usize,
+        branch_index: usize,
+    },
+}
+
+impl PlantSpatialRef {
+    fn plant_index(self) -> usize {
+        match self {
+            Self::Trunk(index)
+            | Self::Branch {
+                plant_index: index, ..
+            } => index,
+        }
+    }
+}
+
+/// Sparse broadphase for implicit 1 cm cell queries. Buckets contain only
+/// plant parts whose generated bounds can cover a query point.
+#[derive(Clone, Debug, Default)]
+struct PlantSpatialIndex {
+    canopy: HashMap<(i32, i32), Vec<PlantSpatialRef>>,
+    roots: HashMap<(i32, i32), Vec<PlantSpatialRef>>,
+    seed_cells: HashMap<[i32; 3], usize>,
+    tree_hosts: HashMap<(i32, i32), Vec<usize>>,
+}
+
+impl PlantSpatialIndex {
+    fn build(
+        plants: &[Plant],
+        growth: &[PlantGrowth],
+        branches: &[Vec<BranchSegment>],
+        age_years: f32,
+    ) -> Self {
+        let mut index = Self::default();
+        for (plant_index, plant) in plants.iter().enumerate() {
+            let Some(&plant_growth) = growth.get(plant_index) else {
+                continue;
+            };
+            let plant_branches = branches.get(plant_index).map(Vec::as_slice).unwrap_or(&[]);
+            let seed_cell = if age_years < plant.germination_age_years {
+                plant.seed_cell()
+            } else {
+                plant.apical_seed_cell(plant_growth)
+            };
+            index.seed_cells.entry(seed_cell).or_insert(plant_index);
+
+            if plant.genome.mycorrhizal_affinity >= 0.35 {
+                insert_spatial_bounds(
+                    &mut index.tree_hosts,
+                    plant.x - 2.5,
+                    plant.y - 2.5,
+                    plant.x + 2.5,
+                    plant.y + 2.5,
+                    plant_index,
+                );
+            }
+
+            if plant_growth.trunk_height_m > 0.0 {
+                let radius = plant_growth.trunk_radius_m;
+                insert_spatial_bounds(
+                    &mut index.canopy,
+                    plant.x - radius,
+                    plant.y - radius,
+                    plant.x + radius,
+                    plant.y + radius,
+                    PlantSpatialRef::Trunk(plant_index),
+                );
+            }
+
+            for (branch_index, branch) in plant_branches.iter().enumerate() {
+                let query_radius = if branch.is_root {
+                    branch.radius_m
+                } else {
+                    branch.radius_m.max(LEAF_CLUSTER_RADIUS_M)
+                };
+                let minimum = branch.start.min(branch.end) - Vec3::splat(query_radius);
+                let maximum = branch.start.max(branch.end) + Vec3::splat(query_radius);
+                let spatial_ref = PlantSpatialRef::Branch {
+                    plant_index,
+                    branch_index,
+                };
+                if branch.is_root {
+                    insert_spatial_bounds(
+                        &mut index.roots,
+                        minimum.x,
+                        minimum.y,
+                        maximum.x,
+                        maximum.y,
+                        spatial_ref,
+                    );
+                } else {
+                    insert_spatial_bounds(
+                        &mut index.canopy,
+                        minimum.x,
+                        minimum.y,
+                        maximum.x,
+                        maximum.y,
+                        spatial_ref,
+                    );
+                }
+            }
+        }
+        index
+    }
+}
+
+fn plant_spatial_bucket(x: f32, y: f32) -> (i32, i32) {
+    (
+        (x / PLANT_QUERY_BUCKET_M).floor() as i32,
+        (y / PLANT_QUERY_BUCKET_M).floor() as i32,
+    )
+}
+
+fn insert_spatial_bounds<T: Copy>(
+    buckets: &mut HashMap<(i32, i32), Vec<T>>,
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    value: T,
+) {
+    let (min_x, min_y) = plant_spatial_bucket(min_x, min_y);
+    let (max_x, max_y) = plant_spatial_bucket(max_x, max_y);
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            buckets.entry((x, y)).or_default().push(value);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct MyceliumSegment {
     start: Vec3,
     end: Vec3,
@@ -530,9 +828,8 @@ impl GeneratedWorld {
         let seed_hash = hash_seed(seed);
         // A seed-derived calendar epoch keeps the initial season reproducible.
         let season_phase_offset = (unit_noise(seed_hash ^ 0x6A09_E667_F3BC_C909) + 1.0) * 0.5;
-        let mut terrain_voxels = Vec::with_capacity(
-            WORLD_OVERVIEW_SIDE_CELLS * WORLD_OVERVIEW_SIDE_CELLS,
-        );
+        let mut terrain_voxels =
+            Vec::with_capacity(WORLD_OVERVIEW_SIDE_CELLS * WORLD_OVERVIEW_SIDE_CELLS);
         for y in 0..WORLD_OVERVIEW_SIDE_CELLS {
             for x in 0..WORLD_OVERVIEW_SIDE_CELLS {
                 let field_x = x as f32 + 0.5;
@@ -584,6 +881,7 @@ impl GeneratedWorld {
             morphotypes,
             plant_growth: Vec::new(),
             plant_branches: Vec::new(),
+            plant_spatial_index: PlantSpatialIndex::default(),
             mycelium_segments: Vec::new(),
             mycelium_buckets: vec![Vec::new(); 25 * 25],
             seed_hash,
@@ -682,20 +980,26 @@ impl GeneratedWorld {
             .zip(&self.plant_branches)
         {
             if self.age_years < plant.germination_age_years
-                || !plant.wood_intersects_region(*growth, branches, region_min, region_max)
+                || !plant.wood_intersects_region(*growth, branches, region_min, region_max, false)
             {
                 continue;
             }
 
-            for voxel in plant.voxels_at_age(
-                *growth,
-                self.seed_hash,
-                branches,
-                season_phase,
-                self.geometry_age_years,
-                WORLD_REV_M,
-                Some((center, radius_m)),
-            ) {
+            for voxel in plant
+                .voxels_at_age(
+                    *growth,
+                    self.seed_hash,
+                    branches,
+                    season_phase,
+                    self.geometry_age_years,
+                    WORLD_REV_M,
+                    Some((center, radius_m)),
+                    true,
+                    false,
+                    None,
+                )
+                .expect("unbounded render-shell generation")
+            {
                 if voxel.content != GeneratedCellContent::PlantWood
                     || voxel.center.distance_squared(center) > radius_squared
                 {
@@ -712,6 +1016,119 @@ impl GeneratedWorld {
             }
         }
         result
+    }
+
+    /// Enumerate complete 1 cm plant-wood volume near a point for physical
+    /// activation. Unlike `plant_wood_voxels_near`, this includes interior and
+    /// root REVs; the render-only shell must never be used as a physical body.
+    pub fn plant_wood_rev_cells_near(
+        &self,
+        center: Vec3,
+        radius_m: f32,
+        max_cells: usize,
+    ) -> Result<Vec<[i32; 3]>, String> {
+        let candidates = self.plant_wood_rev_candidates_near(center, radius_m, max_cells)?;
+        Ok(candidates
+            .into_iter()
+            .filter(|&cell| {
+                self.sample_cell(cell)
+                    .is_some_and(|sample| sample.content == GeneratedCellContent::PlantWood)
+            })
+            .collect())
+    }
+
+    /// Return the same exact physical wood cells with their generated state
+    /// already sampled. Pass these directly to
+    /// `build_physical_patch_from_generated_cells` to avoid sampling every REV
+    /// a second time during activation.
+    pub fn plant_wood_generated_cells_near(
+        &self,
+        center: Vec3,
+        radius_m: f32,
+        max_cells: usize,
+    ) -> Result<Vec<GeneratedCell>, String> {
+        let candidates = self.plant_wood_rev_candidates_near(center, radius_m, max_cells)?;
+        Ok(candidates
+            .into_iter()
+            .filter_map(|cell| {
+                self.sample_cell(cell)
+                    .filter(|sample| sample.content == GeneratedCellContent::PlantWood)
+            })
+            .collect())
+    }
+
+    fn plant_wood_rev_candidates_near(
+        &self,
+        center: Vec3,
+        radius_m: f32,
+        max_cells: usize,
+    ) -> Result<Vec<[i32; 3]>, String> {
+        if !center.is_finite() || !radius_m.is_finite() || radius_m <= 0.0 {
+            return Err("physical wood query requires a finite center and positive radius".into());
+        }
+        if !(radius_m * radius_m).is_finite() {
+            return Err("physical wood query radius is too large".into());
+        }
+        if max_cells == 0 || max_cells > MAX_PHYSICAL_PATCH_REVS {
+            return Err(format!(
+                "physical wood query limit must be between 1 and {MAX_PHYSICAL_PATCH_REVS} REVs"
+            ));
+        }
+
+        let radius_squared = radius_m * radius_m;
+        let region_min = center - Vec3::splat(radius_m);
+        let region_max = center + Vec3::splat(radius_m);
+        let season_phase = self.season_phase();
+        let mut cells = Vec::new();
+        let mut occupied = HashSet::new();
+        for ((plant, growth), branches) in self
+            .plants
+            .iter()
+            .zip(&self.plant_growth)
+            .zip(&self.plant_branches)
+        {
+            if self.age_years < plant.germination_age_years
+                || !plant.wood_intersects_region(*growth, branches, region_min, region_max, true)
+            {
+                continue;
+            }
+            for voxel in plant
+                .voxels_at_age(
+                    *growth,
+                    self.seed_hash,
+                    branches,
+                    season_phase,
+                    self.geometry_age_years,
+                    WORLD_REV_M,
+                    Some((center, radius_m)),
+                    false,
+                    true,
+                    Some(max_cells),
+                )
+                .map_err(str::to_owned)?
+            {
+                if voxel.content != GeneratedCellContent::PlantWood
+                    || voxel.center.distance_squared(center) > radius_squared
+                {
+                    continue;
+                }
+                let cell = [
+                    ((voxel.center.x + WORLD_SIDE_M * 0.5) / WORLD_REV_M).floor() as i32,
+                    ((voxel.center.y + WORLD_SIDE_M * 0.5) / WORLD_REV_M).floor() as i32,
+                    (voxel.center.z / WORLD_REV_M).floor() as i32,
+                ];
+                if occupied.insert(cell) {
+                    if cells.len() == max_cells {
+                        return Err(format!(
+                            "physical wood query exceeds its {max_cells}-REV limit"
+                        ));
+                    }
+                    cells.push(cell);
+                }
+            }
+        }
+        cells.sort_unstable();
+        Ok(cells)
     }
 
     /// Stable identity for renderer caches; geometry changes only when a
@@ -734,7 +1151,10 @@ impl GeneratedWorld {
     /// geometry. Candidate trees are culled by their seeded crown radius first.
     fn character_overlaps_wood(&self, foot: Vec3, radius: f32, height: f32) -> bool {
         for (plant, segments) in self.plants.iter().zip(&self.plant_branches) {
-            let reach = plant.genome.crown_spread_m.max(plant.genome.maximum_height_m * 0.35)
+            let reach = plant
+                .genome
+                .crown_spread_m
+                .max(plant.genome.maximum_height_m * 0.35)
                 + radius;
             if (plant.x - foot.x).abs() > reach || (plant.y - foot.y).abs() > reach {
                 continue;
@@ -818,9 +1238,14 @@ impl GeneratedWorld {
                 }
                 for ix in min_x..max_x {
                     let x = (ix as f32 + 0.5) * cell - WORLD_SIDE_M * 0.5;
-                    if let Some((min,max)) = self.view_bounds {
-                        if x + half_cell <= min.x || x - half_cell >= max.x
-                            || y + half_cell <= min.y || y - half_cell >= max.y { continue; }
+                    if let Some((min, max)) = self.view_bounds {
+                        if x + half_cell <= min.x
+                            || x - half_cell >= max.x
+                            || y + half_cell <= min.y
+                            || y - half_cell >= max.y
+                        {
+                            continue;
+                        }
                     }
                     let dx = x - center.x;
                     let dy = y - center.y;
@@ -830,8 +1255,7 @@ impl GeneratedWorld {
                     // neighboring LOD grids had different cell widths.
                     let nearest_x = (dx.abs() - half_cell).max(0.0);
                     let nearest_y = (dy.abs() - half_cell).max(0.0);
-                    let nearest_distance_squared =
-                        nearest_x * nearest_x + nearest_y * nearest_y;
+                    let nearest_distance_squared = nearest_x * nearest_x + nearest_y * nearest_y;
                     let farthest_x = dx.abs() + half_cell;
                     let farthest_y = dy.abs() + half_cell;
                     let farthest_distance_squared =
@@ -876,25 +1300,18 @@ impl GeneratedWorld {
     /// Return the plant's inherited genome at its seed while dormant and at
     /// its apical growth cell after germination.
     pub fn seed_genome_at_cell(&self, cell: [i32; 3]) -> Option<SeedGenome> {
-        self.plants
-            .iter()
-            .enumerate()
-            .find_map(|(index, plant)| {
-                if self.age_years < plant.germination_age_years {
-                    (plant.seed_cell() == cell).then_some(plant.genome)
-                } else {
-                    self.plant_growth
-                        .get(index)
-                        .filter(|growth| plant.apical_seed_cell(**growth) == cell)
-                        .map(|_| plant.genome)
-                }
-            })
+        self.plant_spatial_index
+            .seed_cells
+            .get(&cell)
+            .and_then(|&index| self.plants.get(index))
+            .map(|plant| plant.genome)
     }
 
     /// Sample one cell on the deterministic 1 cm lattice. Coordinates start
-    /// at the south-west world corner; valid horizontal indices are 0..1000,
-    /// and the vertical sample domain is 0..1600. Cells represent the current
-    /// generated geometry, not dynamic solver state.
+    /// at the south-west world corner; valid horizontal indices are
+    /// `0..WORLD_REV_SIDE`, and the vertical domain is
+    /// `0..WORLD_SAMPLE_HEIGHT_CELLS`. Cells represent generated geometry, not
+    /// dynamic solver state.
     pub fn sample_cell(&self, cell: [i32; 3]) -> Option<GeneratedCell> {
         let [x, y, z] = cell;
         if !(0..WORLD_REV_SIDE).contains(&x)
@@ -909,10 +1326,8 @@ impl GeneratedWorld {
         let z_m = (z as f32 + 0.5) * WORLD_REV_M;
         let field_x = x_m / WORLD_CELL_M;
         let field_y = y_m / WORLD_CELL_M;
-        let (terrain_x, terrain_y) = terrain_field_coordinates(
-            x_m - WORLD_SIDE_M * 0.5,
-            y_m - WORLD_SIDE_M * 0.5,
-        );
+        let (terrain_x, terrain_y) =
+            terrain_field_coordinates(x_m - WORLD_SIDE_M * 0.5, y_m - WORLD_SIDE_M * 0.5);
         let terrain_height_m = terrain_height(self.seed_hash, terrain_x, terrain_y);
         let (soil_moisture, fertility) = ecology_at(self.seed_hash, field_x, field_y);
         let temperature_kelvin = climate_temperature(self.seed_hash, field_x, field_y, z_m);
@@ -934,9 +1349,7 @@ impl GeneratedWorld {
         };
         let generated_soil_content = matches!(
             vegetation,
-            Some(
-                GeneratedCellContent::PlantWood | GeneratedCellContent::Mycelium
-            )
+            Some(GeneratedCellContent::PlantWood | GeneratedCellContent::Mycelium)
         );
         let content = if z_m <= terrain_height_m && !generated_soil_content {
             GeneratedCellContent::Terrain
@@ -990,17 +1403,18 @@ impl GeneratedWorld {
         Some(cells)
     }
 
-    /// Build a physical scene from a bounded 1 cm region of the generated
-    /// world. The material policy is explicit for every cell; `None` omits a
-    /// cell from the physical domain, while unsupported contents should return
-    /// an error. Region size is limited by `sample_region` to bound memory and
-    /// construction work.
+    /// Legacy absolute-coordinate scene builder. The generated map origin is
+    /// not aligned to the engine's global REV lattice; use
+    /// `build_physical_patch` for solver-compatible local coordinates.
+    #[deprecated(
+        note = "the generated map is not aligned to the global REV lattice; use build_physical_patch"
+    )]
     pub fn build_physical_region<F>(
         &self,
         config: SceneConfig,
         min_cell: [i32; 3],
         max_cell_exclusive: [i32; 3],
-        mut physics_for_cell: F,
+        physics_for_cell: F,
     ) -> Result<Scene, String>
     where
         F: FnMut(GeneratedCell) -> Result<Option<GeneratedCellPhysics>, String>,
@@ -1012,32 +1426,123 @@ impl GeneratedWorld {
                     "invalid physical world region {min_cell:?}..{max_cell_exclusive:?} or sample limit exceeded"
                 )
             })?;
-        let mut spawns = Vec::with_capacity(cells.len());
-        for cell in cells {
-            let Some(state) = physics_for_cell(cell).map_err(|reason| {
-                format!(
-                    "material policy rejected {:?} at {:?}: {reason}",
-                    cell.content, cell.cell
-                )
-            })? else {
-                continue;
-            };
-            let spawn = cell
-                .to_voxel_spawn(
-                    state.composition,
-                    state.anisotropy,
-                    state.velocity,
-                    state.kinematic,
-                )
-                .map_err(|reason| {
-                    format!(
-                        "cannot create physical {:?} at {:?}: {reason}",
-                        cell.content, cell.cell
-                    )
-                })?;
-            spawns.push(spawn);
-        }
+        let (spawns, _) = build_physical_spawns(cells, None, physics_for_cell)?;
         Scene::from_voxels(config, spawns)
+    }
+
+    /// Build a bounded physical patch with local solver coordinates and a
+    /// retained world origin. Unlike a render LOD, every included 1 cm sample
+    /// becomes an independent REV with its own state in the returned Scene.
+    pub fn build_physical_patch<F>(
+        &self,
+        config: SceneConfig,
+        min_cell: [i32; 3],
+        max_cell_exclusive: [i32; 3],
+        physics_for_cell: F,
+    ) -> Result<PhysicalWorldPatch, String>
+    where
+        F: FnMut(GeneratedCell) -> Result<Option<GeneratedCellPhysics>, String>,
+    {
+        let cells = self
+            .sample_region(min_cell, max_cell_exclusive)
+            .ok_or_else(|| {
+                format!(
+                    "invalid physical world region {min_cell:?}..{max_cell_exclusive:?} or sample limit exceeded"
+                )
+            })?;
+        let (spawns, source_cells) =
+            build_physical_spawns(cells, Some(min_cell), physics_for_cell)?;
+        let scene = Scene::from_voxels(config, spawns)?;
+        Ok(PhysicalWorldPatch {
+            origin_cell: min_cell,
+            origin_world_m: world_cell_origin_m(min_cell),
+            source_cells,
+            scene,
+        })
+    }
+
+    /// Build a physical patch from an explicit sparse set of generated 1 cm
+    /// cells. Duplicate identities are rejected to prevent double-counting mass.
+    pub fn build_physical_patch_from_cells<F, I>(
+        &self,
+        config: SceneConfig,
+        origin_cell: [i32; 3],
+        source_cells: I,
+        physics_for_cell: F,
+    ) -> Result<PhysicalWorldPatch, String>
+    where
+        F: FnMut(GeneratedCell) -> Result<Option<GeneratedCellPhysics>, String>,
+        I: IntoIterator<Item = [i32; 3]>,
+    {
+        let mut bounded_source_cells = Vec::new();
+        for cell in source_cells {
+            if bounded_source_cells.len() == MAX_PHYSICAL_PATCH_REVS {
+                return Err(format!(
+                    "physical world patch exceeds its {MAX_PHYSICAL_PATCH_REVS}-REV limit"
+                ));
+            }
+            bounded_source_cells.push(cell);
+        }
+        let mut source_cells = bounded_source_cells;
+        if source_cells.is_empty() {
+            return Err("physical world patch requires at least one source cell".into());
+        }
+        source_cells.sort_unstable();
+        if source_cells.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err("physical world patch contains duplicate source cells".into());
+        }
+
+        let cells = source_cells
+            .iter()
+            .map(|&cell| {
+                self.sample_cell(cell)
+                    .ok_or_else(|| format!("physical patch cell {cell:?} is outside the world"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assemble_physical_patch(config, origin_cell, cells, physics_for_cell)
+    }
+
+    /// Build a physical patch from cells already sampled from this world.
+    /// This keeps exact generated state and avoids a second world lookup for
+    /// every REV when activating geometry returned by a generated-cell query.
+    pub fn build_physical_patch_from_generated_cells<F, I>(
+        &self,
+        config: SceneConfig,
+        origin_cell: [i32; 3],
+        generated_cells: I,
+        physics_for_cell: F,
+    ) -> Result<PhysicalWorldPatch, String>
+    where
+        F: FnMut(GeneratedCell) -> Result<Option<GeneratedCellPhysics>, String>,
+        I: IntoIterator<Item = GeneratedCell>,
+    {
+        let mut cells = Vec::new();
+        for cell in generated_cells {
+            if cells.len() == MAX_PHYSICAL_PATCH_REVS {
+                return Err(format!(
+                    "physical world patch exceeds its {MAX_PHYSICAL_PATCH_REVS}-REV limit"
+                ));
+            }
+            if !(0..WORLD_REV_SIDE).contains(&cell.cell[0])
+                || !(0..WORLD_REV_SIDE).contains(&cell.cell[1])
+                || !(0..WORLD_SAMPLE_HEIGHT_CELLS).contains(&cell.cell[2])
+            {
+                return Err(format!(
+                    "physical patch cell {:?} is outside the world",
+                    cell.cell
+                ));
+            }
+            cells.push(cell);
+        }
+        if cells.is_empty() {
+            return Err("physical world patch requires at least one source cell".into());
+        }
+        cells.sort_unstable_by_key(|cell| cell.cell);
+        if cells.windows(2).any(|pair| pair[0].cell == pair[1].cell) {
+            return Err("physical world patch contains duplicate source cells".into());
+        }
+
+        assemble_physical_patch(config, origin_cell, cells, physics_for_cell)
     }
 
     fn vegetation_at_point(
@@ -1045,46 +1550,91 @@ impl GeneratedWorld {
         cell: [i32; 3],
         point: Vec3,
     ) -> Option<(GeneratedCellContent, Option<Vec3>)> {
-        self.plants
-            .iter()
-            .zip(&self.plant_growth)
-            .zip(&self.plant_branches)
-            .filter_map(|((plant, growth), branches)| {
-                plant.content_at_point(
-                    *growth,
-                    point,
-                    self.seed_hash,
-                    cell,
-                    branches,
-                    self.season_phase(),
-                )
-            })
-            .chain(
-                ground_flora_at_point(
-                    self.seed_hash,
-                    self.geometry_age_years,
-                    self.season_phase(),
-                    point,
-                    &self.plants,
-                )
-                .map(|content| (content, None)),
-            )
-            .min_by_key(|(content, _)| content.priority())
+        let season_phase = self.season_phase();
+        let mut best: Option<(GeneratedCellContent, Option<Vec3>)> = None;
+        if let Some(candidates) = self
+            .plant_spatial_index
+            .canopy
+            .get(&plant_spatial_bucket(point.x, point.y))
+        {
+            let mut start = 0;
+            while start < candidates.len() {
+                let plant_index = candidates[start].plant_index();
+                let mut end = start + 1;
+                while end < candidates.len() && candidates[end].plant_index() == plant_index {
+                    end += 1;
+                }
+                if let (Some(plant), Some(growth), Some(branches)) = (
+                    self.plants.get(plant_index),
+                    self.plant_growth.get(plant_index),
+                    self.plant_branches.get(plant_index),
+                ) {
+                    let sampled = plant.content_at_indexed_point(
+                        *growth,
+                        point,
+                        self.seed_hash,
+                        cell,
+                        branches,
+                        season_phase,
+                        &candidates[start..end],
+                    );
+                    if let Some((content, _)) = sampled {
+                        if best.is_none_or(|(current, _)| content.priority() < current.priority()) {
+                            best = sampled;
+                        }
+                    }
+                }
+                start = end;
+            }
+        }
+        if let Some(content) = ground_flora_at_point(
+            self.seed_hash,
+            self.geometry_age_years,
+            season_phase,
+            point,
+            &self.plants,
+            &self.plant_spatial_index,
+        ) {
+            if best.is_none_or(|(current, _)| content.priority() < current.priority()) {
+                best = Some((content, None));
+            }
+        }
+        best
     }
 
     fn root_content_at_point(&self, point: Vec3) -> Option<(GeneratedCellContent, Vec3)> {
-        self.plants
-            .iter()
-            .zip(&self.plant_branches)
-            .filter_map(|(plant, branches)| {
-                plant.root_content_at_point(
+        let candidates = self
+            .plant_spatial_index
+            .roots
+            .get(&plant_spatial_bucket(point.x, point.y))?;
+        let mut best: Option<(GeneratedCellContent, Vec3)> = None;
+        let mut start = 0;
+        while start < candidates.len() {
+            let plant_index = candidates[start].plant_index();
+            let mut end = start + 1;
+            while end < candidates.len() && candidates[end].plant_index() == plant_index {
+                end += 1;
+            }
+            if let (Some(plant), Some(branches)) = (
+                self.plants.get(plant_index),
+                self.plant_branches.get(plant_index),
+            ) {
+                let sampled = plant.root_content_at_indexed_point(
                     self.geometry_age_years,
                     point,
                     self.seed_hash,
                     branches,
-                )
-            })
-            .min_by_key(|(content, _)| content.priority())
+                    &candidates[start..end],
+                );
+                if let Some((content, _)) = sampled {
+                    if best.is_none_or(|(current, _)| content.priority() < current.priority()) {
+                        best = sampled;
+                    }
+                }
+            }
+            start = end;
+        }
+        best
     }
 
     fn mycelium_content_at_point(&self, point: Vec3) -> Option<GeneratedCellContent> {
@@ -1144,11 +1694,14 @@ impl GeneratedWorld {
                 .zip(self.plant_growth.par_iter())
                 .map(|(plant, growth)| plant.branch_segments(*growth, self.seed_hash))
                 .collect();
-            (self.mycelium_segments, self.mycelium_buckets) = make_mycelium(
-                self.seed_hash,
-                self.geometry_age_years,
+            self.plant_spatial_index = PlantSpatialIndex::build(
                 &self.plants,
+                &self.plant_growth,
+                &self.plant_branches,
+                self.age_years,
             );
+            (self.mycelium_segments, self.mycelium_buckets) =
+                make_mycelium(self.seed_hash, self.geometry_age_years, &self.plants);
         }
         self.voxels.clone_from(&self.terrain_voxels);
         let mut candidates = make_ground_flora(
@@ -1163,15 +1716,20 @@ impl GeneratedWorld {
             .zip(self.plant_growth.par_iter())
             .zip(self.plant_branches.par_iter())
             .map(|((plant, growth), branches)| {
-                plant.voxels_at_age(
-                    *growth,
-                    self.seed_hash,
-                    branches,
-                    season_phase,
-                    self.geometry_age_years,
-                    WORLD_CELL_M,
-                    None,
-                )
+                plant
+                    .voxels_at_age(
+                        *growth,
+                        self.seed_hash,
+                        branches,
+                        season_phase,
+                        self.geometry_age_years,
+                        WORLD_CELL_M,
+                        None,
+                        false,
+                        false,
+                        None,
+                    )
+                    .expect("unbounded overview geometry generation")
             })
             .collect();
         for mut plant_voxels in plant_candidates {
@@ -1180,8 +1738,7 @@ impl GeneratedWorld {
         self.voxels.reserve(candidates.len());
         let mut preview_cells: HashMap<(i32, i32, i32), usize> =
             HashMap::with_capacity(candidates.len().min(262_144));
-        let mut terrain_height_by_column =
-            HashMap::with_capacity(candidates.len().min(65_536));
+        let mut terrain_height_by_column = HashMap::with_capacity(candidates.len().min(65_536));
         for mut voxel in candidates {
             // All displayed 10 cm cubes use one world-aligned lattice. Plant
             // candidate centers can be offset (for example trunk-local cells);
@@ -1222,8 +1779,7 @@ impl GeneratedWorld {
                 self.voxels.push(voxel);
                 continue;
             }
-            if aligned_center.z - voxel.size.z * 0.5 < terrain_z - 1.0e-4
-            {
+            if aligned_center.z - voxel.size.z * 0.5 < terrain_z - 1.0e-4 {
                 continue;
             }
             voxel.center = aligned_center;
@@ -1287,11 +1843,7 @@ fn make_ground_flora(
                 let center_x = x + angle.cos() * radius;
                 let center_y = y + angle.sin() * radius;
                 let height = (0.12 + fertility * 0.24) * (0.12 + growth * 0.88);
-                let center = Vec3::new(
-                    center_x,
-                    center_y,
-                    ground_z + height * 0.5,
-                );
+                let center = Vec3::new(center_x, center_y, ground_z + height * 0.5);
                 let color = if is_fern {
                     [0.11, 0.33 + fertility * 0.10, 0.13, 1.0]
                 } else {
@@ -1368,16 +1920,8 @@ fn make_ground_flora(
                 });
             }
             result.push(TerrainVoxel {
-                center: Vec3::new(
-                    x,
-                    y,
-                    ground_z + stem_height + form.cap_thickness_m * 0.5,
-                ),
-                size: Vec3::new(
-                    form.cap_width_m,
-                    form.cap_width_m,
-                    form.cap_thickness_m,
-                ),
+                center: Vec3::new(x, y, ground_z + stem_height + form.cap_thickness_m * 0.5),
+                size: Vec3::new(form.cap_width_m, form.cap_width_m, form.cap_thickness_m),
                 color: form.cap_color,
                 content: form.content,
                 fiber_direction: None,
@@ -1403,12 +1947,12 @@ fn ground_flora_at_point(
     season_phase: f32,
     point: Vec3,
     plants: &[Plant],
+    plant_spatial_index: &PlantSpatialIndex,
 ) -> Option<GeneratedCellContent> {
     let mut found = None;
     let mut record = |content: GeneratedCellContent| {
-        if found.is_none_or(|current: GeneratedCellContent| {
-            content.priority() < current.priority()
-        }) {
+        if found.is_none_or(|current: GeneratedCellContent| content.priority() < current.priority())
+        {
             found = Some(content);
         }
     };
@@ -1436,8 +1980,8 @@ fn ground_flora_at_point(
                 .clamp(0.1, 1.0);
             let (terrain_x, terrain_y) = terrain_field_coordinates(x, y);
             let ground_z = terrain_height(seed, terrain_x, terrain_y);
-            let height = (0.12 + fertility * 0.24)
-                * (0.12 + (age_years / 4.0).clamp(0.0, 1.0) * 0.88);
+            let height =
+                (0.12 + fertility * 0.24) * (0.12 + (age_years / 4.0).clamp(0.0, 1.0) * 0.88);
             let plant_count = 2 + ((cell_hash >> 12) % 4) as usize;
             let is_wildflower = wildflower_site(cell_hash, moisture, fertility);
             let content = if is_wildflower {
@@ -1491,10 +2035,15 @@ fn ground_flora_at_point(
                 + value_noise(seed ^ 0x5899_65CC_7537_4CC3, nx / 22.0, ny / 22.0) * 0.35)
                 .clamp(0.1, 1.0);
             let spot = lattice_hash(seed ^ 0xDB4F_0B91_75AE_2165, gx, gy);
-            let has_tree_host = plants.iter().any(|plant| {
-                plant.genome.mycorrhizal_affinity >= 0.35
-                    && (plant.x - x).powi(2) + (plant.y - y).powi(2) <= 2.5_f32.powi(2)
-            });
+            let has_tree_host = plant_spatial_index
+                .tree_hosts
+                .get(&plant_spatial_bucket(x, y))
+                .is_some_and(|hosts| {
+                    hosts.iter().any(|&plant_index| {
+                        let plant = &plants[plant_index];
+                        (plant.x - x).powi(2) + (plant.y - y).powi(2) <= 2.5_f32.powi(2)
+                    })
+                });
             let Some(form) = fungus_form(
                 spot,
                 moisture,
@@ -1517,9 +2066,7 @@ fn ground_flora_at_point(
                 && point.z <= ground_z + stem_height;
             let cap = (point.x - x).abs() <= form.cap_width_m * 0.5
                 && (point.y - y).abs() <= form.cap_width_m * 0.5
-                && (point.z
-                    - (ground_z + stem_height + form.cap_thickness_m * 0.5))
-                    .abs()
+                && (point.z - (ground_z + stem_height + form.cap_thickness_m * 0.5)).abs()
                     <= form.cap_thickness_m * 0.5;
             if stem || cap {
                 record(form.content);
@@ -1541,8 +2088,7 @@ fn fungus_form(
     age_years: f32,
     season_phase: f32,
 ) -> Option<FungusForm> {
-    if moisture < 0.64 || age_years < 1.0 || site_hash % 13 != 0 || !fungi_fruiting(season_phase)
-    {
+    if moisture < 0.64 || age_years < 1.0 || site_hash % 13 != 0 || !fungi_fruiting(season_phase) {
         return None;
     }
 
@@ -1625,17 +2171,26 @@ fn make_mycelium(
             let radius = 0.012 + moisture * 0.006;
 
             for arm in 0..arm_count {
-                let arm_hash = lattice_hash(site_hash ^ 0xA24B_AED4_963E_E407, arm as i32, gy as i32 - gx as i32);
+                let arm_hash = lattice_hash(
+                    site_hash ^ 0xA24B_AED4_963E_E407,
+                    arm as i32,
+                    gy as i32 - gx as i32,
+                );
                 let angle = std::f32::consts::TAU * arm as f32 / arm_count as f32
                     + unit_noise(arm_hash) * 0.30;
                 let direction = Vec3::new(angle.cos(), angle.sin(), 0.0);
                 let length = spread * (0.45 + (unit_noise(arm_hash.rotate_left(17)) + 1.0) * 0.275);
-                let depth = 0.04 + colony_growth * 0.12
+                let depth = 0.04
+                    + colony_growth * 0.12
                     + (unit_noise(arm_hash.rotate_left(31)).abs() * 0.04);
                 let shoulder = center + direction * (length * 0.52) - Vec3::Z * (depth * 0.36);
                 let tip = center + direction * length - Vec3::Z * depth;
                 insert_mycelium_segment(
-                    MyceliumSegment { start: center, end: shoulder, radius_m: radius },
+                    MyceliumSegment {
+                        start: center,
+                        end: shoulder,
+                        radius_m: radius,
+                    },
                     &mut segments,
                     &mut buckets,
                 );
@@ -1651,9 +2206,8 @@ fn make_mycelium(
 
                 let side_angle = angle + if arm % 2 == 0 { 0.82 } else { -0.82 };
                 let side_direction = Vec3::new(side_angle.cos(), side_angle.sin(), 0.0);
-                let side_tip = shoulder
-                    + side_direction * (length * 0.34)
-                    - Vec3::Z * (depth * 0.30);
+                let side_tip =
+                    shoulder + side_direction * (length * 0.34) - Vec3::Z * (depth * 0.30);
                 insert_mycelium_segment(
                     MyceliumSegment {
                         start: shoulder,
@@ -1676,10 +2230,14 @@ fn insert_mycelium_segment(
 ) {
     let segment_index = segments.len();
     segments.push(segment);
-    let min_x = (((segment.start.x.min(segment.end.x) - segment.radius_m + 4.8) / 0.4).floor()) as i32;
-    let max_x = (((segment.start.x.max(segment.end.x) + segment.radius_m + 4.8) / 0.4).floor()) as i32;
-    let min_y = (((segment.start.y.min(segment.end.y) - segment.radius_m + 4.8) / 0.4).floor()) as i32;
-    let max_y = (((segment.start.y.max(segment.end.y) + segment.radius_m + 4.8) / 0.4).floor()) as i32;
+    let min_x =
+        (((segment.start.x.min(segment.end.x) - segment.radius_m + 4.8) / 0.4).floor()) as i32;
+    let max_x =
+        (((segment.start.x.max(segment.end.x) + segment.radius_m + 4.8) / 0.4).floor()) as i32;
+    let min_y =
+        (((segment.start.y.min(segment.end.y) - segment.radius_m + 4.8) / 0.4).floor()) as i32;
+    let max_y =
+        (((segment.start.y.max(segment.end.y) + segment.radius_m + 4.8) / 0.4).floor()) as i32;
     if max_x < 0 || max_y < 0 || min_x >= 25 || min_y >= 25 {
         return;
     }
@@ -1715,12 +2273,13 @@ impl Plant {
         )
     }
 
-    fn root_content_at_point(
+    fn root_content_at_indexed_point(
         self,
         age_years: f32,
         point: Vec3,
         seed: u64,
         branches: &[BranchSegment],
+        candidates: &[PlantSpatialRef],
     ) -> Option<(GeneratedCellContent, Vec3)> {
         let maturity = 0.08 + 0.92 * (age_years / 100.0).clamp(0.0, 1.0).powf(0.72);
         let vigor = self.growth_vigor(seed);
@@ -1736,7 +2295,16 @@ impl Plant {
             return None;
         }
 
-        for branch in branches.iter().filter(|branch| branch.is_root) {
+        for candidate in candidates {
+            let PlantSpatialRef::Branch { branch_index, .. } = *candidate else {
+                continue;
+            };
+            let Some(branch) = branches.get(branch_index) else {
+                continue;
+            };
+            if !branch.is_root {
+                continue;
+            }
             let segment = branch.end - branch.start;
             let length_squared = segment.length_squared();
             if length_squared <= f32::EPSILON {
@@ -1754,9 +2322,8 @@ impl Plant {
     /// Deterministic individual growth response from the seed and local habitat.
     /// This affects generated shape only, not physical material state.
     fn growth_vigor(self, seed: u64) -> f32 {
-        let moisture_fit = (1.0
-            - ((self.moisture - self.genome.moisture_optimum) / 0.42).abs())
-        .clamp(0.25, 1.0);
+        let moisture_fit =
+            (1.0 - ((self.moisture - self.genome.moisture_optimum) / 0.42).abs()).clamp(0.25, 1.0);
         let temperature_fit = (1.0
             - ((self.temperature_kelvin - self.genome.temperature_optimum_kelvin) / 10.0).abs())
         .clamp(0.25, 1.0);
@@ -1764,7 +2331,8 @@ impl Plant {
             + self.fertility.clamp(0.0, 1.0) * 0.25
             + moisture_fit * 0.15
             + temperature_fit * 0.10;
-        let individual_variation = 0.94 + (unit_noise(self.genome.individual_id ^ seed) + 1.0) * 0.06;
+        let individual_variation =
+            0.94 + (unit_noise(self.genome.individual_id ^ seed) + 1.0) * 0.06;
         (0.85 + site_fit * 0.25) * individual_variation
     }
 
@@ -1793,8 +2361,7 @@ impl Plant {
             // crown. Let spacing grow smoothly with the plant's realized size
             // so seedlings can develop lateral shoots before the sapling stage.
             let relative_size = (height / self.genome.maximum_height_m).clamp(0.0, 1.0);
-            let node_spacing = self.genome.branch_spacing_m
-                * (0.40 + 0.38 * relative_size.sqrt());
+            let node_spacing = self.genome.branch_spacing_m * (0.40 + 0.38 * relative_size.sqrt());
             let node_count = (trunk_height / node_spacing).floor().max(1.0) as usize;
             for node in 0..node_count {
                 let node_hash = lattice_hash(seed ^ phase_hash, node as i32, 0x51A7);
@@ -1804,8 +2371,8 @@ impl Plant {
                 let node_jitter = unit_noise(node_hash.rotate_left(23)) * node_spacing * 0.22;
                 let start_z = (self.soil_z + node_spacing * (node as f32 + 1.0) + node_jitter)
                     .min(self.soil_z + trunk_height * 0.96);
-                let height_fraction = ((start_z - self.soil_z) / trunk_height.max(WORLD_REV_M))
-                    .clamp(0.0, 1.0);
+                let height_fraction =
+                    ((start_z - self.soil_z) / trunk_height.max(WORLD_REV_M)).clamp(0.0, 1.0);
                 let bud_hash = node_hash;
                 let buds = 2 + (bud_hash as usize % 2);
                 for bud in 0..buds {
@@ -1827,26 +2394,31 @@ impl Plant {
                         * (0.72 + unit_noise(hash ^ 0xD6E8_FEB8_6659_FD93).abs() * 0.28);
                     let start = Vec3::new(self.x, self.y, start_z);
                     let horizontal = Vec3::new(angle.cos(), angle.sin(), 0.0);
-                    let upward = 0.16
-                        + slope * 0.78
-                        + apical_dominance * (1.0 - height_fraction) * 0.40;
+                    let upward =
+                        0.16 + slope * 0.78 + apical_dominance * (1.0 - height_fraction) * 0.40;
                     let end = start + horizontal * length_m + Vec3::Z * (length_m * upward);
                     let radius_m = (trunk_radius
                         * width
                         * 0.68
                         * (0.72 + unit_noise(hash.rotate_left(17)).abs() * 0.28))
                         .max(WORLD_REV_M * 0.55);
-                    segments.push(BranchSegment { start, end, radius_m, is_root: false });
+                    segments.push(BranchSegment {
+                        start,
+                        end,
+                        radius_m,
+                        is_root: false,
+                    });
 
                     // Established shoots form smaller axes where light and
                     // resource supply can support them. Hashes fix bud identity
                     // across growth updates; seed traits shape the probability.
-                    let side_probability = (branching_rate
-                        * (0.70 + 0.30 * vigor)
-                        * (1.0 - apical_dominance * 0.25))
-                        .clamp(0.0, 1.0);
-                    if matches!(growth.stage, GrowthStage::Pole | GrowthStage::Mature | GrowthStage::Senescent)
-                        && unit_noise(hash.rotate_left(29)).mul_add(0.5, 0.5) < side_probability
+                    let side_probability =
+                        (branching_rate * (0.70 + 0.30 * vigor) * (1.0 - apical_dominance * 0.25))
+                            .clamp(0.0, 1.0);
+                    if matches!(
+                        growth.stage,
+                        GrowthStage::Pole | GrowthStage::Mature | GrowthStage::Senescent
+                    ) && unit_noise(hash.rotate_left(29)).mul_add(0.5, 0.5) < side_probability
                     {
                         let split_fraction = 0.48 + unit_noise(hash.rotate_left(31)).abs() * 0.28;
                         let midpoint = start.lerp(end, split_fraction);
@@ -1866,7 +2438,8 @@ impl Plant {
                         // Fine outer shoots divide again near their tips,
                         // creating a branching canopy instead of bare, evenly
                         // spaced spokes. Their abundance follows vigor.
-                        let twig_hash = lattice_hash(hash ^ 0xA076_1D64_78BD_642F, node as i32, bud as i32);
+                        let twig_hash =
+                            lattice_hash(hash ^ 0xA076_1D64_78BD_642F, node as i32, bud as i32);
                         let twig_probability = branching_rate * vigor * 0.80;
                         if unit_noise(twig_hash).mul_add(0.5, 0.5) < twig_probability {
                             let twig_start = midpoint.lerp(side_end, 0.62);
@@ -1874,11 +2447,17 @@ impl Plant {
                             for twig in 0..twig_count {
                                 let side = if twig == 0 { -1.0 } else { 1.0 };
                                 let twig_angle = split_angle
-                                    + side * (0.48 + unit_noise(twig_hash.rotate_left(17)).abs() * 0.36);
-                                let twig_length = side_length * (0.46 + 0.16 * growth.structural_light);
+                                    + side
+                                        * (0.48
+                                            + unit_noise(twig_hash.rotate_left(17)).abs() * 0.36);
+                                let twig_length =
+                                    side_length * (0.46 + 0.16 * growth.structural_light);
                                 let twig_end = twig_start
-                                    + Vec3::new(twig_angle.cos(), twig_angle.sin(), 0.42 + slope * 0.32)
-                                        * twig_length;
+                                    + Vec3::new(
+                                        twig_angle.cos(),
+                                        twig_angle.sin(),
+                                        0.42 + slope * 0.32,
+                                    ) * twig_length;
                                 segments.push(BranchSegment {
                                     start: twig_start,
                                     end: twig_end,
@@ -1896,17 +2475,12 @@ impl Plant {
         // shoot axis where new leaves and lateral buds form, not an empty gap
         // above a truncated stem. Its relative strength follows apical dominance.
         if height > trunk_height + WORLD_REV_M {
-            let leader_start = Vec3::new(
-                self.x,
-                self.y,
-                self.soil_z + trunk_height * 0.92,
-            );
+            let leader_start = Vec3::new(self.x, self.y, self.soil_z + trunk_height * 0.92);
             let leader_end = Vec3::new(self.x, self.y, self.soil_z + height);
             segments.push(BranchSegment {
                 start: leader_start,
                 end: leader_end,
-                radius_m: (trunk_radius * (0.18 + apical_dominance * 0.10))
-                    .max(WORLD_REV_M * 0.55),
+                radius_m: (trunk_radius * (0.18 + apical_dominance * 0.10)).max(WORLD_REV_M * 0.55),
                 is_root: false,
             });
         }
@@ -1920,11 +2494,13 @@ impl Plant {
             GrowthStage::Mature => 1.0,
             GrowthStage::Senescent => 0.92,
         };
-        let root_extent = lateral_extent * root_stage_scale * vigor * (0.85 + self.fertility * 0.25);
+        let root_extent =
+            lateral_extent * root_stage_scale * vigor * (0.85 + self.fertility * 0.25);
         let root_depth = depth_factor * root_stage_scale * vigor * (1.10 - self.moisture * 0.50);
         let base = Vec3::new(self.x, self.y, self.soil_z);
         for root in 0..root_count {
-            let root_hash = lattice_hash(seed ^ 0xDB4F_0B91_75AE_2165, plant_x + root as i32, plant_y);
+            let root_hash =
+                lattice_hash(seed ^ 0xDB4F_0B91_75AE_2165, plant_x + root as i32, plant_y);
             let angle = phase
                 + std::f32::consts::TAU * root as f32 / root_count as f32
                 + unit_noise(root_hash) * 0.16;
@@ -1951,7 +2527,7 @@ impl Plant {
 
     /// Sample seed-specific, age- and environment-dependent shoots at the
     /// implicit 1 cm REV resolution; the 10 cm preview is only a render LOD.
-    fn content_at_point(
+    fn content_at_indexed_point(
         self,
         growth: PlantGrowth,
         point: Vec3,
@@ -1959,13 +2535,17 @@ impl Plant {
         cell: [i32; 3],
         branches: &[BranchSegment],
         season_phase: f32,
+        candidates: &[PlantSpatialRef],
     ) -> Option<(GeneratedCellContent, Option<Vec3>)> {
         let trunk_height = growth.trunk_height_m;
         let trunk_radius = growth.trunk_radius_m;
         let local_z = point.z - self.soil_z;
         let local_x = point.x - self.x;
         let local_y = point.y - self.y;
-        if (0.0..trunk_height).contains(&local_z) {
+        let has_trunk_candidate = candidates
+            .iter()
+            .any(|candidate| matches!(candidate, PlantSpatialRef::Trunk(_)));
+        if has_trunk_candidate && (0.0..trunk_height).contains(&local_z) {
             let taper = 0.72 + 0.28 * (1.0 - local_z / trunk_height.max(WORLD_REV_M));
             let radius = trunk_radius * taper;
             if local_x * local_x + local_y * local_y <= radius * radius {
@@ -1973,7 +2553,16 @@ impl Plant {
             }
         }
 
-        for branch in branches.iter().filter(|branch| !branch.is_root) {
+        for candidate in candidates {
+            let PlantSpatialRef::Branch { branch_index, .. } = *candidate else {
+                continue;
+            };
+            let Some(branch) = branches.get(branch_index) else {
+                continue;
+            };
+            if branch.is_root {
+                continue;
+            }
             let segment = branch.end - branch.start;
             let length_squared = segment.length_squared();
             if length_squared <= f32::EPSILON {
@@ -1988,8 +2577,18 @@ impl Plant {
 
         let in_leaf_season = (0.20..0.84).contains(&season_phase);
         if in_leaf_season || self.genome.leaf_retention >= 0.85 {
-            let leaf_radius = (0.20 + growth.crown_spread_m * 0.055).clamp(0.22, 0.42);
-            for (branch_index, branch) in branches.iter().enumerate().filter(|(_, branch)| !branch.is_root) {
+            let leaf_radius =
+                (0.20 + growth.crown_spread_m * 0.055).clamp(0.22, LEAF_CLUSTER_RADIUS_M);
+            for candidate in candidates {
+                let PlantSpatialRef::Branch { branch_index, .. } = *candidate else {
+                    continue;
+                };
+                let Some(branch) = branches.get(branch_index) else {
+                    continue;
+                };
+                if branch.is_root {
+                    continue;
+                }
                 for (cluster_index, center) in [branch.start.lerp(branch.end, 0.62), branch.end]
                     .into_iter()
                     .enumerate()
@@ -2020,13 +2619,10 @@ impl Plant {
         branches: &[BranchSegment],
         region_min: Vec3,
         region_max: Vec3,
+        include_roots: bool,
     ) -> bool {
         let trunk_radius = growth.trunk_radius_m;
-        let trunk_min = Vec3::new(
-            self.x - trunk_radius,
-            self.y - trunk_radius,
-            self.soil_z,
-        );
+        let trunk_min = Vec3::new(self.x - trunk_radius, self.y - trunk_radius, self.soil_z);
         let trunk_max = Vec3::new(
             self.x + trunk_radius,
             self.y + trunk_radius,
@@ -2041,11 +2637,17 @@ impl Plant {
                 && max.z >= region_min.z
         };
         overlaps(trunk_min, trunk_max)
-            || branches.iter().filter(|branch| !branch.is_root).any(|branch| {
-                let radius = branch.radius_m + WORLD_REV_M;
-                let extent = Vec3::splat(radius);
-                overlaps(branch.start.min(branch.end) - extent, branch.start.max(branch.end) + extent)
-            })
+            || branches
+                .iter()
+                .filter(|branch| include_roots || !branch.is_root)
+                .any(|branch| {
+                    let radius = branch.radius_m + WORLD_REV_M;
+                    let extent = Vec3::splat(radius);
+                    overlaps(
+                        branch.start.min(branch.end) - extent,
+                        branch.start.max(branch.end) + extent,
+                    )
+                })
     }
 
     fn voxels_at_age(
@@ -2057,11 +2659,14 @@ impl Plant {
         world_age_years: f32,
         wood_cell_m: f32,
         wood_region: Option<(Vec3, f32)>,
-    ) -> Vec<TerrainVoxel> {
+        surface_only: bool,
+        include_roots: bool,
+        max_wood_cells: Option<usize>,
+    ) -> Result<Vec<TerrainVoxel>, &'static str> {
         if world_age_years < self.germination_age_years {
             let [seed_x, seed_y, seed_z] = self.seed_cell();
             let pigment = (unit_noise(self.genome.individual_id) + 1.0) * 0.5;
-            return vec![TerrainVoxel {
+            return Ok(vec![TerrainVoxel {
                 center: Vec3::new(
                     (seed_x as f32 + 0.5) * WORLD_REV_M - WORLD_SIDE_M * 0.5,
                     (seed_y as f32 + 0.5) * WORLD_REV_M - WORLD_SIDE_M * 0.5,
@@ -2070,8 +2675,8 @@ impl Plant {
                 size: Vec3::splat(WORLD_REV_M),
                 color: [0.36 + pigment * 0.16, 0.24 + pigment * 0.10, 0.10, 1.0],
                 content: GeneratedCellContent::Seed,
-                    fiber_direction: None,
-            }];
+                fiber_direction: None,
+            }]);
         }
         let pigment = (unit_noise(self.genome.individual_id ^ seed) + 1.0) * 0.5;
         let bark_color = [
@@ -2091,33 +2696,29 @@ impl Plant {
         let side_cells = (WORLD_SIDE_M / wood_cell_m).ceil() as i32;
         let height_cells = (WORLD_SAMPLE_HEIGHT_M / wood_cell_m).ceil() as i32;
         let trunk_half_cell = wood_cell_m * 0.5;
-        let mut trunk_min_x = (((self.x - trunk_radius + WORLD_SIDE_M * 0.5) / wood_cell_m)
-            .floor() as i32)
+        let mut trunk_min_x = (((self.x - trunk_radius + WORLD_SIDE_M * 0.5) / wood_cell_m).floor()
+            as i32)
             .clamp(0, side_cells - 1);
-        let mut trunk_max_x = (((self.x + trunk_radius + WORLD_SIDE_M * 0.5) / wood_cell_m)
-            .floor() as i32)
+        let mut trunk_max_x = (((self.x + trunk_radius + WORLD_SIDE_M * 0.5) / wood_cell_m).floor()
+            as i32)
             .clamp(0, side_cells - 1);
-        let mut trunk_min_y = (((self.y - trunk_radius + WORLD_SIDE_M * 0.5) / wood_cell_m)
-            .floor() as i32)
+        let mut trunk_min_y = (((self.y - trunk_radius + WORLD_SIDE_M * 0.5) / wood_cell_m).floor()
+            as i32)
             .clamp(0, side_cells - 1);
-        let mut trunk_max_y = (((self.y + trunk_radius + WORLD_SIDE_M * 0.5) / wood_cell_m)
-            .floor() as i32)
+        let mut trunk_max_y = (((self.y + trunk_radius + WORLD_SIDE_M * 0.5) / wood_cell_m).floor()
+            as i32)
             .clamp(0, side_cells - 1);
         let mut trunk_min_z = (self.soil_z / wood_cell_m).floor() as i32;
         let mut trunk_max_z = ((self.soil_z + trunk_height) / wood_cell_m).floor() as i32;
         if let Some((center, radius)) = wood_region {
-            trunk_min_x = trunk_min_x.max(
-                ((center.x - radius + WORLD_SIDE_M * 0.5) / wood_cell_m).floor() as i32,
-            );
-            trunk_max_x = trunk_max_x.min(
-                ((center.x + radius + WORLD_SIDE_M * 0.5) / wood_cell_m).floor() as i32,
-            );
-            trunk_min_y = trunk_min_y.max(
-                ((center.y - radius + WORLD_SIDE_M * 0.5) / wood_cell_m).floor() as i32,
-            );
-            trunk_max_y = trunk_max_y.min(
-                ((center.y + radius + WORLD_SIDE_M * 0.5) / wood_cell_m).floor() as i32,
-            );
+            trunk_min_x = trunk_min_x
+                .max(((center.x - radius + WORLD_SIDE_M * 0.5) / wood_cell_m).floor() as i32);
+            trunk_max_x = trunk_max_x
+                .min(((center.x + radius + WORLD_SIDE_M * 0.5) / wood_cell_m).floor() as i32);
+            trunk_min_y = trunk_min_y
+                .max(((center.y - radius + WORLD_SIDE_M * 0.5) / wood_cell_m).floor() as i32);
+            trunk_max_y = trunk_max_y
+                .min(((center.y + radius + WORLD_SIDE_M * 0.5) / wood_cell_m).floor() as i32);
             trunk_min_z = trunk_min_z.max(((center.z - radius) / wood_cell_m).floor() as i32);
             trunk_max_z = trunk_max_z.min(((center.z + radius) / wood_cell_m).floor() as i32);
         }
@@ -2127,13 +2728,15 @@ impl Plant {
         trunk_max_x = trunk_max_x.min(side_cells - 1);
         trunk_max_y = trunk_max_y.min(side_cells - 1);
         trunk_max_z = trunk_max_z.min(height_cells - 1);
-        // Refine only visible boundary cells. The implicit physical volume
-        // remains complete; occluded cubes do not need render instances.
-        let surface_only = wood_cell_m < WORLD_CELL_M;
+        // Render callers may request only boundary cells. Physics requests the
+        // full occupied volume so hidden REVs still carry mass and bonds.
         let trunk_cell_occupied = |cell: [i32; 3]| {
-            if cell[0] < 0 || cell[0] >= side_cells
-                || cell[1] < 0 || cell[1] >= side_cells
-                || cell[2] < 0 || cell[2] >= height_cells
+            if cell[0] < 0
+                || cell[0] >= side_cells
+                || cell[1] < 0
+                || cell[1] >= side_cells
+                || cell[2] < 0
+                || cell[2] >= height_cells
             {
                 return false;
             }
@@ -2142,8 +2745,8 @@ impl Plant {
             if z + trunk_half_cell <= 0.0 || z - trunk_half_cell >= trunk_height {
                 return false;
             }
-            let taper = 0.72 + 0.28 * (1.0 - z.clamp(0.0, trunk_height)
-                / trunk_height.max(wood_cell_m));
+            let taper =
+                0.72 + 0.28 * (1.0 - z.clamp(0.0, trunk_height) / trunk_height.max(wood_cell_m));
             let radius = trunk_radius * taper;
             let dx = ((center.x - self.x).abs() - trunk_half_cell).max(0.0);
             let dy = ((center.y - self.y).abs() - trunk_half_cell).max(0.0);
@@ -2153,15 +2756,11 @@ impl Plant {
         for z_cell in trunk_min_z..=trunk_max_z {
             let center_z = (z_cell as f32 + 0.5) * wood_cell_m;
             let local_z = center_z - self.soil_z;
-            if local_z + trunk_half_cell <= 0.0
-                || local_z - trunk_half_cell >= trunk_height
-            {
+            if local_z + trunk_half_cell <= 0.0 || local_z - trunk_half_cell >= trunk_height {
                 continue;
             }
             let taper = 0.72
-                + 0.28
-                    * (1.0 - local_z.clamp(0.0, trunk_height)
-                        / trunk_height.max(wood_cell_m));
+                + 0.28 * (1.0 - local_z.clamp(0.0, trunk_height) / trunk_height.max(wood_cell_m));
             let radius = trunk_radius * taper;
             for y_cell in trunk_min_y..=trunk_max_y {
                 let center_y = (y_cell as f32 + 0.5) * wood_cell_m - WORLD_SIDE_M * 0.5;
@@ -2172,10 +2771,13 @@ impl Plant {
                     if dx * dx + dy * dy > radius * radius {
                         continue;
                     }
-                    if surface_only && cell_has_six_neighbours(
-                        [x_cell, y_cell, z_cell], &trunk_cell_occupied,
-                    ) {
+                    if surface_only
+                        && cell_has_six_neighbours([x_cell, y_cell, z_cell], &trunk_cell_occupied)
+                    {
                         continue;
+                    }
+                    if max_wood_cells.is_some_and(|limit| result.len() >= limit) {
+                        return Err("physical plant wood exceeds its REV limit");
                     }
                     result.push(TerrainVoxel {
                         center: Vec3::new(center_x, center_y, center_z),
@@ -2188,7 +2790,10 @@ impl Plant {
             }
         }
 
-        for branch in branches.iter().filter(|branch| !branch.is_root) {
+        for branch in branches
+            .iter()
+            .filter(|branch| include_roots || !branch.is_root)
+        {
             let segment = branch.end - branch.start;
             let cell_half = wood_cell_m * 0.5;
             let extent = Vec3::splat(branch.radius_m + cell_half);
@@ -2222,21 +2827,37 @@ impl Plant {
             max_cell[0] = max_cell[0].min(side_cells - 1);
             max_cell[1] = max_cell[1].min(side_cells - 1);
             max_cell[2] = max_cell[2].min(height_cells - 1);
+            let mut exceeded_limit = false;
             visit_branch_cells(
-                branch.start, branch.end, branch.radius_m, wood_cell_m,
-                min_cell, max_cell, surface_only,
-                |cell| result.push(TerrainVoxel {
-                    center: plant_cell_center(cell, wood_cell_m),
-                    size: Vec3::splat(wood_cell_m),
-                    color: bark_color,
-                    content: GeneratedCellContent::PlantWood,
-                    fiber_direction: Some(segment.normalize_or_zero()),
-                }),
+                branch.start,
+                branch.end,
+                branch.radius_m,
+                wood_cell_m,
+                min_cell,
+                max_cell,
+                surface_only,
+                |cell| {
+                    if max_wood_cells.is_some_and(|limit| result.len() >= limit) {
+                        exceeded_limit = true;
+                        return false;
+                    }
+                    result.push(TerrainVoxel {
+                        center: plant_cell_center(cell, wood_cell_m),
+                        size: Vec3::splat(wood_cell_m),
+                        color: bark_color,
+                        content: GeneratedCellContent::PlantWood,
+                        fiber_direction: Some(segment.normalize_or_zero()),
+                    });
+                    true
+                },
             );
+            if exceeded_limit {
+                return Err("physical plant wood exceeds its REV limit");
+            }
         }
 
         if wood_cell_m < WORLD_CELL_M {
-            return result;
+            return Ok(result);
         }
 
         // Foliage grows in small clusters at branch tips. A closed crown shape
@@ -2296,8 +2917,8 @@ impl Plant {
                             }
                         }
                     }
-                    }
                 }
+            }
         }
         if growth.height_m > 0.0 {
             let [seed_x, seed_y, seed_z] = self.apical_seed_cell(growth);
@@ -2313,7 +2934,7 @@ impl Plant {
                 fiber_direction: None,
             });
         }
-        result
+        Ok(result)
     }
 }
 
@@ -2341,9 +2962,14 @@ fn cell_has_six_neighbours(cell: [i32; 3], occupied: impl Fn([i32; 3]) -> bool) 
 /// Slice a capsule along its longest axis. The final capsule/AABB predicate
 /// matches the exhaustive bounding-box rasterizer; only empty space is pruned.
 fn visit_branch_cells(
-    start: Vec3, end: Vec3, radius_m: f32, cell_m: f32,
-    min_cell: [i32; 3], max_cell: [i32; 3], surface_only: bool,
-    mut emit: impl FnMut([i32; 3]),
+    start: Vec3,
+    end: Vec3,
+    radius_m: f32,
+    cell_m: f32,
+    min_cell: [i32; 3],
+    max_cell: [i32; 3],
+    surface_only: bool,
+    mut emit: impl FnMut([i32; 3]) -> bool,
 ) {
     if (0..3).any(|axis| min_cell[axis] > max_cell[axis]) {
         return;
@@ -2366,14 +2992,20 @@ fn visit_branch_cells(
     let side_cells = (WORLD_SIDE_M / cell_m).ceil() as i32;
     let height_cells = (WORLD_SAMPLE_HEIGHT_M / cell_m).ceil() as i32;
     let occupied = |cell: [i32; 3]| {
-        cell[0] >= 0 && cell[0] < side_cells
-            && cell[1] >= 0 && cell[1] < side_cells
-            && cell[2] >= 0 && cell[2] < height_cells
+        cell[0] >= 0
+            && cell[0] < side_cells
+            && cell[1] >= 0
+            && cell[1] < side_cells
+            && cell[2] >= 0
+            && cell[2] < height_cells
             && segment_aabb_distance_squared(
-                start, end, plant_cell_center(cell, cell_m), half_extent,
+                start,
+                end,
+                plant_cell_center(cell, cell_m),
+                half_extent,
             ) <= radius_m * radius_m
     };
-    for slice in min_cell[axis]..=max_cell[axis] {
+    'slices: for slice in min_cell[axis]..=max_cell[axis] {
         let center_axis = (slice as f32 + 0.5) * cell_m + origin[axis];
         let (t_min, t_max) = if abs_direction[axis] > 1e-12 {
             let a = (center_axis - extent - start[axis]) / direction[axis];
@@ -2400,7 +3032,9 @@ fn visit_branch_cells(
                 cell[u] = cu;
                 cell[v] = cv;
                 if occupied(cell) && (!surface_only || !cell_has_six_neighbours(cell, &occupied)) {
-                    emit(cell);
+                    if !emit(cell) {
+                        break 'slices;
+                    }
                 }
             }
         }
@@ -2417,7 +3051,8 @@ fn segment_aabb_distance_squared(start: Vec3, end: Vec3, center: Vec3, half_exte
     let half = half_extent.as_dvec3();
     let distance_at = |t: f64| {
         ((relative + direction * t).abs() - half)
-            .max(glam::DVec3::ZERO).length_squared()
+            .max(glam::DVec3::ZERO)
+            .length_squared()
     };
     let length_squared = direction.length_squared();
     if length_squared == 0.0 {
@@ -2518,7 +3153,7 @@ fn compute_plant_growth(
                 let distance = Vec3::new(plant.x - other.x, plant.y - other.y, 0.0).length();
                 let overlap = ((root_extent + other_root_extent - distance)
                     / (root_extent + other_root_extent).max(WORLD_CELL_M))
-                    .clamp(0.0, 1.0);
+                .clamp(0.0, 1.0);
                 let shared_fraction = overlap * overlap * 0.55;
                 shared_water_demand += other.genome.water_demand * shared_fraction;
                 shared_nutrient_demand += other.genome.nutrient_demand * shared_fraction;
@@ -2531,8 +3166,7 @@ fn compute_plant_growth(
             // Eight annual daylight sectors approximate a moving sun. A taller
             // neighbor blocks a sector only when its projected shadow reaches
             // this crown; each ray has the same deterministic seed phase.
-            let azimuth_phase = unit_noise(seed ^ 0x4CF5_AD43_2745_937F)
-                * std::f32::consts::PI;
+            let azimuth_phase = unit_noise(seed ^ 0x4CF5_AD43_2745_937F) * std::f32::consts::PI;
             let own_height = potential_heights[index];
             let mut lit_sectors = 0.0;
             for ray in 0..8 {
@@ -2570,7 +3204,7 @@ fn compute_plant_growth(
 
             let temperature_sufficiency = (1.0
                 - ((plant.temperature_kelvin - genome.temperature_optimum_kelvin) / 16.0).abs())
-                .clamp(0.20, 1.0);
+            .clamp(0.20, 1.0);
             let limiting_factor = light_sufficiency
                 .min(water_sufficiency)
                 .min(nutrient_sufficiency)
@@ -2584,8 +3218,8 @@ fn compute_plant_growth(
             } else {
                 GrowthStage::from_development_age(development_age_years).max(prior.stage)
             };
-            let height_fraction = (1.0 - (-development_age_years / 34.0).exp())
-                / (1.0 - (-100.0_f32 / 34.0).exp());
+            let height_fraction =
+                (1.0 - (-development_age_years / 34.0).exp()) / (1.0 - (-100.0_f32 / 34.0).exp());
             let individual_hash = lattice_hash(
                 seed ^ 0x94D0_49BB_1331_11EB,
                 ((plant.x + WORLD_SIDE_M * 0.5) / WORLD_CELL_M).round() as i32,
@@ -2727,7 +3361,9 @@ fn morphotype_distance(left: [f32; 8], right: [f32; 8]) -> f32 {
 }
 
 fn pseudo_latin_name(genome: SeedGenome, id: u64, group_number: usize) -> String {
-    let genus_roots = ["Sylvara", "Nemora", "Lignora", "Viridia", "Frondara", "Arboria"];
+    let genus_roots = [
+        "Sylvara", "Nemora", "Lignora", "Viridia", "Frondara", "Arboria",
+    ];
     let height = if genome.maximum_height_m > 17.0 {
         "altissima"
     } else if genome.maximum_height_m < 12.0 {
@@ -2743,14 +3379,27 @@ fn pseudo_latin_name(genome: SeedGenome, id: u64, group_number: usize) -> String
         "patula"
     };
     let genus = genus_roots[(id as usize) % genus_roots.len()];
-    format!("{genus} {height} {branching} morph. {}", roman_numeral(group_number))
+    format!(
+        "{genus} {height} {branching} morph. {}",
+        roman_numeral(group_number)
+    )
 }
 
 fn roman_numeral(mut value: usize) -> String {
     const NUMERALS: &[(usize, &str)] = &[
-        (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"),
-        (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"),
-        (5, "V"), (4, "IV"), (1, "I"),
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
     ];
     let mut result = String::new();
     for &(amount, numeral) in NUMERALS {
@@ -2820,25 +3469,34 @@ fn terrain_height(seed: u64, x: f32, y: f32) -> f32 {
     // Domain-warped rolling hills and shallow drainage depressions. These
     // wavelengths keep local walking relief gentle while breaking up the
     // formerly uniform hundreds-of-metres slopes. Heights remain 10 cm steps.
-    let warp_x = value_noise(seed ^ 0xB65A_37CF_4E29_810D, x/190.0,y/190.0)*22.0;
-    let warp_y = value_noise(seed ^ 0x71CA_58D2_903E_B46F, x/190.0,y/190.0)*22.0;
-    let hills = value_noise(seed ^ 0x9A35_F82D_614C_E70B,(x+warp_x)/65.0,(y+warp_y)/65.0);
-    let swale = value_noise(seed ^ 0x43D8_6AB9_E715_C02F,(x+warp_x)/130.0,(y+warp_y)/130.0).abs();
-    let channel = (1.0-swale/0.16).clamp(0.0,1.0);
-    let small = value_noise(seed ^ 0xD138_69FA_275B_C04E,x/13.0,y/13.0);
+    let warp_x = value_noise(seed ^ 0xB65A_37CF_4E29_810D, x / 190.0, y / 190.0) * 22.0;
+    let warp_y = value_noise(seed ^ 0x71CA_58D2_903E_B46F, x / 190.0, y / 190.0) * 22.0;
+    let hills = value_noise(
+        seed ^ 0x9A35_F82D_614C_E70B,
+        (x + warp_x) / 65.0,
+        (y + warp_y) / 65.0,
+    );
+    let swale = value_noise(
+        seed ^ 0x43D8_6AB9_E715_C02F,
+        (x + warp_x) / 130.0,
+        (y + warp_y) / 130.0,
+    )
+    .abs();
+    let channel = (1.0 - swale / 0.16).clamp(0.0, 1.0);
+    let small = value_noise(seed ^ 0xD138_69FA_275B_C04E, x / 13.0, y / 13.0);
     // Elevation varies over hundreds of metres horizontally; the local relief
     // is a continuous seeded height field sampled on the 10 cm render lattice.
-    let elevation_m = (48.0 + large*48.0 + medium*18.0 + fine*4.0
-        + hills*2.6 - channel*channel*0.65 + small*0.16).max(2.0);
+    let elevation_m = (48.0 + large * 48.0 + medium * 18.0 + fine * 4.0 + hills * 2.6
+        - channel * channel * 0.65
+        + small * 0.16)
+        .max(2.0);
     (elevation_m / WORLD_CELL_M).round() * WORLD_CELL_M
 }
 
 fn ecology_at(seed: u64, x: f32, y: f32) -> (f32, f32) {
-    let moisture = (0.5
-        + value_noise(seed ^ 0x8EBC_6AF0_9C88_C6E3, x / 27.0, y / 27.0) * 0.38)
+    let moisture = (0.5 + value_noise(seed ^ 0x8EBC_6AF0_9C88_C6E3, x / 27.0, y / 27.0) * 0.38)
         .clamp(0.0, 1.0);
-    let fertility = (0.55
-        + value_noise(seed ^ 0x5899_65CC_7537_4CC3, x / 22.0, y / 22.0) * 0.35)
+    let fertility = (0.55 + value_noise(seed ^ 0x5899_65CC_7537_4CC3, x / 22.0, y / 22.0) * 0.35)
         .clamp(0.1, 1.0);
     (moisture, fertility)
 }
@@ -2848,8 +3506,7 @@ fn climate_temperature(seed: u64, x: f32, y: f32, altitude_m: f32) -> f32 {
     // then create local variation. This is ecological input only and is not
     // yet coupled to the thermal solver.
     let regional_offset_k = unit_noise(seed ^ 0x243F_6A88_85A3_08D3) * 4.0;
-    let local_variation_k =
-        value_noise(seed ^ 0x5899_65CC_7537_4CC3, x / 31.0, y / 31.0) * 11.4;
+    let local_variation_k = value_noise(seed ^ 0x5899_65CC_7537_4CC3, x / 31.0, y / 31.0) * 11.4;
     288.15 + regional_offset_k + local_variation_k - altitude_m * 0.0065
 }
 
@@ -2897,14 +3554,54 @@ fn normal_noise(value: u64) -> f32 {
     let second_hash = lattice_hash(value ^ 0xA076_1D64_78BD_642F, 0x4E4F_524D, 0x414C);
     let u1 = ((value >> 11) as f64 + 0.5) / TWO_POW_53;
     let u2 = (second_hash >> 11) as f64 / TWO_POW_53;
-    ((-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos())
-        .clamp(-4.0, 4.0) as f32
+    ((-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()).clamp(-4.0, 4.0) as f32
 }
 
 #[cfg(test)]
 mod render_geometry_tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn physical_world_patch_preserves_centimetre_spacing_at_map_scale() {
+        let world = GeneratedWorld::from_seed("1001");
+        let min_cell = [10, 20, 10];
+        let max_cell = [12, 21, 11];
+        let oak = crate::material::Material::component_id("oak").unwrap();
+        let mut expected_world_positions = Vec::new();
+        let patch = world
+            .build_physical_patch(SceneConfig::default(), min_cell, max_cell, |cell| {
+                expected_world_positions.push(
+                    cell.to_voxel_spawn(Composition::pure(oak), 0.0, Vec3::ZERO, false)
+                        .unwrap()
+                        .center,
+                );
+                Ok(Some(GeneratedCellPhysics {
+                    composition: Composition::pure(oak),
+                    anisotropy: 0.0,
+                    velocity: Vec3::ZERO,
+                    kinematic: false,
+                }))
+            })
+            .unwrap();
+
+        assert_eq!(patch.origin_cell, min_cell);
+        assert_eq!(patch.source_cells, vec![[10, 20, 10], [11, 20, 10]]);
+        assert_eq!(patch.scene.positions.len(), 2);
+        assert!(
+            (patch.scene.positions[1].x - patch.scene.positions[0].x - crate::coordinates::CELL_M)
+                .abs()
+                < 1e-12
+        );
+        for (local, expected) in patch.scene.positions.iter().zip(expected_world_positions) {
+            assert!(
+                (patch.world_position(*local) - expected)
+                    .abs()
+                    .max_element()
+                    < 1e-9
+            );
+        }
+    }
 
     #[test]
     fn analytic_segment_box_distance_matches_refined_reference() {
@@ -2928,7 +3625,8 @@ mod render_geometry_tests {
             let delta = end.as_dvec3() - start.as_dvec3();
             let distance_at = |t: f64| {
                 ((relative + delta * t).abs() - half.as_dvec3())
-                    .max(glam::DVec3::ZERO).length_squared()
+                    .max(glam::DVec3::ZERO)
+                    .length_squared()
             };
             let mut lower = 0.0;
             let mut upper = 1.0;
@@ -2945,8 +3643,10 @@ mod render_geometry_tests {
             let reference = distance_at((lower + upper) * 0.5);
             let actual = f64::from(segment_aabb_distance_squared(start, end, center, half));
             let tolerance = (reference.abs() * 2e-6).max(1e-10);
-            assert!((actual - reference).abs() <= tolerance,
-                "case {case}: analytic={actual} reference={reference}");
+            assert!(
+                (actual - reference).abs() <= tolerance,
+                "case {case}: analytic={actual} reference={reference}"
+            );
         }
     }
 
@@ -2963,12 +3663,18 @@ mod render_geometry_tests {
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while scheduler.is_busy() {
-            assert!(std::time::Instant::now() < deadline, "growth worker did not finish");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "growth worker did not finish"
+            );
             scheduler.advance(&mut actual, 0.0);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert_eq!(actual.age_years.to_bits(), expected.age_years.to_bits());
-        assert_eq!(actual.calendar_years.to_bits(), expected.calendar_years.to_bits());
+        assert_eq!(
+            actual.calendar_years.to_bits(),
+            expected.calendar_years.to_bits()
+        );
         assert_eq!(actual.render_cache_key(), expected.render_cache_key());
         assert_eq!(actual.voxels.len(), expected.voxels.len());
         for (a, b) in actual.voxels.iter().zip(&expected.voxels) {
@@ -2985,7 +3691,11 @@ mod render_geometry_tests {
         world.advance_growth(40.0 * SIMULATION_YEAR_SECONDS);
         let plant = world.plants[0];
         let camera = Vec3::new(plant.x + 1.0, plant.y, plant.soil_z + 1.42);
-        let before = (world.render_cache_key(), world.age_years, world.voxels.len());
+        let before = (
+            world.render_cache_key(),
+            world.age_years,
+            world.voxels.len(),
+        );
         let snapshot_start = std::time::Instant::now();
         let snapshot = world.clone();
         let snapshot_ms = snapshot_start.elapsed().as_secs_f64() * 1_000.0;
@@ -2993,7 +3703,9 @@ mod render_geometry_tests {
             let start = std::time::Instant::now();
             let cells = snapshot.plant_wood_voxels_near(camera, 10.8);
             (start.elapsed(), cells)
-        }).join().unwrap();
+        })
+        .join()
+        .unwrap();
         assert!(!cells.is_empty());
         let mut occupied = HashSet::new();
         for voxel in &cells {
@@ -3001,10 +3713,20 @@ mod render_geometry_tests {
             assert_eq!(voxel.size, Vec3::splat(WORLD_REV_M));
             assert!(voxel.center.distance_squared(camera) <= 10.8 * 10.8);
             let cell = ((voxel.center + Vec3::new(WORLD_SIDE_M * 0.5, WORLD_SIDE_M * 0.5, 0.0))
-                / WORLD_REV_M).floor().as_ivec3().to_array();
+                / WORLD_REV_M)
+                .floor()
+                .as_ivec3()
+                .to_array();
             assert!(occupied.insert(cell), "duplicate centimetre render cell");
         }
-        assert_eq!(before, (world.render_cache_key(), world.age_years, world.voxels.len()));
+        assert_eq!(
+            before,
+            (
+                world.render_cache_key(),
+                world.age_years,
+                world.voxels.len()
+            )
+        );
         eprintln!("mature seed 1001 render refinement: snapshot_ms={snapshot_ms:.3} detail_ms={:.3} cells={}",
             elapsed.as_secs_f64() * 1_000.0, cells.len());
     }
@@ -3023,16 +3745,25 @@ mod render_geometry_tests {
             ];
             let start = plant_cell_center(base, cell_m) + Vec3::new(0.003, -0.002, 0.001);
             for direction in [
-                Vec3::ZERO, Vec3::new(0.24, 0.18, 0.21),
-                Vec3::new(-0.24, 0.18, 0.09), Vec3::new(0.03, -0.24, 0.16),
-                Vec3::new(0.01, 0.02, -0.24), Vec3::new(0.0, 0.0, 0.24),
+                Vec3::ZERO,
+                Vec3::new(0.24, 0.18, 0.21),
+                Vec3::new(-0.24, 0.18, 0.09),
+                Vec3::new(0.03, -0.24, 0.16),
+                Vec3::new(0.01, 0.02, -0.24),
+                Vec3::new(0.0, 0.0, 0.24),
             ] {
                 let end = start + direction;
                 let radius = cell_m * 1.8;
                 let extent = Vec3::splat(radius + cell_m * 0.5);
                 let origin = Vec3::new(-WORLD_SIDE_M * 0.5, -WORLD_SIDE_M * 0.5, 0.0);
-                let min = ((start.min(end) - extent - origin) / cell_m).floor().as_ivec3().to_array();
-                let max = ((start.max(end) + extent - origin) / cell_m).ceil().as_ivec3().to_array();
+                let min = ((start.min(end) - extent - origin) / cell_m)
+                    .floor()
+                    .as_ivec3()
+                    .to_array();
+                let max = ((start.max(end) + extent - origin) / cell_m)
+                    .ceil()
+                    .as_ivec3()
+                    .to_array();
                 for clipped in [false, true] {
                     let mut lo = min;
                     let mut hi = max;
@@ -3040,9 +3771,14 @@ mod render_geometry_tests {
                         lo[0] += 1;
                         hi[1] -= 1;
                     }
-                    let occupied = |cell| segment_aabb_distance_squared(
-                        start, end, plant_cell_center(cell, cell_m), Vec3::splat(cell_m * 0.5),
-                    ) <= radius * radius;
+                    let occupied = |cell| {
+                        segment_aabb_distance_squared(
+                            start,
+                            end,
+                            plant_cell_center(cell, cell_m),
+                            Vec3::splat(cell_m * 0.5),
+                        ) <= radius * radius
+                    };
                     let timer = std::time::Instant::now();
                     let mut expected = BTreeSet::new();
                     for z in lo[2]..=hi[2] {
@@ -3059,17 +3795,27 @@ mod render_geometry_tests {
                     let mut actual = BTreeSet::new();
                     visit_branch_cells(start, end, radius, cell_m, lo, hi, false, |cell| {
                         assert!(actual.insert(cell), "duplicate branch cell");
+                        true
                     });
                     sliced_time += timer.elapsed();
-                    assert_eq!(actual, expected, "slice changed occupied cells: {direction:?} {cell_m} clipped={clipped}");
-                    let expected_surface: BTreeSet<_> = expected.iter().copied()
+                    assert_eq!(
+                        actual, expected,
+                        "slice changed occupied cells: {direction:?} {cell_m} clipped={clipped}"
+                    );
+                    let expected_surface: BTreeSet<_> = expected
+                        .iter()
+                        .copied()
                         .filter(|&cell| !cell_has_six_neighbours(cell, &occupied))
                         .collect();
                     let mut surface = BTreeSet::new();
                     visit_branch_cells(start, end, radius, cell_m, lo, hi, true, |cell| {
                         surface.insert(cell);
+                        true
                     });
-                    assert_eq!(surface, expected_surface, "surface filtering changed the boundary");
+                    assert_eq!(
+                        surface, expected_surface,
+                        "surface filtering changed the boundary"
+                    );
                     full_count += actual.len();
                     surface_count += surface.len();
                 }

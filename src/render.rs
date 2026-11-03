@@ -4,10 +4,19 @@ use crate::{
     tool::Tool,
     ui::Rect,
 };
-use voxel_physics_lab::world::{GeneratedCellContent, GeneratedWorld, WORLD_SIDE_M};
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Quat, Vec3};
-use std::{collections::HashSet, sync::Arc};
+use glam::{DQuat, DVec3, Mat4, Quat, Vec3};
+use std::{
+    collections::HashSet,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
+use voxel_physics_lab::documents::{
+    BoneMaterialLimits, BoneSkinTransform, SkeletonDocument, VoxelBoneWeightDocument,
+    VoxelModelDocument,
+};
+use voxel_physics_lab::voxel_surface::exterior_face_masks;
+use voxel_physics_lab::world::{GeneratedCellContent, GeneratedWorld, WORLD_SIDE_M};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -26,10 +35,474 @@ struct Instance {
     color: [f32; 4],
     rotation: [f32; 4],
     surface: f32,
+    skin_index: u32,
+}
+
+/// Lightweight render metadata retained while the authored `Scene` is owned
+/// by its physics worker. Build again after authored material edits.
+pub struct AuthoredPhysicsRenderSource {
+    dynamic_scene_indices: Vec<usize>,
+    material_colors: Vec<[f32; 4]>,
+    kinematic_poses: Vec<AuthoredKinematicPose>,
+    cache_key: u64,
+}
+
+#[derive(Clone, Copy)]
+struct AuthoredKinematicPose {
+    position: DVec3,
+    rotation: Quat,
+    color: [f32; 4],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SkinInfluenceGpu {
+    bone_indices: [u32; 4],
+    weights: [f32; 4],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BoneSkinTransformGpu {
+    translation: [f32; 4],
+    rotation: [f32; 4],
+}
+
+fn storage_buffer<T: Pod>(device: &wgpu::Device, count: usize, label: &str) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: (count.max(1) * std::mem::size_of::<T>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn create_skinning_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    influences: &wgpu::Buffer,
+    bones: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("voxel skeleton skinning buffers"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: influences.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: bones.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+fn pack_skin_influences(
+    voxel_count: usize,
+    weights: &[VoxelBoneWeightDocument],
+) -> Vec<SkinInfluenceGpu> {
+    let mut packed = vec![SkinInfluenceGpu::zeroed(); voxel_count];
+    let mut counts = vec![0_u8; voxel_count];
+    for binding in weights {
+        let voxel_index = binding.voxel_index as usize;
+        let Some(influence_count) = counts.get_mut(voxel_index) else {
+            continue;
+        };
+        if *influence_count >= 4 {
+            continue;
+        }
+        let slot = usize::from(*influence_count);
+        let Some(influence) = packed.get_mut(voxel_index) else {
+            continue;
+        };
+        influence.bone_indices[slot] = binding.bone_index;
+        influence.weights[slot] = binding.weight.max(0.0);
+        *influence_count += 1;
+    }
+    packed
+}
+
+fn pack_bone_transforms(transforms: &[BoneSkinTransform]) -> Vec<BoneSkinTransformGpu> {
+    transforms
+        .iter()
+        .map(|transform| BoneSkinTransformGpu {
+            translation: [
+                transform.translation_m.x as f32,
+                transform.translation_m.y as f32,
+                transform.translation_m.z as f32,
+                0.0,
+            ],
+            rotation: [
+                transform.rotation.x as f32,
+                transform.rotation.y as f32,
+                transform.rotation.z as f32,
+                transform.rotation.w as f32,
+            ],
+        })
+        .collect()
+}
+fn hash_vec3<H: Hasher>(value: Vec3, hasher: &mut H) {
+    for component in value.to_array() {
+        component.to_bits().hash(hasher);
+    }
+}
+
+fn bone_gizmo_key(
+    skeleton: &SkeletonDocument,
+    selected_bone: Option<usize>,
+    cell_size: f32,
+    posed_positions: Option<&[DVec3]>,
+) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    skeleton.bones.len().hash(&mut hasher);
+    selected_bone.hash(&mut hasher);
+    cell_size.to_bits().hash(&mut hasher);
+    for bone in &skeleton.bones {
+        bone.parent.hash(&mut hasher);
+        for value in bone.rest_translation_m.to_array() {
+            value.to_bits().hash(&mut hasher);
+        }
+        for value in bone.rest_rotation.to_array() {
+            value.to_bits().hash(&mut hasher);
+        }
+    }
+    if let Some(positions) = posed_positions {
+        positions.len().hash(&mut hasher);
+        for position in positions {
+            for value in position.to_array() {
+                value.to_bits().hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
+fn build_bone_gizmos(
+    skeleton: &SkeletonDocument,
+    selected_bone: Option<usize>,
+    cell_size: f32,
+    posed_positions: Option<&[DVec3]>,
+) -> Vec<Instance> {
+    let mut global: Vec<(DVec3, DQuat)> = Vec::with_capacity(skeleton.bones.len());
+    for bone in &skeleton.bones {
+        let local_position = bone.rest_translation_m;
+        let local_rotation = DQuat::from_xyzw(
+            f64::from(bone.rest_rotation.x),
+            f64::from(bone.rest_rotation.y),
+            f64::from(bone.rest_rotation.z),
+            f64::from(bone.rest_rotation.w),
+        )
+        .normalize();
+        let world = match bone.parent {
+            Some(parent) if (parent as usize) < global.len() => {
+                let (parent_position, parent_rotation) = global[parent as usize];
+                (
+                    parent_position + parent_rotation * local_position,
+                    (parent_rotation * local_rotation).normalize(),
+                )
+            }
+            _ => (local_position, local_rotation),
+        };
+        global.push(world);
+    }
+    if let Some(positions) = posed_positions.filter(|positions| positions.len() == global.len()) {
+        for (transform, position) in global.iter_mut().zip(positions.iter().copied()) {
+            transform.0 = position;
+        }
+    }
+
+    let mut instances = Vec::with_capacity(skeleton.bones.len().saturating_mul(2));
+    let radius = (cell_size.max(0.01) * 0.8).clamp(0.006, 0.022);
+    for (index, bone) in skeleton.bones.iter().enumerate() {
+        let (position, _) = global[index];
+        let selected = selected_bone == Some(index);
+        let joint_color = if selected {
+            [0.08, 1.0, 0.72, 1.0]
+        } else if bone.parent.is_none() {
+            [1.0, 0.72, 0.18, 1.0]
+        } else {
+            [0.18, 0.72, 1.0, 1.0]
+        };
+        let joint_radius = if bone.parent.is_none() {
+            radius * 1.45
+        } else {
+            radius
+        };
+        instances.push(Instance {
+            center: position.as_vec3().to_array(),
+            size: [joint_radius * 2.0; 3],
+            color: joint_color,
+            rotation: Quat::IDENTITY.to_array(),
+            surface: 0.0,
+            skin_index: u32::MAX,
+        });
+        if let Some(parent) = bone
+            .parent
+            .map(|parent| parent as usize)
+            .filter(|&parent| parent < index)
+        {
+            let start = global[parent].0.as_vec3();
+            let end = position.as_vec3();
+            let direction = end - start;
+            let length = direction.length();
+            if length > 1e-6 {
+                instances.push(Instance {
+                    center: ((start + end) * 0.5).to_array(),
+                    size: [radius * 0.82, radius * 0.82, length + radius],
+                    color: if selected {
+                        [0.12, 0.92, 0.68, 1.0]
+                    } else {
+                        [0.28, 0.62, 0.86, 1.0]
+                    },
+                    rotation: Quat::from_rotation_arc(Vec3::Z, direction / length).to_array(),
+                    surface: 0.0,
+                    skin_index: u32::MAX,
+                });
+            }
+        }
+    }
+    instances
 }
 fn surface_kind(content: GeneratedCellContent) -> f32 {
-    match content { GeneratedCellContent::Terrain => 1.0, GeneratedCellContent::PlantWood => 2.0, _ => 0.0 }
+    match content {
+        GeneratedCellContent::Terrain => 1.0,
+        GeneratedCellContent::PlantWood => 2.0,
+        _ => 0.0,
+    }
 }
+
+fn material_display_color(name: &str) -> [f32; 3] {
+    let name = name.to_ascii_lowercase();
+    if ["wood", "oak", "timber"].iter().any(|part| name.contains(part)) {
+        [0.55, 0.32, 0.14]
+    } else if ["iron", "steel", "metal", "aluminum", "aluminium"]
+        .iter()
+        .any(|part| name.contains(part))
+    {
+        [0.58, 0.62, 0.66]
+    } else if ["stone", "rock", "granite", "concrete"]
+        .iter()
+        .any(|part| name.contains(part))
+    {
+        [0.47, 0.49, 0.52]
+    } else if ["water", "ice"].iter().any(|part| name.contains(part)) {
+        [0.16, 0.48, 0.86]
+    } else if ["flesh", "skin", "meat"].iter().any(|part| name.contains(part)) {
+        [0.86, 0.43, 0.43]
+    } else if name.contains("glass") {
+        [0.48, 0.78, 0.84]
+    } else if ["sand", "soil", "dirt"].iter().any(|part| name.contains(part)) {
+        [0.66, 0.52, 0.32]
+    } else {
+        [0.68, 0.70, 0.73]
+    }
+}
+
+fn voxel_display_color(scene: &Scene, voxel_index: usize) -> [f32; 4] {
+    let Some(voxel) = scene.voxels.get(voxel_index) else {
+        return [0.68, 0.70, 0.73, 1.0];
+    };
+    let mut color = [0.0; 3];
+    let mut weight_sum = 0.0;
+    for &(component, fraction) in &voxel.composition.components {
+        let Some(material) = scene.materials.get(component as usize) else {
+            continue;
+        };
+        let weight = fraction.max(0.0);
+        let component_color = material_display_color(&material.name);
+        for channel in 0..3 {
+            color[channel] += component_color[channel] * weight;
+        }
+        weight_sum += weight;
+    }
+    if weight_sum > 0.0 {
+        for channel in &mut color {
+            *channel /= weight_sum;
+        }
+    } else {
+        color = [0.68, 0.70, 0.73];
+    }
+    [color[0], color[1], color[2], 1.0]
+}
+
+impl AuthoredPhysicsRenderSource {
+    pub fn from_scene(scene: &Scene) -> Self {
+        let mut dynamic_scene_indices = Vec::new();
+        let mut material_colors = Vec::with_capacity(scene.voxels.len());
+        let mut kinematic_poses = Vec::new();
+        for (index, voxel) in scene.voxels.iter().enumerate() {
+            let color = voxel_display_color(scene, index);
+            material_colors.push(color);
+            if voxel.kinematic {
+                kinematic_poses.push(AuthoredKinematicPose {
+                    position: scene.positions[index],
+                    rotation: scene.rotations[index],
+                    color,
+                });
+            } else {
+                dynamic_scene_indices.push(index);
+            }
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        dynamic_scene_indices.hash(&mut hasher);
+        for color in &material_colors {
+            for channel in color {
+                channel.to_bits().hash(&mut hasher);
+            }
+        }
+        for pose in &kinematic_poses {
+            for component in pose.position.to_array() {
+                component.to_bits().hash(&mut hasher);
+            }
+            for component in pose.rotation.to_array() {
+                component.to_bits().hash(&mut hasher);
+            }
+            for channel in pose.color {
+                channel.to_bits().hash(&mut hasher);
+            }
+        }
+        Self {
+            dynamic_scene_indices,
+            material_colors,
+            kinematic_poses,
+            cache_key: hasher.finish(),
+        }
+    }
+}
+
+fn authored_frame_indices_match(
+    source: &AuthoredPhysicsRenderSource,
+    cells: &[voxel_physics_lab::world_physics::PhysicalCellPose],
+) -> bool {
+    cells.len() == source.dynamic_scene_indices.len()
+        && cells
+            .iter()
+            .zip(&source.dynamic_scene_indices)
+            .all(|(cell, &expected_index)| cell.scene_index == expected_index)
+}
+
+fn has_axis_aligned_rotation(rotation: Quat) -> bool {
+    const TOLERANCE: f32 = 1.0e-4;
+    if !rotation.is_finite() || (rotation.length_squared() - 1.0).abs() > TOLERANCE * 4.0 {
+        return false;
+    }
+    let mut used_axes = [false; 3];
+    for basis in [Vec3::X, Vec3::Y, Vec3::Z] {
+        let rotated = (rotation * basis).abs();
+        let axis = if rotated.x >= rotated.y && rotated.x >= rotated.z {
+            0
+        } else if rotated.y >= rotated.z {
+            1
+        } else {
+            2
+        };
+        if used_axes[axis]
+            || rotated[axis] < 1.0 - TOLERANCE
+            || (0..3).any(|component| component != axis && rotated[component] > TOLERANCE)
+        {
+            return false;
+        }
+        used_axes[axis] = true;
+    }
+    true
+}
+
+/// Convert world-axis mask bits to the matching local cube-face bits. The
+/// shader uses local vertex normals, while the surface classifier uses world axes.
+fn local_face_mask(world_mask: u8, rotation: Quat) -> u8 {
+    let mut local_mask = 0u8;
+    for local_axis in 0..3 {
+        for positive in [false, true] {
+            let sign = if positive { 1.0 } else { -1.0 };
+            let mut local_normal = Vec3::ZERO;
+            local_normal[local_axis] = sign;
+            let world_normal = rotation * local_normal;
+            let world_axis = if world_normal.x.abs() >= world_normal.y.abs()
+                && world_normal.x.abs() >= world_normal.z.abs()
+            {
+                0
+            } else if world_normal.y.abs() >= world_normal.z.abs() {
+                1
+            } else {
+                2
+            };
+            let world_positive = world_normal[world_axis] > 0.0;
+            let world_bit = 1u8 << (world_axis * 2 + usize::from(world_positive));
+            if world_mask & world_bit != 0 {
+                local_mask |= 1u8 << (local_axis * 2 + usize::from(positive));
+            }
+        }
+    }
+    local_mask
+}
+
+fn apply_surface_culling(
+    instances: &mut [Instance],
+    pose_at: impl FnMut(usize) -> (DVec3, Quat),
+) {
+    let poses: Vec<_> = (0..instances.len()).map(pose_at).collect();
+    let masks = compute_surface_masks(&poses);
+    apply_surface_masks(instances, &masks, |index| poses[index].1);
+}
+
+fn compute_surface_masks(poses: &[(DVec3, Quat)]) -> Vec<Option<u8>> {
+    let mut result = vec![None; poses.len()];
+    if poses.is_empty() {
+        return result;
+    }
+    let eligible_indices: Vec<_> = poses
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, rotation))| has_axis_aligned_rotation(*rotation).then_some(index))
+        .collect();
+    let Some(&first_eligible) = eligible_indices.first() else {
+        return result;
+    };
+    let anchor = poses[first_eligible].0;
+    let positions: Vec<_> = eligible_indices
+        .iter()
+        .map(|&index| (poses[index].0 - anchor).as_vec3().to_array())
+        .collect();
+    let masks = exterior_face_masks(&positions, CELL);
+    for (&index, &mask) in eligible_indices.iter().zip(&masks) {
+        result[index] = Some(mask);
+    }
+    result
+}
+
+fn apply_surface_masks(
+    instances: &mut [Instance],
+    masks: &[Option<u8>],
+    mut rotation_at: impl FnMut(usize) -> Quat,
+) {
+    for instance in instances.iter_mut() {
+        // Preserve complete REV geometry; actual pose offsets carry gaps.
+        instance.size = [CELL; 3];
+        instance.surface = 0.0;
+    }
+    for (index, instance) in instances.iter_mut().enumerate() {
+        if let Some(Some(world_mask)) = masks.get(index) {
+            let local_mask = local_face_mask(*world_mask, rotation_at(index));
+            instance.size = [CELL; 3];
+            instance.surface = -(f32::from(local_mask) + 1.0);
+        }
+    }
+}
+
+/// Drop only cells whose six faces are hidden. `skin_index` remains the source
+/// REV index, so compacting the draw list does not compact skinning data.
+fn compact_fully_hidden(instances: &mut Vec<Instance>, voxel_count: usize) -> usize {
+    let voxel_count = voxel_count.min(instances.len());
+    let mut compacted: Vec<_> = instances
+        .drain(..voxel_count)
+        .filter(|instance| instance.surface != -1.0)
+        .collect();
+    let kept_voxels = compacted.len();
+    compacted.append(instances);
+    *instances = compacted;
+    kept_voxels
+}
+
 impl Instance {
     fn cube(center: Vec3, rotation: Quat, color: [f32; 4]) -> Self {
         Self {
@@ -38,6 +511,39 @@ impl Instance {
             color,
             rotation: rotation.to_array(),
             surface: 0.0,
+            skin_index: u32::MAX,
+        }
+    }
+}
+
+fn push_box_outline(instances: &mut Vec<Instance>, bounds: (Vec3, Vec3), color: [f32; 4]) {
+    let padding = 0.0008;
+    let minimum = bounds.0.min(bounds.1) - Vec3::splat(padding);
+    let maximum = bounds.0.max(bounds.1) + Vec3::splat(padding);
+    let thickness = ((maximum - minimum).min_element() * 0.07).clamp(0.00045, 0.0025);
+    for axis in 0..3 {
+        let side_axes = (0..3)
+            .filter(|&candidate| candidate != axis)
+            .collect::<Vec<_>>();
+        for side in 0..4 {
+            let mut start = minimum;
+            for (bit, &side_axis) in side_axes.iter().enumerate() {
+                if side & (1 << bit) != 0 {
+                    start[side_axis] = maximum[side_axis];
+                }
+            }
+            let mut end = start;
+            end[axis] = maximum[axis];
+            let mut size = Vec3::splat(thickness);
+            size[axis] = (end[axis] - start[axis]).max(thickness);
+            instances.push(Instance {
+                center: ((start + end) * 0.5).to_array(),
+                size: size.to_array(),
+                color,
+                rotation: Quat::IDENTITY.to_array(),
+                surface: 0.0,
+                skin_index: u32::MAX,
+            });
         }
     }
 }
@@ -65,7 +571,8 @@ fn push_plant_lod(
             size: voxel.size.to_array(),
             color,
             rotation: Quat::IDENTITY.to_array(),
-                surface: surface_kind(voxel.content),
+            surface: surface_kind(voxel.content),
+            skin_index: u32::MAX,
         });
         return;
     }
@@ -86,13 +593,7 @@ fn push_plant_lod(
         (local_center.y / lod).floor() as i32,
         (local_center.z / lod).floor() as i32,
     );
-    let key = (
-        lod_cell.0,
-        lod_cell.1,
-        lod_cell.2,
-        lod_level,
-        material,
-    );
+    let key = (lod_cell.0, lod_cell.1, lod_cell.2, lod_level, material);
     if !occupied.insert(key) {
         return;
     }
@@ -113,7 +614,8 @@ fn push_plant_lod(
         size: [lod; 3],
         color,
         rotation: Quat::IDENTITY.to_array(),
-                surface: surface_kind(voxel.content),
+        surface: surface_kind(voxel.content),
+        skin_index: u32::MAX,
     });
 }
 type WorldCacheKey = (u64, u64, i32, i32, i32);
@@ -128,7 +630,9 @@ struct WorldGeometryCache {
 
 impl WorldGeometryCache {
     fn restrict_to_bounds(&mut self, world: &GeneratedWorld) {
-        let Some((min,max)) = world.view_bounds else { return; };
+        let Some((min, max)) = world.view_bounds else {
+            return;
+        };
         fn clip(instances: &mut Vec<Instance>, terrain: &mut usize, min: Vec3, max: Vec3) {
             let mut retained_terrain = 0;
             let old_terrain = *terrain;
@@ -138,21 +642,37 @@ impl WorldGeometryCache {
                 index += 1;
                 let center = Vec3::from_array(instance.center);
                 let size = Vec3::from_array(instance.size);
-                let lower = (center-size*0.5).max(min);
-                let upper = (center+size*0.5).min(max);
-                if upper.x <= lower.x || upper.y <= lower.y || upper.z <= lower.z { return false; }
-                instance.center = ((lower+upper)*0.5).to_array();
-                instance.size = (upper-lower).to_array();
-                if was_terrain { retained_terrain += 1; }
+                let lower = (center - size * 0.5).max(min);
+                let upper = (center + size * 0.5).min(max);
+                if upper.x <= lower.x || upper.y <= lower.y || upper.z <= lower.z {
+                    return false;
+                }
+                instance.center = ((lower + upper) * 0.5).to_array();
+                instance.size = (upper - lower).to_array();
+                if was_terrain {
+                    retained_terrain += 1;
+                }
                 true
             });
             *terrain = retained_terrain;
         }
-        clip(&mut self.world_instance_cache,&mut self.world_terrain_instance_count,min,max);
-        clip(&mut self.world_transition_cache,&mut self.world_transition_terrain_count,min,max);
+        clip(
+            &mut self.world_instance_cache,
+            &mut self.world_terrain_instance_count,
+            min,
+            max,
+        );
+        clip(
+            &mut self.world_transition_cache,
+            &mut self.world_transition_terrain_count,
+            min,
+            max,
+        );
     }
     fn overview(world: &GeneratedWorld, camera_position: Vec3) -> Self {
-        let world_instance_cache = world.voxels.iter()
+        let world_instance_cache = world
+            .voxels
+            .iter()
             .filter(|voxel| {
                 let delta = voxel.center - camera_position;
                 let radius = 1_000.0 + voxel.size.x.max(voxel.size.y) * 0.5;
@@ -164,9 +684,13 @@ impl WorldGeometryCache {
                 color: voxel.color,
                 rotation: Quat::IDENTITY.to_array(),
                 surface: surface_kind(voxel.content),
+                skin_index: u32::MAX,
             })
             .collect();
-        let mut cache = Self { world_instance_cache, ..Self::default() };
+        let mut cache = Self {
+            world_instance_cache,
+            ..Self::default()
+        };
         cache.restrict_to_bounds(world);
         cache
     }
@@ -188,6 +712,7 @@ impl WorldGeometryCache {
                 color: voxel.color,
                 rotation: Quat::IDENTITY.to_array(),
                 surface: surface_kind(voxel.content),
+                skin_index: u32::MAX,
             };
             if voxel.color[3] < 0.999 {
                 cache.world_transition_cache.push(instance);
@@ -217,9 +742,7 @@ impl WorldGeometryCache {
             // Close wood is replaced by its 1 cm local refinement. Keep
             // the coarse level in the blend band so the tree never fades
             // into empty space while crossing the detail boundary.
-            if voxel.content == GeneratedCellContent::PlantWood
-                && distance_squared <= 5.2 * 5.2
-            {
+            if voxel.content == GeneratedCellContent::PlantWood && distance_squared <= 5.2 * 5.2 {
                 continue;
             }
             if is_tree_cell {
@@ -297,7 +820,8 @@ impl WorldGeometryCache {
                     size: voxel.size.to_array(),
                     color: voxel.color,
                     rotation: Quat::IDENTITY.to_array(),
-                surface: surface_kind(voxel.content),
+                    surface: surface_kind(voxel.content),
+                    skin_index: u32::MAX,
                 });
             }
         }
@@ -322,6 +846,7 @@ impl WorldGeometryCache {
                 color,
                 rotation: Quat::IDENTITY.to_array(),
                 surface: surface_kind(voxel.content),
+                skin_index: u32::MAX,
             });
         }
         cache.restrict_to_bounds(world);
@@ -387,7 +912,9 @@ impl Camera {
                 self.target + self.offset_direction() * self.radius
             };
             self.free_position = Some(position);
-            self.free_speed_mps = (self.radius * 0.06).clamp(10.0, 200.0);
+            // Model-editor orbit radii can be only a few centimetres. Using
+            // that radius directly made WASD freecam crawl at 3 cm/s.
+            self.free_speed_mps = (self.radius * 0.8).clamp(0.5, 200.0);
         }
     }
     pub fn disable_freecam(&mut self) {
@@ -406,14 +933,13 @@ impl Camera {
         self.pitch = (self.pitch + dy as f32 * self.look_sensitivity).clamp(-1.55, 1.55);
     }
     pub fn position(&self) -> Vec3 {
-        self.free_position
-            .unwrap_or_else(|| {
-                if self.first_person {
-                    self.target
-                } else {
-                    self.target + self.offset_direction() * self.radius
-                }
-            })
+        self.free_position.unwrap_or_else(|| {
+            if self.first_person {
+                self.target
+            } else {
+                self.target + self.offset_direction() * self.radius
+            }
+        })
     }
     pub fn move_freecam(&mut self, right: f32, forward: f32, up: f32, dt: f32, fast: bool) {
         if self.free_position.is_none() {
@@ -436,7 +962,7 @@ impl Camera {
         }
     }
     pub fn adjust_free_speed(&mut self, amount: f32) {
-        self.free_speed_mps = (self.free_speed_mps * (amount * 0.2).exp()).clamp(0.5, 5000.0);
+        self.free_speed_mps = (self.free_speed_mps * (amount * 0.2).exp()).clamp(0.005, 5000.0);
     }
     fn matrix(&self, aspect: f32) -> Mat4 {
         let offset = self.offset_direction() * self.radius;
@@ -461,12 +987,44 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     transition_pipeline: wgpu::RenderPipeline,
     ui_pipeline: wgpu::RenderPipeline,
+    skinning_layout: wgpu::BindGroupLayout,
+    skinning_influence_buffer: wgpu::Buffer,
+    skinning_bone_buffer: wgpu::Buffer,
+    skinning_influence_capacity: usize,
+    skinning_bone_capacity: usize,
+    skinning_bind_group: wgpu::BindGroup,
+    skinning_default_bind_group: wgpu::BindGroup,
+    skinning_weight_cache_key: Option<(u64, usize, usize, usize)>,
+    skinning_weight_job: Option<(
+        (u64, usize, usize, usize),
+        std::sync::mpsc::Receiver<Vec<SkinInfluenceGpu>>,
+    )>,
+    bone_material_limits: Vec<BoneMaterialLimits>,
+    bone_material_limits_cache_key: Option<(u64, usize, usize, usize, usize)>,
     vertices: wgpu::Buffer,
     terrain_vertices: wgpu::Buffer,
     instances: wgpu::Buffer,
     instance_capacity: usize,
+    selected_instances: wgpu::Buffer,
+    selected_instance_capacity: usize,
+    bone_instances: wgpu::Buffer,
+    bone_instance_capacity: usize,
+    bone_instance_cache: Vec<Instance>,
+    bone_gizmo_cache_key: Option<u64>,
     physics_instances: wgpu::Buffer,
     physics_capacity: usize,
+    physics_instance_cache: Vec<Instance>,
+    physics_cache_key: Option<(u64, u64)>,
+    authored_physics_instances: Vec<Instance>,
+    authored_physics_instance_buffer: wgpu::Buffer,
+    authored_physics_instance_capacity: usize,
+    authored_physics_active: bool,
+    authored_physics_cache_key: Option<(u64, u64, u64)>,
+    scene_voxel_instance_count: usize,
+    scene_surface_masks: Vec<Option<u8>>,
+    scene_surface_mask_cache_key: Option<(usize, usize, usize, usize, u64, u64)>,
+    scene_instance_cache: Vec<Instance>,
+    scene_instance_cache_key: Option<u64>,
     world_instance_cache: Vec<Instance>,
     world_transition_cache: Vec<Instance>,
     world_terrain_instance_count: usize,
@@ -604,6 +1162,88 @@ fn uniform(
     (buffer, layout, group)
 }
 impl Renderer {
+    /// Replace an authored scene's dynamic REV rendering with a worker frame.
+    /// Keep this lightweight source snapshot while the full Scene is moved to
+    /// its worker. Topology changes use a neutral dynamic color.
+    pub fn set_authored_physics_frame(
+        &mut self,
+        source: &AuthoredPhysicsRenderSource,
+        frame: Option<&voxel_physics_lab::world_physics::PhysicsFrame>,
+    ) -> usize {
+        let Some(frame) = frame else {
+            self.authored_physics_instances.clear();
+            self.authored_physics_active = false;
+            self.authored_physics_cache_key = None;
+            return 0;
+        };
+        let cache_key = (frame.generation, frame.revision, source.cache_key);
+        if self.authored_physics_cache_key == Some(cache_key) {
+            self.authored_physics_active = true;
+            return self.authored_physics_instances.len();
+        }
+        self.authored_physics_instances.clear();
+
+        let material_mapping_is_stable = authored_frame_indices_match(source, &frame.cells);
+        self.authored_physics_instances
+            .extend(frame.cells.iter().map(|cell| {
+                let color = if material_mapping_is_stable {
+                    source
+                        .material_colors
+                        .get(cell.scene_index)
+                        .copied()
+                        .unwrap_or([0.68, 0.70, 0.73, 1.0])
+                } else {
+                    [0.68, 0.70, 0.73, 1.0]
+                };
+                Instance {
+                    center: cell.world_position_m.as_vec3().to_array(),
+                    size: [CELL; 3],
+                    color,
+                    rotation: cell.rotation.to_array(),
+                    surface: 0.0,
+                    skin_index: u32::MAX,
+                }
+            }));
+        // Build one combined pose list so exact face contacts are classified
+        // consistently across dynamic and constrained authored REVs.
+        let dynamic_count = self.authored_physics_instances.len();
+        self.authored_physics_instances.extend(source.kinematic_poses.iter().map(|pose| {
+            let mut instance = Instance::cube(pose.position.as_vec3(), pose.rotation, pose.color);
+            instance.skin_index = u32::MAX;
+            instance
+        }));
+        apply_surface_culling(&mut self.authored_physics_instances, |index| {
+            if index < dynamic_count {
+                let cell = &frame.cells[index];
+                (cell.world_position_m, cell.rotation)
+            } else {
+                let pose = source.kinematic_poses[index - dynamic_count];
+                (pose.position, pose.rotation)
+            }
+        });
+        let authored_count = self.authored_physics_instances.len();
+        compact_fully_hidden(&mut self.authored_physics_instances, authored_count);
+        if self.authored_physics_instances.len() > self.authored_physics_instance_capacity {
+            self.authored_physics_instance_capacity =
+                self.authored_physics_instances.len().next_power_of_two();
+            self.authored_physics_instance_buffer = instance_buffer(
+                &self.device,
+                self.authored_physics_instance_capacity,
+                std::mem::size_of::<Instance>(),
+            );
+        }
+        if !self.authored_physics_instances.is_empty() {
+            self.queue.write_buffer(
+                &self.authored_physics_instance_buffer,
+                0,
+                bytemuck::cast_slice(&self.authored_physics_instances),
+            );
+        }
+        self.authored_physics_active = true;
+        self.authored_physics_cache_key = Some(cache_key);
+        self.authored_physics_instances.len()
+    }
+
     pub async fn new(window: Arc<Window>) -> Result<Self, Box<dyn std::error::Error>> {
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window.clone())?;
@@ -651,6 +1291,55 @@ impl Renderer {
         surface.configure(&device, &config);
         let (camera_buffer, camera_layout, camera_group) = uniform(&device, 64);
         let (screen_buffer, screen_layout, screen_group) = uniform(&device, 16);
+        let skinning_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("voxel skeleton skinning layout"),
+            entries: &[0, 1].map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }),
+        });
+        let skinning_influence_buffer =
+            storage_buffer::<SkinInfluenceGpu>(&device, 1, "voxel skeleton influences");
+        let skinning_bone_buffer =
+            storage_buffer::<BoneSkinTransformGpu>(&device, 1, "voxel skeleton bone transforms");
+        let identity_bone = BoneSkinTransformGpu {
+            translation: [0.0; 4],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        };
+        queue.write_buffer(
+            &skinning_influence_buffer,
+            0,
+            bytemuck::bytes_of(&SkinInfluenceGpu::zeroed()),
+        );
+        queue.write_buffer(&skinning_bone_buffer, 0, bytemuck::bytes_of(&identity_bone));
+        let skinning_bind_group = create_skinning_bind_group(
+            &device,
+            &skinning_layout,
+            &skinning_influence_buffer,
+            &skinning_bone_buffer,
+        );
+        let fallback_influence = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("fallback voxel skin influence"),
+            contents: bytemuck::bytes_of(&SkinInfluenceGpu::zeroed()),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let fallback_bone = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("fallback voxel skin bone"),
+            contents: bytemuck::bytes_of(&identity_bone),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let skinning_default_bind_group = create_skinning_bind_group(
+            &device,
+            &skinning_layout,
+            &fallback_influence,
+            &fallback_bone,
+        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("voxel shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/voxel.wgsl").into()),
@@ -661,7 +1350,7 @@ impl Renderer {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&camera_layout],
+            bind_group_layouts: &[&camera_layout, &skinning_layout],
             push_constant_ranges: &[],
         });
         let ui_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -670,7 +1359,7 @@ impl Renderer {
             push_constant_ranges: &[],
         });
         let vertex_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
-        let instance_attrs = wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x4, 5 => Float32x4, 6 => Float32];
+        let instance_attrs = wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x3, 4 => Float32x4, 5 => Float32x4, 6 => Float32, 7 => Uint32];
         let ui_attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
         let target = Some(wgpu::ColorTargetState {
             format,
@@ -809,7 +1498,11 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX,
         });
         let instances = instance_buffer(&device, 100_000, std::mem::size_of::<Instance>());
+        let selected_instances = instance_buffer(&device, 1024, std::mem::size_of::<Instance>());
+        let bone_instances = instance_buffer(&device, 256, std::mem::size_of::<Instance>());
         let physics_instances = instance_buffer(&device, 1024, std::mem::size_of::<Instance>());
+        let authored_physics_instance_buffer =
+            instance_buffer(&device, 1, std::mem::size_of::<Instance>());
         let ui_instances = instance_buffer(&device, 10_000, std::mem::size_of::<Rect>());
         let depth = depth(&device, &config);
         Ok(Self {
@@ -821,12 +1514,41 @@ impl Renderer {
             pipeline,
             transition_pipeline,
             ui_pipeline,
+            skinning_layout,
+            skinning_influence_buffer,
+            skinning_bone_buffer,
+            skinning_influence_capacity: 1,
+            skinning_bone_capacity: 1,
+            skinning_bind_group,
+            skinning_default_bind_group,
+            skinning_weight_cache_key: None,
+            skinning_weight_job: None,
+            bone_material_limits: Vec::new(),
+            bone_material_limits_cache_key: None,
             vertices,
             terrain_vertices,
             instances,
             instance_capacity: 100_000,
+            selected_instances,
+            selected_instance_capacity: 1024,
+            bone_instances,
+            bone_instance_capacity: 256,
+            bone_instance_cache: Vec::new(),
+            bone_gizmo_cache_key: None,
             physics_instances,
             physics_capacity: 1024,
+            physics_instance_cache: Vec::with_capacity(1024),
+            physics_cache_key: None,
+            authored_physics_instances: Vec::new(),
+            authored_physics_instance_buffer,
+            authored_physics_instance_capacity: 1,
+            authored_physics_active: false,
+            authored_physics_cache_key: None,
+            scene_voxel_instance_count: 0,
+            scene_surface_masks: Vec::new(),
+            scene_surface_mask_cache_key: None,
+            scene_instance_cache: Vec::new(),
+            scene_instance_cache_key: None,
             world_instance_cache: Vec::new(),
             world_transition_cache: Vec::new(),
             world_terrain_instance_count: 0,
@@ -852,6 +1574,142 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
         self.depth = depth(&self.device, &self.config);
     }
+
+    fn prepare_skeleton_skinning(
+        &mut self,
+        model: &VoxelModelDocument,
+        voxel_count: usize,
+        clip_index: Option<usize>,
+        time_s: f64,
+        weights_revision: u64,
+        model_revision: u64,
+    ) -> bool {
+        let Some(skeleton) = model.skeleton.as_ref() else {
+            return false;
+        };
+        if voxel_count == 0 || skeleton.bones.is_empty() || skeleton.voxel_weights.is_empty() {
+            return false;
+        }
+        let material_limits_key = (
+            model_revision,
+            model as *const VoxelModelDocument as usize,
+            model.materials.as_ptr() as usize,
+            model.voxels.as_ptr() as usize,
+            skeleton.voxel_weights.as_ptr() as usize,
+        );
+        if self.bone_material_limits_cache_key != Some(material_limits_key) {
+            self.bone_material_limits = model.skeleton_material_limits().unwrap_or_default();
+            self.bone_material_limits_cache_key = Some(material_limits_key);
+        }
+        let transforms = match clip_index {
+            Some(index) => match skeleton.bone_skin_transforms_at_with_material_limits(
+                index,
+                time_s,
+                Some(&self.bone_material_limits),
+            ) {
+                Ok(transforms) => transforms,
+                Err(_) => return false,
+            },
+            None => vec![
+                BoneSkinTransform {
+                    translation_m: DVec3::ZERO,
+                    rotation: DQuat::IDENTITY,
+                };
+                skeleton.bones.len()
+            ],
+        };
+        if transforms.is_empty() {
+            return false;
+        }
+
+        let weight_key = (
+            weights_revision,
+            voxel_count,
+            skeleton.voxel_weights.len(),
+            skeleton.voxel_weights.as_ptr() as usize,
+        );
+        let mut bind_group_dirty = false;
+        if self.skinning_weight_cache_key != Some(weight_key) {
+            let mut completed = None;
+            if let Some((job_key, receiver)) = self.skinning_weight_job.take() {
+                if job_key == weight_key {
+                    match receiver.try_recv() {
+                        Ok(packed) => completed = Some(packed),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            self.skinning_weight_job = Some((job_key, receiver));
+                            return false;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                    }
+                } else if matches!(
+                    receiver.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ) {
+                    self.skinning_weight_job = Some((job_key, receiver));
+                    return false;
+                }
+            }
+            let packed = if let Some(packed) = completed {
+                packed
+            } else {
+                let weights = skeleton.voxel_weights.clone();
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let spawn = std::thread::Builder::new()
+                    .name("voxel-skin-weight-pack".into())
+                    .spawn(move || {
+                        let _ = sender.send(pack_skin_influences(voxel_count, &weights));
+                    });
+                match spawn {
+                    Ok(_) => {
+                        self.skinning_weight_job = Some((weight_key, receiver));
+                        return false;
+                    }
+                    Err(_) => pack_skin_influences(voxel_count, &skeleton.voxel_weights),
+                }
+            };
+            if packed.len() > self.skinning_influence_capacity {
+                self.skinning_influence_capacity = packed.len().next_power_of_two();
+                self.skinning_influence_buffer = storage_buffer::<SkinInfluenceGpu>(
+                    &self.device,
+                    self.skinning_influence_capacity,
+                    "voxel skeleton influences",
+                );
+                bind_group_dirty = true;
+            }
+            self.queue.write_buffer(
+                &self.skinning_influence_buffer,
+                0,
+                bytemuck::cast_slice(&packed),
+            );
+            self.skinning_weight_cache_key = Some(weight_key);
+        }
+
+        let packed_transforms = pack_bone_transforms(&transforms);
+        if packed_transforms.len() > self.skinning_bone_capacity {
+            self.skinning_bone_capacity = packed_transforms.len().next_power_of_two();
+            self.skinning_bone_buffer = storage_buffer::<BoneSkinTransformGpu>(
+                &self.device,
+                self.skinning_bone_capacity,
+                "voxel skeleton bone transforms",
+            );
+            bind_group_dirty = true;
+        }
+        self.queue.write_buffer(
+            &self.skinning_bone_buffer,
+            0,
+            bytemuck::cast_slice(&packed_transforms),
+        );
+        if bind_group_dirty {
+            self.skinning_bind_group = create_skinning_bind_group(
+                &self.device,
+                &self.skinning_layout,
+                &self.skinning_influence_buffer,
+                &self.skinning_bone_buffer,
+            );
+        }
+        true
+    }
+
     pub fn draw(
         &mut self,
         scene: &Scene,
@@ -860,19 +1718,68 @@ impl Renderer {
         physics: Option<&voxel_physics_lab::world_physics::PhysicsFrame>,
         camera: &Camera,
         ui: &[Rect],
+        scene_viewport: Option<[u32; 4]>,
+        hovered_face: Option<(Vec3, Vec3)>,
+        selected_voxels: &[usize],
+        selection_bounds: Option<(Vec3, Vec3)>,
+        selection_preview: Option<(Vec3, Vec3)>,
+        sculpt_preview_cells: &[Vec3],
+        sculpt_preview_bounds: Option<(Vec3, Vec3)>,
+        sculpt_preview_cell_size: f32,
         show_bonds: bool,
+        rig: Option<(&VoxelModelDocument, Option<usize>, f32, Option<usize>, f64)>,
+        show_rig_overlay: bool,
+        skinning_weights_revision: u64,
+        model_revision: u64,
     ) -> Result<(), wgpu::SurfaceError> {
+        let authored_physics_override = self.authored_physics_active;
+        let skinning_enabled = !authored_physics_override
+            && rig.filter(|_| generated_world.is_none()).is_some_and(
+                |(model, _, _, clip_index, time_s)| {
+                    self.prepare_skeleton_skinning(
+                        model,
+                        scene.voxels.len(),
+                        clip_index,
+                        time_s,
+                        skinning_weights_revision,
+                        model_revision,
+                    )
+                },
+            );
         let mut world_cache_changed = false;
-        let physical_instances: Vec<_> = physics.into_iter().flat_map(|frame| &frame.poses)
-            .map(|&(p,q)| Instance { center:p.to_array(), size:[CELL;3],
-                color:[0.62,0.35,0.13,1.0], rotation:q.to_array(), surface:2.0 }).collect();
-        if physical_instances.len() > self.physics_capacity {
-            self.physics_capacity = physical_instances.len().next_power_of_two();
-            self.physics_instances = instance_buffer(&self.device,self.physics_capacity,
-                std::mem::size_of::<Instance>());
-        }
-        if !physical_instances.is_empty() {
-            self.queue.write_buffer(&self.physics_instances,0,bytemuck::cast_slice(&physical_instances));
+        if let Some(frame) = physics {
+            let cache_key = (frame.generation, frame.revision);
+            if self.physics_cache_key != Some(cache_key) {
+                self.physics_instance_cache.clear();
+                self.physics_instance_cache
+                    .extend(frame.cells.iter().map(|cell| Instance {
+                        center: cell.world_position_m.as_vec3().to_array(),
+                        size: [CELL; 3],
+                        color: [0.62, 0.35, 0.13, 1.0],
+                        rotation: cell.rotation.to_array(),
+                        surface: 2.0,
+                        skin_index: u32::MAX,
+                    }));
+                if self.physics_instance_cache.len() > self.physics_capacity {
+                    self.physics_capacity = self.physics_instance_cache.len().next_power_of_two();
+                    self.physics_instances = instance_buffer(
+                        &self.device,
+                        self.physics_capacity,
+                        std::mem::size_of::<Instance>(),
+                    );
+                }
+                if !self.physics_instance_cache.is_empty() {
+                    self.queue.write_buffer(
+                        &self.physics_instances,
+                        0,
+                        bytemuck::cast_slice(&self.physics_instance_cache),
+                    );
+                }
+                self.physics_cache_key = Some(cache_key);
+            }
+        } else {
+            self.physics_cache_key = None;
+            self.physics_instance_cache.clear();
         }
         if let Some(world) = generated_world {
             let camera_position = camera.position();
@@ -922,8 +1829,10 @@ impl Renderer {
                         if built_key.0 == seed_revision && built_key.1 <= geometry_revision {
                             self.world_instance_cache = geometry.world_instance_cache;
                             self.world_transition_cache = geometry.world_transition_cache;
-                            self.world_terrain_instance_count = geometry.world_terrain_instance_count;
-                            self.world_transition_terrain_count = geometry.world_transition_terrain_count;
+                            self.world_terrain_instance_count =
+                                geometry.world_terrain_instance_count;
+                            self.world_transition_terrain_count =
+                                geometry.world_transition_terrain_count;
                             self.cached_world_key = Some(built_key);
                             world_cache_changed = true;
                         }
@@ -959,7 +1868,66 @@ impl Renderer {
             self.world_snapshot = None;
             self.world_terrain_instance_count = 0;
         }
-        let mut instances: Vec<_> = if generated_world.is_some() {
+        let scene_cacheable =
+            generated_world.is_none() && tool.is_none() && sculpt_preview_cells.is_empty();
+        let mut scene_hasher = std::collections::hash_map::DefaultHasher::new();
+        (scene.positions.as_ptr() as usize).hash(&mut scene_hasher);
+        scene.positions.len().hash(&mut scene_hasher);
+        (scene.voxels.as_ptr() as usize).hash(&mut scene_hasher);
+        (scene.bonds[0].as_ptr() as usize).hash(&mut scene_hasher);
+        (scene.bonds[1].as_ptr() as usize).hash(&mut scene_hasher);
+        (scene.bonds[2].as_ptr() as usize).hash(&mut scene_hasher);
+        scene.render_revision.hash(&mut scene_hasher);
+        scene.substep_index.hash(&mut scene_hasher);
+        scene.broken.hash(&mut scene_hasher);
+        for material in &scene.materials {
+            for channel in material_display_color(&material.name) {
+                channel.to_bits().hash(&mut scene_hasher);
+            }
+        }
+        show_bonds.hash(&mut scene_hasher);
+        if let Some((center, normal)) = hovered_face {
+            1_u8.hash(&mut scene_hasher);
+            hash_vec3(center, &mut scene_hasher);
+            hash_vec3(normal, &mut scene_hasher);
+        } else {
+            0_u8.hash(&mut scene_hasher);
+        }
+        for bounds in [selection_bounds, selection_preview, sculpt_preview_bounds] {
+            if let Some((minimum, maximum)) = bounds {
+                1_u8.hash(&mut scene_hasher);
+                hash_vec3(minimum, &mut scene_hasher);
+                hash_vec3(maximum, &mut scene_hasher);
+            } else {
+                0_u8.hash(&mut scene_hasher);
+            }
+        }
+        sculpt_preview_cell_size.to_bits().hash(&mut scene_hasher);
+        let scene_cache_key = scene_hasher.finish();
+        let scene_cache_hit =
+            scene_cacheable && self.scene_instance_cache_key == Some(scene_cache_key);
+        if generated_world.is_none() && !show_bonds {
+            let surface_cache_key = (
+                scene.positions.as_ptr() as usize,
+                scene.positions.len(),
+                scene.rotations.as_ptr() as usize,
+                scene.rotations.len(),
+                scene.render_revision,
+                scene.substep_index,
+            );
+            if self.scene_surface_mask_cache_key != Some(surface_cache_key) {
+                let poses: Vec<_> = scene
+                    .positions
+                    .iter()
+                    .copied()
+                    .zip(scene.rotations.iter().copied())
+                    .collect();
+                self.scene_surface_masks = compute_surface_masks(&poses);
+                self.scene_surface_mask_cache_key = Some(surface_cache_key);
+            }
+        }
+
+        let mut instances: Vec<_> = if generated_world.is_some() || scene_cache_hit {
             Vec::new()
         } else {
             let damage = scene.incident_bond_damage();
@@ -978,71 +1946,152 @@ impl Renderer {
                         [0.92, 0.52, 0.24, 1.]
                     } else {
                         let d = damage[i].0;
-                        [0.55 + 0.39 * d, 0.32 + 0.43 * d, 0.12 + 0.18 * d, 1.]
+                        let material = voxel_display_color(scene, i);
+                        let amount = d.clamp(0.0, 1.0);
+                        [
+                            material[0] + (0.94 - material[0]) * amount,
+                            material[1] + (0.75 - material[1]) * amount,
+                            material[2] + (0.38 - material[2]) * amount,
+                            1.0,
+                        ]
                     };
-                    Instance::cube(p.as_vec3(), scene.rotations[i], color)
+                    let mut instance = Instance::cube(p.as_vec3(), scene.rotations[i], color);
+                    if !show_bonds {
+                        instance.size = [CELL; 3];
+                        if let Some(Some(world_mask)) = self.scene_surface_masks.get(i) {
+                            let local_mask = local_face_mask(*world_mask, scene.rotations[i]);
+                            instance.size = [CELL; 3];
+                            instance.surface = -(f32::from(local_mask) + 1.0);
+                        }
+                    }
+                    instance.skin_index = i as u32;
+                    instance
                 })
                 .collect()
         };
-        if generated_world.is_none() {
-        if let Some(t) = tool {
-            if let Some(m) = t.mount {
-                // External guide visualization, not an additional collision body.
-                let direction = if m.direction == Vec3::ZERO {
-                    Vec3::X
-                } else {
-                    m.direction
-                };
-                let offset = Vec3::Y * 0.045;
-                instances.push(Instance {
-                    center: (m.world_base + offset.as_dvec3()).as_vec3().to_array(),
-                    size: [0.8, 0.008, 0.008],
-                    color: [0.18, 0.55, 0.85, 1.0],
-                    rotation: Quat::from_rotation_arc(Vec3::X, direction).to_array(),
-                    surface: 0.0,
-                });
-                let base = t.position + (t.rotation * m.local_base).as_dvec3();
-                instances.push(Instance::cube(base.as_vec3(), m.rotation, [0.18, 0.55, 0.85, 1.0]));
+        let mut scene_voxel_instance_count = if scene_cache_hit {
+            self.scene_voxel_instance_count
+        } else {
+            0
+        };
+        if generated_world.is_none() && !scene_cache_hit {
+            scene_voxel_instance_count = scene.voxels.len().min(instances.len());
+            if !show_bonds {
+                scene_voxel_instance_count =
+                    compact_fully_hidden(&mut instances, scene_voxel_instance_count);
             }
-            instances.extend(
-                t.world_cells()
-                    .map(|p| Instance::cube(p.as_vec3(), t.rotation, t.color)),
-            );
         }
-        if show_bonds {
-            for axis in 0..3 {
-                for (i, b) in scene.bonds[axis].iter().enumerate() {
-                    if b.neighbor == EMPTY || scene.voxels[i].kinematic {
-                        continue;
-                    }
-                    let a = scene.positions[i];
-                    let d = scene.positions[b.neighbor as usize] - a;
-                    if d.length_squared() < 1e-12 {
-                        continue;
-                    }
+        if generated_world.is_none() && !scene_cache_hit {
+            if let Some(t) = tool {
+                if let Some(m) = t.mount {
+                    // External guide visualization, not an additional collision body.
+                    let direction = if m.direction == Vec3::ZERO {
+                        Vec3::X
+                    } else {
+                        m.direction
+                    };
+                    let offset = Vec3::Y * 0.045;
                     instances.push(Instance {
-                        center: (a + d * 0.5).as_vec3().to_array(),
-                        size: [CELL * 0.08, CELL * 0.08, d.length() as f32],
-                        rotation: Quat::from_rotation_arc(Vec3::Z, d.normalize().as_vec3()).to_array(),
+                        center: (m.world_base + offset.as_dvec3()).as_vec3().to_array(),
+                        size: [0.8, 0.008, 0.008],
+                        color: [0.18, 0.55, 0.85, 1.0],
+                        rotation: Quat::from_rotation_arc(Vec3::X, direction).to_array(),
                         surface: 0.0,
-                        color: [b.damage, 1. - b.damage, 0.2, 1.],
+                        skin_index: u32::MAX,
+                    });
+                    let base = t.position + (t.rotation * m.local_base).as_dvec3();
+                    instances.push(Instance::cube(
+                        base.as_vec3(),
+                        m.rotation,
+                        [0.18, 0.55, 0.85, 1.0],
+                    ));
+                }
+                instances.extend(
+                    t.world_cells()
+                        .map(|p| Instance::cube(p.as_vec3(), t.rotation, t.color)),
+                );
+            }
+            if show_bonds {
+                for axis in 0..3 {
+                    for (i, b) in scene.bonds[axis].iter().enumerate() {
+                        if b.neighbor == EMPTY || scene.voxels[i].kinematic {
+                            continue;
+                        }
+                        let a = scene.positions[i];
+                        let d = scene.positions[b.neighbor as usize] - a;
+                        if d.length_squared() < 1e-12 {
+                            continue;
+                        }
+                        instances.push(Instance {
+                            center: (a + d * 0.5).as_vec3().to_array(),
+                            size: [CELL * 0.08, CELL * 0.08, d.length() as f32],
+                            rotation: Quat::from_rotation_arc(Vec3::Z, d.normalize().as_vec3())
+                                .to_array(),
+                            surface: 0.0,
+                            color: [b.damage, 1. - b.damage, 0.2, 1.],
+                            skin_index: u32::MAX,
+                        });
+                    }
+                }
+                // Shrink cubes to expose the lattice; absent bonds are never drawn.
+                for i in 0..scene.voxels.len() {
+                    if !scene.voxels[i].kinematic {
+                        instances[i].size = [CELL * 0.35; 3];
+                    }
+                }
+            }
+            if let Some((center, normal)) = hovered_face {
+                let normal = normal.normalize_or_zero();
+                if normal.length_squared() > 0.5 {
+                    instances.push(Instance {
+                        center: (center + normal * (CELL * 0.52)).to_array(),
+                        size: [CELL * 0.92, CELL * 0.92, CELL * 0.012],
+                        color: [0.08, 0.95, 0.68, 1.0],
+                        rotation: Quat::from_rotation_arc(Vec3::Z, normal).to_array(),
+                        surface: 0.0,
+                        skin_index: u32::MAX,
                     });
                 }
             }
-            // Shrink cubes to expose the lattice; absent bonds are never drawn.
-            for i in 0..scene.voxels.len() {
-                if !scene.voxels[i].kinematic {
-                    instances[i].size = [CELL * 0.35; 3];
+            if let Some(bounds) = selection_bounds {
+                push_box_outline(&mut instances, bounds, [0.24, 1.0, 0.72, 1.0]);
+            }
+            if let Some(bounds) = selection_preview {
+                push_box_outline(&mut instances, bounds, [1.0, 0.72, 0.18, 1.0]);
+            }
+            for &center in sculpt_preview_cells {
+                instances.push(Instance {
+                    center: center.to_array(),
+                    size: [sculpt_preview_cell_size * 0.94; 3],
+                    color: [0.12, 0.94, 1.0, 0.42],
+                    rotation: Quat::IDENTITY.to_array(),
+                    surface: 0.0,
+                    skin_index: u32::MAX,
+                });
+            }
+            if sculpt_preview_cells.is_empty() {
+                if let Some(bounds) = sculpt_preview_bounds {
+                    push_box_outline(&mut instances, bounds, [0.12, 0.94, 1.0, 0.95]);
                 }
             }
         }
-        }
         let static_instance_count = if generated_world.is_some() {
             self.world_instance_cache.len() + self.world_transition_cache.len()
+        } else if scene_cache_hit {
+            self.scene_instance_cache.len()
         } else {
             instances.len()
         };
         let instance_count = static_instance_count;
+        let upload_scene_instances = generated_world.is_none() && !scene_cache_hit;
+        if upload_scene_instances && scene_cacheable {
+            self.scene_instance_cache.clear();
+            self.scene_instance_cache.extend_from_slice(&instances);
+            self.scene_voxel_instance_count = scene_voxel_instance_count;
+            self.scene_instance_cache_key = Some(scene_cache_key);
+        } else if !scene_cacheable {
+            self.scene_instance_cache_key = None;
+        }
         if instance_count > self.instance_capacity {
             self.instance_capacity = instance_count.next_power_of_two();
             self.instances = instance_buffer(
@@ -1064,8 +2113,8 @@ impl Renderer {
                     bytemuck::cast_slice(&self.world_instance_cache),
                 );
                 if !self.world_transition_cache.is_empty() {
-                    let transition_offset = self.world_instance_cache.len()
-                        * std::mem::size_of::<Instance>();
+                    let transition_offset =
+                        self.world_instance_cache.len() * std::mem::size_of::<Instance>();
                     self.queue.write_buffer(
                         &self.instances,
                         transition_offset as u64,
@@ -1073,18 +2122,100 @@ impl Renderer {
                     );
                 }
             }
-        } else {
+        } else if upload_scene_instances {
             self.queue
                 .write_buffer(&self.instances, 0, bytemuck::cast_slice(&instances));
         }
+        let selected_instances = if generated_world.is_none() {
+            selected_voxels
+                .iter()
+                .copied()
+                .filter(|&index| index < scene.positions.len())
+                .map(|index| {
+                    let mut instance = Instance::cube(
+                        scene.positions[index].as_vec3(),
+                        scene.rotations[index],
+                        [0.08, 0.78, 0.59, 1.0],
+                    );
+                    instance.skin_index = index as u32;
+                    if show_bonds && !scene.voxels[index].kinematic {
+                        instance.size = [CELL * 0.35; 3];
+                    }
+                    instance
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        // Keep rig visualization in its own tiny cache and GPU buffer. Bone
+        // selection changes therefore never invalidate/rebuild the voxel mesh.
+        if let Some((model, selected_bone, cell_size, clip_index, time_s)) =
+            rig.filter(|_| generated_world.is_none() && show_rig_overlay)
+        {
+            if let Some(skeleton) = model.skeleton.as_ref() {
+                let posed_positions = clip_index.and_then(|index| {
+                    skeleton
+                        .bone_global_positions_at_with_material_limits(
+                            index,
+                            time_s,
+                            Some(&self.bone_material_limits),
+                        )
+                        .ok()
+                });
+                let posed_positions = posed_positions.as_deref();
+                let gizmo_key = bone_gizmo_key(skeleton, selected_bone, cell_size, posed_positions);
+                if self.bone_gizmo_cache_key != Some(gizmo_key) {
+                    self.bone_instance_cache =
+                        build_bone_gizmos(skeleton, selected_bone, cell_size, posed_positions);
+                    self.bone_gizmo_cache_key = Some(gizmo_key);
+                    if self.bone_instance_cache.len() > self.bone_instance_capacity {
+                        self.bone_instance_capacity =
+                            self.bone_instance_cache.len().next_power_of_two();
+                        self.bone_instances = instance_buffer(
+                            &self.device,
+                            self.bone_instance_capacity,
+                            std::mem::size_of::<Instance>(),
+                        );
+                    }
+                    if !self.bone_instance_cache.is_empty() {
+                        self.queue.write_buffer(
+                            &self.bone_instances,
+                            0,
+                            bytemuck::cast_slice(&self.bone_instance_cache),
+                        );
+                    }
+                }
+            }
+        } else {
+            self.bone_gizmo_cache_key = None;
+            self.bone_instance_cache.clear();
+        }
+        if selected_instances.len() > self.selected_instance_capacity {
+            self.selected_instance_capacity = selected_instances.len().next_power_of_two();
+            self.selected_instances = instance_buffer(
+                &self.device,
+                self.selected_instance_capacity,
+                std::mem::size_of::<Instance>(),
+            );
+        }
+        if !selected_instances.is_empty() {
+            self.queue.write_buffer(
+                &self.selected_instances,
+                0,
+                bytemuck::cast_slice(&selected_instances),
+            );
+        }
         self.queue
             .write_buffer(&self.ui_instances, 0, bytemuck::cast_slice(ui));
+        let camera_viewport =
+            scene_viewport.unwrap_or([0, 0, self.config.width, self.config.height]);
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::cast_slice(
                 &camera
-                    .matrix(self.config.width as f32 / self.config.height as f32)
+                    .matrix(camera_viewport[2] as f32 / camera_viewport[3].max(1) as f32)
                     .to_cols_array(),
             ),
         );
@@ -1123,12 +2254,23 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            if let Some([x, y, width, height]) = scene_viewport {
+                pass.set_viewport(x as f32, y as f32, width as f32, height as f32, 0.0, 1.0);
+                pass.set_scissor_rect(x, y, width, height);
+            }
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_group, &[]);
-            if generated_world.is_some() {
+            pass.set_bind_group(1, &self.skinning_default_bind_group, &[]);
+            if authored_physics_override {
+                if !self.authored_physics_instances.is_empty() {
+                    pass.set_vertex_buffer(0, self.vertices.slice(..));
+                    pass.set_vertex_buffer(1, self.authored_physics_instance_buffer.slice(..));
+                    pass.draw(0..36, 0..self.authored_physics_instances.len() as u32);
+                }
+            } else if generated_world.is_some() {
                 if self.world_terrain_instance_count > 0 {
-                    let terrain_bytes = self.world_terrain_instance_count
-                        * std::mem::size_of::<Instance>();
+                    let terrain_bytes =
+                        self.world_terrain_instance_count * std::mem::size_of::<Instance>();
                     pass.set_vertex_buffer(0, self.terrain_vertices.slice(..));
                     pass.set_vertex_buffer(1, self.instances.slice(..terrain_bytes as u64));
                     pass.draw(0..30, 0..self.world_terrain_instance_count as u32);
@@ -1136,39 +2278,83 @@ impl Renderer {
                 // Transition instances have their own pass below. Including
                 // them here draws them twice and treats terrain skirts as
                 // full cubes in the opaque object pass.
-                let object_count = self.world_instance_cache.len()
+                let object_count = self
+                    .world_instance_cache
+                    .len()
                     .saturating_sub(self.world_terrain_instance_count);
                 if object_count > 0 {
-                    let object_offset = self.world_terrain_instance_count
-                        * std::mem::size_of::<Instance>();
+                    let object_offset =
+                        self.world_terrain_instance_count * std::mem::size_of::<Instance>();
                     pass.set_vertex_buffer(0, self.vertices.slice(..));
                     pass.set_vertex_buffer(1, self.instances.slice(object_offset as u64..));
                     pass.draw(0..36, 0..object_count as u32);
                 }
             } else {
                 pass.set_vertex_buffer(0, self.vertices.slice(..));
-                pass.set_vertex_buffer(1, self.instances.slice(..));
-                pass.draw(0..36, 0..instance_count as u32);
+                if skinning_enabled && scene_voxel_instance_count <= instance_count {
+                    let voxel_count = scene_voxel_instance_count;
+                    if voxel_count > 0 {
+                        pass.set_bind_group(1, &self.skinning_bind_group, &[]);
+                        let voxel_bytes = voxel_count * std::mem::size_of::<Instance>();
+                        pass.set_vertex_buffer(1, self.instances.slice(..voxel_bytes as u64));
+                        pass.draw(0..36, 0..voxel_count as u32);
+                    }
+                    let extra_count = instance_count - voxel_count;
+                    if extra_count > 0 {
+                        pass.set_bind_group(1, &self.skinning_default_bind_group, &[]);
+                        let extra_offset = voxel_count * std::mem::size_of::<Instance>();
+                        pass.set_vertex_buffer(1, self.instances.slice(extra_offset as u64..));
+                        pass.draw(0..36, 0..extra_count as u32);
+                    }
+                } else {
+                    pass.set_vertex_buffer(1, self.instances.slice(..));
+                    pass.draw(0..36, 0..instance_count as u32);
+                }
             }
-            if !physical_instances.is_empty() {
-                pass.set_vertex_buffer(0,self.vertices.slice(..));
-                pass.set_vertex_buffer(1,self.physics_instances.slice(..));
-                pass.draw(0..36,0..physical_instances.len() as u32);
+            pass.set_bind_group(1, &self.skinning_default_bind_group, &[]);
+            if !authored_physics_override && !selected_instances.is_empty() {
+                if skinning_enabled {
+                    pass.set_bind_group(1, &self.skinning_bind_group, &[]);
+                }
+                pass.set_vertex_buffer(0, self.vertices.slice(..));
+                pass.set_vertex_buffer(1, self.selected_instances.slice(..));
+                pass.draw(0..36, 0..selected_instances.len() as u32);
             }
-            if generated_world.is_some() && !self.world_transition_cache.is_empty() {
+            pass.set_bind_group(1, &self.skinning_default_bind_group, &[]);
+            if !authored_physics_override && !self.physics_instance_cache.is_empty() {
+                pass.set_vertex_buffer(0, self.vertices.slice(..));
+                pass.set_vertex_buffer(1, self.physics_instances.slice(..));
+                pass.draw(0..36, 0..self.physics_instance_cache.len() as u32);
+            }
+            if !authored_physics_override && !self.bone_instance_cache.is_empty() {
+                pass.set_vertex_buffer(0, self.vertices.slice(..));
+                pass.set_vertex_buffer(1, self.bone_instances.slice(..));
+                pass.draw(0..36, 0..self.bone_instance_cache.len() as u32);
+            }
+            if !authored_physics_override
+                && generated_world.is_some()
+                && !self.world_transition_cache.is_empty()
+            {
                 pass.set_pipeline(&self.transition_pipeline);
                 pass.set_bind_group(0, &self.camera_group, &[]);
+                pass.set_bind_group(1, &self.skinning_default_bind_group, &[]);
                 let transition_start = self.world_instance_cache.len();
                 if self.world_transition_terrain_count > 0 {
                     let start_bytes = transition_start * std::mem::size_of::<Instance>();
                     let end_bytes = (transition_start + self.world_transition_terrain_count)
                         * std::mem::size_of::<Instance>();
                     pass.set_vertex_buffer(0, self.terrain_vertices.slice(..));
-                    pass.set_vertex_buffer(1, self.instances.slice(start_bytes as u64..end_bytes as u64));
+                    pass.set_vertex_buffer(
+                        1,
+                        self.instances.slice(start_bytes as u64..end_bytes as u64),
+                    );
                     pass.draw(0..30, 0..self.world_transition_terrain_count as u32);
                 }
-                let transition_object_start = transition_start + self.world_transition_terrain_count;
-                let transition_object_count = self.world_transition_cache.len()
+                let transition_object_start =
+                    transition_start + self.world_transition_terrain_count;
+                let transition_object_count = self
+                    .world_transition_cache
+                    .len()
                     .saturating_sub(self.world_transition_terrain_count);
                 if transition_object_count > 0 {
                     let start_bytes = transition_object_start * std::mem::size_of::<Instance>();
@@ -1201,6 +2387,139 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod material_palette_tests {
+    use super::{
+        authored_frame_indices_match, has_axis_aligned_rotation, local_face_mask,
+        material_display_color, AuthoredPhysicsRenderSource,
+    };
+    use glam::{DVec3, Quat};
+    use voxel_physics_lab::world_physics::PhysicalCellPose;
+
+    #[test]
+    fn named_materials_have_distinct_display_colors() {
+        let iron = material_display_color("iron");
+        let wood = material_display_color("oak wood");
+        let flesh = material_display_color("flesh");
+        assert_ne!(iron, wood);
+        assert_ne!(iron, flesh);
+        assert_ne!(wood, flesh);
+    }
+
+    #[test]
+    fn authored_material_mapping_requires_same_dynamic_rev_indices() {
+        let source = AuthoredPhysicsRenderSource {
+            dynamic_scene_indices: vec![0, 2],
+            material_colors: vec![[0.0; 4]; 3],
+            kinematic_poses: Vec::new(),
+            cache_key: 0,
+        };
+        let cell = |scene_index| PhysicalCellPose {
+            scene_index,
+            source_cell: None,
+            world_position_m: DVec3::ZERO,
+            rotation: Quat::IDENTITY,
+        };
+
+        assert!(authored_frame_indices_match(&source, &[cell(0), cell(2)]));
+        assert!(!authored_frame_indices_match(&source, &[cell(0)]));
+        assert!(!authored_frame_indices_match(&source, &[cell(0), cell(1)]));
+    }
+
+    #[test]
+    fn axis_aligned_rotation_maps_world_occlusion_to_local_face_bits() {
+        let rotation = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        assert!(has_axis_aligned_rotation(rotation));
+        assert_eq!(local_face_mask(1 << 0, rotation), 1 << 3);
+        assert!(!has_axis_aligned_rotation(Quat::from_rotation_y(0.1)));
+    }
+
+    #[test]
+    fn surface_culling_keeps_revs_and_preserves_gaps_and_rotated_cells() {
+        use super::{apply_surface_culling, Instance};
+        use crate::scene::CELL;
+        use glam::{DVec3, Vec3};
+
+        let mut touching = [
+            Instance::cube(Vec3::ZERO, Quat::IDENTITY, [1.0; 4]),
+            Instance::cube(Vec3::X * CELL, Quat::IDENTITY, [1.0; 4]),
+        ];
+        apply_surface_culling(&mut touching, |index| {
+            (DVec3::new(index as f64 * f64::from(CELL), 0.0, 0.0), Quat::IDENTITY)
+        });
+        assert_eq!(touching.len(), 2);
+        assert_eq!(touching[0].size, [CELL; 3]);
+        assert_eq!((-(touching[0].surface) - 1.0) as u8, 0b11_1101);
+        assert_eq!((-(touching[1].surface) - 1.0) as u8, 0b11_1110);
+
+        let mut gap = [
+            Instance::cube(Vec3::ZERO, Quat::IDENTITY, [1.0; 4]),
+            Instance::cube(Vec3::X * (CELL * 1.01), Quat::IDENTITY, [1.0; 4]),
+        ];
+        apply_surface_culling(&mut gap, |index| {
+            (
+                DVec3::new(index as f64 * f64::from(CELL * 1.01), 0.0, 0.0),
+                Quat::IDENTITY,
+            )
+        });
+        assert_eq!((-(gap[0].surface) - 1.0) as u8, 0b11_1111);
+
+        let rotated = Quat::from_rotation_z(0.1);
+        let mut rotated_pair = [
+            Instance::cube(Vec3::ZERO, rotated, [1.0; 4]),
+            Instance::cube(Vec3::X * CELL, Quat::IDENTITY, [1.0; 4]),
+        ];
+        apply_surface_culling(&mut rotated_pair, |index| {
+            (
+                DVec3::new(index as f64 * f64::from(CELL), 0.0, 0.0),
+                if index == 0 { rotated } else { Quat::IDENTITY },
+            )
+        });
+        assert_eq!(rotated_pair[0].surface, 0.0);
+        assert_eq!((-(rotated_pair[1].surface) - 1.0) as u8, 0b11_1111);
+        assert!(rotated_pair
+            .iter()
+            .all(|instance| instance.size == [CELL; 3]));
+    }
+
+    #[test]
+    fn compaction_drops_only_hidden_render_cell_and_preserves_physics_count() {
+        use super::{apply_surface_culling, compact_fully_hidden, Instance};
+        use crate::scene::CELL;
+        use glam::{DVec3, Quat};
+
+        let mut physics_poses = Vec::new();
+        let mut render_instances = Vec::new();
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 0..3 {
+                    let position = DVec3::new(
+                        f64::from(x) * f64::from(CELL),
+                        f64::from(y) * f64::from(CELL),
+                        f64::from(z) * f64::from(CELL),
+                    );
+                    physics_poses.push((position, Quat::IDENTITY));
+                    render_instances.push(Instance::cube(
+                        position.as_vec3(),
+                        Quat::IDENTITY,
+                        [1.0; 4],
+                    ));
+                }
+            }
+        }
+
+        let physics_count = physics_poses.len();
+        apply_surface_culling(&mut render_instances, |index| physics_poses[index]);
+        let render_count = compact_fully_hidden(&mut render_instances, physics_count);
+
+        assert_eq!(physics_count, 27);
+        assert_eq!(render_count, 26);
+        assert_eq!(render_instances.len(), 26);
+        assert!(render_instances.iter().all(|instance| instance.surface != -1.0));
+        assert_eq!(74_usize.pow(3) - 72_usize.pow(3), 31_976);
     }
 }
 

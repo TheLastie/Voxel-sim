@@ -80,7 +80,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ];
         solver::step_with_axis_targets(&mut scene, &mut tool, &targets);
         let bond = &scene.bonds[0][0];
-        let strain = ((scene.positions[1].x - scene.positions[0].x - CELL as f64) / CELL as f64) as f32;
+        let strain =
+            ((scene.positions[1].x - scene.positions[0].x - CELL as f64) / CELL as f64) as f32;
         let signed_ratio = strain * young / strength;
         max_ratio = max_ratio.max(signed_ratio.abs());
         if previous_bond && bond.neighbor == EMPTY {

@@ -5,6 +5,7 @@
 /.codex/
 /video_work/
 /validation/__pycache__/
+/validation/live-tests/
 /validation/*_frames*/
 /validation/*-frames/
 /validation/.library_upload_helpers_current/
@@ -27,4 +28,11 @@
 /*.res
 /*.cdtor.c
 /*.cdtor.o
-/validation/live-tests/
+
+# Keep the project-scoped Graphify skill visible while leaving other agent state ignored.
+!/.agents/
+/.agents/*
+!/.agents/skills/
+/.agents/skills/*
+!/.agents/skills/graphify/
+!/.agents/skills/graphify/**

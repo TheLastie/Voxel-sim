@@ -30,10 +30,28 @@ fn parallel_enabled_for(voxel_count: usize) -> bool {
     voxel_count >= *threshold
 }
 
+fn parallel_assembly_precompute_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VOXEL_ASSEMBLY_PRECOMPUTE_PARALLEL")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
 fn fused_pcg_reductions_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("VOXEL_PCG_FUSED_REDUCTIONS")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
+fn component_pcg_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VOXEL_PCG_COMPONENTS_PARALLEL")
             .map(|value| value != "0")
             .unwrap_or(true)
     })
@@ -86,7 +104,7 @@ fn tensor_compliance(scene: &Scene, n: usize, frame: Mat3) -> Mat3 {
         .phase_state(scene.voxels[n].mass, scene.voxels[n].thermal_energy_f32())
         .solid_fraction
         .clamp(1e-4, 1.0);
-    tensor_compliance_at_solid_fraction(scene,n,frame,solid)
+    tensor_compliance_at_solid_fraction(scene, n, frame, solid)
 }
 
 fn tensor_compliance_at_solid_fraction(scene: &Scene, n: usize, frame: Mat3, solid: f32) -> Mat3 {
@@ -116,7 +134,7 @@ fn tensor_compliance_at_solid_fraction(scene: &Scene, n: usize, frame: Mat3, sol
 pub fn stiffness_matrix(scene: &Scene, i: usize, j: usize, frame: Mat3) -> Mat3 {
     let a_compliance = tensor_compliance(scene, i, frame);
     let b_compliance = tensor_compliance(scene, j, frame);
-    stiffness_from_compliances(a_compliance,b_compliance)
+    stiffness_from_compliances(a_compliance, b_compliance)
 }
 
 fn stiffness_from_compliances(a_compliance: Mat3, b_compliance: Mat3) -> Mat3 {
@@ -132,19 +150,27 @@ fn stiffness_from_compliances(a_compliance: Mat3, b_compliance: Mat3) -> Mat3 {
 /// momentum; the measured loss in free nodal kinetic energy becomes heat.
 /// Tangential bond damping needs rotational inertia/torques, which this REV
 /// model does not currently represent, so it is intentionally not fabricated.
-fn translational_mobility(
-    scene: &Scene,
-    targets: &[[Option<f64>; 3]],
-    index: usize,
-) -> Vec3 {
+fn translational_mobility(scene: &Scene, targets: &[[Option<f64>; 3]], index: usize) -> Vec3 {
     let voxel = &scene.voxels[index];
     if voxel.kinematic {
         Vec3::ZERO
     } else {
         Vec3::new(
-            if targets[index][0].is_none() { 1.0 / voxel.mass } else { 0.0 },
-            if targets[index][1].is_none() { 1.0 / voxel.mass } else { 0.0 },
-            if targets[index][2].is_none() { 1.0 / voxel.mass } else { 0.0 },
+            if targets[index][0].is_none() {
+                1.0 / voxel.mass
+            } else {
+                0.0
+            },
+            if targets[index][1].is_none() {
+                1.0 / voxel.mass
+            } else {
+                0.0
+            },
+            if targets[index][2].is_none() {
+                1.0 / voxel.mass
+            } else {
+                0.0
+            },
         )
     }
 }
@@ -166,121 +192,141 @@ fn apply_solid_viscoelastic_damping(
     // damping mobility, so iterating this sparse list preserves the complete
     // active damping set while avoiding a 3 * voxel_count topology scan.
     for constraint in constraints {
-            let axis = constraint.axis;
-            let i = constraint.i;
-            if scene.aggregate_of[i].is_some() {
-                continue;
-            }
-            let bond = scene.bonds[axis][i];
-            let cached_constraint = (bond.neighbor != EMPTY
-                && constraint.j == bond.neighbor as usize)
-                .then_some(constraint);
-            if bond.neighbor == EMPTY {
-                continue;
-            }
-            let j = bond.neighbor as usize;
-            if j >= scene.voxels.len() {
-                continue;
-            }
-            let kelvin_voigt_time = 0.5
-                * (scene.properties[i].solid_kelvin_voigt_time_s
-                    + scene.properties[j].solid_kelvin_voigt_time_s);
-            if !kelvin_voigt_time.is_finite() || kelvin_voigt_time <= 0.0 {
-                continue;
-            }
-            let separation = scene.positions[j] - scene.positions[i];
-            let normal = separation.normalize_or_zero().as_vec3();
-            if normal == Vec3::ZERO {
-                continue;
-            }
-            let mobility_i = translational_mobility(scene, targets, i);
-            let mobility_j = translational_mobility(scene, targets, j);
-            let inverse_effective_mass = (mobility_i + mobility_j).dot(normal * normal);
-            if inverse_effective_mass <= 0.0 {
-                continue;
-            }
-            let velocity_i = scene.voxels[i].velocity;
-            let velocity_j = scene.voxels[j].velocity;
-            let relative_speed = (velocity_j - velocity_i).dot(normal);
-            if relative_speed.abs() <= 1e-12 {
-                continue;
-            }
+        let axis = constraint.axis;
+        let i = constraint.i;
+        if scene.aggregate_of[i].is_some() {
+            continue;
+        }
+        let bond = scene.bonds[axis][i];
+        let cached_constraint = (bond.neighbor != EMPTY && constraint.j == bond.neighbor as usize)
+            .then_some(constraint);
+        if bond.neighbor == EMPTY {
+            continue;
+        }
+        let j = bond.neighbor as usize;
+        if j >= scene.voxels.len() {
+            continue;
+        }
+        let kelvin_voigt_time = 0.5
+            * (scene.properties[i].solid_kelvin_voigt_time_s
+                + scene.properties[j].solid_kelvin_voigt_time_s);
+        if !kelvin_voigt_time.is_finite() || kelvin_voigt_time <= 0.0 {
+            continue;
+        }
+        let separation = scene.positions[j] - scene.positions[i];
+        let normal = separation.normalize_or_zero().as_vec3();
+        if normal == Vec3::ZERO {
+            continue;
+        }
+        let mobility_i = translational_mobility(scene, targets, i);
+        let mobility_j = translational_mobility(scene, targets, j);
+        let inverse_effective_mass = (mobility_i + mobility_j).dot(normal * normal);
+        if inverse_effective_mass <= 0.0 {
+            continue;
+        }
+        let velocity_i = scene.voxels[i].velocity;
+        let velocity_j = scene.voxels[j].velocity;
+        let relative_speed = (velocity_j - velocity_i).dot(normal);
+        if relative_speed.abs() <= 1e-12 {
+            continue;
+        }
 
-            // A zero normal rate produces no dashpot force or heat. Test it
-            // before evaluating the temperature-dependent bond stiffness.
-            let frame = basis(axis, scene.rotations[i].slerp(scene.rotations[j], 0.5));
-            let material_stiffness = cached_constraint
-                .filter(|constraint| {
-                    constraint.rotation_i == scene.rotations[i]
-                        && constraint.rotation_j == scene.rotations[j]
-                        && constraint.thermal_energy_i
-                            == scene.voxels[i].thermal_energy_f32()
-                        && constraint.thermal_energy_j
-                            == scene.voxels[j].thermal_energy_f32()
-                })
-                .map(|constraint| {
-                    cache_hits += 1;
-                    constraint.material_k.x_axis.x
-                })
-                .unwrap_or_else(|| stiffness_matrix(scene, i, j, frame).x_axis.x);
-            let stiffness = material_stiffness * (1.0 - bond.damage).clamp(0.0, 1.0);
-            let dashpot = kelvin_voigt_time * stiffness;
-            if !dashpot.is_finite() || dashpot <= 0.0 {
-                continue;
-            }
+        // A zero normal rate produces no dashpot force or heat. Test it
+        // before evaluating the temperature-dependent bond stiffness.
+        let frame = basis(axis, scene.rotations[i].slerp(scene.rotations[j], 0.5));
+        let material_stiffness = cached_constraint
+            .filter(|constraint| {
+                constraint.rotation_i == scene.rotations[i]
+                    && constraint.rotation_j == scene.rotations[j]
+                    && constraint.thermal_energy_i == scene.voxels[i].thermal_energy_f32()
+                    && constraint.thermal_energy_j == scene.voxels[j].thermal_energy_f32()
+            })
+            .map(|constraint| {
+                cache_hits += 1;
+                constraint.material_k.x_axis.x
+            })
+            .unwrap_or_else(|| stiffness_matrix(scene, i, j, frame).x_axis.x);
+        let stiffness = material_stiffness * (1.0 - bond.damage).clamp(0.0, 1.0);
+        let dashpot = kelvin_voigt_time * stiffness;
+        if !dashpot.is_finite() || dashpot <= 0.0 {
+            continue;
+        }
 
-            // Backward-Euler integration keeps stiff material dashpots stable.
-            let denominator = 1.0 + dt * dashpot * inverse_effective_mass;
-            if !denominator.is_finite() || denominator <= 0.0 {
-                continue;
-            }
-            let impulse_scalar = -dt * dashpot * relative_speed / denominator;
-            let impulse_on_j = normal * impulse_scalar;
-            let new_velocity_i = velocity_i
-                - Vec3::new(
-                    mobility_i.x * impulse_on_j.x,
-                    mobility_i.y * impulse_on_j.y,
-                    mobility_i.z * impulse_on_j.z,
-                );
-            let new_velocity_j = velocity_j
-                + Vec3::new(
-                    mobility_j.x * impulse_on_j.x,
-                    mobility_j.y * impulse_on_j.y,
-                    mobility_j.z * impulse_on_j.z,
-                );
-
-            // Compute the exact kinetic-energy change of the free translational
-            // degrees of freedom from the applied impulse. Prescribed axes do
-            // not contribute kinetic energy, even if their target velocity is
-            // nonzero. This is algebraically equivalent to measuring both
-            // kinetic energies before and after the impulse, with fewer vector
-            // squares and mass multiplications.
-            let free_velocity_i = Vec3::new(
-                if mobility_i.x > 0.0 { velocity_i.x } else { 0.0 },
-                if mobility_i.y > 0.0 { velocity_i.y } else { 0.0 },
-                if mobility_i.z > 0.0 { velocity_i.z } else { 0.0 },
+        // Backward-Euler integration keeps stiff material dashpots stable.
+        let denominator = 1.0 + dt * dashpot * inverse_effective_mass;
+        if !denominator.is_finite() || denominator <= 0.0 {
+            continue;
+        }
+        let impulse_scalar = -dt * dashpot * relative_speed / denominator;
+        let impulse_on_j = normal * impulse_scalar;
+        let new_velocity_i = velocity_i
+            - Vec3::new(
+                mobility_i.x * impulse_on_j.x,
+                mobility_i.y * impulse_on_j.y,
+                mobility_i.z * impulse_on_j.z,
             );
-            let free_velocity_j = Vec3::new(
-                if mobility_j.x > 0.0 { velocity_j.x } else { 0.0 },
-                if mobility_j.y > 0.0 { velocity_j.y } else { 0.0 },
-                if mobility_j.z > 0.0 { velocity_j.z } else { 0.0 },
+        let new_velocity_j = velocity_j
+            + Vec3::new(
+                mobility_j.x * impulse_on_j.x,
+                mobility_j.y * impulse_on_j.y,
+                mobility_j.z * impulse_on_j.z,
             );
-            let kinetic_change = impulse_scalar
-                * (free_velocity_j - free_velocity_i).dot(normal)
-                + 0.5 * impulse_scalar * impulse_scalar * inverse_effective_mass;
-            scene.voxels[i].velocity = new_velocity_i;
-            scene.voxels[j].velocity = new_velocity_j;
 
-            let heat = (-kinetic_change).max(0.0) as f64;
-            if heat > 0.0 {
-                scene.energy.solid_viscoelastic_heat += heat;
-                let deferred_delta = deferred_thermal_cell_delta
-                    .get_or_insert_with(|| vec![0.0; scene.voxels.len()]);
-                deferred_delta[i] += scene.voxels[i]
-                    .add_internal_energy_j_deferred_thermal_cells(heat * 0.5);
-                deferred_delta[j] += scene.voxels[j]
-                    .add_internal_energy_j_deferred_thermal_cells(heat * 0.5);
-            }
+        // Compute the exact kinetic-energy change of the free translational
+        // degrees of freedom from the applied impulse. Prescribed axes do
+        // not contribute kinetic energy, even if their target velocity is
+        // nonzero. This is algebraically equivalent to measuring both
+        // kinetic energies before and after the impulse, with fewer vector
+        // squares and mass multiplications.
+        let free_velocity_i = Vec3::new(
+            if mobility_i.x > 0.0 {
+                velocity_i.x
+            } else {
+                0.0
+            },
+            if mobility_i.y > 0.0 {
+                velocity_i.y
+            } else {
+                0.0
+            },
+            if mobility_i.z > 0.0 {
+                velocity_i.z
+            } else {
+                0.0
+            },
+        );
+        let free_velocity_j = Vec3::new(
+            if mobility_j.x > 0.0 {
+                velocity_j.x
+            } else {
+                0.0
+            },
+            if mobility_j.y > 0.0 {
+                velocity_j.y
+            } else {
+                0.0
+            },
+            if mobility_j.z > 0.0 {
+                velocity_j.z
+            } else {
+                0.0
+            },
+        );
+        let kinetic_change = impulse_scalar * (free_velocity_j - free_velocity_i).dot(normal)
+            + 0.5 * impulse_scalar * impulse_scalar * inverse_effective_mass;
+        scene.voxels[i].velocity = new_velocity_i;
+        scene.voxels[j].velocity = new_velocity_j;
+
+        let heat = (-kinetic_change).max(0.0) as f64;
+        if heat > 0.0 {
+            scene.energy.solid_viscoelastic_heat += heat;
+            let deferred_delta =
+                deferred_thermal_cell_delta.get_or_insert_with(|| vec![0.0; scene.voxels.len()]);
+            deferred_delta[i] +=
+                scene.voxels[i].add_internal_energy_j_deferred_thermal_cells(heat * 0.5);
+            deferred_delta[j] +=
+                scene.voxels[j].add_internal_energy_j_deferred_thermal_cells(heat * 0.5);
+        }
     }
     if let Some(deferred_delta) = deferred_thermal_cell_delta {
         for (voxel, delta) in scene.voxels.iter_mut().zip(deferred_delta) {
@@ -294,18 +340,27 @@ fn apply_solid_viscoelastic_damping(
 /// stress-free temperature at scene creation. Each REV contributes half of
 /// its anisotropic eigenstrain tensor projected along the bond direction.
 fn bond_thermal_rest(scene: &Scene, i: usize, j: usize, frame: Mat3) -> DVec3 {
-    let temperatures = [i,j].map(|n| scene.properties[n]
-        .phase_state(scene.voxels[n].mass,scene.voxels[n].thermal_energy_f32()).temperature_kelvin);
-    bond_thermal_rest_at_temperatures(scene,i,j,frame,temperatures)
+    let temperatures = [i, j].map(|n| {
+        scene.properties[n]
+            .phase_state(scene.voxels[n].mass, scene.voxels[n].thermal_energy_f32())
+            .temperature_kelvin
+    });
+    bond_thermal_rest_at_temperatures(scene, i, j, frame, temperatures)
 }
 
-fn bond_thermal_rest_at_temperatures(scene: &Scene, i: usize, j: usize,
-    frame: Mat3, temperatures: [f32;2]) -> DVec3 {
+fn bond_thermal_rest_at_temperatures(
+    scene: &Scene,
+    i: usize,
+    j: usize,
+    frame: Mat3,
+    temperatures: [f32; 2],
+) -> DVec3 {
     let direction = frame.x_axis.as_dvec3().normalize_or_zero();
     let endpoint_expansion = |n: usize, temperature: f32| {
         let material = &scene.properties[n];
-        let fiber =
-            (scene.rotations[n] * scene.voxels[n].microstructure.fibers()).as_dvec3().normalize_or_zero();
+        let fiber = (scene.rotations[n] * scene.voxels[n].microstructure.fibers())
+            .as_dvec3()
+            .normalize_or_zero();
         let alpha_parallel = material.thermal_expansion_parallel as f64;
         let alpha_perpendicular = material.thermal_expansion_perpendicular as f64;
         let alpha_direction = direction * alpha_perpendicular
@@ -313,8 +368,9 @@ fn bond_thermal_rest_at_temperatures(scene: &Scene, i: usize, j: usize,
         alpha_direction * (temperature as f64 - scene.reference_temperatures_kelvin[n] as f64)
     };
     frame.as_dmat3().transpose()
-        * (direction * DCELL + (endpoint_expansion(i,temperatures[0])
-            + endpoint_expansion(j,temperatures[1])) * (0.5 * DCELL))
+        * (direction * DCELL
+            + (endpoint_expansion(i, temperatures[0]) + endpoint_expansion(j, temperatures[1]))
+                * (0.5 * DCELL))
 }
 
 /// Initial local-frame rest offset of a new bond at its current contact pose.
@@ -329,7 +385,8 @@ pub(crate) fn bond_formation_offset(scene: &Scene, i: usize, j: usize, axis: usi
 fn bond_elastic_displacement(scene: &Scene, i: usize, j: usize, axis: usize, frame: Mat3) -> Vec3 {
     (frame.as_dmat3().transpose() * (scene.positions[j] - scene.positions[i])
         - bond_thermal_rest(scene, i, j, frame)
-        - DVec3::from_array(scene.bonds[axis][i].formation_offset.map(f64::from))).as_vec3()
+        - DVec3::from_array(scene.bonds[axis][i].formation_offset.map(f64::from)))
+    .as_vec3()
 }
 
 /// Recover the current stored elastic energy of an intact bond (joules).
@@ -532,10 +589,15 @@ pub fn fix_voxel_axes(
             scene.voxels[voxel].velocity[axis] = 0.0;
         }
     }
+    scene.mark_render_changed();
     Ok(())
 }
 /// Fix all axes at a world coordinate.
-pub fn fix_voxel_at(scene: &mut Scene, voxel: usize, coordinate: impl Into<DVec3>) -> Result<(), &'static str> {
+pub fn fix_voxel_at(
+    scene: &mut Scene,
+    voxel: usize,
+    coordinate: impl Into<DVec3>,
+) -> Result<(), &'static str> {
     fix_voxel_axes(scene, voxel, coordinate.into().to_array().map(Some))
 }
 /// Fix selected axes at their current coordinates; false leaves an axis free.
@@ -575,6 +637,16 @@ pub fn release_voxel(scene: &mut Scene, voxel: usize) -> Result<(), &'static str
 /// Returns the largest quaternion angle changed by this fit.
 fn fit_rotations(scene: &mut Scene, scratch: &mut SolverScratch) -> f32 {
     let n = scene.voxels.len();
+    if !scene
+        .voxels
+        .iter()
+        .enumerate()
+        .any(|(i, voxel)| !voxel.kinematic && scene.aggregate_of[i].is_none())
+    {
+        // Coarse rigid bodies carry their exact pose in RigidAggregate. Their
+        // per-REV polar fits are only needed after a contact or load wakes them.
+        return 0.0;
+    }
     scratch.rotation_gradients.resize(n, Mat3::ZERO);
     scratch.rotation_gradients.fill(Mat3::ZERO);
     scratch.rotation_counts.resize(n, Vec3::ZERO);
@@ -668,11 +740,7 @@ fn fit_rotations(scene: &mut Scene, scratch: &mut SolverScratch) -> f32 {
 /// First-order ambient-air coupling for the solid REV surface. Intact bonds
 /// hide their shared face; a broken or external face sees air. Pressure drag
 /// is integrated facewise so internal REV faces do not create artificial area.
-fn atmosphere_loads(
-    scene: &Scene,
-    exposed_faces: &mut Vec<[u8; 3]>,
-    loads: &mut Vec<Vec3>,
-) {
+fn atmosphere_loads(scene: &Scene, exposed_faces: &mut Vec<[u8; 3]>, loads: &mut Vec<Vec3>) {
     let air = scene.config.atmosphere;
     let density = air.density_kg_m3();
     let voxel_count = scene.voxels.len();
@@ -750,12 +818,151 @@ fn atmosphere_loads(
     }
 }
 
+/// A worst-case chain bound rejects soft/slender bodies before coarse motion
+/// can hide internal displacement (0.5% REV) or stress (0.1% of strength).
+fn small_rigid_loading(scene: &Scene, members: &[usize], loads: &[Vec3]) -> bool {
+    if members.is_empty() {
+        return false;
+    }
+    let mut mass = 0.0_f64;
+    let mut force = DVec3::ZERO;
+    let mut stiffness = f64::INFINITY;
+    let mut strength = f64::INFINITY;
+    for &i in members {
+        let v = &scene.voxels[i];
+        let m = &scene.properties[i];
+        if v.mass <= 0.0
+            || !v.mass.is_finite()
+            || scene.external_forces[i] != Vec3::ZERO
+            || scene.external_accelerations[i] != Vec3::ZERO
+        {
+            return false;
+        }
+        mass += f64::from(v.mass);
+        force += loads.get(i).copied().unwrap_or(Vec3::ZERO).as_dvec3();
+        stiffness = stiffness.min(f64::from(
+            m.young.min(m.young_perp).min(m.shear) * AREA / CELL,
+        ));
+        strength = strength.min(f64::from(
+            m.tensile_strength
+                .min(m.tensile_strength_perp)
+                .min(m.compressive_strength)
+                .min(m.compressive_strength_perp)
+                .min(m.shear_strength)
+                .min(m.shear_strength_perp),
+        ));
+    }
+    if mass <= 0.0 || stiffness <= 0.0 || strength <= 0.0 || !force.is_finite() {
+        return false;
+    }
+    let acceleration = force / mass;
+    let mut differential = 0.0_f64;
+    for &i in members {
+        let load = loads.get(i).copied().unwrap_or(Vec3::ZERO).as_dvec3();
+        differential =
+            differential.max((load - acceleration * f64::from(scene.voxels[i].mass)).length());
+    }
+    let n = members.len() as f64;
+    differential * n * n / stiffness <= DCELL * 0.005
+        && differential * n / f64::from(AREA) <= strength * 0.001
+}
+
+fn quiescent_supported(
+    scene: &Scene,
+    scratch: &SolverScratch,
+    gravity: Vec3,
+    loads: &[Vec3],
+) -> bool {
+    if scratch.adaptive_gravity != Some(gravity)
+        || scratch.adaptive_energies.len() != scene.voxels.len()
+        || scratch.adaptive_loads.len() != loads.len()
+        || scratch.adaptive_loads.iter().zip(loads).enumerate().any(|(i, (old, now))| {
+            let scale = old.length().max(now.length()).max(scene.voxels[i].mass * gravity.length());
+            (*old - *now).length() > 8.0 * f32::EPSILON * scale
+        })
+        || scratch.adaptive_positions != scene.positions
+        || scratch.adaptive_revision != Some(scene.render_revision)
+        || bincode::serialize(&scene.config).ok().as_ref() != Some(&scratch.adaptive_config)
+        || scratch.contacts.is_empty()
+        || !scene.releases.is_empty()
+        || !scene.solver_residual.is_finite()
+        || scene.solver_residual > scene.config.solver_relative_tolerance
+    {
+        return false;
+    }
+    let mut supported = vec![false; scene.cluster_count];
+    for (i, v) in scene.voxels.iter().enumerate() {
+        if v.kinematic || scene.axis_targets[i].iter().any(Option::is_some) {
+            if let Some(supported) = supported.get_mut(scene.clusters[i] as usize) {
+                *supported = true;
+            }
+        }
+    }
+    for c in &scratch.contacts {
+        if c.i >= scene.voxels.len() || c.j >= scene.voxels.len() {
+            return false;
+        }
+        if scene.voxels[c.i].kinematic {
+            if let Some(supported) = supported.get_mut(scene.clusters[c.j] as usize) {
+                *supported = true;
+            }
+        }
+        if scene.voxels[c.j].kinematic {
+            if let Some(supported) = supported.get_mut(scene.clusters[c.i] as usize) {
+                *supported = true;
+            }
+        }
+    }
+    for (i, v) in scene.voxels.iter().enumerate() {
+        if v.kinematic {
+            continue;
+        }
+        let m = &scene.properties[i];
+        if !supported
+            .get(scene.clusters[i] as usize)
+            .copied()
+            .unwrap_or(false)
+            || !v.velocity.is_finite()
+            || v.velocity.length_squared() > 1e-10
+            || (v.thermal_energy_f32() - scratch.adaptive_energies[i]).abs()
+                > v.mass * m.heat_capacity * 0.001
+            || m.phase_state(v.mass, v.thermal_energy_f32()).solid_fraction < 1.0
+        {
+            return false;
+        }
+    }
+    scene.bonds.iter().enumerate().all(|(axis, bonds)| {
+        bonds.iter().enumerate().all(|(i, b)| {
+            if b.neighbor == EMPTY {
+                return true;
+            }
+            let m = &scene.properties[i];
+            let strength = m
+                .tensile_strength
+                .min(m.tensile_strength_perp)
+                .min(m.compressive_strength)
+                .min(m.compressive_strength_perp)
+                .min(m.shear_strength)
+                .min(m.shear_strength_perp);
+            b.damage == 0.0
+                && b.equivalent_plastic_strain == 0.0
+                && scene.workspace[axis][i].last_force.length() <= strength * AREA * 0.01
+        })
+    })
+}
+
 fn wake_candidates_with_differential_loading(scene: &mut Scene, gravity: Vec3, loads: &[Vec3]) {
     if !scene.has_registered_rigid_candidates() {
         return;
     }
     let mut wake_voxels = Vec::new();
     for aggregate in scene.rigid_aggregates.iter().flatten() {
+        if scene.adaptive_substeps {
+            let members = aggregate.member_indices().collect::<Vec<_>>();
+            if small_rigid_loading(scene, &members, loads) {
+                continue;
+            }
+        }
         let mut reference_acceleration: Option<Vec3> = None;
         let mut nonuniform = false;
         for member in aggregate.member_poses() {
@@ -784,17 +991,18 @@ fn wake_candidates_with_differential_loading(scene: &mut Scene, gravity: Vec3, l
     scene.wake_rigid_candidates_for_voxels(&wake_voxels);
 }
 
-/// Coarsen only complete components whose current state is exactly compatible
-/// with free rigid motion: intact bonds carry no force, the material is at its
-/// reference thermal energy and fully solid, and there are no constraints or
-/// applied nodal loads. The existing aggregate wake paths refine the retained
-/// REV state before contact, nonuniform loading, thermal changes, or boundary
-/// removal. This is a broadphase/DOF reduction for inert bodies, not a rule
-/// that makes stressed material rigid.
+/// Coarsen only complete components compatible with free rigid motion: intact
+/// bonds carry no force above the configured solver error scale, the material
+/// is at its reference thermal energy and fully solid, and there are no
+/// constraints or applied nodal loads. Aggregate wake paths refine the
+/// retained REV state before contact, nonuniform loading, thermal changes, or
+/// boundary removal. This is a broadphase/DOF reduction for inert bodies, not
+/// a rule that makes stressed material rigid.
 fn auto_register_quiescent_components(
     scene: &mut Scene,
     targets: &[[Option<f64>; 3]],
     applied_loads: &[Vec3],
+    contacts: &[collision::Contact],
 ) -> usize {
     let cluster_count = scene.cluster_count;
     if cluster_count == 0 || scene.clusters.len() != scene.voxels.len() {
@@ -827,8 +1035,15 @@ fn auto_register_quiescent_components(
             *cursor += 1;
         }
     }
+    let mut contacted = vec![false; scene.voxels.len()];
+    for contact in contacts {
+        contacted[contact.i] = true;
+        contacted[contact.j] = true;
+    }
 
     let mut registered_revs = 0usize;
+    let gravity = Vec3::from_array(scene.config.gravity);
+    let gravity_magnitude = gravity.length();
     for cluster in 0..cluster_count {
         if sizes[cluster] < AUTO_AGGREGATE_MIN_REVS {
             continue;
@@ -836,22 +1051,22 @@ fn auto_register_quiescent_components(
         let component = &members[offsets[cluster]..offsets[cluster + 1]];
         if component
             .iter()
-            .any(|&index| scene.aggregate_of[index].is_some())
+            .any(|&index| scene.aggregate_of[index].is_some() || contacted[index])
         {
             continue;
         }
 
+        let weak_field =
+            scene.adaptive_substeps && small_rigid_loading(scene, component, applied_loads);
         let unconstrained_and_unloaded = component.iter().all(|&index| {
             let voxel = &scene.voxels[index];
-            let reference_energy = scene.properties[index].energy_at_temperature(
-                voxel.mass,
-                scene.reference_temperatures_kelvin[index],
-            );
+            let reference_energy = scene.properties[index]
+                .energy_at_temperature(voxel.mass, scene.reference_temperatures_kelvin[index]);
             !voxel.kinematic
                 && targets[index].iter().all(Option::is_none)
                 && scene.external_forces[index] == Vec3::ZERO
                 && scene.external_accelerations[index] == Vec3::ZERO
-                && applied_loads[index] == Vec3::ZERO
+                && (applied_loads[index] == Vec3::ZERO || weak_field)
                 && voxel.thermal_energy_f32().to_bits() == reference_energy.to_bits()
                 && scene.properties[index]
                     .phase_state(voxel.mass, voxel.thermal_energy_f32())
@@ -862,20 +1077,56 @@ fn auto_register_quiescent_components(
             continue;
         }
 
-        // A zero nodal resultant alone is insufficient: any stored bond force
-        // represents an unresolved elastic mode that this rigid tier cannot
-        // evolve. Retain such components in the fine solver.
+        // A zero nodal resultant alone is insufficient: stored bond forces
+        // represent elastic modes that this rigid tier cannot evolve. Ignore
+        // only residuals bounded by the linear solve tolerance, scaled by the
+        // component's applied and inertial load; retain real self-stress.
+        let reference_load_n = component.iter().fold(0.0_f32, |maximum, &index| {
+            let inertial_load = scene.voxels[index].mass * gravity_magnitude;
+            maximum.max(applied_loads[index].length() + inertial_load)
+        });
+        if !reference_load_n.is_finite() {
+            continue;
+        }
+        let force_tolerance_n = scene.config.solver_relative_tolerance * reference_load_n;
         let force_free = (0..3).all(|axis| {
             component.iter().all(|&index| {
-                scene.bonds[axis][index].neighbor == EMPTY
-                    || scene.workspace[axis][index].last_force == Vec3::ZERO
+                let bond = scene.bonds[axis][index];
+                if bond.neighbor == EMPTY {
+                    return true;
+                }
+                if bond.damage != 0.0
+                    || bond.equivalent_plastic_strain != 0.0
+                    || scene.workspace[axis][index].last_force.length() > force_tolerance_n
+                {
+                    return false;
+                }
+                if scene.substep_index == 0 {
+                    let j = bond.neighbor as usize;
+                    let frame = basis(axis, scene.rotations[index].slerp(scene.rotations[j], 0.5));
+                    // Last-force buffers have not been evaluated at startup.
+                    // Inspect retained strain rather than treating zero buffers
+                    // as proof that an authored/prestressed body is unloaded.
+                    let displacement = bond_elastic_displacement(scene, index, j, axis, frame)
+                        - Vec3::from_array(bond.plastic_strain) * CELL;
+                    displacement.length() <= CELL * 1e-7
+                } else {
+                    true
+                }
             })
         });
         if !force_free {
             continue;
         }
 
-        if scene.register_rigid_aggregate_candidate(component).is_ok() {
+        if scene
+            .register_rigid_aggregate_candidate_in_cluster(
+                component,
+                cluster as u32,
+                sizes[cluster],
+            )
+            .is_ok()
+        {
             registered_revs += component.len();
         }
     }
@@ -909,6 +1160,31 @@ pub fn step_with_axis_targets_and_loads(
     targets: &[[Option<f64>; 3]],
     loads: &[Vec3],
 ) {
+    let dt = f64::from(scene.config.fixed_dt);
+    if !crate::live_tests::enabled() {
+        advance_step_with_axis_targets_and_loads(scene, tool, targets, loads);
+        scene.simulated_seconds += dt;
+        return;
+    }
+    let started = Instant::now();
+    let thread = std::thread::current();
+    let test_name = thread.name().filter(|name| *name != "main").unwrap_or("");
+    if scene.simulated_seconds == 0.0 {
+        crate::live_tests::observe_scene(scene, test_name, 0.0, 0.0);
+    }
+    advance_step_with_axis_targets_and_loads(scene, tool, targets, loads);
+    scene.simulated_seconds += dt;
+    crate::live_tests::observe_scene(
+        scene, test_name, scene.simulated_seconds, started.elapsed().as_secs_f64() * 1000.0,
+    );
+}
+
+fn advance_step_with_axis_targets_and_loads(
+    scene: &mut Scene,
+    tool: &mut Option<Tool>,
+    targets: &[[Option<f64>; 3]],
+    loads: &[Vec3],
+) {
     assert!(targets.is_empty() || targets.len() == scene.voxels.len());
     assert!(loads.is_empty() || loads.len() == scene.voxels.len());
     scene.solver_residual_audit = None;
@@ -926,9 +1202,11 @@ pub fn step_with_axis_targets_and_loads(
     let mut merged_targets = std::mem::take(&mut solver_scratch.merged_targets);
     merged_targets.clear();
     merged_targets.reserve(voxel_count);
-    merged_targets.extend(scene.axis_targets.iter().enumerate().map(|(i, fixed)| {
-        std::array::from_fn(|a| targets.get(i).and_then(|t| t[a]).or(fixed[a]))
-    }));
+    merged_targets.extend(
+        scene.axis_targets.iter().enumerate().map(|(i, fixed)| {
+            std::array::from_fn(|a| targets.get(i).and_then(|t| t[a]).or(fixed[a]))
+        }),
+    );
     assert!(merged_targets
         .iter()
         .flatten()
@@ -946,8 +1224,7 @@ pub fn step_with_axis_targets_and_loads(
             .collect();
         scene.wake_rigid_candidates_for_voxels(&constrained);
     }
-    let mut atmosphere_exposed_faces =
-        std::mem::take(&mut solver_scratch.atmosphere_exposed_faces);
+    let mut atmosphere_exposed_faces = std::mem::take(&mut solver_scratch.atmosphere_exposed_faces);
     let mut ambient_loads = std::mem::take(&mut solver_scratch.ambient_loads);
     atmosphere_loads(scene, &mut atmosphere_exposed_faces, &mut ambient_loads);
     let mut applied_loads = std::mem::take(&mut solver_scratch.applied_loads);
@@ -962,9 +1239,72 @@ pub fn step_with_axis_targets_and_loads(
             Vec3::ZERO
         };
     }
-    let h = scene.config.fixed_dt / scene.config.substeps as f32;
     let gravity = Vec3::from_array(scene.config.gravity);
     wake_candidates_with_differential_loading(scene, gravity, &applied_loads);
+    let may_adapt = scene.adaptive_substeps
+        && tool.is_none()
+        && loads.is_empty()
+        && scene.releases.is_empty()
+        && !topology_changed
+        && scene.thermal_bonding_rule().is_none()
+        && scene.thermal_fusion_rule().is_none()
+        && scene.external_forces.iter().all(|f| *f == Vec3::ZERO)
+        && scene
+            .external_accelerations
+            .iter()
+            .all(|a| *a == Vec3::ZERO)
+        && targets.iter().zip(&scene.positions).all(|(target, p)| {
+            target
+                .iter()
+                .enumerate()
+                .all(|(a, value)| value.map(|v| v == p[a]).unwrap_or(true))
+        });
+    if may_adapt && quiescent_supported(scene, &solver_scratch, gravity, &applied_loads) {
+        // A supported equilibrium under identical loads has no mechanical work.
+        // Keep its complete REV/bond state; heat transport still advances by dt.
+        // The certificate stays anchored to the last actual mechanical solve,
+        // so successive small thermal changes eventually wake the material.
+        scene.last_mechanical_substeps = 0;
+        scene.previous.clone_from(&scene.positions);
+        for voxel in &mut scene.voxels {
+            if !voxel.kinematic {
+                voxel.velocity = Vec3::ZERO;
+            }
+        }
+        if let Err(reason) = scene.conduct_heat(scene.config.fixed_dt) {
+            eprintln!("thermal transport skipped: {reason}");
+        }
+        scene.substep_index += 1;
+        scene.mark_render_changed();
+        solver_scratch.adaptive_revision = Some(scene.render_revision);
+        solver_scratch.merged_targets = merged_targets;
+        solver_scratch.atmosphere_exposed_faces = atmosphere_exposed_faces;
+        solver_scratch.ambient_loads = ambient_loads;
+        solver_scratch.applied_loads = applied_loads;
+        solver_scratch.melted = melted;
+        scene.solver_scratch = solver_scratch;
+        return;
+    }
+    if may_adapt && scene.substep_index == 0 {
+        auto_register_quiescent_components(scene, targets, &applied_loads, &[]);
+    }
+    let coarse_clear = may_adapt
+        && collision::rigid_candidates_clear_for_step(
+            scene,
+            f64::from(scene.config.fixed_dt),
+            gravity.as_dvec3(),
+            &applied_loads,
+        );
+    if scene.adaptive_substeps && !coarse_clear && scene.has_registered_rigid_candidates() {
+        scene.wake_all_rigid_candidates();
+    }
+    let effective_substeps = if may_adapt && coarse_clear {
+        1
+    } else {
+        scene.config.substeps
+    };
+    scene.last_mechanical_substeps = effective_substeps;
+    let h = scene.config.fixed_dt / effective_substeps as f32;
     let profile_step = std::env::var_os("VOXEL_PROFILE_STEP").is_some();
     let mut stage_time = [Duration::ZERO; 5];
     let mut total_pcg_iterations = 0usize;
@@ -992,8 +1332,7 @@ pub fn step_with_axis_targets_and_loads(
     let voxel_count = scene.voxels.len();
     let mut substep_start_positions = std::mem::take(&mut solver_scratch.substep_start_positions);
     substep_start_positions.resize(voxel_count, DVec3::ZERO);
-    let mut substep_start_velocities =
-        std::mem::take(&mut solver_scratch.substep_start_velocities);
+    let mut substep_start_velocities = std::mem::take(&mut solver_scratch.substep_start_velocities);
     substep_start_velocities.clear();
     substep_start_velocities.reserve(voxel_count);
     let mut load_integrated_velocities =
@@ -1001,22 +1340,18 @@ pub fn step_with_axis_targets_and_loads(
     load_integrated_velocities.resize(voxel_count, Vec3::ZERO);
     let mut contact_work_mode = std::mem::take(&mut solver_scratch.contact_work_mode);
     contact_work_mode.resize(voxel_count, 0);
-    let mut tool_contact_velocity =
-        std::mem::take(&mut solver_scratch.tool_contact_velocity);
+    let mut tool_contact_velocity = std::mem::take(&mut solver_scratch.tool_contact_velocity);
     let mut drift_velocity = std::mem::take(&mut solver_scratch.drift_velocity);
     let mut predicted = std::mem::take(&mut solver_scratch.predicted);
     let mut solved_positions = std::mem::take(&mut solver_scratch.solved_positions);
-    let mut pre_contact_velocities =
-        std::mem::take(&mut solver_scratch.pre_contact_velocities);
+    let mut pre_contact_velocities = std::mem::take(&mut solver_scratch.pre_contact_velocities);
     let mut contacts = std::mem::take(&mut solver_scratch.contacts);
-    let mut impact_energies_j =
-        std::mem::take(&mut solver_scratch.impact_energies_j);
-    let mut normal_impulses_ns =
-        std::mem::take(&mut solver_scratch.normal_impulses_ns);
+    let mut impact_energies_j = std::mem::take(&mut solver_scratch.impact_energies_j);
+    let mut normal_impulses_ns = std::mem::take(&mut solver_scratch.normal_impulses_ns);
     let mut contact_physical_velocities =
         std::mem::take(&mut solver_scratch.contact_physical_velocities);
     let mut contact_targets = targets.to_vec();
-    for _ in 0..scene.config.substeps {
+    for _ in 0..effective_substeps {
         let mut phase_start = Instant::now();
         let mut detail_start = profile_step.then(Instant::now);
         substep_start_positions.clone_from(&scene.positions);
@@ -1028,24 +1363,51 @@ pub fn step_with_axis_targets_and_loads(
             detail_start = Some(Instant::now());
         }
         drift_velocity.resize(scene.voxels.len(), Vec3::ZERO);
-        drift_velocity.fill(Vec3::ZERO);
         if scene.has_registered_rigid_candidates() {
             let gravity_d = DVec3::new(gravity.x as f64, gravity.y as f64, gravity.z as f64);
             if scene
-                .advance_registered_rigid_candidates(h as f64, gravity_d, &applied_loads)
+                .advance_registered_rigid_candidates(
+                    h as f64,
+                    gravity_d,
+                    &applied_loads,
+                    coarse_clear.then_some(f64::from(
+                        scene.config.fixed_dt / scene.config.substeps as f32,
+                    )),
+                )
                 .is_err()
             {
                 scene.wake_all_rigid_candidates();
             }
         }
-        let aggregate_membership = &scene.aggregate_of;
-        for (i, (p, v)) in scene
-            .positions
-            .iter_mut()
-            .zip(&mut scene.voxels)
-            .enumerate()
-        {
-            if !v.kinematic {
+        let mut all_dynamic_coarse = scene.has_registered_rigid_candidates();
+        let mut target_motion = false;
+        for (i, voxel) in scene.voxels.iter().enumerate() {
+            if !voxel.kinematic && scene.aggregate_of[i].is_none() {
+                all_dynamic_coarse = false;
+            }
+            if let Some(target) = targets.get(i) {
+                for axis in 0..3 {
+                    if let Some(position) = target[axis] {
+                        if !voxel.kinematic || scene.positions[i][axis] != position {
+                            target_motion = true;
+                        }
+                    }
+                }
+            }
+        }
+        let coarse_prediction = tool.is_none() && all_dynamic_coarse && !target_motion;
+        if !coarse_prediction {
+            let aggregate_membership = &scene.aggregate_of;
+            for (i, (p, v)) in scene
+                .positions
+                .iter_mut()
+                .zip(&mut scene.voxels)
+                .enumerate()
+            {
+                if v.kinematic {
+                    drift_velocity[i] = Vec3::ZERO;
+                    continue;
+                }
                 if aggregate_membership[i].is_some() {
                     drift_velocity[i] = v.velocity;
                     continue;
@@ -1060,16 +1422,20 @@ pub fn step_with_axis_targets_and_loads(
                 *p += v.velocity.as_dvec3() * h as f64;
             }
         }
-        for (i, target) in targets.iter().enumerate() {
-            for axis in 0..3 {
-                if let Some(p) = target[axis] {
-                    scene.positions[i][axis] = p;
+        if target_motion {
+            for (i, target) in targets.iter().enumerate() {
+                for axis in 0..3 {
+                    if let Some(p) = target[axis] {
+                        scene.positions[i][axis] = p;
+                    }
                 }
             }
         }
-        for work in &mut scene.workspace {
-            for w in work {
-                w.lambda = Vec3::ZERO;
+        if !coarse_prediction {
+            for work in &mut scene.workspace {
+                for w in work {
+                    w.lambda = Vec3::ZERO;
+                }
             }
         }
         if let Some(start) = detail_start {
@@ -1080,7 +1446,9 @@ pub fn step_with_axis_targets_and_loads(
             t.advance_into(scene, h, targets, &mut tool_contact_velocity);
         } else {
             tool_contact_velocity.resize(scene.positions.len(), Vec3::ZERO);
-            tool_contact_velocity.fill(Vec3::ZERO);
+            if !coarse_prediction {
+                tool_contact_velocity.fill(Vec3::ZERO);
+            }
         }
         if let Some(t) = tool.as_ref() {
             if scene.has_registered_rigid_candidates() && !t.contacted_voxels.is_empty() {
@@ -1096,17 +1464,73 @@ pub fn step_with_axis_targets_and_loads(
         // on the next substep, after the implicit bond solve has already
         // damped the impact. That delayed stress made a sharp tool stop at the
         // surface without loading bonds enough to fail.
-        for (p, &delta_v) in scene.positions.iter_mut().zip(&tool_contact_velocity) {
-            *p += delta_v.as_dvec3() * (0.5 * h as f64);
+        if tool.is_some() {
+            for (p, &delta_v) in scene.positions.iter_mut().zip(&tool_contact_velocity) {
+                *p += delta_v.as_dvec3() * (0.5 * h as f64);
+            }
         }
         predicted.clone_from(&scene.positions);
+        // Fit material frames from the physical prediction. Geometric contact
+        // projection can temporarily flatten multiple swept layers onto one
+        // plane; that infeasible intermediate state must not rotate the rest
+        // frames or create apparent strain energy.
+        let rotation_start = profile_step.then(Instant::now);
+        if !coarse_clear {
+            fit_rotations(scene, &mut solver_scratch);
+        }
+        if let Some(start) = rotation_start {
+            rotation_fit_time += start.elapsed();
+        }
         // A fixed surface is a unilateral position constraint in the SAME
         // inertial/elastic minimization. Projecting only surface REVs after
         // that solve injected unresolved compression into bonds, whose huge
         // apparent strain energy was then spent on heat and fracture.
         // The inertial reference remains the unprojected prediction.
         contact_targets.clone_from_slice(targets);
-        collision::project_into(scene, targets, &mut contacts);
+        solver_scratch
+            .previous_contact_axis_normals
+            .clone_from(&solver_scratch.contact_axis_normals);
+        solver_scratch
+            .contact_axis_normals
+            .resize(voxel_count, [0.0; 3]);
+        solver_scratch.contact_axis_normals.fill([0.0; 3]);
+        solver_scratch.contact_lower.resize(voxel_count, [None; 3]);
+        solver_scratch.contact_lower.fill([None; 3]);
+        solver_scratch.contact_upper.resize(voxel_count, [None; 3]);
+        solver_scratch.contact_upper.fill([None; 3]);
+        if coarse_clear {
+            // The whole-step conservative sweep already certified every body
+            // against every other body and fixed REV. A looser collision-bin
+            // query can report a false positive and wake a body after its
+            // coarse drift, which would run fine elasticity at the coarse h.
+            // Retain the certified rigid motion until the next step's test.
+            contacts.clear();
+        } else {
+            collision::project_into(scene, targets, &mut contacts);
+        }
+        if coarse_prediction
+            && scene
+                .voxels
+                .iter()
+                .enumerate()
+                .any(|(i, voxel)| !voxel.kinematic && scene.aggregate_of[i].is_none())
+        {
+            // A swept coarse bound may wake a body inside collision projection.
+            // Restore the fine-step buffers before the ordinary solve consumes
+            // them; aggregate-only steps never need these per-REV values.
+            drift_velocity.fill(Vec3::ZERO);
+            tool_contact_velocity.fill(Vec3::ZERO);
+            for (i, voxel) in scene.voxels.iter().enumerate() {
+                if !voxel.kinematic && scene.aggregate_of[i].is_none() {
+                    drift_velocity[i] = voxel.velocity;
+                }
+            }
+            for work in &mut scene.workspace {
+                for w in work {
+                    w.lambda = Vec3::ZERO;
+                }
+            }
+        }
         if scene.has_registered_rigid_candidates() {
             let mut contacted_candidates = Vec::new();
             for contact in &contacts {
@@ -1127,52 +1551,239 @@ pub fn step_with_axis_targets_and_loads(
             }
         }
         for contact in &contacts {
-            let axis = if contact.normal.x.abs() > 0.5 { 0 }
-                else if contact.normal.y.abs() > 0.5 { 1 } else { 2 };
+            let axis = if contact.normal.x.abs() > 0.5 {
+                0
+            } else if contact.normal.y.abs() > 0.5 {
+                1
+            } else {
+                2
+            };
             let fixed = |i: usize| scene.voxels[i].kinematic || targets[i][axis].is_some();
             let (dynamic, support, sign) = if fixed(contact.i) && !fixed(contact.j) {
-                (contact.j,contact.i,contact.normal[axis])
+                (contact.j, contact.i, contact.normal[axis])
             } else if fixed(contact.j) && !fixed(contact.i) {
-                (contact.i,contact.j,-contact.normal[axis])
-            } else { continue; };
-            let gap = (predicted[dynamic][axis]-scene.positions[support][axis])*sign as f64-DCELL;
-            if gap > 1e-6 { continue; }
-            let plane = scene.positions[support][axis]+sign as f64*DCELL;
-            contact_targets[dynamic][axis]=Some(plane);
-            scene.positions[dynamic][axis]=plane;
+                (contact.i, contact.j, -contact.normal[axis])
+            } else {
+                continue;
+            };
+            let gap =
+                (predicted[dynamic][axis] - scene.positions[support][axis]) * sign as f64 - DCELL;
+            if gap > 1e-6 {
+                continue;
+            }
+            let plane = scene.positions[support][axis] + sign as f64 * DCELL;
+            if (substep_start_positions[dynamic][axis] - scene.positions[support][axis])
+                * (sign as f64)
+                < 0.0
+            {
+                continue;
+            }
+            let plane = match contact_targets[dynamic][axis] {
+                Some(previous) if solver_scratch.contact_axis_normals[dynamic][axis] == sign => {
+                    if sign > 0.0 {
+                        plane.max(previous)
+                    } else {
+                        plane.min(previous)
+                    }
+                }
+                _ => plane,
+            };
+            contact_targets[dynamic][axis] = Some(plane);
+            solver_scratch.contact_axis_normals[dynamic][axis] = sign;
+            if sign > 0.0 {
+                solver_scratch.contact_lower[dynamic][axis] = Some(plane);
+            } else {
+                solver_scratch.contact_upper[dynamic][axis] = Some(plane);
+            }
+            scene.positions[dynamic][axis] = plane;
+        }
+        solver_scratch
+            .contact_feasible_positions
+            .clone_from(&scene.positions);
+        if solver_scratch.previous_contact_axis_normals.len() == voxel_count
+            && solver_scratch
+                .previous_contact_axis_normals
+                .iter()
+                .any(|axes| *axes != [0.0; 3])
+        {
+            for i in 0..voxel_count {
+                for axis in 0..3 {
+                    let normal = solver_scratch.contact_axis_normals[i][axis];
+                    if normal != 0.0
+                        && solver_scratch.previous_contact_axis_normals[i][axis] != normal
+                    {
+                        contact_targets[i][axis] = targets[i][axis];
+                        solver_scratch.contact_axis_normals[i][axis] = 0.0;
+                    }
+                }
+            }
         }
         if let Some(start) = detail_start {
             pre_solve_detail_time[3] += start.elapsed();
         }
-        let rotation_start = profile_step.then(Instant::now);
-        fit_rotations(scene, &mut solver_scratch);
-        if let Some(start) = rotation_start {
-            rotation_fit_time += start.elapsed();
-        }
         stage_time[0] += phase_start.elapsed();
         phase_start = Instant::now();
         for iteration in 0..scene.config.corotation_iterations {
-            let (iterations, detail_time) = solve_coupled(
-                scene,
-                h,
-                &contact_targets,
-                &applied_loads,
-                &predicted,
-                &mut solver_scratch,
-                iteration > 0,
-                reusable_cuda_solution,
-                &mut cuda_enabled_for_step,
-            );
-            reusable_cuda_solution = cuda_enabled_for_step;
-            total_pcg_iterations += iterations;
-            for index in 0..solve_detail_time.len() {
-                solve_detail_time[index] += detail_time[index];
+            let mut contact_pass = 0usize;
+            loop {
+                let (iterations, detail_time) = solve_coupled(
+                    scene,
+                    h,
+                    &contact_targets,
+                    &applied_loads,
+                    &predicted,
+                    &mut solver_scratch,
+                    iteration > 0 || contact_pass > 0,
+                    reusable_cuda_solution,
+                    &mut cuda_enabled_for_step,
+                );
+                reusable_cuda_solution = cuda_enabled_for_step;
+                total_pcg_iterations += iterations;
+                for index in 0..solve_detail_time.len() {
+                    solve_detail_time[index] += detail_time[index];
+                }
+                // Keep the active-set search feasible: coupled elastic motion
+                // can cross a previously released plane. Activate the first
+                // blocking bound along the segment from the feasible iterate.
+                let mut blocking = None;
+                let mut alpha = 1.0_f64;
+                for i in 0..voxel_count {
+                    for axis in 0..3 {
+                        if targets[i][axis].is_some()
+                            || solver_scratch.contact_axis_normals[i][axis] != 0.0
+                        {
+                            continue;
+                        }
+                        for (plane, normal) in [
+                            (solver_scratch.contact_lower[i][axis], 1.0),
+                            (solver_scratch.contact_upper[i][axis], -1.0),
+                        ] {
+                            let Some(plane) = plane else {
+                                continue;
+                            };
+                            let gap = (scene.positions[i][axis] - plane) * normal;
+                            if gap >= -1e-8 {
+                                continue;
+                            }
+                            let old_gap = ((solver_scratch.contact_feasible_positions[i][axis]
+                                - plane)
+                                * normal)
+                                .max(0.0);
+                            let fraction = (old_gap / (old_gap - gap)).clamp(0.0, 1.0);
+                            if fraction <= alpha {
+                                alpha = fraction;
+                                blocking = Some((i, axis, plane, normal));
+                            }
+                        }
+                    }
+                }
+                if let Some((i, axis, plane, normal)) = blocking {
+                    solved_positions.clone_from(&scene.positions);
+                    for (p, &old) in scene
+                        .positions
+                        .iter_mut()
+                        .zip(&solver_scratch.contact_feasible_positions)
+                    {
+                        *p = old + (*p - old) * alpha;
+                    }
+                    contact_targets[i][axis] = Some(plane);
+                    solver_scratch.contact_axis_normals[i][axis] = normal as f32;
+                    scene.positions[i][axis] = plane;
+                    // Activate simultaneous hits together (a flat contact face
+                    // must not require one matrix factorization per surface REV).
+                    for j in 0..voxel_count {
+                        for a in 0..3 {
+                            if targets[j][a].is_some()
+                                || solver_scratch.contact_axis_normals[j][a] != 0.0
+                            {
+                                continue;
+                            }
+                            for (bound, sign) in [
+                                (solver_scratch.contact_lower[j][a], 1.0),
+                                (solver_scratch.contact_upper[j][a], -1.0),
+                            ] {
+                                let Some(bound) = bound else {
+                                    continue;
+                                };
+                                let direction = (solved_positions[j][a]
+                                    - solver_scratch.contact_feasible_positions[j][a])
+                                    * sign;
+                                if (scene.positions[j][a] - bound).abs() <= 1e-8
+                                    && direction < -1e-12
+                                {
+                                    contact_targets[j][a] = Some(bound);
+                                    solver_scratch.contact_axis_normals[j][a] = sign as f32;
+                                    scene.positions[j][a] = bound;
+                                }
+                            }
+                        }
+                    }
+                    solver_scratch
+                        .contact_feasible_positions
+                        .clone_from(&scene.positions);
+                    contact_pass += 1;
+                    continue;
+                }
+                solver_scratch
+                    .contact_feasible_positions
+                    .clone_from(&scene.positions);
+                // Unilateral contact can push away from a fixed surface; it cannot
+                // pull an interior voxel down onto that surface. During a large
+                // sweep several layers can touch in the prediction. Release those
+                // with a tensile reaction and re-solve the SAME inertial system.
+                // Each pass removes at least one temporary axis constraint, so the
+                // loop terminates without an arbitrary physical force clamp.
+                solver_scratch
+                    .contact_reactions
+                    .resize(voxel_count, DVec3::ZERO);
+                for i in 0..voxel_count {
+                    solver_scratch.contact_reactions[i] = (scene.positions[i] - predicted[i])
+                        * (f64::from(scene.voxels[i].mass) / f64::from(h).powi(2))
+                        - applied_loads[i].as_dvec3();
+                }
+                for c in &solver_scratch.constraints {
+                    let force =
+                        c.k.as_dmat3() * (scene.positions[c.j] - scene.positions[c.i] - c.rest);
+                    solver_scratch.contact_reactions[c.i] -= force;
+                    solver_scratch.contact_reactions[c.j] += force;
+                }
+                let mut released = false;
+                for i in 0..voxel_count {
+                    for axis in 0..3 {
+                        let normal = solver_scratch.contact_axis_normals[i][axis];
+                        if normal == 0.0 {
+                            continue;
+                        }
+                        let reaction =
+                            solver_scratch.contact_reactions[i][axis] * f64::from(normal);
+                        let inertial_force = ((scene.positions[i][axis] - predicted[i][axis])
+                            * (f64::from(scene.voxels[i].mass) / f64::from(h).powi(2)))
+                        .abs();
+                        let tolerance = f64::from(scene.config.solver_relative_tolerance)
+                            * inertial_force
+                                .max(f64::from(applied_loads[i][axis]).abs())
+                                .max(1e-6);
+                        if reaction < -tolerance {
+                            contact_targets[i][axis] = targets[i][axis];
+                            solver_scratch.contact_axis_normals[i][axis] = 0.0;
+                            released = true;
+                        }
+                    }
+                }
+                if !released {
+                    break;
+                }
+                contact_pass += 1;
             }
             if iteration + 1 == scene.config.corotation_iterations {
                 break;
             }
             let rotation_start = profile_step.then(Instant::now);
-            let orientation_change = fit_rotations(scene, &mut solver_scratch);
+            let orientation_change = if coarse_clear {
+                0.0
+            } else {
+                fit_rotations(scene, &mut solver_scratch)
+            };
             if let Some(start) = rotation_start {
                 rotation_fit_time += start.elapsed();
             }
@@ -1193,7 +1804,11 @@ pub fn step_with_axis_targets_and_loads(
         for i in 0..voxel_count {
             pre_contact_velocities[i] = drift_velocity[i] + tool_contact_velocity[i];
         }
-        collision::project_into(scene, targets, &mut contacts);
+        if coarse_clear {
+            contacts.clear();
+        } else {
+            collision::project_into(scene, targets, &mut contacts);
+        }
         if scene.has_registered_rigid_candidates() {
             let mut contacted_candidates = Vec::new();
             for contact in &contacts {
@@ -1239,8 +1854,7 @@ pub fn step_with_axis_targets_and_loads(
                         1.0 / scene.voxels[voxel].mass
                     }
                 };
-                let inverse_effective_mass =
-                    inverse_mass(contact.i) + inverse_mass(contact.j);
+                let inverse_effective_mass = inverse_mass(contact.i) + inverse_mass(contact.j);
                 let closing_speed = (scene.voxels[contact.j].velocity
                     - scene.voxels[contact.i].velocity)
                     .dot(contact.normal);
@@ -1269,8 +1883,14 @@ pub fn step_with_axis_targets_and_loads(
             debug_assert_eq!(solver_scratch.assembly_phase_strengths.len(), voxel_count);
             &solver_scratch.assembly_phase_strengths
         } else {
-            solver_scratch.fracture_phase_strengths.resize(voxel_count, (1.0, 1.0));
-            for (i, strength) in solver_scratch.fracture_phase_strengths.iter_mut().enumerate() {
+            solver_scratch
+                .fracture_phase_strengths
+                .resize(voxel_count, (1.0, 1.0));
+            for (i, strength) in solver_scratch
+                .fracture_phase_strengths
+                .iter_mut()
+                .enumerate()
+            {
                 *strength = phase_strength(scene, i);
             }
             &solver_scratch.fracture_phase_strengths
@@ -1299,14 +1919,8 @@ pub fn step_with_axis_targets_and_loads(
             let last_force = frame
                 * (k * (u - Vec3::from_array(bond.plastic_strain) * CELL))
                 * (1.0 - bond.damage);
-            let dissipation = crate::fracture::update(
-                &mut bond,
-                u,
-                k,
-                limits,
-                h,
-                &scene.config.fracture,
-            );
+            let dissipation =
+                crate::fracture::update(&mut bond, u, k, limits, h, &scene.config.fracture);
             Some(FractureOutcome {
                 bond,
                 last_force,
@@ -1327,7 +1941,9 @@ pub fn step_with_axis_targets_and_loads(
         let track_aggregate_fractures = scene.has_registered_rigid_candidates();
         let mut fractured_aggregate_voxels = Vec::new();
         for (constraint, outcome) in constraints.iter().zip(outcomes.iter_mut()) {
-            let Some(outcome) = outcome.take() else { continue };
+            let Some(outcome) = outcome.take() else {
+                continue;
+            };
             let i = constraint.i;
             let j = constraint.j;
             let axis = constraint.axis;
@@ -1365,11 +1981,13 @@ pub fn step_with_axis_targets_and_loads(
         phase_start = Instant::now();
         for i in 0..scene.voxels.len() {
             if !scene.voxels[i].kinematic && scene.aggregate_of[i].is_none() {
-                let constraint_velocity = ((solved_positions[i] - predicted[i]) / h as f64).as_vec3();
+                let constraint_velocity =
+                    ((solved_positions[i] - predicted[i]) / h as f64).as_vec3();
                 for axis in 0..3 {
                     if targets.get(i).and_then(|target| target[axis]).is_some() {
                         scene.voxels[i].velocity[axis] =
-                            ((scene.positions[i][axis] - scene.previous[i][axis]) / h as f64) as f32;
+                            ((scene.positions[i][axis] - scene.previous[i][axis]) / h as f64)
+                                as f32;
                     } else {
                         scene.voxels[i].velocity[axis] = drift_velocity[i][axis]
                             + constraint_velocity[axis]
@@ -1442,12 +2060,14 @@ pub fn step_with_axis_targets_and_loads(
                     ),
                     // A persistent contact constrains the actual projected
                     // displacement, so don't count its trial velocity as work.
-                    _ => applied_force.dot((scene.positions[i] - substep_start_positions[i]).as_vec3()),
+                    _ => applied_force
+                        .dot((scene.positions[i] - substep_start_positions[i]).as_vec3()),
                 };
                 scene.energy.external_work += work as f64;
             }
         }
         scene.substep_index += 1;
+        scene.mark_render_changed();
         stage_time[4] += phase_start.elapsed();
     }
     if let Some((i, j)) = scene.take_pending_fusion() {
@@ -1467,8 +2087,7 @@ pub fn step_with_axis_targets_and_loads(
     // World exits are a topology event at the fixed-step boundary. This keeps
     // every solver/contact array in one consistent index space for the step.
     let removed_at_boundary = scene.enforce_world_bounds();
-    let completed_fixed_steps =
-        scene.substep_index / (scene.config.substeps.max(1) as u64);
+    let completed_fixed_steps = scene.substep_index / (scene.config.substeps.max(1) as u64);
     if completed_fixed_steps > 0
         && completed_fixed_steps % AUTO_AGGREGATE_SCAN_INTERVAL_STEPS == 0
         && removed_at_boundary == 0
@@ -1476,7 +2095,7 @@ pub fn step_with_axis_targets_and_loads(
     {
         let scan_start = Instant::now();
         auto_aggregated_revs =
-            auto_register_quiescent_components(scene, targets, &applied_loads);
+            auto_register_quiescent_components(scene, targets, &applied_loads, &contacts);
         aggregate_scan_time += scan_start.elapsed();
     }
     solver_scratch.merged_targets = merged_targets;
@@ -1497,6 +2116,19 @@ pub fn step_with_axis_targets_and_loads(
     solver_scratch.melted = melted;
     solver_scratch.normal_impulses_ns = normal_impulses_ns;
     solver_scratch.contact_physical_velocities = contact_physical_velocities;
+    solver_scratch.adaptive_gravity = Some(gravity);
+    solver_scratch
+        .adaptive_loads
+        .clone_from(&solver_scratch.applied_loads);
+    solver_scratch
+        .adaptive_positions
+        .clone_from(&scene.positions);
+    solver_scratch.adaptive_config = bincode::serialize(&scene.config).unwrap_or_default();
+    solver_scratch.adaptive_revision = Some(scene.render_revision);
+    solver_scratch.adaptive_energies.clear();
+    solver_scratch
+        .adaptive_energies
+        .extend(scene.voxels.iter().map(|v| v.thermal_energy_f32()));
     scene.solver_scratch = solver_scratch;
     if profile_step {
         let ms = stage_time.map(|duration| duration.as_secs_f64() * 1000.0);
@@ -1531,12 +2163,18 @@ pub fn step_with_axis_targets_and_loads(
 /// see one consistent topology for the whole step.
 fn break_fully_melted_bonds(scene: &mut Scene, melted: &mut Vec<bool>) -> bool {
     melted.clear();
-    melted.extend(scene.voxels.iter().zip(&scene.properties).map(|(voxel, material)| {
-        material
-            .phase_state(voxel.mass, voxel.thermal_energy_f32())
-            .solid_fraction
-            <= 0.0
-    }));
+    melted.extend(
+        scene
+            .voxels
+            .iter()
+            .zip(&scene.properties)
+            .map(|(voxel, material)| {
+                material
+                    .phase_state(voxel.mass, voxel.thermal_energy_f32())
+                    .solid_fraction
+                    <= 0.0
+            }),
+    );
     if !melted.iter().any(|&value| value) {
         return false;
     }
@@ -1586,6 +2224,7 @@ fn break_fully_melted_bonds(scene: &mut Scene, melted: &mut Vec<bool>) -> bool {
 }
 
 pub fn rebuild_clusters(scene: &mut Scene) {
+    scene.mark_render_changed();
     let n = scene.voxels.len();
     let mut parent: Vec<usize> = (0..n).collect();
     fn root(p: &mut [usize], mut i: usize) -> usize {
@@ -1621,6 +2260,480 @@ pub fn rebuild_clusters(scene: &mut Scene) {
 mod tests {
     use super::*;
 
+    fn free_falling_oak_block() -> Scene {
+        use crate::material::Material;
+        use crate::scene::{SceneConfig, VoxelSpawn};
+
+        let oak = Material::component_id("oak").unwrap();
+        let mut spawns = Vec::with_capacity(64);
+        for z in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    spawns.push(VoxelSpawn::at_cell([x, y, z + 8], oak).at_temperature(293.15));
+                }
+            }
+        }
+        let mut config = SceneConfig::default();
+        config.fixed_dt = 0.01;
+        config.substeps = 1;
+        config.gravity = [0.0, 0.0, -9.81];
+        config.atmosphere.pressure_pa = 0.0;
+        let mut scene = Scene::from_voxels(config, spawns).unwrap();
+        let mut tool = None;
+        for _ in 0..63 {
+            step(&mut scene, &mut tool);
+        }
+        scene
+    }
+
+    fn cached_test_constraint(
+        scene: &Scene,
+        i: usize,
+        axis: usize,
+        j: usize,
+        previous: Option<Constraint>,
+    ) -> Constraint {
+        let phases = [i, j].map(|n| {
+            scene.properties[n].phase_state(scene.voxels[n].mass, scene.voxels[n].thermal_energy_f32())
+        });
+        make_constraint_at_phases(scene, i, axis, j, phases, [0; 2], previous)
+    }
+
+    fn rest_cache_test_scene() -> Scene {
+        use crate::material::Material;
+        use crate::scene::{SceneConfig, VoxelSpawn};
+
+        let oak = Material::component_id("oak").unwrap();
+        Scene::from_voxels(
+            SceneConfig::default(),
+            vec![
+                VoxelSpawn::at_cell([0, 0, 8], oak).at_temperature(293.15),
+                VoxelSpawn::at_cell([1, 0, 8], oak).at_temperature(293.15),
+                VoxelSpawn::at_cell([0, 1, 8], oak).at_temperature(293.15),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn rest_cache_stiffness_inputs(scene: &Scene) -> [StiffnessInput; 2] {
+        [0, 1].map(|n| {
+            let material = &scene.properties[n];
+            let micro = scene.voxels[n].microstructure;
+            let phase = material.phase_state(
+                scene.voxels[n].mass,
+                scene.voxels[n].thermal_energy_f32(),
+            );
+            StiffnessInput {
+                rotation: scene.rotations[n],
+                world_fiber: scene.rotations[n] * micro.fibers(),
+                anisotropy: micro.anisotropy,
+                moduli: Vec3::new(material.young, material.young_perp, material.shear),
+                solid: phase.solid_fraction.clamp(1e-4, 1.0),
+            }
+        })
+    }
+
+    fn assert_rest_cache_rebuilds_after(
+        mut scene: Scene,
+        mutate: impl FnOnce(&mut Scene),
+    ) {
+        let previous_inputs = rest_cache_stiffness_inputs(&scene);
+        let previous = cached_test_constraint(&scene, 0, 0, 1, None);
+        let mut stale = previous;
+        let sentinel = DVec3::splat(42.0);
+        stale.rest = sentinel;
+        mutate(&mut scene);
+
+        let current_inputs = rest_cache_stiffness_inputs(&scene);
+        let revisions = std::array::from_fn(|n| {
+            if previous_inputs[n] != current_inputs[n] { 1 } else { 0 }
+        });
+        let phases = [0, 1].map(|n| {
+            scene.properties[n].phase_state(
+                scene.voxels[n].mass,
+                scene.voxels[n].thermal_energy_f32(),
+            )
+        });
+        let cached = make_constraint_at_phases(
+            &scene,
+            0,
+            0,
+            1,
+            phases,
+            revisions,
+            Some(stale),
+        );
+        let rebuilt =
+            make_constraint_at_phases(&scene, 0, 0, 1, phases, revisions, None);
+        assert_ne!(cached.rest, sentinel);
+        assert_eq!(cached.rest, rebuilt.rest);
+        assert_eq!(cached.k, rebuilt.k);
+    }
+
+    #[test]
+    fn bond_rest_cache_reuses_only_exact_inputs_and_damage_still_updates_stiffness() {
+        let scene = rest_cache_test_scene();
+        let initial = cached_test_constraint(&scene, 0, 0, 1, None);
+
+        let sentinel = DVec3::splat(42.0);
+        let sentinel_k = Mat3::from_diagonal(Vec3::splat(42.0));
+        let mut reusable = initial;
+        reusable.rest = sentinel;
+        reusable.k = sentinel_k;
+        let reused = cached_test_constraint(&scene, 0, 0, 1, Some(reusable));
+        assert_eq!(reused.rest, sentinel);
+        assert_eq!(reused.k, sentinel_k);
+
+        assert_rest_cache_rebuilds_after(rest_cache_test_scene(), |scene| {
+            scene.voxels[0].add_internal_energy_j(1.0);
+        });
+        assert_rest_cache_rebuilds_after(rest_cache_test_scene(), |scene| {
+            scene.reference_temperatures_kelvin[0] += 1.0;
+        });
+        assert_rest_cache_rebuilds_after(rest_cache_test_scene(), |scene| {
+            scene.properties[0].thermal_expansion_parallel += 1.0e-6;
+        });
+        assert_rest_cache_rebuilds_after(rest_cache_test_scene(), |scene| {
+            scene.voxels[0].microstructure.orientation = Quat::from_rotation_y(0.25);
+        });
+        assert_rest_cache_rebuilds_after(rest_cache_test_scene(), |scene| {
+            scene.bonds[0][0].formation_offset[0] = 1.0e-5;
+        });
+        assert_rest_cache_rebuilds_after(rest_cache_test_scene(), |scene| {
+            scene.bonds[0][0].plastic_strain[0] = 0.01;
+        });
+        assert_rest_cache_rebuilds_after(rest_cache_test_scene(), |scene| {
+            scene.rotations[0] = Quat::from_rotation_y(0.1);
+        });
+
+        let mut scene = rest_cache_test_scene();
+        let before_damage = cached_test_constraint(&scene, 0, 0, 1, None);
+        scene.bonds[0][0].damage = 0.4;
+        let cached_damage = cached_test_constraint(&scene, 0, 0, 1, Some(before_damage));
+        let rebuilt_damage = cached_test_constraint(&scene, 0, 0, 1, None);
+        assert_eq!(cached_damage.rest, before_damage.rest);
+        assert_eq!(cached_damage.rest, rebuilt_damage.rest);
+        assert_eq!(cached_damage.k, rebuilt_damage.k);
+        assert_ne!(cached_damage.k, before_damage.k);
+
+        let topology_scene = rest_cache_test_scene();
+        let topology_cache = cached_test_constraint(&topology_scene, 0, 0, 1, None);
+        let mismatched_topology =
+            cached_test_constraint(&topology_scene, 0, 0, 2, Some(topology_cache));
+        assert_eq!(
+            mismatched_topology.rest,
+            cached_test_constraint(&topology_scene, 0, 0, 2, None).rest
+        );
+    }
+
+    #[test]
+    fn rotation_fit_skips_fully_coarse_scene_without_touching_rev_rotations() {
+        let mut scene = free_falling_oak_block();
+        let targets = vec![[None; 3]; scene.voxels.len()];
+        let loads = vec![Vec3::ZERO; scene.voxels.len()];
+        assert_eq!(
+            auto_register_quiescent_components(&mut scene, &targets, &loads, &[]),
+            scene.voxels.len()
+        );
+        let rotations = scene.rotations.clone();
+        let mut scratch = SolverScratch::default();
+
+        assert_eq!(fit_rotations(&mut scene, &mut scratch), 0.0);
+        assert_eq!(scene.rotations, rotations);
+        assert!(scratch.rotation_gradients.is_empty());
+        assert!(scratch.rotation_counts.is_empty());
+    }
+
+    #[test]
+    fn coarse_solve_skips_fixed_floor_but_keeps_prescribed_deformable_bonds() {
+        use crate::material::Material;
+        use crate::scene::{SceneConfig, VoxelSpawn};
+
+        for kinematic_floor in [true, false] {
+            let oak = Material::component_id("oak").unwrap();
+            let mut spawns = Vec::new();
+            for x in 0..2 {
+                let voxel = VoxelSpawn::at_cell([x, 0, 0], oak);
+                spawns.push(if kinematic_floor { voxel.fixed() } else { voxel });
+            }
+            for z in 0..4 {
+                for y in 0..4 {
+                    for x in 0..4 {
+                        spawns.push(VoxelSpawn::at_cell([x + 10, y + 10, z + 10], oak));
+                    }
+                }
+            }
+            let mut config = SceneConfig::default();
+            config.gravity = [0.0; 3];
+            config.atmosphere.pressure_pa = 0.0;
+            let mut scene = Scene::from_voxels(config, spawns).unwrap();
+            let members: Vec<_> = (2..scene.voxels.len()).collect();
+            scene.register_rigid_aggregate_candidate(&members).unwrap();
+            let positions = scene.positions.clone();
+            let mut targets = vec![[None; 3]; scene.voxels.len()];
+            if !kinematic_floor {
+                for i in 0..2 {
+                    targets[i] = positions[i].to_array().map(Some);
+                }
+            }
+            let loads = vec![Vec3::ZERO; scene.voxels.len()];
+            let mut scratch = SolverScratch::default();
+            let mut cuda_enabled = false;
+            solve_coupled(&mut scene, 0.01, &targets, &loads, &positions,
+                &mut scratch, false, false, &mut cuda_enabled);
+            assert_eq!(scene.positions, positions);
+            assert_eq!(scene.broken, 0);
+            if kinematic_floor {
+                assert!(scratch.constraints.is_empty(),
+                    "fixed-only floor bonds must not trigger fine assembly");
+                assert!(scratch.stiffness_inputs.is_empty());
+            } else {
+                assert!(!scratch.constraints.is_empty(),
+                    "prescribed deformable bonds still require fracture evaluation");
+            }
+        }
+    }
+
+    #[test]
+    fn fine_solve_filters_only_kinematic_to_kinematic_bonds() {
+        use crate::material::Material;
+        use crate::scene::{SceneConfig, VoxelSpawn};
+
+        let oak = Material::component_id("oak").unwrap();
+        let make_scene = || {
+            let mut config = SceneConfig::default();
+            config.gravity = [0.0; 3];
+            config.atmosphere.pressure_pa = 0.0;
+            Scene::from_voxels(
+                config,
+                vec![
+                    // Build the lattice while all REV are deformable so the
+                    // support bond exists; Scene construction omits bonds
+                    // between unlike kinematic states.
+                    VoxelSpawn::at_cell([0, 0, 0], oak),
+                    VoxelSpawn::at_cell([1, 0, 0], oak),
+                    VoxelSpawn::at_cell([0, 0, 1], oak),
+                ],
+            )
+            .unwrap()
+        };
+
+        let mut filtered = make_scene();
+        let mut reference = make_scene();
+        let index_at_cell = |scene: &Scene, cell| {
+            let center = VoxelSpawn::at_cell(cell, oak).center;
+            scene
+                .positions
+                .iter()
+                .position(|&position| position == center)
+                .expect("the requested fixture cell should exist")
+        };
+        let prescribed = index_at_cell(&filtered, [0, 0, 1]);
+        // Preserve the bonds generated above while imposing the fixed state,
+        // so the fixture exercises the fine solver's kinematic bond filter.
+        for scene in [&mut filtered, &mut reference] {
+            let fixed_a = index_at_cell(scene, [0, 0, 0]);
+            let fixed_b = index_at_cell(scene, [1, 0, 0]);
+            scene.voxels[fixed_a].kinematic = true;
+            scene.voxels[fixed_b].kinematic = true;
+        }
+        let mut fixed_fixed = None;
+        'find_bond: for axis in 0..3 {
+            for i in 0..filtered.voxels.len() {
+                let j = filtered.bonds[axis][i].neighbor;
+                if j != EMPTY
+                    && filtered.voxels[i].kinematic
+                    && filtered.voxels[j as usize].kinematic
+                {
+                    fixed_fixed = Some((axis, i));
+                    break 'find_bond;
+                }
+            }
+        }
+        let fixed_fixed = fixed_fixed
+            .expect("the fixed floor should contain a bonded kinematic pair");
+        reference.bonds[fixed_fixed.0][fixed_fixed.1].neighbor = EMPTY;
+
+        let positions = filtered.positions.clone();
+        let mut targets = vec![[None; 3]; filtered.voxels.len()];
+        targets[prescribed] = positions[prescribed].to_array().map(Some);
+        let loads = vec![Vec3::ZERO; filtered.voxels.len()];
+        let mut filtered_scratch = SolverScratch::default();
+        let mut reference_scratch = SolverScratch::default();
+        let mut filtered_cuda = false;
+        let mut reference_cuda = false;
+        solve_coupled(
+            &mut filtered,
+            0.01,
+            &targets,
+            &loads,
+            &positions,
+            &mut filtered_scratch,
+            false,
+            false,
+            &mut filtered_cuda,
+        );
+        solve_coupled(
+            &mut reference,
+            0.01,
+            &targets,
+            &loads,
+            &positions,
+            &mut reference_scratch,
+            false,
+            false,
+            &mut reference_cuda,
+        );
+
+        assert!(filtered_scratch.constraints.iter().all(|constraint| {
+            !(filtered.voxels[constraint.i].kinematic
+                && filtered.voxels[constraint.j].kinematic)
+        }));
+        assert!(filtered_scratch.constraints.iter().any(|constraint| {
+            filtered.voxels[constraint.i].kinematic
+                != filtered.voxels[constraint.j].kinematic
+        }), "kinematic-to-prescribed deformable support bonds must remain assembled");
+        assert_eq!(filtered.positions, reference.positions);
+        assert_eq!(filtered.voxels.iter().map(|v| v.velocity).collect::<Vec<_>>(),
+            reference.voxels.iter().map(|v| v.velocity).collect::<Vec<_>>());
+        assert_eq!(filtered.broken, reference.broken);
+    }
+
+    #[test]
+    fn auto_aggregation_accepts_only_solver_scale_residuals() {
+        let mut scene = free_falling_oak_block();
+        let mut nonzero_force_bonds = 0usize;
+        let mut max_force_n = 0.0_f32;
+        for axis in 0..3 {
+            for index in 0..scene.voxels.len() {
+                if scene.bonds[axis][index].neighbor != EMPTY {
+                    let force = scene.workspace[axis][index].last_force.length();
+                    nonzero_force_bonds += usize::from(force != 0.0);
+                    max_force_n = max_force_n.max(force);
+                }
+            }
+        }
+        let members: Vec<_> = (0..scene.voxels.len()).collect();
+        let candidate = scene.rigid_aggregate_snapshot(&members).unwrap();
+        let internal_motion = candidate.has_unresolved_internal_motion();
+        let targets = vec![[None; 3]; scene.voxels.len()];
+        let loads = vec![Vec3::ZERO; scene.voxels.len()];
+        let registered = auto_register_quiescent_components(&mut scene, &targets, &loads, &[]);
+        let gravity_force_n =
+            scene.voxels[0].mass * Vec3::from_array(scene.config.gravity).length();
+        let force_tolerance_n = scene.config.solver_relative_tolerance * gravity_force_n;
+        println!(
+            "free-fall aggregate: cluster_count={} component_revs={} bonds={} nonzero_force_bonds={} max_bond_force_n={:.9e} force_tolerance_n={:.9e} solver_residual={:.3e} unresolved_internal_motion={} registered_revs={}",
+            scene.cluster_count,
+            members.len(),
+            scene
+                .bonds
+                .iter()
+                .map(|axis| axis.iter().filter(|bond| bond.neighbor != EMPTY).count())
+                .sum::<usize>(),
+            nonzero_force_bonds,
+            max_force_n,
+            force_tolerance_n,
+            scene.solver_residual,
+            internal_motion,
+            registered,
+        );
+        assert_eq!(scene.cluster_count, 1);
+        assert!(!internal_motion);
+        assert!(max_force_n <= force_tolerance_n);
+        assert_eq!(registered, members.len());
+        assert!(scene.aggregate_for_voxel(0).is_some());
+    }
+
+    #[test]
+    fn auto_aggregation_rejects_resolvable_internal_stress() {
+        let mut scene = free_falling_oak_block();
+        scene.workspace[0][0].last_force = Vec3::X * 1.0e-3;
+        let targets = vec![[None; 3]; scene.voxels.len()];
+        let loads = vec![Vec3::ZERO; scene.voxels.len()];
+        let registered = auto_register_quiescent_components(&mut scene, &targets, &loads, &[]);
+
+        assert_eq!(registered, 0);
+        assert!(scene.aggregate_for_voxel(0).is_none());
+    }
+
+    #[test]
+    fn contact_in_component_blocks_coarse_registration() {
+        let mut scene = free_falling_oak_block();
+        let targets = vec![[None; 3]; scene.voxels.len()];
+        let loads = vec![Vec3::ZERO; scene.voxels.len()];
+        let contacts = [collision::Contact {
+            i: 0,
+            j: 63,
+            normal: Vec3::X,
+            new_impact: false,
+        }];
+
+        let registered =
+            auto_register_quiescent_components(&mut scene, &targets, &loads, &contacts);
+
+        assert_eq!(registered, 0);
+        assert!(scene.aggregate_for_voxel(0).is_none());
+    }
+
+    #[test]
+    fn nonuniform_force_wakes_aggregate_before_fine_solve() {
+        let mut scene = free_falling_oak_block();
+        let targets = vec![[None; 3]; scene.voxels.len()];
+        let loads = vec![Vec3::ZERO; scene.voxels.len()];
+        assert_eq!(
+            auto_register_quiescent_components(&mut scene, &targets, &loads, &[]),
+            64
+        );
+
+        scene.external_forces[0] = Vec3::X * 1.0e-4;
+        let mut tool = None;
+        step(&mut scene, &mut tool);
+
+        assert!(scene.aggregate_of.iter().all(Option::is_none));
+        assert!(scene.voxels[0].velocity.x > 0.0);
+        assert_eq!(scene.broken, 0);
+    }
+
+    #[test]
+    fn coarse_prediction_wake_reinitializes_fine_velocities_before_solve() {
+        use crate::{material::Material, scene::VoxelSpawn};
+
+        let oak = Material::component_id("oak").unwrap();
+        let mut spawns = Vec::with_capacity(65);
+        for z in 8..12 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    spawns.push(VoxelSpawn::at_cell([x, y, z], oak));
+                }
+            }
+        }
+        spawns.push(VoxelSpawn::at_cell([5, 0, 8], oak).fixed());
+        let mut config = crate::scene::SceneConfig::default();
+        config.fixed_dt = 0.01;
+        config.gravity = [0.0; 3];
+        config.atmosphere.pressure_pa = 0.0;
+        let mut scene = Scene::from_voxels(config, spawns).unwrap();
+        for voxel in &mut scene.voxels[..64] {
+            voxel.velocity = Vec3::X * 2.0;
+        }
+        scene
+            .register_rigid_aggregate_candidate(&(0..64).collect::<Vec<_>>())
+            .unwrap();
+        scene.solver_scratch.drift_velocity = vec![Vec3::splat(99.0); scene.voxels.len()];
+        scene.solver_scratch.tool_contact_velocity = vec![Vec3::splat(99.0); scene.voxels.len()];
+        scene.previous.clone_from(&scene.positions);
+        let mut tool = None;
+
+        step(&mut scene, &mut tool);
+
+        assert!(scene.aggregate_of[..64].iter().all(Option::is_none));
+        assert!(scene.voxels[..64]
+            .iter()
+            .all(|voxel| voxel.velocity.abs().max_element() < 10.0));
+        assert_eq!(scene.broken, 0);
+    }
+
     #[test]
     fn geometric_multigrid_eligibility_uses_rest_cells_and_rejects_non_face_edges() {
         let constraint = Constraint {
@@ -1635,22 +2748,368 @@ mod tests {
             rotation_j: Quat::IDENTITY,
             thermal_energy_i: 0.0,
             thermal_energy_j: 0.0,
+            damage: 0.0,
             stiffness_revisions: [0; 2],
+            rest_input: RestInput::default(),
         };
         let incidence = [[0_u32; 6]; 2];
         let incidence_len = [1_u8; 2];
         let active = [0_usize, 1];
         let active_index = [0_u32, 1];
-        let rest = [DVec3::splat(DCELL * 0.5), DVec3::splat(DCELL * 0.5) + DVec3::X * DCELL];
+        let rest = [
+            DVec3::splat(DCELL * 0.5),
+            DVec3::splat(DCELL * 0.5) + DVec3::X * DCELL,
+        ];
         let coordinates = geometric_multigrid_coordinates(
-            &active, &active_index, &incidence, &incidence_len, &[constraint], &rest,
-        ).unwrap();
+            &active,
+            &active_index,
+            &incidence,
+            &incidence_len,
+            &[constraint],
+            &rest,
+        )
+        .unwrap();
         assert_eq!(coordinates, [[0, 0, 0], [1, 0, 0]]);
 
         let diagonal_neighbor = [rest[0], rest[0] + DVec3::new(DCELL, DCELL, 0.0)];
         assert!(geometric_multigrid_coordinates(
-            &active, &active_index, &incidence, &incidence_len, &[constraint], &diagonal_neighbor,
-        ).is_err());
+            &active,
+            &active_index,
+            &incidence,
+            &incidence_len,
+            &[constraint],
+            &diagonal_neighbor,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn component_ic0_matches_serial_apply_for_interleaved_components() {
+        let constraint = |i, j| Constraint {
+            i,
+            j,
+            axis: 0,
+            frame: Mat3::IDENTITY,
+            material_k: Mat3::IDENTITY,
+            k: Mat3::IDENTITY,
+            rest: DVec3::ZERO,
+            rotation_i: Quat::IDENTITY,
+            rotation_j: Quat::IDENTITY,
+            thermal_energy_i: 0.0,
+            thermal_energy_j: 0.0,
+            damage: 0.0,
+            stiffness_revisions: [0; 2],
+            rest_input: RestInput::default(),
+        };
+        let constraints = [constraint(0, 3), constraint(1, 2)];
+        let mut incidence = [[u32::MAX; 6]; 4];
+        incidence[0][0] = 0;
+        incidence[3][0] = 0;
+        incidence[1][0] = 1;
+        incidence[2][0] = 1;
+        let incidence_len = [1; 4];
+        let mut active = vec![0, 1, 2, 3];
+        let mut active_index = vec![0, 1, 2, 3];
+        let mut serial_lower = Vec::new();
+        let mut serial_lower_count = Vec::new();
+        let mut serial_upper = Vec::new();
+        let mut serial_upper_count = Vec::new();
+        build_ic0_links(
+            &constraints,
+            &incidence,
+            &incidence_len,
+            &active,
+            &active_index,
+            &mut serial_lower,
+            &mut serial_lower_count,
+            &mut serial_upper,
+            &mut serial_upper_count,
+        );
+
+        let factor_diagonal_inverse = [Mat3::IDENTITY; 4];
+        let factor_edges = [Mat3::IDENTITY * 0.125; 2];
+        let rhs = [Vec3::X, Vec3::Y, Vec3::Z, Vec3::splat(2.0)];
+        let mut serial_work = [Vec3::ZERO; 4];
+        let mut serial_out = [Vec3::ZERO; 4];
+        apply_ic0(
+            &factor_diagonal_inverse,
+            &factor_edges,
+            &active,
+            &serial_lower,
+            &serial_lower_count,
+            &serial_upper,
+            &serial_upper_count,
+            &rhs,
+            &mut serial_work,
+            &mut serial_out,
+        );
+
+        let mut parent = Vec::new();
+        let mut root_to_id = Vec::new();
+        let mut sizes = Vec::new();
+        let mut offsets = Vec::new();
+        let mut members = Vec::new();
+        let mut ranges = Vec::new();
+        assert_eq!(
+            order_active_by_ic0_components(
+                &constraints,
+                &mut active,
+                &mut active_index,
+                &mut parent,
+                &mut root_to_id,
+                &mut sizes,
+                &mut offsets,
+                &mut members,
+                &mut ranges,
+            ),
+            2
+        );
+        assert_eq!(active, [0, 3, 1, 2]);
+        assert_eq!(ranges, [(0, 2), (2, 4)]);
+        let mut batches = Vec::new();
+        build_ic0_component_batches(&ranges, active.len(), &mut batches);
+
+        let mut component_lower = Vec::new();
+        let mut component_lower_count = Vec::new();
+        let mut component_upper = Vec::new();
+        let mut component_upper_count = Vec::new();
+        build_ic0_links(
+            &constraints,
+            &incidence,
+            &incidence_len,
+            &active,
+            &active_index,
+            &mut component_lower,
+            &mut component_lower_count,
+            &mut component_upper,
+            &mut component_upper_count,
+        );
+        let mut component_work = [Vec3::ZERO; 4];
+        let mut component_out = [Vec3::ZERO; 4];
+        let mut component_rhs = [Vec3::ZERO; 4];
+        for (slot, &voxel) in active.iter().enumerate() {
+            component_rhs[slot] = rhs[voxel];
+        }
+        apply_ic0_component_batches(
+            &factor_diagonal_inverse,
+            &factor_edges,
+            &active,
+            &ranges,
+            &batches,
+            &component_lower,
+            &component_lower_count,
+            &component_upper,
+            &component_upper_count,
+            &component_rhs,
+            &mut component_work,
+            &mut component_out,
+        );
+        let mut component_out_by_voxel = [Vec3::ZERO; 4];
+        for (slot, &voxel) in active.iter().enumerate() {
+            component_out_by_voxel[voxel] = component_out[slot];
+        }
+        assert_eq!(component_out_by_voxel, serial_out);
+    }
+
+    #[test]
+    fn reused_component_ic0_rebuilds_links_when_active_graph_splits() {
+        let constraint = Constraint {
+            i: 0,
+            j: 1,
+            axis: 0,
+            frame: Mat3::IDENTITY,
+            material_k: Mat3::IDENTITY,
+            k: Mat3::IDENTITY,
+            rest: DVec3::ZERO,
+            rotation_i: Quat::IDENTITY,
+            rotation_j: Quat::IDENTITY,
+            thermal_energy_i: 0.0,
+            thermal_energy_j: 0.0,
+            damage: 0.0,
+            stiffness_revisions: [0; 2],
+            rest_input: RestInput::default(),
+        };
+        let old_constraints = [constraint];
+        let old_incidence = [[0_u32; 6]; 2];
+        let old_incidence_len = [1_u8; 2];
+        let active = [0_usize, 1];
+        let active_index = [0_u32, 1];
+        let mut lower_links = Vec::new();
+        let mut lower_count = Vec::new();
+        let mut upper_links = Vec::new();
+        let mut upper_count = Vec::new();
+        build_ic0_links(
+            &old_constraints,
+            &old_incidence,
+            &old_incidence_len,
+            &active,
+            &active_index,
+            &mut lower_links,
+            &mut lower_count,
+            &mut upper_links,
+            &mut upper_count,
+        );
+        assert_eq!(upper_count[0], 1);
+        let stale_neighbor = upper_links[0][0][1] as usize;
+        assert_eq!(stale_neighbor, 1);
+        assert!(!(0..1).contains(&stale_neighbor));
+
+        // A contact active-set change removes the edge and splits the current
+        // graph into singleton components while the caller requests reuse.
+        assert!(should_rebuild_cpu_preconditioner(true, false, false, false));
+        let new_incidence = [[u32::MAX; 6]; 2];
+        let new_incidence_len = [0_u8; 2];
+        build_ic0_links(
+            &[],
+            &new_incidence,
+            &new_incidence_len,
+            &active,
+            &active_index,
+            &mut lower_links,
+            &mut lower_count,
+            &mut upper_links,
+            &mut upper_count,
+        );
+        assert_eq!(lower_count, [0, 0]);
+        assert_eq!(upper_count, [0, 0]);
+
+        let factor_diagonal_inverse = [Mat3::IDENTITY; 2];
+        let factor_edges = [Mat3::IDENTITY];
+        for start in 0..2 {
+            let rhs = [Vec3::X];
+            let mut work = [Vec3::ZERO];
+            let mut output = [Vec3::ZERO];
+            apply_ic0_component(
+                start,
+                &active,
+                &factor_diagonal_inverse,
+                &factor_edges,
+                &lower_links,
+                &lower_count,
+                &upper_links,
+                &upper_count,
+                &rhs,
+                &mut work,
+                &mut output,
+            );
+            assert_eq!(output, [Vec3::X]);
+        }
+    }
+
+    #[test]
+    fn independent_component_pcg_solves_each_block_to_the_same_residual_contract() {
+        let active = [0_usize, 1];
+        let diagonal = [Mat3::IDENTITY * 2.0; 2];
+        let rows = [PcgRow::default(); 2];
+        let edge_blocks: [[f32; 9]; 0] = [];
+        let incidence_len = [0_u8; 2];
+        let rhs = [Vec3::new(2.0, 4.0, 6.0), Vec3::new(4.0, -2.0, 8.0)];
+        let factor_diagonal_inverse = [Mat3::IDENTITY * (1.0 / 2.0_f32.sqrt()); 2];
+        let factor_edges: [Mat3; 0] = [];
+        let lower_links = [[[0_u32; 2]; 6]; 2];
+        let lower_link_count = [0_u8; 2];
+        let upper_links = [[[0_u32; 2]; 6]; 2];
+        let upper_link_count = [0_u8; 2];
+        let ranges = [(0, 1), (1, 2)];
+        let mut dx = vec![Vec3::ZERO; 2];
+        let mut ap = vec![Vec3::ZERO; 2];
+        let mut r = rhs.to_vec();
+        let mut z = vec![Vec3::ZERO; 2];
+        let mut p = vec![Vec3::ZERO; 2];
+        let mut work = vec![Vec3::ZERO; 2];
+        let chunks = split_mut_by_ranges(&mut dx, &ranges)
+            .into_iter()
+            .zip(split_mut_by_ranges(&mut ap, &ranges))
+            .zip(split_mut_by_ranges(&mut r, &ranges))
+            .zip(split_mut_by_ranges(&mut z, &ranges))
+            .zip(split_mut_by_ranges(&mut p, &ranges))
+            .zip(split_mut_by_ranges(&mut work, &ranges));
+        let mut states = Vec::with_capacity(ranges.len());
+        for (component, (((((dx, ap), r), z), p), work)) in chunks.enumerate() {
+            let (start, end) = ranges[component];
+            states.push(ComponentPcgState {
+                start,
+                end,
+                dx,
+                ap,
+                r,
+                z,
+                p,
+                work,
+                iterations: 0,
+                converged: false,
+            });
+        }
+        states.par_iter_mut().for_each(|state| {
+            solve_pcg_component(
+                state,
+                &active,
+                &diagonal,
+                &rows,
+                &edge_blocks,
+                &incidence_len,
+                &rhs,
+                &factor_diagonal_inverse,
+                &factor_edges,
+                &lower_links,
+                &lower_link_count,
+                &upper_links,
+                &upper_link_count,
+                1e-5,
+                8,
+            );
+        });
+        assert!(states.iter().all(|state| state.converged));
+        drop(states);
+
+        for component in 0..2 {
+            let expected = rhs[component] * 0.5;
+            assert!((dx[component] - expected).length() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn component_ic0_does_not_join_through_inactive_degree_of_freedom() {
+        let constraint = Constraint {
+            i: 0,
+            j: 2,
+            axis: 0,
+            frame: Mat3::IDENTITY,
+            material_k: Mat3::IDENTITY,
+            k: Mat3::IDENTITY,
+            rest: DVec3::ZERO,
+            rotation_i: Quat::IDENTITY,
+            rotation_j: Quat::IDENTITY,
+            thermal_energy_i: 0.0,
+            thermal_energy_j: 0.0,
+            damage: 0.0,
+            stiffness_revisions: [0; 2],
+            rest_input: RestInput::default(),
+        };
+        let mut active = vec![0, 1];
+        let mut active_index = vec![0, 1, u32::MAX];
+        let mut parent = Vec::new();
+        let mut root_to_id = Vec::new();
+        let mut sizes = Vec::new();
+        let mut offsets = Vec::new();
+        let mut members = Vec::new();
+        let mut ranges = Vec::new();
+        assert_eq!(
+            order_active_by_ic0_components(
+                &[constraint],
+                &mut active,
+                &mut active_index,
+                &mut parent,
+                &mut root_to_id,
+                &mut sizes,
+                &mut offsets,
+                &mut members,
+                &mut ranges,
+            ),
+            2
+        );
+        assert_eq!(active, [0, 1]);
+        assert_eq!(ranges, [(0, 1), (1, 2)]);
     }
 
     #[test]
@@ -1809,7 +3268,9 @@ mod tests {
         fit_rotations(&mut s, &mut scratch);
         let frame = basis(0, s.rotations[0]);
         let j = s.bonds[0][0].neighbor as usize;
-        let c = (frame.as_dmat3().transpose() * (s.positions[j] - s.positions[0]) - DVec3::X * DCELL).as_vec3();
+        let c = (frame.as_dmat3().transpose() * (s.positions[j] - s.positions[0])
+            - DVec3::X * DCELL)
+            .as_vec3();
         assert!(c.length() < 1e-6);
     }
     #[test]
@@ -2017,7 +3478,9 @@ fn apply_releases(scene: &mut Scene, targets: &[[Option<f64>; 3]]) {
             scene.releases.push(r);
             continue;
         }
-        let normal = (scene.positions[r.j] - scene.positions[r.i]).normalize_or_zero().as_vec3();
+        let normal = (scene.positions[r.j] - scene.positions[r.i])
+            .normalize_or_zero()
+            .as_vec3();
         let wi = if scene.voxels[r.i].kinematic {
             0.0
         } else {
@@ -2075,12 +3538,39 @@ struct Constraint {
     rotation_j: Quat,
     thermal_energy_i: f32,
     thermal_energy_j: f32,
-    stiffness_revisions: [u64;2],
+    damage: f32,
+    stiffness_revisions: [u64; 2],
+    rest_input: RestInput,
+}
+
+/// Exact inputs to the bond rest vector. Thermal expansion and bond offsets
+/// can change independently of the directional compliance operator.
+#[derive(Clone, Copy, PartialEq)]
+struct RestInput {
+    fiber_orientations: [Quat; 2],
+    expansion: [[f32; 2]; 2],
+    temperatures: [f32; 2],
+    reference_temperatures: [f32; 2],
+    formation_offset: [f64; 3],
+    plastic_strain: [f32; 3],
+}
+
+impl Default for RestInput {
+    fn default() -> Self {
+        Self {
+            fiber_orientations: [Quat::IDENTITY; 2],
+            expansion: [[0.0; 2]; 2],
+            temperatures: [0.0; 2],
+            reference_temperatures: [0.0; 2],
+            formation_offset: [0.0; 3],
+            plastic_strain: [0.0; 3],
+        }
+    }
 }
 
 /// Exact inputs to the directional compliance operator. No rounded/hash key:
 /// a changed rotation, fiber, phase fraction or modulus invalidates the cache.
-#[derive(Clone,Copy,PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 struct StiffnessInput {
     rotation: Quat,
     world_fiber: Vec3,
@@ -2115,6 +3605,46 @@ impl Default for PcgRow {
     }
 }
 
+fn assemble_pcg_row(
+    voxel: usize,
+    incident: &[u32],
+    constraints: &[Constraint],
+    active_index: &[u32],
+) -> PcgRow {
+    let mut row = PcgRow::default();
+    for (slot, &edge) in incident.iter().enumerate() {
+        let constraint = &constraints[edge as usize];
+        let reverse = constraint.i != voxel;
+        let neighbor = if reverse { constraint.i } else { constraint.j };
+        row.neighbors[slot] = active_index[neighbor];
+        row.edge_ids[slot] = edge;
+        if reverse {
+            row.transpose_mask |= 1 << slot;
+        }
+    }
+    row
+}
+
+#[cfg(test)]
+#[test]
+fn pcg_row_reassembly_clears_removed_neighbors_and_transpose_bits() {
+    use crate::material::Material;
+    use crate::scene::{SceneConfig, VoxelSpawn};
+    let oak = Material::component_id("oak").unwrap();
+    let scene = Scene::from_voxels(SceneConfig::default(), (0..3)
+        .map(|x| VoxelSpawn::at_cell([x, 0, 0], oak)).collect()).unwrap();
+    let constraints = [make_constraint(&scene, 0, 0, 1), make_constraint(&scene, 1, 0, 2)];
+    let active = [0, 1, 2];
+    let old = assemble_pcg_row(1, &[0, 1], &constraints, &active);
+    assert_eq!(old.transpose_mask, 1);
+    assert_eq!(&old.neighbors[..2], &[0, 2]);
+    // Removing the first edge moves a forward edge into a formerly reversed slot.
+    let rebuilt = assemble_pcg_row(1, &[1], &constraints, &active);
+    assert_eq!(rebuilt.transpose_mask, 0);
+    assert_eq!(rebuilt.neighbors, [2, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX]);
+    assert_eq!(rebuilt.edge_ids, [1, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX]);
+}
+
 #[inline]
 fn pack_pcg_block(matrix: Mat3) -> [f32; 9] {
     [
@@ -2141,7 +3671,10 @@ fn apply_pcg_block(matrix: [f32; 9], value: Vec3) -> Vec3 {
 
 #[inline]
 fn transpose_pcg_block(matrix: [f32; 9]) -> [f32; 9] {
-    [matrix[0], matrix[3], matrix[6], matrix[1], matrix[4], matrix[7], matrix[2], matrix[5], matrix[8]]
+    [
+        matrix[0], matrix[3], matrix[6], matrix[1], matrix[4], matrix[7], matrix[2], matrix[5],
+        matrix[8],
+    ]
 }
 
 #[inline]
@@ -2154,11 +3687,11 @@ fn apply_pcg_block_transpose(matrix: [f32; 9], value: Vec3) -> Vec3 {
 }
 
 #[inline]
-fn apply_pcg_block_f64(a: [f32;9], x: DVec3) -> DVec3 {
+fn apply_pcg_block_f64(a: [f32; 9], x: DVec3) -> DVec3 {
     DVec3::new(
-        a[0] as f64*x.x + a[1] as f64*x.y + a[2] as f64*x.z,
-        a[3] as f64*x.x + a[4] as f64*x.y + a[5] as f64*x.z,
-        a[6] as f64*x.x + a[7] as f64*x.y + a[8] as f64*x.z,
+        a[0] as f64 * x.x + a[1] as f64 * x.y + a[2] as f64 * x.z,
+        a[3] as f64 * x.x + a[4] as f64 * x.y + a[5] as f64 * x.z,
+        a[6] as f64 * x.x + a[7] as f64 * x.y + a[8] as f64 * x.z,
     )
 }
 
@@ -2166,9 +3699,9 @@ fn apply_pcg_block_f64(a: [f32;9], x: DVec3) -> DVec3 {
 fn apply_pcg_block_f64_oriented(a: [f32; 9], x: DVec3, transpose: bool) -> DVec3 {
     if transpose {
         DVec3::new(
-            a[0] as f64*x.x + a[3] as f64*x.y + a[6] as f64*x.z,
-            a[1] as f64*x.x + a[4] as f64*x.y + a[7] as f64*x.z,
-            a[2] as f64*x.x + a[5] as f64*x.y + a[8] as f64*x.z,
+            a[0] as f64 * x.x + a[3] as f64 * x.y + a[6] as f64 * x.z,
+            a[1] as f64 * x.x + a[4] as f64 * x.y + a[7] as f64 * x.z,
+            a[2] as f64 * x.x + a[5] as f64 * x.y + a[8] as f64 * x.z,
         )
     } else {
         apply_pcg_block_f64(a, x)
@@ -2177,70 +3710,98 @@ fn apply_pcg_block_f64_oriented(a: [f32; 9], x: DVec3, transpose: bool) -> DVec3
 
 /// Replace the recurrence residual by an independent b-Ax evaluation. The
 /// returned norm uses f64 before residual components are stored for a restart.
-fn recompute_pcg_residual(diagonal: &[Mat3], rows: &[PcgRow], edge_blocks: &[[f32; 9]],
-    active: &[usize], incidence_len: &[u8], rhs: &[Vec3],
-    dx: &[Vec3], residual: &mut [Vec3]) -> f64 {
+fn recompute_pcg_residual(
+    diagonal: &[Mat3],
+    rows: &[PcgRow],
+    edge_blocks: &[[f32; 9]],
+    active: &[usize],
+    incidence_len: &[u8],
+    rhs: &[Vec3],
+    dx: &[Vec3],
+    residual: &mut [Vec3],
+) -> f64 {
     let mut norm_squared = 0.0;
     let mut rhs_squared = 0.0;
-    for (slot,&i) in active.iter().enumerate() {
-        let mut ax = diagonal[i].as_dmat3()*dx[slot].as_dvec3();
+    for (slot, &i) in active.iter().enumerate() {
+        let mut ax = diagonal[i].as_dmat3() * dx[slot].as_dvec3();
         for edge in 0..incidence_len[i] as usize {
             let neighbor = rows[slot].neighbors[edge];
             if neighbor != u32::MAX {
                 let block = edge_blocks[rows[slot].edge_ids[edge] as usize];
-                ax += apply_pcg_block_f64_oriented(block,dx[neighbor as usize].as_dvec3(),
-                    rows[slot].transpose_mask & (1 << edge) != 0);
+                ax += apply_pcg_block_f64_oriented(
+                    block,
+                    dx[neighbor as usize].as_dvec3(),
+                    rows[slot].transpose_mask & (1 << edge) != 0,
+                );
             }
         }
         let b = rhs[i].as_dvec3();
-        let r = b-ax;
+        let r = b - ax;
         residual[slot] = r.as_vec3();
         norm_squared += r.length_squared();
         rhs_squared += b.length_squared();
     }
-    if rhs_squared > 0.0 { (norm_squared/rhs_squared).sqrt() }
-    else if norm_squared == 0.0 { 0.0 } else { f64::INFINITY }
+    if rhs_squared > 0.0 {
+        (norm_squared / rhs_squared).sqrt()
+    } else if norm_squared == 0.0 {
+        0.0
+    } else {
+        f64::INFINITY
+    }
 }
 
 /// Evaluate the original assembled operator independently of PCG's recurrence
 /// and preconditioner. Also measure the actual correction retained by scene
 /// coordinates. This is an opt-in diagnostic; it does not change the trajectory.
 fn audit_pcg_residual(
-    diagonal: &[Mat3], rows: &[PcgRow], edge_blocks: &[[f32; 9]],
-    active: &[usize], incidence_len: &[u8],
-    rhs: &[Vec3], dx: &[Vec3], positions: &[DVec3],
+    diagonal: &[Mat3],
+    rows: &[PcgRow],
+    edge_blocks: &[[f32; 9]],
+    active: &[usize],
+    incidence_len: &[u8],
+    rhs: &[Vec3],
+    dx: &[Vec3],
+    positions: &[DVec3],
 ) -> crate::scene::SolverResidualAudit {
     let applied = |slot: usize| {
         let i = active[slot];
         // Record the correction actually retained by authoritative coordinates.
-        (positions[i]+dx[slot].as_dvec3())-positions[i]
+        (positions[i] + dx[slot].as_dvec3()) - positions[i]
     };
     let mut rhs_squared = 0.0;
     let mut correction_squared = 0.0;
     let mut applied_squared = 0.0;
     let mut rounding_squared = 0.0;
-    for (slot,&i) in active.iter().enumerate() {
+    for (slot, &i) in active.iter().enumerate() {
         let x = dx[slot].as_dvec3();
         let rounded = applied(slot);
-        let mut ax = diagonal[i].as_dmat3()*x;
-        let mut ax_rounded = diagonal[i].as_dmat3()*rounded;
+        let mut ax = diagonal[i].as_dmat3() * x;
+        let mut ax_rounded = diagonal[i].as_dmat3() * rounded;
         for edge in 0..incidence_len[i] as usize {
             let neighbor = rows[slot].neighbors[edge];
-            if neighbor == u32::MAX { continue; }
+            if neighbor == u32::MAX {
+                continue;
+            }
             let block = edge_blocks[rows[slot].edge_ids[edge] as usize];
             let transpose = rows[slot].transpose_mask & (1 << edge) != 0;
-            ax += apply_pcg_block_f64_oriented(block,dx[neighbor as usize].as_dvec3(),transpose);
-            ax_rounded += apply_pcg_block_f64_oriented(block,applied(neighbor as usize),transpose);
+            ax += apply_pcg_block_f64_oriented(block, dx[neighbor as usize].as_dvec3(), transpose);
+            ax_rounded +=
+                apply_pcg_block_f64_oriented(block, applied(neighbor as usize), transpose);
         }
         let b = rhs[i].as_dvec3();
         rhs_squared += b.length_squared();
-        correction_squared += (b-ax).length_squared();
-        applied_squared += (b-ax_rounded).length_squared();
-        rounding_squared += (x-rounded).length_squared();
+        correction_squared += (b - ax).length_squared();
+        applied_squared += (b - ax_rounded).length_squared();
+        rounding_squared += (x - rounded).length_squared();
     }
     let relative = |squared: f64| {
-        if rhs_squared > 0.0 { (squared/rhs_squared).sqrt() }
-        else if squared == 0.0 { 0.0 } else { f64::INFINITY }
+        if rhs_squared > 0.0 {
+            (squared / rhs_squared).sqrt()
+        } else if squared == 0.0 {
+            0.0
+        } else {
+            f64::INFINITY
+        }
     };
     crate::scene::SolverResidualAudit {
         correction_relative: relative(correction_squared),
@@ -2258,7 +3819,10 @@ fn worst_audited_residual(previous: Option<f64>, audit: crate::scene::SolverResi
     if !audit.correction_relative.is_finite() || !audit.applied_relative.is_finite() {
         f64::INFINITY
     } else {
-        previous.unwrap_or(0.0).max(audit.correction_relative).max(audit.applied_relative)
+        previous
+            .unwrap_or(0.0)
+            .max(audit.correction_relative)
+            .max(audit.applied_relative)
     }
 }
 
@@ -2283,85 +3847,132 @@ mod residual_audit_tests {
             assert!((reverse[index] - shared_reverse[index]).abs() <= 1e-6);
         }
         let x = Vec3::new(0.25, -1.5, 2.0);
-        assert!((apply_pcg_block(shared_reverse, x) - apply_pcg_block(reverse, x)).length() <= 1e-6);
+        assert!(
+            (apply_pcg_block(shared_reverse, x) - apply_pcg_block(reverse, x)).length() <= 1e-6
+        );
     }
 
     #[test]
     fn independent_audit_distinguishes_solved_vector_from_rounded_coordinates() {
-        let diagonal = [Mat3::from_diagonal(Vec3::new(4.0,5.0,6.0)),
-            Mat3::from_diagonal(Vec3::new(3.0,4.0,5.0))];
-        let mut rows = [PcgRow::default();2];
+        let diagonal = [
+            Mat3::from_diagonal(Vec3::new(4.0, 5.0, 6.0)),
+            Mat3::from_diagonal(Vec3::new(3.0, 4.0, 5.0)),
+        ];
+        let mut rows = [PcgRow::default(); 2];
         let edge_blocks = [pack_pcg_block(-Mat3::IDENTITY)];
         rows[0].neighbors[0] = 1;
         rows[1].neighbors[0] = 0;
         rows[0].edge_ids[0] = 0;
         rows[1].edge_ids[0] = 0;
-        let rhs = [Vec3::new(0.0,1.0,2.875),Vec3::new(1.375,0.75,0.125)];
-        let dx = [Vec3::new(0.125,0.25,0.5),Vec3::new(0.5,0.25,0.125)];
-        let local = audit_pcg_residual(&diagonal,&rows,&edge_blocks,&[0,1],&[1,1],
-            &rhs,&dx,&[DVec3::ZERO;2]);
-        assert_eq!(local.correction_relative,0.0);
-        assert_eq!(local.applied_relative,0.0);
-        assert_eq!(local.position_rounding_l2_m,0.0);
-        let far = audit_pcg_residual(&diagonal,&rows,&edge_blocks,&[0,1],&[1,1],&rhs,&dx,
-            &[DVec3::splat(1e18);2]);
-        assert_eq!(far.correction_relative,0.0);
-        assert_eq!(far.applied_relative,1.0);
+        let rhs = [Vec3::new(0.0, 1.0, 2.875), Vec3::new(1.375, 0.75, 0.125)];
+        let dx = [Vec3::new(0.125, 0.25, 0.5), Vec3::new(0.5, 0.25, 0.125)];
+        let local = audit_pcg_residual(
+            &diagonal,
+            &rows,
+            &edge_blocks,
+            &[0, 1],
+            &[1, 1],
+            &rhs,
+            &dx,
+            &[DVec3::ZERO; 2],
+        );
+        assert_eq!(local.correction_relative, 0.0);
+        assert_eq!(local.applied_relative, 0.0);
+        assert_eq!(local.position_rounding_l2_m, 0.0);
+        let far = audit_pcg_residual(
+            &diagonal,
+            &rows,
+            &edge_blocks,
+            &[0, 1],
+            &[1, 1],
+            &rhs,
+            &dx,
+            &[DVec3::splat(1e18); 2],
+        );
+        assert_eq!(far.correction_relative, 0.0);
+        assert_eq!(far.applied_relative, 1.0);
         assert!(far.position_rounding_l2_m > 0.0);
     }
 
     #[test]
     fn independent_audit_handles_empty_system_without_nan() {
-        let audit = audit_pcg_residual(&[],&[],&[],&[],&[],&[],&[],&[]);
-        assert_eq!(audit.correction_relative,0.0);
-        assert_eq!(audit.applied_relative,0.0);
-        assert_eq!(audit.position_rounding_l2_m,0.0);
+        let audit = audit_pcg_residual(&[], &[], &[], &[], &[], &[], &[], &[]);
+        assert_eq!(audit.correction_relative, 0.0);
+        assert_eq!(audit.applied_relative, 0.0);
+        assert_eq!(audit.position_rounding_l2_m, 0.0);
     }
 
     #[test]
     fn earlier_bad_solve_is_not_hidden_by_a_later_good_solve() {
         let audit = |value| crate::scene::SolverResidualAudit {
-            correction_relative: value, applied_relative: value, position_rounding_l2_m: 0.0,
+            correction_relative: value,
+            applied_relative: value,
+            position_rounding_l2_m: 0.0,
         };
-        let worst = worst_audited_residual(None,audit(0.2));
-        assert_eq!(worst_audited_residual(Some(worst),audit(1e-6)),0.2);
-        assert_eq!(worst_audited_residual(Some(worst),audit(f64::NAN)),f64::INFINITY);
+        let worst = worst_audited_residual(None, audit(0.2));
+        assert_eq!(worst_audited_residual(Some(worst), audit(1e-6)), 0.2);
+        assert_eq!(
+            worst_audited_residual(Some(worst), audit(f64::NAN)),
+            f64::INFINITY
+        );
     }
 
     #[test]
     fn physical_elastic_correction_smaller_than_render_ulp_survives_application() {
-        use crate::{material::Material, scene::{SceneConfig,VoxelSpawn}};
+        use crate::{
+            material::Material,
+            scene::{SceneConfig, VoxelSpawn},
+        };
         let iron = Material::component_id("iron").unwrap();
         let mut config = SceneConfig::default();
-        config.gravity = [0.0;3];
+        config.gravity = [0.0; 3];
         config.atmosphere.pressure_pa = 0.0;
         config.fixed_dt = 0.001;
         config.substeps = 1;
         config.corotation_iterations = 1;
         config.iterations = 256;
-        let mut scene = Scene::from_voxels(config,vec![
-            VoxelSpawn::at_cell([0,0,0],iron),
-            VoxelSpawn::at_cell([1,0,0],iron),
-        ]).unwrap();
+        let mut scene = Scene::from_voxels(
+            config,
+            vec![
+                VoxelSpawn::at_cell([0, 0, 0], iron),
+                VoxelSpawn::at_cell([1, 0, 0], iron),
+            ],
+        )
+        .unwrap();
         scene.fix_voxels(&[0]).unwrap();
-        assert_eq!(scene.bonds[0][0].neighbor,1,"the elastic test needs a retained bond to its support");
+        assert_eq!(
+            scene.bonds[0][0].neighbor, 1,
+            "the elastic test needs a retained bond to its support"
+        );
         let start = scene.positions[1];
         let force = 0.01_f32;
-        let stiffness = stiffness_matrix(&scene,0,1,Mat3::IDENTITY).x_axis.x as f64;
+        let stiffness = stiffness_matrix(&scene, 0, 1, Mat3::IDENTITY).x_axis.x as f64;
         let expected = force as f64 / (scene.voxels[1].mass as f64 / 0.001_f64.powi(2) + stiffness);
-        set_force(&mut scene,1,Vec3::X*force).unwrap();
-        step(&mut scene,&mut None);
-        let displacement = scene.positions[1].x-start.x;
+        set_force(&mut scene, 1, Vec3::X * force).unwrap();
+        step(&mut scene, &mut None);
+        let displacement = scene.positions[1].x - start.x;
         assert!(displacement > 0.0);
-        assert_eq!(scene.positions[1].as_vec3(),start.as_vec3(),"render projection may round the motion");
-        assert!((displacement-expected).abs()/expected < 0.005,
-            "actual={displacement:.12e} expected={expected:.12e}");
-        assert_eq!(scene.broken,0);
+        assert_eq!(
+            scene.positions[1].as_vec3(),
+            start.as_vec3(),
+            "render projection may round the motion"
+        );
+        assert!(
+            (displacement - expected).abs() / expected < 0.005,
+            "actual={displacement:.12e} expected={expected:.12e}"
+        );
+        assert_eq!(scene.broken, 0);
     }
 }
 
 #[derive(Default)]
 pub(crate) struct SolverScratch {
+    adaptive_gravity: Option<Vec3>,
+    adaptive_energies: Vec<f32>,
+    adaptive_loads: Vec<Vec3>,
+    adaptive_positions: Vec<DVec3>,
+    adaptive_config: Vec<u8>,
+    adaptive_revision: Option<u64>,
     merged_targets: Vec<[Option<f64>; 3]>,
     atmosphere_exposed_faces: Vec<[u8; 3]>,
     ambient_loads: Vec<Vec3>,
@@ -2383,6 +3994,21 @@ pub(crate) struct SolverScratch {
     free: Vec<Vec3>,
     active: Vec<usize>,
     active_index: Vec<u32>,
+    banded_factor: Option<crate::banded::BandedFactor>,
+    banded_factor_free: Vec<Vec3>,
+    banded_factor_pool: Vec<(Vec<Vec3>, crate::banded::BandedFactor)>,
+    banded_diagonal: Vec<Mat3>,
+    banded_lower: Vec<(usize, usize, Mat3)>,
+    banded_rhs: Vec<Vec3>,
+    banded_dx: Vec<DVec3>,
+    banded_residual: Vec<DVec3>,
+    banded_correction: Vec<DVec3>,
+    contact_axis_normals: Vec<[f32; 3]>,
+    previous_contact_axis_normals: Vec<[f32; 3]>,
+    contact_lower: Vec<[Option<f64>; 3]>,
+    contact_upper: Vec<[Option<f64>; 3]>,
+    contact_feasible_positions: Vec<DVec3>,
+    contact_reactions: Vec<DVec3>,
     masses: Vec<f32>,
     incidence: Vec<[u32; 6]>,
     incidence_len: Vec<u8>,
@@ -2400,8 +4026,16 @@ pub(crate) struct SolverScratch {
     ic0_black_slots: Vec<usize>,
     ic0_color_stack: Vec<usize>,
     ic0_natural_active: Vec<usize>,
+    ic0_component_parent: Vec<u32>,
+    ic0_component_root_to_id: Vec<u32>,
+    ic0_component_sizes: Vec<usize>,
+    ic0_component_offsets: Vec<usize>,
+    ic0_component_members: Vec<usize>,
+    ic0_component_ranges: Vec<(usize, usize)>,
+    ic0_component_batches: Vec<(usize, usize, usize, usize)>,
     cpu_preconditioner_bipartite: bool,
     cpu_preconditioner_ready: bool,
+    cpu_preconditioner_components: bool,
     cpu_preconditioner_free: Vec<Vec3>,
     cpu_preconditioner_graph: Vec<(usize, usize, usize)>,
     cpu_preconditioner_kind: Option<CpuPreconditioner>,
@@ -2420,6 +4054,8 @@ pub(crate) struct SolverScratch {
     pcg_rows: Vec<PcgRow>,
     pcg_edge_blocks: Vec<[f32; 9]>,
     cuda_neighbors: Vec<[u32; 6]>,
+    cuda_edge_ids: Vec<[u32; 6]>,
+    cuda_transpose_masks: Vec<u8>,
     cuda_blocks: Vec<[f32; 54]>,
     cuda_diagonal: Vec<[f32; 9]>,
     cuda_inverse: Vec<[f32; 9]>,
@@ -2432,47 +4068,101 @@ pub(crate) struct SolverScratch {
     rotation_counts: Vec<Vec3>,
 }
 #[cfg(test)]
-fn make_constraint(
+fn make_constraint(scene: &Scene, i: usize, axis: usize, j: usize) -> Constraint {
+    let phases = [i, j].map(|n| {
+        scene.properties[n].phase_state(scene.voxels[n].mass, scene.voxels[n].thermal_energy_f32())
+    });
+    make_constraint_at_phases(scene, i, axis, j, phases, [0; 2], None)
+}
+
+fn make_constraint_at_phases(
     scene: &Scene,
     i: usize,
     axis: usize,
     j: usize,
+    phases: [crate::material::PhaseState; 2],
+    stiffness_revisions: [u64; 2],
+    previous: Option<Constraint>,
 ) -> Constraint {
-    let phases = [i,j].map(|n| scene.properties[n]
-        .phase_state(scene.voxels[n].mass,scene.voxels[n].thermal_energy_f32()));
-    make_constraint_at_phases(scene,i,axis,j,phases,[0;2],None)
-}
-
-fn make_constraint_at_phases(scene: &Scene, i: usize, axis: usize, j: usize,
-    phases: [crate::material::PhaseState;2], stiffness_revisions: [u64;2],
-    previous: Option<Constraint>) -> Constraint {
     let rotation_i = scene.rotations[i];
     let rotation_j = scene.rotations[j];
     let thermal_energy_i = scene.voxels[i].thermal_energy_f32();
     let thermal_energy_j = scene.voxels[j].thermal_energy_f32();
-    let cached = previous.filter(|old|old.i==i && old.j==j && old.axis==axis
-        && old.stiffness_revisions==stiffness_revisions);
-    let (frame,material_k) = if let Some(old)=cached {
-        (old.frame,old.material_k)
+    let cached = previous.filter(|old| {
+        old.i == i
+            && old.j == j
+            && old.axis == axis
+            && old.stiffness_revisions == stiffness_revisions
+    });
+    let (frame, material_k) = if let Some(old) = cached {
+        (old.frame, old.material_k)
     } else {
-        let frame=basis(axis,rotation_i.slerp(rotation_j,0.5));
-        let matrix=stiffness_from_compliances(
-            tensor_compliance_at_solid_fraction(scene,i,frame,phases[0].solid_fraction.clamp(1e-4,1.0)),
-            tensor_compliance_at_solid_fraction(scene,j,frame,phases[1].solid_fraction.clamp(1e-4,1.0)));
-        (frame,matrix)
+        let frame = basis(axis, rotation_i.slerp(rotation_j, 0.5));
+        let matrix = stiffness_from_compliances(
+            tensor_compliance_at_solid_fraction(
+                scene,
+                i,
+                frame,
+                phases[0].solid_fraction.clamp(1e-4, 1.0),
+            ),
+            tensor_compliance_at_solid_fraction(
+                scene,
+                j,
+                frame,
+                phases[1].solid_fraction.clamp(1e-4, 1.0),
+            ),
+        );
+        (frame, matrix)
     };
-    let local = material_k * (1. - scene.bonds[axis][i].damage).max(0.001);
-    let k = frame * local * frame.transpose();
-    // The constitutive tensor is symmetric by construction. Remove roundoff
-    // asymmetry once so the shared edge block can represent its reverse row by
-    // an exact transpose and the global PCG operator remains symmetric.
-    let k = (k + k.transpose()) * 0.5;
     let bond = scene.bonds[axis][i];
-    let rest = frame.as_dmat3()
-        * (bond_thermal_rest_at_temperatures(scene, i, j, frame,
-                [phases[0].temperature_kelvin,phases[1].temperature_kelvin])
-            + DVec3::from_array(bond.formation_offset.map(f64::from))
-            + DVec3::from_array(bond.plastic_strain.map(f64::from)) * DCELL);
+    let rest_input = RestInput {
+        fiber_orientations: [i, j].map(|n| scene.voxels[n].microstructure.orientation),
+        expansion: [i, j].map(|n| {
+            let material = &scene.properties[n];
+            [
+                material.thermal_expansion_parallel,
+                material.thermal_expansion_perpendicular,
+            ]
+        }),
+        temperatures: [phases[0].temperature_kelvin, phases[1].temperature_kelvin],
+        reference_temperatures: [
+            scene.reference_temperatures_kelvin[i],
+            scene.reference_temperatures_kelvin[j],
+        ],
+        formation_offset: bond.formation_offset,
+        plastic_strain: bond.plastic_strain,
+    };
+    let rest = cached
+        .filter(|old| {
+            old.rotation_i == rotation_i
+                && old.rotation_j == rotation_j
+                && old.thermal_energy_i == thermal_energy_i
+                && old.thermal_energy_j == thermal_energy_j
+                && old.rest_input == rest_input
+        })
+        .map(|old| old.rest)
+        .unwrap_or_else(|| {
+            frame.as_dmat3()
+                * (bond_thermal_rest_at_temperatures(
+                    scene,
+                    i,
+                    j,
+                    frame,
+                    [phases[0].temperature_kelvin, phases[1].temperature_kelvin],
+                ) + DVec3::from_array(bond.formation_offset.map(f64::from))
+                    + DVec3::from_array(bond.plastic_strain.map(f64::from)) * DCELL)
+        });
+    let k = cached
+        .filter(|old| old.damage == bond.damage)
+        .map(|old| old.k)
+        .unwrap_or_else(|| {
+            let local = material_k * (1. - bond.damage).max(0.001);
+            let k = frame * local * frame.transpose();
+            // The constitutive tensor is symmetric by construction. Remove
+            // roundoff asymmetry once so the shared edge block can represent
+            // its reverse row by an exact transpose.
+            (k + k.transpose()) * 0.5
+        });
     Constraint {
         i,
         j,
@@ -2485,7 +4175,9 @@ fn make_constraint_at_phases(scene: &Scene, i: usize, axis: usize, j: usize,
         rotation_j,
         thermal_energy_i,
         thermal_energy_j,
+        damage: bond.damage,
         stiffness_revisions,
+        rest_input,
     }
 }
 
@@ -2605,6 +4297,447 @@ fn build_ic0_links(
                 }
             }
         }
+    }
+}
+
+fn ic0_component_root(parent: &mut [u32], mut node: u32) -> u32 {
+    while parent[node as usize] != node {
+        let parent_node = parent[node as usize];
+        parent[node as usize] = parent[parent_node as usize];
+        node = parent[node as usize];
+    }
+    node
+}
+
+// Keep each active matrix component contiguous while preserving the original
+// REV order inside it. Stable intra-component order leaves IC(0)'s triangular
+// arithmetic unchanged; only independent components can move relative to one
+// another. Constraints touching an inactive endpoint do not couple PCG rows.
+fn order_active_by_ic0_components(
+    constraints: &[Constraint],
+    active: &mut Vec<usize>,
+    active_index: &mut [u32],
+    parent: &mut Vec<u32>,
+    root_to_id: &mut Vec<u32>,
+    sizes: &mut Vec<usize>,
+    offsets: &mut Vec<usize>,
+    members: &mut Vec<usize>,
+    ranges: &mut Vec<(usize, usize)>,
+) -> usize {
+    let active_len = active.len();
+    parent.resize(active_len, 0);
+    for (slot, node) in parent.iter_mut().enumerate() {
+        *node = slot as u32;
+    }
+
+    for constraint in constraints {
+        let a = active_index[constraint.i];
+        let b = active_index[constraint.j];
+        if a == u32::MAX || b == u32::MAX {
+            continue;
+        }
+        let root_a = ic0_component_root(parent, a);
+        let root_b = ic0_component_root(parent, b);
+        if root_a != root_b {
+            parent[root_b as usize] = root_a;
+        }
+    }
+
+    root_to_id.resize(active_len, u32::MAX);
+    root_to_id.fill(u32::MAX);
+    sizes.clear();
+    for slot in 0..active_len {
+        let root = ic0_component_root(parent, slot as u32) as usize;
+        let mut id = root_to_id[root];
+        if id == u32::MAX {
+            id = sizes.len() as u32;
+            root_to_id[root] = id;
+            sizes.push(0);
+        }
+        sizes[id as usize] += 1;
+    }
+
+    let component_count = sizes.len();
+    offsets.resize(component_count + 1, 0);
+    for id in 0..component_count {
+        offsets[id + 1] = offsets[id] + sizes[id];
+    }
+    ranges.clear();
+    ranges.extend((0..component_count).map(|id| (offsets[id], offsets[id + 1])));
+
+    // Reuse the component counts as stable scatter cursors after preserving
+    // the final component boundaries above.
+    sizes.copy_from_slice(&offsets[..component_count]);
+    members.resize(active_len, 0);
+    for slot in 0..active_len {
+        let root = ic0_component_root(parent, slot as u32) as usize;
+        let id = root_to_id[root] as usize;
+        let destination = sizes[id];
+        members[destination] = active[slot];
+        sizes[id] += 1;
+    }
+    active.copy_from_slice(members);
+    active_index.fill(u32::MAX);
+    for (slot, &node) in active.iter().enumerate() {
+        active_index[node] = slot as u32;
+    }
+    component_count
+}
+
+// Coalesce small components into a bounded number of contiguous worker slices.
+// This avoids scheduling one Rayon task per voxel when a scene has many islands.
+fn build_ic0_component_batches(
+    ranges: &[(usize, usize)],
+    active_len: usize,
+    batches: &mut Vec<(usize, usize, usize, usize)>,
+) {
+    batches.clear();
+    if ranges.len() < 2 {
+        return;
+    }
+    let target_batches = rayon::current_num_threads()
+        .saturating_mul(4)
+        .max(1)
+        .min(ranges.len());
+    let target_rows = active_len.div_ceil(target_batches);
+    let mut component_start = 0;
+    while component_start < ranges.len() {
+        let remaining_batches = target_batches - batches.len();
+        let max_component_end = ranges.len() - (remaining_batches - 1);
+        let row_start = ranges[component_start].0;
+        let mut component_end = component_start + 1;
+        while component_end < max_component_end
+            && ranges[component_end - 1].1 - row_start < target_rows
+        {
+            component_end += 1;
+        }
+        let row_end = ranges[component_end - 1].1;
+        batches.push((row_start, row_end, component_start, component_end));
+        component_start = component_end;
+    }
+}
+
+fn should_rebuild_cpu_preconditioner(
+    reuse_preconditioner: bool,
+    same_graph: bool,
+    bipartite_graph: bool,
+    cached_bipartite_graph: bool,
+) -> bool {
+    !reuse_preconditioner || !same_graph || bipartite_graph || cached_bipartite_graph
+}
+
+fn split_ic0_work_by_batches<'a>(
+    values: &'a mut [Vec3],
+    batches: &[(usize, usize, usize, usize)],
+) -> Vec<&'a mut [Vec3]> {
+    let total_len = values.len();
+    let mut rest = values;
+    let mut previous_end = 0;
+    let mut chunks = Vec::with_capacity(batches.len());
+    for &(start, end, _, _) in batches {
+        debug_assert_eq!(start, previous_end);
+        let (chunk, tail) = rest.split_at_mut(end - start);
+        chunks.push(chunk);
+        rest = tail;
+        previous_end = end;
+    }
+    debug_assert_eq!(previous_end, total_len);
+    chunks
+}
+
+fn split_mut_by_ranges<'a, T>(values: &'a mut [T], ranges: &[(usize, usize)]) -> Vec<&'a mut [T]> {
+    let total_len = values.len();
+    let mut rest = values;
+    let mut previous_end = 0;
+    let mut chunks = Vec::with_capacity(ranges.len());
+    for &(start, end) in ranges {
+        debug_assert_eq!(start, previous_end);
+        let (chunk, tail) = rest.split_at_mut(end - start);
+        chunks.push(chunk);
+        rest = tail;
+        previous_end = end;
+    }
+    debug_assert_eq!(previous_end, total_len);
+    chunks
+}
+
+struct ComponentPcgState<'a> {
+    start: usize,
+    end: usize,
+    dx: &'a mut [Vec3],
+    ap: &'a mut [Vec3],
+    r: &'a mut [Vec3],
+    z: &'a mut [Vec3],
+    p: &'a mut [Vec3],
+    work: &'a mut [Vec3],
+    iterations: usize,
+    converged: bool,
+}
+
+#[inline]
+fn component_dot(a: &[Vec3], b: &[Vec3]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x.dot(*y) as f64).sum()
+}
+
+fn apply_pcg_component(
+    start: usize,
+    end: usize,
+    active: &[usize],
+    diagonal: &[Mat3],
+    rows: &[PcgRow],
+    edge_blocks: &[[f32; 9]],
+    incidence_len: &[u8],
+    input: &[Vec3],
+    output: &mut [Vec3],
+) {
+    debug_assert_eq!(input.len(), end - start);
+    debug_assert_eq!(output.len(), end - start);
+    for (local, (value, &voxel)) in output.iter_mut().zip(&active[start..end]).enumerate() {
+        let slot = start + local;
+        let row = &rows[slot];
+        let mut result = diagonal[voxel] * input[local];
+        for edge_slot in 0..incidence_len[voxel] as usize {
+            let neighbor = row.neighbors[edge_slot];
+            if neighbor == u32::MAX {
+                continue;
+            }
+            let neighbor = neighbor as usize;
+            debug_assert!((start..end).contains(&neighbor));
+            let block = edge_blocks[row.edge_ids[edge_slot] as usize];
+            result += if row.transpose_mask & (1 << edge_slot) != 0 {
+                apply_pcg_block_transpose(block, input[neighbor - start])
+            } else {
+                apply_pcg_block(block, input[neighbor - start])
+            };
+        }
+        *value = result;
+    }
+}
+
+fn apply_ic0_component(
+    start: usize,
+    active: &[usize],
+    factor_diagonal_inverse: &[Mat3],
+    factor_edges: &[Mat3],
+    lower_links: &[[[u32; 2]; 6]],
+    lower_link_count: &[u8],
+    upper_links: &[[[u32; 2]; 6]],
+    upper_link_count: &[u8],
+    rhs: &[Vec3],
+    work: &mut [Vec3],
+    output: &mut [Vec3],
+) {
+    debug_assert_eq!(rhs.len(), work.len());
+    debug_assert_eq!(rhs.len(), output.len());
+    let end = start + rhs.len();
+    for local in 0..rhs.len() {
+        let slot = start + local;
+        let mut value = rhs[local];
+        for &[edge, neighbor] in &lower_links[slot][..lower_link_count[slot] as usize] {
+            let neighbor = neighbor as usize;
+            debug_assert!((start..end).contains(&neighbor));
+            value -= factor_edges[edge as usize] * work[neighbor - start];
+        }
+        work[local] = factor_diagonal_inverse[active[slot]] * value;
+    }
+    for local in (0..rhs.len()).rev() {
+        let slot = start + local;
+        let mut value = work[local];
+        for &[edge, neighbor] in &upper_links[slot][..upper_link_count[slot] as usize] {
+            let neighbor = neighbor as usize;
+            debug_assert!((start..end).contains(&neighbor));
+            value -= factor_edges[edge as usize].transpose() * output[neighbor - start];
+        }
+        output[local] = factor_diagonal_inverse[active[slot]].transpose() * value;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_pcg_component(
+    state: &mut ComponentPcgState<'_>,
+    active: &[usize],
+    diagonal: &[Mat3],
+    rows: &[PcgRow],
+    edge_blocks: &[[f32; 9]],
+    incidence_len: &[u8],
+    rhs: &[Vec3],
+    factor_diagonal_inverse: &[Mat3],
+    factor_edges: &[Mat3],
+    lower_links: &[[[u32; 2]; 6]],
+    lower_link_count: &[u8],
+    upper_links: &[[[u32; 2]; 6]],
+    upper_link_count: &[u8],
+    relative_tolerance: f64,
+    max_iterations: usize,
+) {
+    let len = state.end - state.start;
+    debug_assert_eq!(state.dx.len(), len);
+    debug_assert_eq!(state.ap.len(), len);
+    debug_assert_eq!(state.r.len(), len);
+    debug_assert_eq!(state.z.len(), len);
+    debug_assert_eq!(state.p.len(), len);
+    debug_assert_eq!(state.work.len(), len);
+
+    let rhs_norm = active[state.start..state.end]
+        .iter()
+        .map(|&voxel| rhs[voxel].dot(rhs[voxel]) as f64)
+        .sum::<f64>()
+        .sqrt();
+    let mut residual_norm = state
+        .r
+        .iter()
+        .map(|value| value.dot(*value) as f64)
+        .sum::<f64>()
+        .sqrt();
+    if residual_norm > rhs_norm {
+        state.dx.fill(Vec3::ZERO);
+        for (local, &voxel) in active[state.start..state.end].iter().enumerate() {
+            state.r[local] = rhs[voxel];
+        }
+        residual_norm = rhs_norm;
+    }
+    if rhs_norm <= 1e-12 || residual_norm / rhs_norm < relative_tolerance {
+        state.converged = true;
+        return;
+    }
+
+    apply_ic0_component(
+        state.start,
+        active,
+        factor_diagonal_inverse,
+        factor_edges,
+        lower_links,
+        lower_link_count,
+        upper_links,
+        upper_link_count,
+        state.r,
+        state.work,
+        state.z,
+    );
+    state.p.copy_from_slice(state.z);
+    let mut rz = component_dot(state.r, state.z);
+
+    for _ in 0..max_iterations {
+        apply_pcg_component(
+            state.start,
+            state.end,
+            active,
+            diagonal,
+            rows,
+            edge_blocks,
+            incidence_len,
+            state.p,
+            state.ap,
+        );
+        let denominator = component_dot(state.p, state.ap);
+        state.iterations += 1;
+        if !denominator.is_finite() || denominator <= 1e-30 || !rz.is_finite() || rz.abs() <= 1e-300
+        {
+            break;
+        }
+
+        let alpha = (rz / denominator) as f32;
+        for local in 0..len {
+            state.dx[local] += alpha * state.p[local];
+            state.r[local] -= alpha * state.ap[local];
+        }
+        residual_norm = state
+            .r
+            .iter()
+            .map(|value| value.dot(*value) as f64)
+            .sum::<f64>()
+            .sqrt();
+
+        if residual_norm / rhs_norm < relative_tolerance {
+            apply_pcg_component(
+                state.start,
+                state.end,
+                active,
+                diagonal,
+                rows,
+                edge_blocks,
+                incidence_len,
+                state.dx,
+                state.ap,
+            );
+            for (local, &voxel) in active[state.start..state.end].iter().enumerate() {
+                state.r[local] = rhs[voxel] - state.ap[local];
+            }
+            residual_norm = state
+                .r
+                .iter()
+                .map(|value| value.dot(*value) as f64)
+                .sum::<f64>()
+                .sqrt();
+            if residual_norm / rhs_norm < relative_tolerance {
+                state.converged = true;
+                break;
+            }
+
+            apply_ic0_component(
+                state.start,
+                active,
+                factor_diagonal_inverse,
+                factor_edges,
+                lower_links,
+                lower_link_count,
+                upper_links,
+                upper_link_count,
+                state.r,
+                state.work,
+                state.z,
+            );
+            state.p.copy_from_slice(state.z);
+            rz = component_dot(state.r, state.z);
+            continue;
+        }
+
+        apply_ic0_component(
+            state.start,
+            active,
+            factor_diagonal_inverse,
+            factor_edges,
+            lower_links,
+            lower_link_count,
+            upper_links,
+            upper_link_count,
+            state.r,
+            state.work,
+            state.z,
+        );
+        let next_rz = component_dot(state.r, state.z);
+        if !next_rz.is_finite() || !rz.is_finite() || rz.abs() <= 1e-300 {
+            break;
+        }
+        let beta = (next_rz / rz) as f32;
+        for local in 0..len {
+            state.p[local] = state.z[local] + beta * state.p[local];
+        }
+        rz = next_rz;
+    }
+
+    if !state.converged {
+        apply_pcg_component(
+            state.start,
+            state.end,
+            active,
+            diagonal,
+            rows,
+            edge_blocks,
+            incidence_len,
+            state.dx,
+            state.ap,
+        );
+        for (local, &voxel) in active[state.start..state.end].iter().enumerate() {
+            state.r[local] = rhs[voxel] - state.ap[local];
+        }
+        let true_residual = state
+            .r
+            .iter()
+            .map(|value| value.dot(*value) as f64)
+            .sum::<f64>()
+            .sqrt();
+        state.converged = true_residual / rhs_norm < relative_tolerance;
     }
 }
 
@@ -2748,10 +4881,7 @@ fn order_active_by_color(
     natural_active.clone_from(active);
     active.sort_by_key(|&i| colors[i]);
     active_index.fill(u32::MAX);
-    let red_count = active
-        .iter()
-        .take_while(|&&i| colors[i] == 0)
-        .count();
+    let red_count = active.iter().take_while(|&&i| colors[i] == 0).count();
     for (slot, &i) in active.iter().enumerate() {
         active_index[i] = slot as u32;
     }
@@ -2913,7 +5043,14 @@ fn build_ic0_with_optional_bipartite(
             factor_edges,
         );
         if std::env::var_os("VOXEL_PROFILE_STEP").is_some() {
-            eprintln!("CPU IC(0) bipartite ordering: {}", if built { "active" } else { "factor rejected; using natural ordering" });
+            eprintln!(
+                "CPU IC(0) bipartite ordering: {}",
+                if built {
+                    "active"
+                } else {
+                    "factor rejected; using natural ordering"
+                }
+            );
         }
         if built {
             return true;
@@ -2971,6 +5108,60 @@ fn apply_ic0(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_ic0_component_batches(
+    factor_diagonal_inverse: &[Mat3],
+    factor_edges: &[Mat3],
+    active: &[usize],
+    ranges: &[(usize, usize)],
+    batches: &[(usize, usize, usize, usize)],
+    lower_links: &[[[u32; 2]; 6]],
+    lower_link_count: &[u8],
+    upper_links: &[[[u32; 2]; 6]],
+    upper_link_count: &[u8],
+    rhs: &[Vec3],
+    work: &mut [Vec3],
+    out: &mut [Vec3],
+) {
+    let work_chunks = split_ic0_work_by_batches(work, batches);
+    let out_chunks = split_ic0_work_by_batches(out, batches);
+    work_chunks
+        .into_par_iter()
+        .zip(out_chunks.into_par_iter())
+        .zip(batches.par_iter())
+        .for_each(
+            |((work, out), &(batch_start, _, component_start, component_end))| {
+                for component in component_start..component_end {
+                    let (start, end) = ranges[component];
+                    for slot in start..end {
+                        let mut value = rhs[slot];
+                        for &[edge, neighbor] in
+                            &lower_links[slot][..lower_link_count[slot] as usize]
+                        {
+                            let neighbor = neighbor as usize;
+                            debug_assert!((start..end).contains(&neighbor));
+                            value -= factor_edges[edge as usize] * work[neighbor - batch_start];
+                        }
+                        work[slot - batch_start] = factor_diagonal_inverse[active[slot]] * value;
+                    }
+                    for slot in (start..end).rev() {
+                        let mut value = work[slot - batch_start];
+                        for &[edge, neighbor] in
+                            &upper_links[slot][..upper_link_count[slot] as usize]
+                        {
+                            let neighbor = neighbor as usize;
+                            debug_assert!((start..end).contains(&neighbor));
+                            value -= factor_edges[edge as usize].transpose()
+                                * out[neighbor - batch_start];
+                        }
+                        out[slot - batch_start] =
+                            factor_diagonal_inverse[active[slot]].transpose() * value;
+                    }
+                }
+            },
+        );
+}
+
 fn apply_ic0_bipartite(
     factor_diagonal_inverse: &[Mat3],
     factor_edges: &[Mat3],
@@ -3013,24 +5204,36 @@ fn apply_ic0_bipartite(
         *value = factor_diagonal_inverse[i] * value_out;
     };
     if parallel_enabled_for(active.len()) {
-        work_black.par_iter_mut().enumerate().for_each(solve_black_forward);
+        work_black
+            .par_iter_mut()
+            .enumerate()
+            .for_each(solve_black_forward);
     } else {
-        work_black.iter_mut().enumerate().for_each(solve_black_forward);
+        work_black
+            .iter_mut()
+            .enumerate()
+            .for_each(solve_black_forward);
     }
     let solve_black_backward = |(local, value): (usize, &mut Vec3)| {
         let i = active[red_count + local];
         *value = factor_diagonal_inverse[i].transpose() * work_black[local];
     };
     if parallel_enabled_for(active.len()) {
-        out_black.par_iter_mut().enumerate().for_each(solve_black_backward);
+        out_black
+            .par_iter_mut()
+            .enumerate()
+            .for_each(solve_black_backward);
     } else {
-        out_black.iter_mut().enumerate().for_each(solve_black_backward);
+        out_black
+            .iter_mut()
+            .enumerate()
+            .for_each(solve_black_backward);
     }
     let solve_red_backward = |(slot, (value, &i)): (usize, (&mut Vec3, &usize))| {
         let mut value_out = work_red[slot];
         for &[edge, neighbor] in &upper_links[slot][..upper_link_count[slot] as usize] {
-            value_out -= factor_edges[edge as usize].transpose()
-                * out_black[neighbor as usize - red_count];
+            value_out -=
+                factor_edges[edge as usize].transpose() * out_black[neighbor as usize - red_count];
         }
         *value = factor_diagonal_inverse[i].transpose() * value_out;
     };
@@ -3058,6 +5261,8 @@ fn apply_preconditioner(
     factor_diagonal_inverse: &[Mat3],
     factor_edges: &[Mat3],
     active: &[usize],
+    ic0_component_ranges: &[(usize, usize)],
+    ic0_component_batches: &[(usize, usize, usize, usize)],
     red_slots: &[usize],
     lower_links: &[[[u32; 2]; 6]],
     lower_link_count: &[u8],
@@ -3081,6 +5286,21 @@ fn apply_preconditioner(
                     factor_edges,
                     active,
                     red_slots,
+                    lower_links,
+                    lower_link_count,
+                    upper_links,
+                    upper_link_count,
+                    rhs,
+                    work,
+                    out,
+                );
+            } else if !ic0_component_batches.is_empty() {
+                apply_ic0_component_batches(
+                    factor_diagonal_inverse,
+                    factor_edges,
+                    active,
+                    ic0_component_ranges,
+                    ic0_component_batches,
                     lower_links,
                     lower_link_count,
                     upper_links,
@@ -3119,30 +5339,42 @@ fn apply_preconditioner(
 }
 
 fn build_multigrid_preconditioner(
-    free: &[Vec3], active: &[usize], active_index: &[u32], diagonal: &[Mat3],
-    incidence: &[[u32; 6]], incidence_len: &[u8], constraints: &[Constraint],
+    free: &[Vec3],
+    active: &[usize],
+    active_index: &[u32],
+    diagonal: &[Mat3],
+    incidence: &[[u32; 6]],
+    incidence_len: &[u8],
+    constraints: &[Constraint],
     rest_positions: &[DVec3],
 ) -> Result<crate::multigrid::Multigrid, &'static str> {
-    let coarsening = std::env::var("VOXEL_MULTIGRID_COARSENING")
-        .unwrap_or_default();
+    let coarsening = std::env::var("VOXEL_MULTIGRID_COARSENING").unwrap_or_default();
     let geometric = coarsening.eq_ignore_ascii_case("geometric")
         || coarsening.eq_ignore_ascii_case("geometric_q1");
     let geometric_q1 = coarsening.eq_ignore_ascii_case("geometric_q1");
     let coordinates = if geometric {
         Some(geometric_multigrid_coordinates(
-            active, active_index, incidence, incidence_len, constraints, rest_positions,
+            active,
+            active_index,
+            incidence,
+            incidence_len,
+            constraints,
+            rest_positions,
         )?)
     } else {
         None
     };
-    let diagonal = active.iter().map(|&i| {
-        let d = diagonal[i];
-        (d + d.transpose()) * 0.5
-    }).collect();
+    let diagonal = active
+        .iter()
+        .map(|&i| {
+            let d = diagonal[i];
+            (d + d.transpose()) * 0.5
+        })
+        .collect();
     let masks = active.iter().map(|&i| free[i]).collect();
-    let mut offsets = Vec::with_capacity(active.len()+1);
-    let mut columns = Vec::with_capacity(active.len()*6);
-    let mut blocks = Vec::with_capacity(active.len()*6);
+    let mut offsets = Vec::with_capacity(active.len() + 1);
+    let mut columns = Vec::with_capacity(active.len() * 6);
+    let mut blocks = Vec::with_capacity(active.len() * 6);
     offsets.push(0);
     for &i in active {
         let pi = Mat3::from_diagonal(free[i]);
@@ -3158,7 +5390,13 @@ fn build_multigrid_preconditioner(
         offsets.push(columns.len());
     }
     crate::multigrid::Multigrid::build(
-        diagonal, masks, offsets, columns, blocks, coordinates, geometric_q1,
+        diagonal,
+        masks,
+        offsets,
+        columns,
+        blocks,
+        coordinates,
+        geometric_q1,
     )
 }
 
@@ -3180,7 +5418,8 @@ fn geometric_multigrid_coordinates(
     let mut coordinates = Vec::with_capacity(active.len());
     let mut unique = rustc_hash::FxHashSet::default();
     for &voxel in active {
-        let position = *rest_positions.get(voxel)
+        let position = *rest_positions
+            .get(voxel)
             .ok_or("missing stable rest position for geometric multigrid")?;
         let mut cell = [0_i64; 3];
         for axis in 0..3 {
@@ -3203,7 +5442,11 @@ fn geometric_multigrid_coordinates(
     for (slot, &voxel) in active.iter().enumerate() {
         for &edge in &incidence[voxel][..incidence_len[voxel] as usize] {
             let constraint = &constraints[edge as usize];
-            let neighbor = if constraint.i == voxel { constraint.j } else { constraint.i };
+            let neighbor = if constraint.i == voxel {
+                constraint.j
+            } else {
+                constraint.i
+            };
             let neighbor_slot = active_index[neighbor];
             if neighbor_slot == u32::MAX {
                 continue;
@@ -3218,6 +5461,235 @@ fn geometric_multigrid_coordinates(
         }
     }
     Ok(coordinates)
+}
+
+/// True residual of the current symmetric operator, evaluated in double precision.
+fn banded_residual(
+    diagonal: &[Mat3],
+    lower: &[(usize, usize, Mat3)],
+    rhs: &[Vec3],
+    dx: &[DVec3],
+    residual: &mut Vec<DVec3>,
+) -> f64 {
+    residual.clear();
+    residual.extend(
+        diagonal
+            .iter()
+            .zip(rhs)
+            .zip(dx)
+            .map(|((&a, &b), &x)| b.as_dvec3() - a.as_dmat3() * x),
+    );
+    for &(row, column, block) in lower {
+        let block = block.as_dmat3();
+        residual[row] -= block * dx[column];
+        residual[column] -= block.transpose() * dx[row];
+    }
+    let rhs_squared: f64 = rhs.iter().map(|b| b.as_dvec3().length_squared()).sum();
+    let residual_squared: f64 = residual.iter().map(|r| r.length_squared()).sum();
+    if rhs_squared > 0.0 {
+        (residual_squared / rhs_squared).sqrt()
+    } else if residual_squared == 0.0 {
+        0.0
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// Small narrow-band zones can reuse a complete factor instead of repeating
+/// thousands of incomplete-factor PCG iterations. An older factor is used only
+/// to propose corrections: acceptance always uses the freshly assembled matrix.
+/// If refinement fails, factor the current matrix once, then fall back to PCG.
+fn try_banded_solve(
+    scene: &mut Scene,
+    h: f32,
+    scratch: &mut SolverScratch,
+) -> Option<(Duration, Duration)> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("VOXEL_CPU_BANDED_DIRECT")
+            .map(|s| s != "0")
+            .unwrap_or(true)
+    });
+    let n = scratch.active.len();
+    if !enabled || n == 0 || n > 4_096 {
+        return None;
+    }
+    let start = Instant::now();
+    scratch.banded_diagonal.clear();
+    scratch
+        .banded_diagonal
+        .extend(scratch.active.iter().map(|&i| scratch.diagonal[i]));
+    scratch.banded_lower.clear();
+    let mut bandwidth = 0usize;
+    for constraint in &scratch.constraints {
+        let i = scratch.active_index[constraint.i];
+        let j = scratch.active_index[constraint.j];
+        if i == u32::MAX || j == u32::MAX {
+            continue;
+        }
+        let pi = Mat3::from_diagonal(scratch.free[constraint.i]);
+        let pj = Mat3::from_diagonal(scratch.free[constraint.j]);
+        let block = -pi * constraint.k * pj;
+        let (row, column, lower) = if i > j {
+            (i as usize, j as usize, block)
+        } else {
+            (j as usize, i as usize, block.transpose())
+        };
+        bandwidth = bandwidth.max(row - column);
+        scratch.banded_lower.push((row, column, lower));
+    }
+    // Bound both factor memory and O(n * bandwidth²) construction cost. Broad
+    // graphs keep the existing PCG/multigrid path rather than using dense storage.
+    if bandwidth > 96 || n.saturating_mul(bandwidth + 1) > 400_000 {
+        return None;
+    }
+    scratch.banded_rhs.clear();
+    scratch
+        .banded_rhs
+        .extend(scratch.active.iter().map(|&i| scratch.rhs[i]));
+    let mut factor_time = Duration::ZERO;
+    let mut rebuilt = false;
+    // Partial axis constraints retain a vector row: equal active counts do NOT
+    // imply the same system. Keep factors for the exact free-axis masks so
+    // contact activation/release does not rebuild the same factors every step.
+    // Graph/material changes still require the current-operator residual check.
+    if scratch.banded_factor_free != scratch.free {
+        if let Some(previous) = scratch.banded_factor.take() {
+            if scratch.banded_factor_pool.len() == 4 {
+                scratch.banded_factor_pool.remove(0);
+            }
+            scratch
+                .banded_factor_pool
+                .push((std::mem::take(&mut scratch.banded_factor_free), previous));
+        }
+        if let Some(slot) = scratch
+            .banded_factor_pool
+            .iter()
+            .position(|(free, _)| *free == scratch.free)
+        {
+            let (free, factor) = scratch.banded_factor_pool.swap_remove(slot);
+            scratch.banded_factor_free = free;
+            scratch.banded_factor = Some(factor);
+        } else {
+            scratch.banded_factor_free.clone_from(&scratch.free);
+        }
+    }
+    let mut accepted = None;
+    for _attempt in 0..2 {
+        if scratch.banded_factor.is_none() {
+            let factor_start = Instant::now();
+            scratch.banded_factor = crate::banded::BandedFactor::factor(
+                &scratch.banded_diagonal,
+                &scratch.banded_lower,
+                96,
+            )
+            .ok();
+            factor_time += factor_start.elapsed();
+            rebuilt = true;
+        }
+        let Some(factor) = scratch.banded_factor.as_ref() else {
+            break;
+        };
+        scratch.banded_rhs.clear();
+        scratch
+            .banded_rhs
+            .extend(scratch.active.iter().map(|&i| scratch.rhs[i]));
+        if factor
+            .solve(&scratch.banded_rhs, &mut scratch.banded_dx)
+            .is_err()
+        {
+            scratch.banded_factor = None;
+            break;
+        }
+        for correction in 0..=3 {
+            let relative = banded_residual(
+                &scratch.banded_diagonal,
+                &scratch.banded_lower,
+                &scratch.banded_rhs,
+                &scratch.banded_dx,
+                &mut scratch.banded_residual,
+            );
+            if relative.is_finite() && relative <= f64::from(scene.config.solver_relative_tolerance)
+            {
+                accepted = Some((relative, correction));
+                break;
+            }
+            if correction == 3 || !relative.is_finite() {
+                break;
+            }
+            // Solve the small residual, then add the correction in f64. Casting
+            // the residual to f32 does not round the accumulated displacement.
+            scratch.banded_rhs.clear();
+            scratch
+                .banded_rhs
+                .extend(scratch.banded_residual.iter().map(|r| r.as_vec3()));
+            let correction_result =
+                factor.solve(&scratch.banded_rhs, &mut scratch.banded_correction);
+            scratch.banded_rhs.clear();
+            scratch
+                .banded_rhs
+                .extend(scratch.active.iter().map(|&i| scratch.rhs[i]));
+            if correction_result.is_err() {
+                break;
+            }
+            for (dx, correction) in scratch.banded_dx.iter_mut().zip(&scratch.banded_correction) {
+                *dx += *correction;
+            }
+        }
+        if accepted.is_some() || rebuilt {
+            break;
+        }
+        scratch.banded_factor = None;
+    }
+    let (relative, corrections) = accepted?;
+    scene.solver_residual = relative as f32;
+    if std::env::var_os("VOXEL_AUDIT_PCG_RESIDUAL").is_some() {
+        scratch.banded_correction.clear();
+        scratch.banded_correction.extend(
+            scratch
+                .active
+                .iter()
+                .zip(&scratch.banded_dx)
+                .map(|(&i, &dx)| (scene.positions[i] + dx) - scene.positions[i]),
+        );
+        let applied_relative = banded_residual(
+            &scratch.banded_diagonal,
+            &scratch.banded_lower,
+            &scratch.banded_rhs,
+            &scratch.banded_correction,
+            &mut scratch.banded_residual,
+        );
+        let position_rounding_l2_m = scratch
+            .banded_dx
+            .iter()
+            .zip(&scratch.banded_correction)
+            .map(|(a, b)| (*a - *b).length_squared())
+            .sum::<f64>()
+            .sqrt();
+        let audit = crate::scene::SolverResidualAudit {
+            correction_relative: relative,
+            applied_relative,
+            position_rounding_l2_m,
+        };
+        report_residual_audit("cpu-banded-f64", scene.solver_residual, audit);
+        scene.solver_max_audited_residual = Some(worst_audited_residual(
+            scene.solver_max_audited_residual,
+            audit,
+        ));
+        scene.solver_residual_audit = Some(audit);
+    }
+    for (&i, &dx) in scratch.active.iter().zip(&scratch.banded_dx) {
+        scene.positions[i] += dx;
+    }
+    for c in &scratch.constraints {
+        let force = c.k * (scene.positions[c.j] - scene.positions[c.i] - c.rest).as_vec3();
+        scene.workspace[c.axis][c.i].lambda = -c.frame.transpose() * force * (h * h);
+    }
+    let solve_time = start.elapsed().saturating_sub(factor_time);
+    if std::env::var_os("VOXEL_PROFILE_PCG_SOLVE").is_some() {
+        eprintln!("CPU banded f64 solve: active={n} bandwidth={bandwidth} rebuilt={rebuilt} corrections={corrections} residual={relative:.3e} elapsed={:.2}ms", start.elapsed().as_secs_f64() * 1000.0);
+    }
+    Some((factor_time, solve_time))
 }
 
 /// Primal form of the coupled vector XPBD system for a frozen corotational frame.
@@ -3237,6 +5709,46 @@ fn solve_coupled(
     let assembly_start = Instant::now();
     scene.solver_residual_audit = None;
     let n = scene.voxels.len();
+    if scene.has_registered_rigid_candidates() {
+        let no_fine_degrees_of_freedom = (0..n).all(|i| {
+            scene.aggregate_of[i].is_some()
+                || scene.voxels[i].kinematic
+                || targets[i].iter().all(Option::is_some)
+        });
+        let bonds_are_coarse = scene.bonds.iter().all(|bonds| {
+            bonds.iter().enumerate().all(|(i, bond)| {
+                if bond.neighbor == EMPTY {
+                    return true;
+                }
+                // Kinematic-only bonds have no mechanical unknown and their
+                // owner is excluded from fracture updates. An unrelated fixed
+                // floor must not force assembly of every coarse body's bonds.
+                if scene.voxels[i].kinematic
+                    && scene.voxels[bond.neighbor as usize].kinematic
+                {
+                    return true;
+                }
+                let Some(id) = scene.aggregate_of[i] else {
+                    return false;
+                };
+                scene.aggregate_of[bond.neighbor as usize] == Some(id)
+            })
+        });
+        if no_fine_degrees_of_freedom && bonds_are_coarse {
+            // Aggregates already advanced from their conserved rigid-body
+            // momentum. Their retained REV bonds must not be rebuilt and
+            // re-evaluated as fine constraints every step; they are restored
+            // unchanged if a later interaction wakes the component.
+            scratch.constraints.clear();
+            scratch.constraint_forces.clear();
+            scratch.assembly_phase_strengths.resize(n, (1.0, 1.0));
+            scene.solver_residual = 0.0;
+            return (
+                0,
+                [assembly_start.elapsed(), Duration::ZERO, Duration::ZERO],
+            );
+        }
+    }
     scratch.free.clear();
     scratch
         .free
@@ -3275,10 +5787,23 @@ fn solve_coupled(
             "cuda" => true,
             _ => active_count >= 2_048,
         };
+    // Per-REV constitutive inputs and row initialization are independent. Keep
+    // them parallel only for large active zones; bond compaction and each
+    // REV's ordered force gather retain their stable serial accumulation order.
+    let parallel_assembly = parallel_enabled_for(n) || (try_cuda && n >= 4_096);
+    let parallel_precompute = parallel_assembly && parallel_assembly_precompute_enabled();
     scratch.masses.clear();
-    scratch
-        .masses
-        .extend(scene.voxels.iter().map(|v| v.mass / (h * h)));
+    if parallel_precompute {
+        scene
+            .voxels
+            .par_iter()
+            .map(|v| v.mass / (h * h))
+            .collect_into_vec(&mut scratch.masses);
+    } else {
+        scratch
+            .masses
+            .extend(scene.voxels.iter().map(|v| v.mass / (h * h)));
+    }
     // The bond graph is face-connected, so each voxel can touch at most six
     // constraints. Fixed slots avoid millions of tiny heap allocations on a
     // large scene, while preserving the same per-node gather in the solver.
@@ -3288,10 +5813,23 @@ fn solve_coupled(
     scratch.incidence_len.fill(0);
     scratch.diagonal.resize(n, Mat3::ZERO);
     scratch.rhs.resize(n, Vec3::ZERO);
-    for i in 0..n {
-        scratch.diagonal[i] = Mat3::from_diagonal(Vec3::splat(scratch.masses[i]));
-        scratch.rhs[i] = (predicted[i] - scene.positions[i]).as_vec3() * scratch.masses[i]
+    let initialize_row = |i: usize, diagonal: &mut Mat3, rhs: &mut Vec3| {
+        let mass = scratch.masses[i];
+        *diagonal = Mat3::from_diagonal(Vec3::splat(mass));
+        *rhs = (predicted[i] - scene.positions[i]).as_vec3() * mass
             + loads.get(i).copied().unwrap_or(Vec3::ZERO);
+    };
+    if parallel_precompute {
+        scratch
+            .diagonal
+            .par_iter_mut()
+            .zip(scratch.rhs.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (diagonal, rhs))| initialize_row(i, diagonal, rhs));
+    } else {
+        for i in 0..n {
+            initialize_row(i, &mut scratch.diagonal[i], &mut scratch.rhs[i]);
+        }
     }
     // Constraint constitutive matrices are independent across bonds. Build
     // them in parallel for large zones, then consume the stable axis-major
@@ -3301,38 +5839,97 @@ fn solve_coupled(
     // incident bonds and by stiffness/thermal expansion. Rebuilt on every
     // assembly so heat, composition and mass changes cannot leave stale data.
     scratch.assembly_phases.clear();
-    scratch.assembly_phase_strengths.clear();
-    for (voxel, material) in scene.voxels.iter().zip(&scene.properties) {
-        let phase = material.phase_state(voxel.mass, voxel.thermal_energy_f32());
-        scratch.assembly_phase_strengths.push((
-            phase.solid_fraction.clamp(0.0, 1.0),
-            material.thermal_strength_scale(phase.temperature_kelvin),
-        ));
-        scratch.assembly_phases.push(phase);
-    }
-    scratch.stiffness_inputs.truncate(n);
-    scratch.stiffness_revisions.truncate(n);
-    for i in 0..n {
-        let material=&scene.properties[i];
-        let micro=scene.voxels[i].microstructure;
-        let input=StiffnessInput {
-            rotation:scene.rotations[i],
-            world_fiber:scene.rotations[i]*micro.fibers(),
-            anisotropy:micro.anisotropy,
-            moduli:Vec3::new(material.young,material.young_perp,material.shear),
-            solid:scratch.assembly_phases[i].solid_fraction.clamp(1e-4,1.0),
-        };
-        if i==scratch.stiffness_inputs.len() {
-            scratch.stiffness_inputs.push(input);
-            scratch.stiffness_revisions.push(1);
-        } else if scratch.stiffness_inputs[i]!=input {
-            scratch.stiffness_inputs[i]=input;
-            scratch.stiffness_revisions[i]=scratch.stiffness_revisions[i].wrapping_add(1);
+    if parallel_precompute {
+        scene
+            .voxels
+            .par_iter()
+            .zip(scene.properties.par_iter())
+            .map(|(voxel, material)| material.phase_state(voxel.mass, voxel.thermal_energy_f32()))
+            .collect_into_vec(&mut scratch.assembly_phases);
+    } else {
+        for (voxel, material) in scene.voxels.iter().zip(&scene.properties) {
+            scratch
+                .assembly_phases
+                .push(material.phase_state(voxel.mass, voxel.thermal_energy_f32()));
         }
     }
+    scratch.assembly_phase_strengths.clear();
+    if parallel_precompute {
+        scratch
+            .assembly_phases
+            .par_iter()
+            .zip(scene.properties.par_iter())
+            .map(|(phase, material)| {
+                (
+                    phase.solid_fraction.clamp(0.0, 1.0),
+                    material.thermal_strength_scale(phase.temperature_kelvin),
+                )
+            })
+            .collect_into_vec(&mut scratch.assembly_phase_strengths);
+    } else {
+        for (phase, material) in scratch.assembly_phases.iter().zip(&scene.properties) {
+            scratch.assembly_phase_strengths.push((
+                phase.solid_fraction.clamp(0.0, 1.0),
+                material.thermal_strength_scale(phase.temperature_kelvin),
+            ));
+        }
+    }
+    let previous_stiffness_len = scratch
+        .stiffness_inputs
+        .len()
+        .min(scratch.stiffness_revisions.len())
+        .min(n);
+    scratch.stiffness_inputs.truncate(previous_stiffness_len);
+    scratch.stiffness_revisions.truncate(previous_stiffness_len);
+    scratch.stiffness_inputs.resize(
+        n,
+        StiffnessInput {
+            rotation: Quat::IDENTITY,
+            world_fiber: Vec3::ZERO,
+            anisotropy: 0.0,
+            moduli: Vec3::ZERO,
+            solid: 0.0,
+        },
+    );
+    scratch.stiffness_revisions.resize(n, 0);
     let phases = &scratch.assembly_phases;
-    let revisions=&scratch.stiffness_revisions;
-    let free = &scratch.free;
+    let update_stiffness = |i: usize, cached: &mut StiffnessInput, revision: &mut u64| {
+        let material = &scene.properties[i];
+        let micro = scene.voxels[i].microstructure;
+        let input = StiffnessInput {
+            rotation: scene.rotations[i],
+            world_fiber: scene.rotations[i] * micro.fibers(),
+            anisotropy: micro.anisotropy,
+            moduli: Vec3::new(material.young, material.young_perp, material.shear),
+            solid: phases[i].solid_fraction.clamp(1e-4, 1.0),
+        };
+        if i < previous_stiffness_len {
+            if *cached != input {
+                *cached = input;
+                *revision = revision.wrapping_add(1);
+            }
+        } else {
+            *cached = input;
+            *revision = 1;
+        }
+    };
+    if parallel_precompute {
+        scratch
+            .stiffness_inputs
+            .par_iter_mut()
+            .zip(scratch.stiffness_revisions.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (cached, revision))| update_stiffness(i, cached, revision));
+    } else {
+        for i in 0..n {
+            update_stiffness(
+                i,
+                &mut scratch.stiffness_inputs[i],
+                &mut scratch.stiffness_revisions[i],
+            );
+        }
+    }
+    let revisions = &scratch.stiffness_revisions;
     let build_constraint = |slot: usize, previous: Option<Constraint>| {
         let axis = slot / n;
         let i = slot % n;
@@ -3341,15 +5938,24 @@ fn solve_coupled(
             return None;
         }
         let j = bond.neighbor as usize;
-        if free[i] == Vec3::ZERO && free[j] == Vec3::ZERO && scene.voxels[i].kinematic {
+        // Only a bond between two truly kinematic REVs has no mechanical
+        // response or fracture owner. A prescribed deformable REV still
+        // needs its material constraint for support/fracture bookkeeping.
+        if scene.voxels[i].kinematic && scene.voxels[j].kinematic {
             return None;
         }
-        Some(make_constraint_at_phases(scene, i, axis, j,[phases[i],phases[j]],
-            [revisions[i],revisions[j]],previous))
+        Some(make_constraint_at_phases(
+            scene,
+            i,
+            axis,
+            j,
+            [phases[i], phases[j]],
+            [revisions[i], revisions[j]],
+            previous,
+        ))
     };
     // The CUDA PCG backend leaves the host free to assemble independent bond
     // rows in parallel. Keep CPU-PCG's measured serial cutoff unchanged.
-    let parallel_assembly = parallel_enabled_for(n) || (try_cuda && n >= 4_096);
     if parallel_assembly {
         scratch
             .constraint_slots
@@ -3398,7 +6004,8 @@ fn solve_coupled(
             return;
         }
         *force = constraint.k
-            * (scene.positions[constraint.j] - scene.positions[constraint.i] - constraint.rest).as_vec3();
+            * (scene.positions[constraint.j] - scene.positions[constraint.i] - constraint.rest)
+                .as_vec3();
     };
     if parallel_assembly {
         forces
@@ -3449,9 +6056,13 @@ fn solve_coupled(
             projection * scratch.diagonal[i] * projection + Mat3::IDENTITY - projection;
     }
     let assembly_time = assembly_start.elapsed();
+    if !try_cuda && scene.config.cpu_preconditioner == CpuPreconditioner::IncompleteCholesky0 {
+        if let Some((factor_time, solve_time)) = try_banded_solve(scene, h, scratch) {
+            return (0, [assembly_time, factor_time, solve_time]);
+        }
+    }
     let bipartite_ic0_requested = !try_cuda
-        && scene.config.cpu_preconditioner
-        == CpuPreconditioner::IncompleteCholesky0
+        && scene.config.cpu_preconditioner == CpuPreconditioner::IncompleteCholesky0
         && bipartite_ic0_enabled();
     let bipartite_ic0_graph = bipartite_ic0_requested
         && color_active_graph(
@@ -3475,6 +6086,42 @@ fn solve_coupled(
             &mut scratch.ic0_natural_active,
         );
     }
+    let component_ic0_disabled = std::env::var("VOXEL_IC0_COMPONENT_PARALLEL")
+        .map(|value| matches!(value.as_str(), "0" | "false" | "off"))
+        .unwrap_or(false);
+    let mut component_ic0 = !try_cuda
+        && !bipartite_ic0_graph
+        && !component_ic0_disabled
+        && scene.cluster_count > 1
+        && parallel_enabled_for(active_count)
+        && scene.config.cpu_preconditioner == CpuPreconditioner::IncompleteCholesky0;
+    if component_ic0 {
+        let component_count = order_active_by_ic0_components(
+            &scratch.constraints,
+            &mut scratch.active,
+            &mut scratch.active_index,
+            &mut scratch.ic0_component_parent,
+            &mut scratch.ic0_component_root_to_id,
+            &mut scratch.ic0_component_sizes,
+            &mut scratch.ic0_component_offsets,
+            &mut scratch.ic0_component_members,
+            &mut scratch.ic0_component_ranges,
+        );
+        component_ic0 = component_count > 1;
+        if component_ic0 {
+            build_ic0_component_batches(
+                &scratch.ic0_component_ranges,
+                active_count,
+                &mut scratch.ic0_component_batches,
+            );
+        } else {
+            scratch.ic0_component_ranges.clear();
+            scratch.ic0_component_batches.clear();
+        }
+    } else {
+        scratch.ic0_component_ranges.clear();
+        scratch.ic0_component_batches.clear();
+    }
     let factor_start = Instant::now();
     // A stale factorization is still a valid SPD PCG preconditioner. Reuse it
     // across physical substeps only when the exact DOF mask, ordered bond
@@ -3484,6 +6131,7 @@ fn solve_coupled(
         && scratch.cpu_preconditioner_ready
         && scratch.cpu_preconditioner_kind == Some(scene.config.cpu_preconditioner)
         && scratch.cpu_preconditioner_bipartite == bipartite_ic0_graph
+        && scratch.cpu_preconditioner_components == component_ic0
         && scratch.cpu_preconditioner_free == scratch.free
         && scratch.cpu_preconditioner_graph.len() == scratch.constraints.len()
         && scratch
@@ -3496,9 +6144,12 @@ fn solve_coupled(
     // The opt-in bipartite path changes the row permutation. Never reuse a
     // factor built for a different permutation/topology: doing so pairs the
     // cached triangular factor with unrelated active slots.
-    let rebuild_cpu_preconditioner =
-        (!reuse_preconditioner || bipartite_ic0_graph || scratch.cpu_preconditioner_bipartite)
-            && !same_cpu_preconditioner_graph;
+    let rebuild_cpu_preconditioner = should_rebuild_cpu_preconditioner(
+        reuse_preconditioner,
+        same_cpu_preconditioner_graph,
+        bipartite_ic0_graph,
+        scratch.cpu_preconditioner_bipartite,
+    );
     if rebuild_cpu_preconditioner {
         scratch.cpu_preconditioner_ready = false;
         scratch.multigrid = None;
@@ -3507,17 +6158,17 @@ fn solve_coupled(
             match scene.config.cpu_preconditioner {
                 CpuPreconditioner::IncompleteCholesky0 => {
                     scratch.cpu_preconditioner_bipartite = build_ic0_with_optional_bipartite(
-                    scene,
-                    &scratch.free,
-                    &scratch.diagonal,
-                    &scratch.incidence,
-                    &scratch.incidence_len,
-                    &scratch.constraints,
-                    bipartite_ic0_graph,
-                    &scratch.ic0_colors,
-                    &mut scratch.factor_matrix,
-                    &mut scratch.factor_diagonal,
-                    &mut scratch.factor_edges,
+                        scene,
+                        &scratch.free,
+                        &scratch.diagonal,
+                        &scratch.incidence,
+                        &scratch.incidence_len,
+                        &scratch.constraints,
+                        bipartite_ic0_graph,
+                        &scratch.ic0_colors,
+                        &mut scratch.factor_matrix,
+                        &mut scratch.factor_diagonal,
+                        &mut scratch.factor_edges,
                     )
                 }
                 CpuPreconditioner::BlockJacobi | CpuPreconditioner::AggregationMultigrid => {
@@ -3566,6 +6217,7 @@ fn solve_coupled(
                 }
             }
             scratch.cpu_preconditioner_ready = true;
+            scratch.cpu_preconditioner_components = component_ic0;
             scratch.cpu_preconditioner_free.clone_from(&scratch.free);
             scratch.cpu_preconditioner_graph.clear();
             scratch
@@ -3590,21 +6242,11 @@ fn solve_coupled(
             pack_pcg_block(-row_projection * constraint.k * column_projection);
     }
     for (slot, &i) in active.iter().enumerate() {
-        let row = &mut scratch.pcg_rows[slot];
-        for (edge_slot, &edge) in incidence[i][..incidence_len[i] as usize].iter().enumerate() {
-            let constraint = &constraints[edge as usize];
-            let neighbor = if constraint.i == i {
-                constraint.j
-            } else {
-                constraint.i
-            };
-            let neighbor_index = active_index[neighbor];
-            row.neighbors[edge_slot] = neighbor_index;
-            row.edge_ids[edge_slot] = edge;
-            if constraint.i != i {
-                row.transpose_mask |= 1 << edge_slot;
-            }
-        }
+        // A changed contact mask or fracture can shorten or reorder incidence.
+        // Old neighbors and transpose bits do not belong to the new operator.
+        scratch.pcg_rows[slot] = assemble_pcg_row(
+            i, &incidence[i][..incidence_len[i] as usize], constraints, active_index,
+        );
     }
     let pcg_rows = &scratch.pcg_rows;
     let pcg_edge_blocks = &scratch.pcg_edge_blocks;
@@ -3613,8 +6255,16 @@ fn solve_coupled(
         && (rebuild_cpu_preconditioner || scratch.multigrid.is_none())
     {
         let start = Instant::now();
-        match build_multigrid_preconditioner(free, active, active_index, &scratch.diagonal,
-            incidence, incidence_len, constraints, &scene.rest_positions) {
+        match build_multigrid_preconditioner(
+            free,
+            active,
+            active_index,
+            &scratch.diagonal,
+            incidence,
+            incidence_len,
+            constraints,
+            &scene.rest_positions,
+        ) {
             Ok(hierarchy) => scratch.multigrid = Some(hierarchy),
             Err(reason) => {
                 scratch.multigrid = None;
@@ -3624,23 +6274,23 @@ fn solve_coupled(
         factor_time += start.elapsed();
     }
     let apply_one = |v: &[Vec3], slot: usize| {
-            let i = active[slot];
-            let vi = v[slot];
-            let row = &pcg_rows[slot];
-            let mut value = scratch.diagonal[i] * vi;
-            for edge_slot in 0..incidence_len[i] as usize {
-                let neighbor = row.neighbors[edge_slot];
-                if neighbor != u32::MAX {
-                    let block = pcg_edge_blocks[row.edge_ids[edge_slot] as usize];
-                    let transpose = row.transpose_mask & (1 << edge_slot) != 0;
-                    value += if transpose {
-                        apply_pcg_block_transpose(block, v[neighbor as usize])
-                    } else {
-                        apply_pcg_block(block, v[neighbor as usize])
-                    };
-                }
+        let i = active[slot];
+        let vi = v[slot];
+        let row = &pcg_rows[slot];
+        let mut value = scratch.diagonal[i] * vi;
+        for edge_slot in 0..incidence_len[i] as usize {
+            let neighbor = row.neighbors[edge_slot];
+            if neighbor != u32::MAX {
+                let block = pcg_edge_blocks[row.edge_ids[edge_slot] as usize];
+                let transpose = row.transpose_mask & (1 << edge_slot) != 0;
+                value += if transpose {
+                    apply_pcg_block_transpose(block, v[neighbor as usize])
+                } else {
+                    apply_pcg_block(block, v[neighbor as usize])
+                };
             }
-            value
+        }
+        value
     };
     let apply = |v: &[Vec3], out: &mut [Vec3]| {
         if !parallel_enabled_for(active.len()) {
@@ -3682,30 +6332,26 @@ fn solve_coupled(
                 .sum()
         }
     };
-    let update_and_norm = |dx: &mut [Vec3],
-                           r: &mut [Vec3],
-                           p: &[Vec3],
-                           ap: &[Vec3],
-                           alpha: f32|
-     -> f64 {
-        if !parallel_enabled_for(active_count) {
-            for i in 0..active_count {
-                dx[i] += alpha * p[i];
-                r[i] -= alpha * ap[i];
+    let update_and_norm =
+        |dx: &mut [Vec3], r: &mut [Vec3], p: &[Vec3], ap: &[Vec3], alpha: f32| -> f64 {
+            if !parallel_enabled_for(active_count) {
+                for i in 0..active_count {
+                    dx[i] += alpha * p[i];
+                    r[i] -= alpha * ap[i];
+                }
+                r.iter().map(|value| value.dot(*value) as f64).sum()
+            } else {
+                dx.par_iter_mut()
+                    .zip(r.par_iter_mut())
+                    .zip(p.par_iter().zip(ap.par_iter()))
+                    .map(|((dx, r), (p, ap))| {
+                        *dx += alpha * *p;
+                        *r -= alpha * *ap;
+                        r.dot(*r) as f64
+                    })
+                    .sum()
             }
-            r.iter().map(|value| value.dot(*value) as f64).sum()
-        } else {
-            dx.par_iter_mut()
-                .zip(r.par_iter_mut())
-                .zip(p.par_iter().zip(ap.par_iter()))
-                .map(|((dx, r), (p, ap))| {
-                    *dx += alpha * *p;
-                    *r -= alpha * *ap;
-                    r.dot(*r) as f64
-                })
-                .sum()
-        }
-    };
+        };
     // Reuse a preceding correction on either backend. It is only an initial
     // iterate: check the NEW system residual against its original RHS and
     // discard the guess if it is worse than starting from zero.
@@ -3723,7 +6369,7 @@ fn solve_coupled(
     if !warm_start {
         scratch.dx.fill(Vec3::ZERO);
     } else {
-        for (slot,&i) in active.iter().enumerate() {
+        for (slot, &i) in active.iter().enumerate() {
             scratch.dx[slot] *= free[i];
         }
     }
@@ -3742,8 +6388,10 @@ fn solve_coupled(
     let mut residual_norm = dot(&scratch.r, &scratch.r).sqrt();
     if warm_start && residual_norm > rhs_norm {
         scratch.dx.fill(Vec3::ZERO);
-        for (slot,&i) in active.iter().enumerate() { scratch.r[slot]=scratch.rhs[i]; }
-        residual_norm=rhs_norm;
+        for (slot, &i) in active.iter().enumerate() {
+            scratch.r[slot] = scratch.rhs[i];
+        }
+        residual_norm = rhs_norm;
     }
     scene.solver_residual = if rhs_norm > 1e-12 {
         (residual_norm / rhs_norm) as f32
@@ -3751,6 +6399,7 @@ fn solve_coupled(
         0.0
     };
     scratch.z.resize(active_count, Vec3::ZERO);
+    scratch.p.resize(active_count, Vec3::ZERO);
     scratch.preconditioner_work.resize(active_count, Vec3::ZERO);
     let pcg_start = Instant::now();
     let profile_cuda = std::env::var_os("VOXEL_PROFILE_STEP").is_some();
@@ -3761,22 +6410,40 @@ fn solve_coupled(
         cuda_solution = Some(0);
     } else if try_cuda {
         scratch.cuda_neighbors.resize(active_count, [u32::MAX; 6]);
-        scratch.cuda_blocks.resize(active_count, [0.0; 54]);
-        scratch.cuda_blocks.fill([0.0; 54]);
+        let compact_edges = crate::cuda_solver::expand_edge_blocks_on_gpu_enabled();
+        if compact_edges {
+            scratch.cuda_blocks.clear();
+            scratch.cuda_edge_ids.resize(active_count, [u32::MAX; 6]);
+            scratch.cuda_transpose_masks.resize(active_count, 0);
+        } else {
+            scratch.cuda_blocks.resize(active_count, [0.0; 54]);
+            scratch.cuda_blocks.fill([0.0; 54]);
+        }
         scratch.cuda_diagonal.resize(active_count, [0.0; 9]);
-        scratch.cuda_inverse.resize(active_count, [0.0; 9]);
+        let inverse_on_gpu = crate::cuda_solver::inverse_diagonal_on_gpu_enabled();
+        if inverse_on_gpu {
+            scratch.cuda_inverse.clear();
+        } else {
+            scratch.cuda_inverse.resize(active_count, [0.0; 9]);
+        }
         for (slot, &i) in active.iter().enumerate() {
             scratch.cuda_neighbors[slot] = scratch.pcg_rows[slot].neighbors;
-            for edge_slot in 0..incidence_len[i] as usize {
-                let edge = scratch.pcg_rows[slot].edge_ids[edge_slot] as usize;
-                let block = scratch.pcg_edge_blocks[edge];
-                let packed_block = if scratch.pcg_rows[slot].transpose_mask & (1 << edge_slot) != 0 {
-                    transpose_pcg_block(block)
-                } else {
-                    block
-                };
-                let packed = &mut scratch.cuda_blocks[slot][edge_slot * 9..edge_slot * 9 + 9];
-                packed.copy_from_slice(&packed_block);
+            if compact_edges {
+                scratch.cuda_edge_ids[slot] = scratch.pcg_rows[slot].edge_ids;
+                scratch.cuda_transpose_masks[slot] = scratch.pcg_rows[slot].transpose_mask;
+            } else {
+                for edge_slot in 0..incidence_len[i] as usize {
+                    let edge = scratch.pcg_rows[slot].edge_ids[edge_slot] as usize;
+                    let block = scratch.pcg_edge_blocks[edge];
+                    let packed_block = if scratch.pcg_rows[slot].transpose_mask & (1 << edge_slot) != 0
+                    {
+                        transpose_pcg_block(block)
+                    } else {
+                        block
+                    };
+                    let packed = &mut scratch.cuda_blocks[slot][edge_slot * 9..edge_slot * 9 + 9];
+                    packed.copy_from_slice(&packed_block);
+                }
             }
             let diagonal = scratch.diagonal[i];
             scratch.cuda_diagonal[slot] = [
@@ -3790,18 +6457,20 @@ fn solve_coupled(
                 diagonal.y_axis.z,
                 diagonal.z_axis.z,
             ];
-            let inverse = scratch.diagonal[i].inverse();
-            scratch.cuda_inverse[slot] = [
-                inverse.x_axis.x,
-                inverse.y_axis.x,
-                inverse.z_axis.x,
-                inverse.x_axis.y,
-                inverse.y_axis.y,
-                inverse.z_axis.y,
-                inverse.x_axis.z,
-                inverse.y_axis.z,
-                inverse.z_axis.z,
-            ];
+            if !inverse_on_gpu {
+                let inverse = scratch.diagonal[i].inverse();
+                scratch.cuda_inverse[slot] = [
+                    inverse.x_axis.x,
+                    inverse.y_axis.x,
+                    inverse.z_axis.x,
+                    inverse.x_axis.y,
+                    inverse.y_axis.y,
+                    inverse.z_axis.y,
+                    inverse.x_axis.z,
+                    inverse.y_axis.z,
+                    inverse.z_axis.z,
+                ];
+            }
         }
         match crate::cuda_solver::solve_pcg(
             &scratch.r,
@@ -3811,11 +6480,16 @@ fn solve_coupled(
             &scratch.cuda_inverse,
             cuda_iterations,
             if warm_start && residual_norm > 0.0 {
-                (scene.config.solver_relative_tolerance as f64 * rhs_norm / residual_norm)
-                    .min(1.0) as f32
+                (scene.config.solver_relative_tolerance as f64 * rhs_norm / residual_norm).min(1.0)
+                    as f32
             } else {
                 scene.config.solver_relative_tolerance
             },
+            compact_edges.then_some(crate::cuda_solver::CompactEdgeBlocks {
+                edges: &scratch.pcg_edge_blocks,
+                edge_ids: &scratch.cuda_edge_ids,
+                transpose_masks: &scratch.cuda_transpose_masks,
+            }),
         ) {
             Ok((correction, iterations, residual)) => {
                 if warm_start {
@@ -3860,9 +6534,16 @@ fn solve_coupled(
     }
     let cuda_time = cuda_solution.map(|_| pcg_start.elapsed());
     if cuda_solution.is_some() {
-        let verified = recompute_pcg_residual(&scratch.diagonal,&scratch.pcg_rows,
-            &scratch.pcg_edge_blocks,active,incidence_len,&scratch.rhs,
-            &scratch.dx,&mut scratch.r);
+        let verified = recompute_pcg_residual(
+            &scratch.diagonal,
+            &scratch.pcg_rows,
+            &scratch.pcg_edge_blocks,
+            active,
+            incidence_len,
+            &scratch.rhs,
+            &scratch.dx,
+            &mut scratch.r,
+        );
         scene.solver_residual = verified as f32;
         if !verified.is_finite() || verified > scene.config.solver_relative_tolerance as f64 {
             // Keep the GPU correction as an initial iterate for CPU refinement.
@@ -3875,12 +6556,21 @@ fn solve_coupled(
     }
     if let Some(iterations) = cuda_solution {
         if std::env::var_os("VOXEL_AUDIT_PCG_RESIDUAL").is_some() {
-            let audit = audit_pcg_residual(&scratch.diagonal, &scratch.pcg_rows,
-                &scratch.pcg_edge_blocks,active,incidence_len,&scratch.rhs,
-                &scratch.dx,&scene.positions);
-            report_residual_audit("cuda",scene.solver_residual,audit);
-            scene.solver_max_audited_residual =
-                Some(worst_audited_residual(scene.solver_max_audited_residual,audit));
+            let audit = audit_pcg_residual(
+                &scratch.diagonal,
+                &scratch.pcg_rows,
+                &scratch.pcg_edge_blocks,
+                active,
+                incidence_len,
+                &scratch.rhs,
+                &scratch.dx,
+                &scene.positions,
+            );
+            report_residual_audit("cuda", scene.solver_residual, audit);
+            scene.solver_max_audited_residual = Some(worst_audited_residual(
+                scene.solver_max_audited_residual,
+                audit,
+            ));
             scene.solver_residual_audit = Some(audit);
         }
         if std::env::var_os("VOXEL_PROFILE_STEP").is_some() {
@@ -3911,17 +6601,17 @@ fn solve_coupled(
         match scene.config.cpu_preconditioner {
             CpuPreconditioner::IncompleteCholesky0 => {
                 scratch.cpu_preconditioner_bipartite = build_ic0_with_optional_bipartite(
-                scene,
-                &scratch.free,
-                &scratch.diagonal,
-                &scratch.incidence,
-                &scratch.incidence_len,
-                &scratch.constraints,
-                bipartite_ic0_graph,
-                &scratch.ic0_colors,
-                &mut scratch.factor_matrix,
-                &mut scratch.factor_diagonal,
-                &mut scratch.factor_edges,
+                    scene,
+                    &scratch.free,
+                    &scratch.diagonal,
+                    &scratch.incidence,
+                    &scratch.incidence_len,
+                    &scratch.constraints,
+                    bipartite_ic0_graph,
+                    &scratch.ic0_colors,
+                    &mut scratch.factor_matrix,
+                    &mut scratch.factor_diagonal,
+                    &mut scratch.factor_edges,
                 )
             }
             CpuPreconditioner::BlockJacobi | CpuPreconditioner::AggregationMultigrid => {
@@ -3962,102 +6652,130 @@ fn solve_coupled(
         }
         factor_time += factor_start.elapsed();
         scratch.cpu_preconditioner_ready = true;
+        scratch.cpu_preconditioner_components = false;
     }
     // CUDA can fail after the initial CPU setup was skipped. Build the
     // hierarchy only once CPU fallback is actually needed.
     if scene.config.cpu_preconditioner == CpuPreconditioner::AggregationMultigrid
-        && scratch.multigrid.is_none() && try_cuda
+        && scratch.multigrid.is_none()
+        && try_cuda
     {
         let start = Instant::now();
-        match build_multigrid_preconditioner(free, active, active_index, &scratch.diagonal,
-            incidence, incidence_len, constraints, &scene.rest_positions) {
+        match build_multigrid_preconditioner(
+            free,
+            active,
+            active_index,
+            &scratch.diagonal,
+            incidence,
+            incidence_len,
+            constraints,
+            &scene.rest_positions,
+        ) {
             Ok(hierarchy) => scratch.multigrid = Some(hierarchy),
             Err(reason) => eprintln!("multigrid unavailable; using block Jacobi: {reason}"),
         }
         factor_time += start.elapsed();
     }
     if scene.solver_residual < scene.config.solver_relative_tolerance {
-        scene.solver_residual = recompute_pcg_residual(&scratch.diagonal,&scratch.pcg_rows,
-            &scratch.pcg_edge_blocks,active,incidence_len,&scratch.rhs,
-            &scratch.dx,&mut scratch.r) as f32;
+        scene.solver_residual = recompute_pcg_residual(
+            &scratch.diagonal,
+            &scratch.pcg_rows,
+            &scratch.pcg_edge_blocks,
+            active,
+            incidence_len,
+            &scratch.rhs,
+            &scratch.dx,
+            &mut scratch.r,
+        ) as f32;
     }
-    apply_preconditioner(
-        scene.config.cpu_preconditioner,
-        scratch.cpu_preconditioner_bipartite,
-        &mut scratch.multigrid,
-        &scratch.factor_diagonal,
-        &scratch.factor_diagonal_inverse,
-        &scratch.factor_edges,
-        active,
-        &scratch.ic0_red_slots,
-        &scratch.ic0_lower_links,
-        &scratch.ic0_lower_link_count,
-        &scratch.ic0_upper_links,
-        &scratch.ic0_upper_link_count,
-        &scratch.r,
-        &mut scratch.preconditioner_work,
-        &mut scratch.z,
-    );
-    scratch.p.clone_from(&scratch.z);
-    let dx = &mut scratch.dx;
-    let ap = &mut scratch.ap;
-    let r = &mut scratch.r;
-    let z = &mut scratch.z;
-    let p = &mut scratch.p;
-    let mut rz = dot(r, z);
     let initial = rhs_norm;
     scene.solver_residual = if initial > 1e-12 {
-        (dot(r,r).sqrt()/initial) as f32
-    } else { 0.0 };
+        (dot(&scratch.r, &scratch.r).sqrt() / initial) as f32
+    } else {
+        0.0
+    };
     let mut iterations = 0;
     let mut verified_solution = false;
-    let fuse_reductions = fused_pcg_reductions_enabled();
-    for _ in 0..scene.config.iterations {
-        if initial == 0.0 || scene.solver_residual < scene.config.solver_relative_tolerance {
-            verified_solution = true;
-            break;
+    // These ranges are block diagonal by construction: no active mechanical
+    // constraint crosses a component. Solving each block with the unchanged
+    // tolerance is algebraically equivalent; the full true residual below
+    // remains authoritative and the coupled PCG is kept as a fallback.
+    let component_pcg = component_pcg_enabled()
+        && component_ic0
+        && !scratch.cpu_preconditioner_bipartite
+        && scratch.ic0_component_ranges.len() > 1;
+    if component_pcg {
+        let ranges = &scratch.ic0_component_ranges;
+        let dx_chunks = split_mut_by_ranges(&mut scratch.dx, ranges);
+        let ap_chunks = split_mut_by_ranges(&mut scratch.ap, ranges);
+        let r_chunks = split_mut_by_ranges(&mut scratch.r, ranges);
+        let z_chunks = split_mut_by_ranges(&mut scratch.z, ranges);
+        let p_chunks = split_mut_by_ranges(&mut scratch.p, ranges);
+        let work_chunks = split_mut_by_ranges(&mut scratch.preconditioner_work, ranges);
+        let mut states = Vec::with_capacity(ranges.len());
+        let chunks = dx_chunks
+            .into_iter()
+            .zip(ap_chunks)
+            .zip(r_chunks)
+            .zip(z_chunks)
+            .zip(p_chunks)
+            .zip(work_chunks);
+        for (component, (((((dx, ap), r), z), p), work)) in chunks.enumerate() {
+            let (start, end) = ranges[component];
+            states.push(ComponentPcgState {
+                start,
+                end,
+                dx,
+                ap,
+                r,
+                z,
+                p,
+                work,
+                iterations: 0,
+                converged: false,
+            });
         }
-        let denom = if fuse_reductions {
-            apply_and_dot(p, ap, p)
-        } else {
-            apply(p, ap);
-            dot(&p, &ap)
-        };
-        iterations += 1;
-        if denom <= 1e-30 {
-            break;
-        }
-        let alpha = (rz / denom) as f32;
-        let residual_squared = if fuse_reductions {
-            update_and_norm(dx, r, p, ap, alpha)
-        } else {
-            if !parallel_enabled_for(active_count) {
-                for i in 0..active_count {
-                    dx[i] += alpha * p[i];
-                    r[i] -= alpha * ap[i];
-                }
-            } else {
-                dx.par_iter_mut()
-                    .zip(r.par_iter_mut())
-                    .zip(p.par_iter().zip(ap.par_iter()))
-                    .for_each(|((dx, r), (p, ap))| {
-                        *dx += alpha * *p;
-                        *r -= alpha * *ap;
-                    });
-            }
-            dot(&r, &r)
-        };
-        scene.solver_residual = (residual_squared.sqrt() / initial) as f32;
-        let mut restart = false;
-        if scene.solver_residual < scene.config.solver_relative_tolerance {
-            scene.solver_residual = recompute_pcg_residual(&scratch.diagonal,&scratch.pcg_rows,
-                &scratch.pcg_edge_blocks,active,incidence_len,&scratch.rhs,dx,r) as f32;
-            if scene.solver_residual < scene.config.solver_relative_tolerance {
-                verified_solution = true;
-                break;
-            }
-            restart = true;
-        }
+        states.par_iter_mut().for_each(|state| {
+            solve_pcg_component(
+                state,
+                active,
+                &scratch.diagonal,
+                &scratch.pcg_rows,
+                &scratch.pcg_edge_blocks,
+                incidence_len,
+                &scratch.rhs,
+                &scratch.factor_diagonal_inverse,
+                &scratch.factor_edges,
+                &scratch.ic0_lower_links,
+                &scratch.ic0_lower_link_count,
+                &scratch.ic0_upper_links,
+                &scratch.ic0_upper_link_count,
+                f64::from(scene.config.solver_relative_tolerance),
+                scene.config.iterations,
+            );
+        });
+        iterations = states
+            .iter()
+            .map(|state| state.iterations)
+            .max()
+            .unwrap_or(0);
+        verified_solution = states.iter().all(|state| state.converged);
+        drop(states);
+        scene.solver_residual = recompute_pcg_residual(
+            &scratch.diagonal,
+            &scratch.pcg_rows,
+            &scratch.pcg_edge_blocks,
+            active,
+            incidence_len,
+            &scratch.rhs,
+            &scratch.dx,
+            &mut scratch.r,
+        ) as f32;
+        verified_solution &= scene.solver_residual.is_finite()
+            && scene.solver_residual < scene.config.solver_relative_tolerance;
+    }
+
+    if !verified_solution {
         apply_preconditioner(
             scene.config.cpu_preconditioner,
             scratch.cpu_preconditioner_bipartite,
@@ -4066,45 +6784,151 @@ fn solve_coupled(
             &scratch.factor_diagonal_inverse,
             &scratch.factor_edges,
             active,
+            &scratch.ic0_component_ranges,
+            &scratch.ic0_component_batches,
             &scratch.ic0_red_slots,
             &scratch.ic0_lower_links,
             &scratch.ic0_lower_link_count,
             &scratch.ic0_upper_links,
             &scratch.ic0_upper_link_count,
-            r,
+            &scratch.r,
             &mut scratch.preconditioner_work,
-            z,
+            &mut scratch.z,
         );
-        let next = dot(&r, &z);
-        if restart {
-            p.clone_from_slice(z);
-            rz = next;
-            continue;
-        }
-        let beta = (next / rz) as f32;
-        if !parallel_enabled_for(active_count) {
-            for i in 0..active_count {
-                p[i] = z[i] + beta * p[i];
-            }
+        scratch.p.clone_from(&scratch.z);
+        let dx = &mut scratch.dx;
+        let ap = &mut scratch.ap;
+        let r = &mut scratch.r;
+        let z = &mut scratch.z;
+        let p = &mut scratch.p;
+        let mut rz = dot(r, z);
+        scene.solver_residual = if initial > 1e-12 {
+            (dot(r, r).sqrt() / initial) as f32
         } else {
-            p.par_iter_mut()
-                .zip(z.par_iter())
-                .for_each(|(p, z)| *p = *z + beta * *p);
+            0.0
+        };
+        let fuse_reductions = fused_pcg_reductions_enabled();
+        for _ in 0..scene.config.iterations {
+            if initial == 0.0 || scene.solver_residual < scene.config.solver_relative_tolerance {
+                verified_solution = true;
+                break;
+            }
+            let denom = if fuse_reductions {
+                apply_and_dot(p, ap, p)
+            } else {
+                apply(p, ap);
+                dot(&p, &ap)
+            };
+            iterations += 1;
+            if denom <= 1e-30 {
+                break;
+            }
+            let alpha = (rz / denom) as f32;
+            let residual_squared = if fuse_reductions {
+                update_and_norm(dx, r, p, ap, alpha)
+            } else {
+                if !parallel_enabled_for(active_count) {
+                    for i in 0..active_count {
+                        dx[i] += alpha * p[i];
+                        r[i] -= alpha * ap[i];
+                    }
+                } else {
+                    dx.par_iter_mut()
+                        .zip(r.par_iter_mut())
+                        .zip(p.par_iter().zip(ap.par_iter()))
+                        .for_each(|((dx, r), (p, ap))| {
+                            *dx += alpha * *p;
+                            *r -= alpha * *ap;
+                        });
+                }
+                dot(&r, &r)
+            };
+            scene.solver_residual = (residual_squared.sqrt() / initial) as f32;
+            let mut restart = false;
+            if scene.solver_residual < scene.config.solver_relative_tolerance {
+                scene.solver_residual = recompute_pcg_residual(
+                    &scratch.diagonal,
+                    &scratch.pcg_rows,
+                    &scratch.pcg_edge_blocks,
+                    active,
+                    incidence_len,
+                    &scratch.rhs,
+                    dx,
+                    r,
+                ) as f32;
+                if scene.solver_residual < scene.config.solver_relative_tolerance {
+                    verified_solution = true;
+                    break;
+                }
+                restart = true;
+            }
+            apply_preconditioner(
+                scene.config.cpu_preconditioner,
+                scratch.cpu_preconditioner_bipartite,
+                &mut scratch.multigrid,
+                &scratch.factor_diagonal,
+                &scratch.factor_diagonal_inverse,
+                &scratch.factor_edges,
+                active,
+                &scratch.ic0_component_ranges,
+                &scratch.ic0_component_batches,
+                &scratch.ic0_red_slots,
+                &scratch.ic0_lower_links,
+                &scratch.ic0_lower_link_count,
+                &scratch.ic0_upper_links,
+                &scratch.ic0_upper_link_count,
+                r,
+                &mut scratch.preconditioner_work,
+                z,
+            );
+            let next = dot(&r, &z);
+            if restart {
+                p.clone_from_slice(z);
+                rz = next;
+                continue;
+            }
+            let beta = (next / rz) as f32;
+            if !parallel_enabled_for(active_count) {
+                for i in 0..active_count {
+                    p[i] = z[i] + beta * p[i];
+                }
+            } else {
+                p.par_iter_mut()
+                    .zip(z.par_iter())
+                    .for_each(|(p, z)| *p = *z + beta * *p);
+            }
+            rz = next;
         }
-        rz = next;
-    }
-    if !verified_solution {
-        scene.solver_residual = recompute_pcg_residual(&scratch.diagonal,&scratch.pcg_rows,
-            &scratch.pcg_edge_blocks,active,incidence_len,&scratch.rhs,dx,r) as f32;
+        if !verified_solution {
+            scene.solver_residual = recompute_pcg_residual(
+                &scratch.diagonal,
+                &scratch.pcg_rows,
+                &scratch.pcg_edge_blocks,
+                active,
+                incidence_len,
+                &scratch.rhs,
+                dx,
+                r,
+            ) as f32;
+        }
     }
     let pcg_time = cpu_pcg_start.elapsed();
     if std::env::var_os("VOXEL_AUDIT_PCG_RESIDUAL").is_some() {
-        let audit = audit_pcg_residual(&scratch.diagonal, &scratch.pcg_rows,
-            &scratch.pcg_edge_blocks,active,incidence_len,&scratch.rhs,dx,
-            &scene.positions);
-        report_residual_audit("cpu",scene.solver_residual,audit);
-        scene.solver_max_audited_residual =
-            Some(worst_audited_residual(scene.solver_max_audited_residual,audit));
+        let audit = audit_pcg_residual(
+            &scratch.diagonal,
+            &scratch.pcg_rows,
+            &scratch.pcg_edge_blocks,
+            active,
+            incidence_len,
+            &scratch.rhs,
+            &scratch.dx,
+            &scene.positions,
+        );
+        report_residual_audit("cpu", scene.solver_residual, audit);
+        scene.solver_max_audited_residual = Some(worst_audited_residual(
+            scene.solver_max_audited_residual,
+            audit,
+        ));
         scene.solver_residual_audit = Some(audit);
     }
     if std::env::var_os("VOXEL_PROFILE_PCG_SOLVE").is_some() {
@@ -4116,7 +6940,7 @@ fn solve_coupled(
         );
     }
     for (slot, &i) in active.iter().enumerate() {
-        scene.positions[i] += dx[slot].as_dvec3();
+        scene.positions[i] += scratch.dx[slot].as_dvec3();
     }
     for c in constraints {
         let force = c.k * (scene.positions[c.j] - scene.positions[c.i] - c.rest).as_vec3();

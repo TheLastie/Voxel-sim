@@ -95,7 +95,9 @@ impl fmt::Display for AggregationError {
                 "component has relative motion that the rigid aggregate cannot evolve"
             ),
             Self::InactiveAggregate(i) => write!(f, "aggregate {i} is not active"),
-            Self::AlreadyAggregated(i) => write!(f, "REV {i} already belongs to an active aggregate"),
+            Self::AlreadyAggregated(i) => {
+                write!(f, "REV {i} already belongs to an active aggregate")
+            }
         }
     }
 }
@@ -130,6 +132,14 @@ pub(crate) struct RigidMemberPose {
     pub velocity_m_s: DVec3,
     pub orientation: DQuat,
     pub bond_last_force_n: [DVec3; 3],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RigidMemberTranslationPose {
+    pub index: usize,
+    pub position_m: DVec3,
+    pub rest_position_m: DVec3,
+    pub velocity_m_s: DVec3,
 }
 
 /// A spatially coarse mechanical body with the original REV states retained
@@ -170,9 +180,7 @@ impl RigidAggregate {
     /// untracked spin degree of freedom for each REV. The caller must ensure
     /// that no active bond or interaction crosses the selected component's
     /// boundary and must refine it before local contact or fracture can occur.
-    pub fn from_constituents(
-        constituents: &[ConstituentState],
-    ) -> Result<Self, AggregationError> {
+    pub fn from_constituents(constituents: &[ConstituentState]) -> Result<Self, AggregationError> {
         if constituents.is_empty() {
             return Err(AggregationError::Empty);
         }
@@ -203,7 +211,9 @@ impl RigidAggregate {
                 return Err(AggregationError::InvalidThermalEnergy(c.index));
             }
             if c.thermal_cell_energy_j.as_ref().is_some_and(|cells| {
-                cells.iter().any(|energy| !energy.is_finite() || *energy < 0.0)
+                cells
+                    .iter()
+                    .any(|energy| !energy.is_finite() || *energy < 0.0)
             }) {
                 return Err(AggregationError::InvalidThermalCells(c.index));
             }
@@ -249,11 +259,9 @@ impl RigidAggregate {
             .iter()
             .map(|c| {
                 let r = c.position_m - center_of_mass_m;
-                let residual_velocity = c.velocity_m_s
-                    - linear_velocity_m_s
-                    - angular_velocity.cross(r);
-                residual_kinetic_energy_j +=
-                    0.5 * c.mass_kg * residual_velocity.length_squared();
+                let residual_velocity =
+                    c.velocity_m_s - linear_velocity_m_s - angular_velocity.cross(r);
+                residual_kinetic_energy_j += 0.5 * c.mass_kg * residual_velocity.length_squared();
                 AggregateMember {
                     index: c.index,
                     mass_kg: c.mass_kg,
@@ -327,9 +335,7 @@ impl RigidAggregate {
         let mut max = [0.0; 3];
         for axis in 0..3 {
             let coordinate = |time: f64| {
-                position[axis]
-                    + velocity[axis] * time
-                    + 0.5 * acceleration[axis] * time * time
+                position[axis] + velocity[axis] * time + 0.5 * acceleration[axis] * time * time
             };
             let start = coordinate(0.0);
             let end = coordinate(dt_s);
@@ -353,15 +359,39 @@ impl RigidAggregate {
         self.linear_momentum_kg_m_s / self.mass_kg
     }
 
+    pub(crate) fn mass_kg(&self) -> f64 {
+        self.mass_kg
+    }
+
     pub fn angular_velocity_rad_s(&self) -> DVec3 {
+        if self.angular_momentum_kg_m2_s == DVec3::ZERO {
+            return DVec3::ZERO;
+        }
         let rotation = DMat3::from_quat(self.orientation);
-        let inertia_world =
-            rotation * self.inertia_body_kg_m2 * rotation.transpose();
+        let inertia_world = rotation * self.inertia_body_kg_m2 * rotation.transpose();
         inertia_world.inverse() * self.angular_momentum_kg_m2_s
+    }
+
+    pub(crate) fn angular_momentum_kg_m2_s(&self) -> DVec3 {
+        self.angular_momentum_kg_m2_s
+    }
+
+    /// Frobenius norm of the inverse inertia tensor, invariant under the
+    /// aggregate's world rotation and an upper bound on its spectral norm.
+    pub(crate) fn inverse_inertia_frobenius_norm(&self) -> f64 {
+        let inverse = self.inertia_body_kg_m2.inverse();
+        (inverse.x_axis.length_squared()
+            + inverse.y_axis.length_squared()
+            + inverse.z_axis.length_squared())
+        .sqrt()
     }
 
     pub fn orientation(&self) -> DQuat {
         self.orientation
+    }
+
+    pub(crate) fn has_zero_angular_momentum(&self) -> bool {
+        self.angular_momentum_kg_m2_s == DVec3::ZERO
     }
 
     /// True when relative member motion exceeds roundoff in the resolved rigid
@@ -399,6 +429,25 @@ impl RigidAggregate {
         })
     }
 
+    /// Return only the REV state that changes during pure translation. The
+    /// material orientation and internal bond force are unchanged in this
+    /// case, so the scene can retain their already synchronized arrays.
+    pub(crate) fn translation_member_poses(
+        &self,
+    ) -> impl Iterator<Item = RigidMemberTranslationPose> + '_ {
+        let linear_velocity = self.linear_velocity_m_s();
+        self.members.iter().map(move |member| {
+            let position_offset = self.orientation * member.local_position_m;
+            let rest_offset = self.orientation * member.local_rest_position_m;
+            RigidMemberTranslationPose {
+                index: member.index,
+                position_m: self.center_of_mass_m + position_offset,
+                rest_position_m: self.center_of_mass_m + rest_offset,
+                velocity_m_s: linear_velocity + self.orientation * member.residual_velocity_m_s,
+            }
+        })
+    }
+
     pub fn invariants(&self) -> AggregateInvariants {
         let angular_velocity = self.angular_velocity_rad_s();
         let kinetic_energy = 0.5 * self.linear_momentum_kg_m_s.length_squared() / self.mass_kg
@@ -425,8 +474,7 @@ impl RigidAggregate {
             return Err(AggregationError::InvalidImpulse);
         }
         self.linear_momentum_kg_m_s += impulse_kg_m_s;
-        self.angular_momentum_kg_m2_s +=
-            (point_m - self.center_of_mass_m).cross(impulse_kg_m_s);
+        self.angular_momentum_kg_m2_s += (point_m - self.center_of_mass_m).cross(impulse_kg_m_s);
         Ok(())
     }
 
@@ -461,6 +509,33 @@ impl RigidAggregate {
         Ok(())
     }
 
+    /// Match the translational drift of repeated semi-implicit inertial steps
+    /// without repeating the rigid solve. For constant acceleration their sum
+    /// is v0*dt + a*(dt*dt + dt*h)/2. The h-dependent term is a discretization
+    /// error of the detailed integrator, not thermal energy or external work.
+    pub(crate) fn advance_under_wrench_matching_inertial_step(
+        &mut self,
+        force_n: DVec3,
+        torque_nm: DVec3,
+        dt_s: f64,
+        reference_step_s: f64,
+    ) -> Result<(), AggregationError> {
+        if !reference_step_s.is_finite()
+            || reference_step_s <= 0.0
+            || !dt_s.is_finite()
+            || reference_step_s > dt_s
+        {
+            return Err(AggregationError::InvalidTimeStep);
+        }
+        let drift_bias = force_n / self.mass_kg * (0.5 * dt_s * reference_step_s);
+        if !drift_bias.is_finite() {
+            return Err(AggregationError::InvalidWrench);
+        }
+        self.advance_under_wrench(force_n, torque_nm, dt_s)?;
+        self.center_of_mass_m += drift_bias;
+        Ok(())
+    }
+
     /// Drift the isolated aggregate using a second-order midpoint update for
     /// its torque-free rotation. Linear and angular momentum remain constant.
     pub fn drift_free(&mut self, dt_s: f64) -> Result<(), AggregationError> {
@@ -474,22 +549,16 @@ impl RigidAggregate {
         let omega_start = self.angular_velocity_rad_s();
         let speed_start = omega_start.length();
         if speed_start > 0.0 {
-            let midpoint_delta = DQuat::from_axis_angle(
-                omega_start / speed_start,
-                0.5 * speed_start * dt_s,
-            );
+            let midpoint_delta =
+                DQuat::from_axis_angle(omega_start / speed_start, 0.5 * speed_start * dt_s);
             let midpoint_orientation = (midpoint_delta * self.orientation).normalize();
             let rotation = DMat3::from_quat(midpoint_orientation);
-            let inertia_midpoint =
-                rotation * self.inertia_body_kg_m2 * rotation.transpose();
-            let omega_midpoint =
-                inertia_midpoint.inverse() * self.angular_momentum_kg_m2_s;
+            let inertia_midpoint = rotation * self.inertia_body_kg_m2 * rotation.transpose();
+            let omega_midpoint = inertia_midpoint.inverse() * self.angular_momentum_kg_m2_s;
             let speed_midpoint = omega_midpoint.length();
             if speed_midpoint > 0.0 {
-                let full_delta = DQuat::from_axis_angle(
-                    omega_midpoint / speed_midpoint,
-                    speed_midpoint * dt_s,
-                );
+                let full_delta =
+                    DQuat::from_axis_angle(omega_midpoint / speed_midpoint, speed_midpoint * dt_s);
                 self.orientation = (full_delta * self.orientation).normalize();
             }
         }
@@ -502,19 +571,17 @@ impl RigidAggregate {
         self.members
             .iter()
             .zip(self.member_poses())
-            .map(|(member, pose)| {
-                RefinedConstituent {
-                    index: pose.index,
-                    mass_kg: pose.mass_kg,
-                    position_m: pose.position_m,
-                    rest_position_m: pose.rest_position_m,
-                    previous_position_m: pose.previous_position_m,
-                    velocity_m_s: pose.velocity_m_s,
-                    orientation: pose.orientation,
-                    bond_last_force_n: pose.bond_last_force_n,
-                    thermal_energy_j: member.thermal_energy_j,
-                    thermal_cell_energy_j: member.thermal_cell_energy_j.clone(),
-                }
+            .map(|(member, pose)| RefinedConstituent {
+                index: pose.index,
+                mass_kg: pose.mass_kg,
+                position_m: pose.position_m,
+                rest_position_m: pose.rest_position_m,
+                previous_position_m: pose.previous_position_m,
+                velocity_m_s: pose.velocity_m_s,
+                orientation: pose.orientation,
+                bond_last_force_n: pose.bond_last_force_n,
+                thermal_energy_j: member.thermal_energy_j,
+                thermal_cell_energy_j: member.thermal_cell_energy_j.clone(),
             })
             .collect()
     }

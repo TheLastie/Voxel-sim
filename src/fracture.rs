@@ -5,9 +5,9 @@ use crate::{
     scene::{AREA, CELL},
 };
 use glam::{Mat3, Vec3};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FractureConfig {
     pub damage_rate: f32,
@@ -66,6 +66,8 @@ pub struct Limits {
     pub tension: f32,
     pub compression: f32,
     pub shear: f32,
+    /// Dimensionless tan(phi) for pressure-dependent internal shear strength.
+    pub internal_friction_coefficient: f32,
     pub yield_stress: f32,
     pub hardening: f32,
     pub plastic_failure: f32,
@@ -108,6 +110,7 @@ pub fn pair_limits(
                 alignment[k],
                 anisotropy[k],
             ),
+            internal_friction_coefficient: m.internal_friction_coefficient,
             yield_stress: m.yield_strength,
             hardening: m.hardening_modulus,
             plastic_failure: m.failure_plastic_strain,
@@ -126,6 +129,11 @@ pub fn pair_limits(
         tension: x.tension.min(y.tension),
         compression: x.compression.min(y.compression),
         shear: x.shear.min(y.shear),
+        // For a bond between unlike materials, use the lower friction slope
+        // until a calibrated interface law is available.
+        internal_friction_coefficient: x
+            .internal_friction_coefficient
+            .min(y.internal_friction_coefficient),
         yield_stress: x.yield_stress.min(y.yield_stress),
         hardening: x.hardening.min(y.hardening),
         plastic_failure: x.plastic_failure.min(y.plastic_failure),
@@ -255,8 +263,16 @@ pub fn update(
     } else {
         l.compression
     };
+    // Mohr-Coulomb's shear envelope is tau = c + sigma_n * tan(phi), with
+    // compression positive here. `l.shear` is the zero-confinement cohesion
+    // term; tension does not increase frictional resistance.
+    let shear_limit = if l.internal_friction_coefficient > 0.0 {
+        l.shear + (-stress.x).max(0.0) * l.internal_friction_coefficient
+    } else {
+        l.shear
+    };
     let ratio = ((stress.x / normal_limit.max(1.0)).powi(2)
-        + (stress.y * stress.y + stress.z * stress.z) / l.shear.max(1.0).powi(2))
+        + (stress.y * stress.y + stress.z * stress.z) / shear_limit.max(1.0).powi(2))
     .sqrt();
     let principal = if stress.x.abs() >= stress.y.abs().max(stress.z.abs()) {
         stress.x
@@ -358,6 +374,50 @@ mod tests {
         );
         assert_eq!(b.neighbor, EMPTY);
         assert_eq!(b.plastic_strain, [0.; 3]);
+    }
+    #[test]
+    fn internal_friction_raises_shear_capacity_only_under_compression() {
+        let mut material = Material::table()[3].clone();
+        material.tensile_strength = 1.0e9;
+        material.compressive_strength = 1.0e9;
+        material.shear_strength = 10.0e3;
+        material.internal_friction_coefficient = 0.5;
+        let limits = pair_limits(&material, &material, [1.0; 2], [0.0; 2]);
+        let stiffness = Mat3::IDENTITY;
+        let shear_displacement = Vec3::Y * (30.0e3 * AREA);
+
+        let mut unconfined = Bond {
+            neighbor: 1,
+            ..Default::default()
+        };
+        let unconfined_before = energy(shear_displacement, stiffness, 0.0);
+        let unconfined_loss = update(
+            &mut unconfined,
+            shear_displacement,
+            stiffness,
+            limits,
+            0.001,
+            &config(),
+        );
+        assert_eq!(unconfined.neighbor, EMPTY);
+        assert!((unconfined_loss.total() - unconfined_before).abs() < 1e-8);
+
+        let confined_displacement = shear_displacement - Vec3::X * (100.0e3 * AREA);
+        let mut confined = Bond {
+            neighbor: 1,
+            ..Default::default()
+        };
+        let confined_loss = update(
+            &mut confined,
+            confined_displacement,
+            stiffness,
+            limits,
+            0.001,
+            &config(),
+        );
+        assert_ne!(confined.neighbor, EMPTY);
+        assert_eq!(confined.damage, 0.0);
+        assert_eq!(confined_loss.total(), 0.0);
     }
     #[test]
     fn metal_yields_heats_and_only_then_tears() {

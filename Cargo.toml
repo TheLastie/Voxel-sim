@@ -3,12 +3,17 @@ name = "voxel-physics-lab"
 version = "0.2.0"
 edition = "2021"
 publish = false
-default-run = "voxel-physics-lab"
+default-run = "voxel-editor"
 description = "CPU voxel mechanics laboratory for emergent wood fracture"
 
 [[bin]]
 name = "voxel-physics-lab"
-path = "src/main.rs"
+path = "src/bin/voxel_physics_lab.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "voxel-editor"
+path = "src/bin/voxel_editor.rs"
 required-features = ["desktop"]
 
 [[bin]]
@@ -17,13 +22,17 @@ path = "src/bin/gpu_info.rs"
 required-features = ["desktop"]
 
 [[bin]]
+name = "voxel-editor-mcp"
+path = "src/bin/voxel_editor_mcp.rs"
+
+[[bin]]
 name = "voxel-test-viewer"
 path = "src/bin/voxel_test_viewer.rs"
 required-features = ["desktop"]
 
 [features]
 default = ["desktop"]
-desktop = ["dep:wgpu", "dep:winit", "dep:pollster"]
+desktop = ["dep:wgpu", "dep:winit", "dep:pollster", "dep:rfd"]
 
 [dependencies]
 # Fixed API baseline; update intentionally, together with renderer code.
@@ -33,6 +42,8 @@ glam = { version = "=0.27.0", features = ["serde"] }
 serde = { version = "=1.0.203", features = ["derive"] }
 serde_json = "=1.0.117"
 bincode = "=1.3.3"
+gltf = { version = "=1.4.1", features = ["import", "utils"] }
+tobj = "=4.0.5"
 ron = "=0.8.1"
 rayon = "=1.10.0"
 rustc-hash = "=1.1.0"
@@ -41,6 +52,7 @@ bytemuck = { version = "=1.16.3", features = ["derive"] }
 # Sparse composition storage and synchronous startup of async wgpu setup.
 smallvec = { version = "=1.13.2", features = ["serde"] }
 pollster = { version = "=0.3.0", optional = true }
+rfd = { version = "=0.17.2", default-features = false, features = ["xdg-portal"], optional = true }
 libloading = "=0.8.9"
 
 [profile.dev]

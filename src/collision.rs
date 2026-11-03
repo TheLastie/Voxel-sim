@@ -5,6 +5,10 @@ use rustc_hash::FxHashMap;
 use std::time::Instant;
 
 const COLLISION_BIN_SCALE: f32 = 1.05;
+// Normal swept REV bounds occupy only a few dozen bins. Larger bounds are
+// handled by the sparse sweep below so one fast or corrupted REV cannot make
+// the hash broadphase allocate in proportion to the swept world volume.
+const MAX_BINS_PER_REV: u128 = 4096;
 
 fn collision_bin_scale() -> f32 {
     static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -38,6 +42,7 @@ pub(crate) struct CollisionScratch {
     dynamic_bounds_by_index: Vec<Option<([i32; 3], [i32; 3])>>,
     static_lower_by_index: Vec<[i32; 3]>,
     static_ready: bool,
+    static_requires_sparse: bool,
     candidate_pairs_valid: bool,
     pairs: Vec<(usize, usize)>,
     adjacency: Vec<[u32; 6]>,
@@ -65,6 +70,11 @@ pub(crate) fn project_into(
     let mut scratch = std::mem::take(&mut scene.collision_scratch);
     let mut starts = std::mem::take(&mut scratch.starts);
     starts.clone_from(&scene.previous);
+    if skip_separated_aggregate_collision(scene, &starts, &mut scratch, contacts) {
+        scratch.starts = starts;
+        scene.collision_scratch = scratch;
+        return;
+    }
     let topology_changed = adjacency(
         scene,
         &mut scratch.adjacency,
@@ -88,9 +98,23 @@ pub(crate) fn project_into(
                 &scene.positions[j],
             );
             if let Some(normal) = sweep {
+                if internal_kinematic_face_contact(
+                    scene,
+                    &starts,
+                    targets,
+                    &scratch.adjacency,
+                    i,
+                    j,
+                    normal,
+                ) {
+                    continue;
+                }
                 let separation = (scene.positions[j] - scene.positions[i]).dot(normal.as_dvec3());
                 if separation < DCELL {
-                    let correction = (DCELL - separation + 1e-6) as f32;
+                    // Do not add a visible separation gap to bonded material.
+                    // A 1 um offset on a 1 cm stiff REV becomes real bond strain
+                    // at fracture evaluation and creates repeated support work.
+                    let correction = (DCELL - separation) as f32;
                     changed |= separate(scene, i, j, normal, correction, targets);
                 }
                 contacts.push(Contact {
@@ -106,7 +130,18 @@ pub(crate) fn project_into(
                 scene.positions[j],
                 starts[j] - starts[i],
             ) {
-                changed |= separate(scene, i, j, normal, penetration + 1e-6, targets);
+                if internal_kinematic_face_contact(
+                    scene,
+                    &starts,
+                    targets,
+                    &scratch.adjacency,
+                    i,
+                    j,
+                    normal,
+                ) {
+                    continue;
+                }
+                changed |= separate(scene, i, j, normal, penetration, targets);
                 contacts.push(Contact {
                     i,
                     j,
@@ -116,6 +151,17 @@ pub(crate) fn project_into(
                 continue;
             }
             if let Some(normal) = touching_normal(scene.positions[i], scene.positions[j]) {
+                if internal_kinematic_face_contact(
+                    scene,
+                    &starts,
+                    targets,
+                    &scratch.adjacency,
+                    i,
+                    j,
+                    normal,
+                ) {
+                    continue;
+                }
                 contacts.push(Contact {
                     i,
                     j,
@@ -144,6 +190,335 @@ pub(crate) fn project_into(
     }
     scratch.starts = starts;
     scene.collision_scratch = scratch;
+}
+
+#[derive(Clone, Copy)]
+struct AggregateSweepBounds {
+    representative: usize,
+    min: DVec3,
+    max: DVec3,
+}
+
+#[derive(Clone, Copy)]
+struct StepSweepBounds {
+    min: DVec3,
+    max: DVec3,
+}
+
+/// Conservative whole-step contact forecast for the coarse rigid tier.
+/// Current member AABBs are inflated for translation and bounded rotation.
+pub(crate) fn rigid_candidates_clear_for_step(
+    scene: &Scene,
+    dt_s: f64,
+    gravity_m_s2: DVec3,
+    nodal_loads_n: &[Vec3],
+) -> bool {
+    if !dt_s.is_finite()
+        || dt_s < 0.0
+        || !gravity_m_s2.is_finite()
+        || (!nodal_loads_n.is_empty() && nodal_loads_n.len() != scene.voxels.len())
+        || scene.aggregate_of.len() != scene.voxels.len()
+        || scene.positions.len() != scene.voxels.len()
+        || scene.external_forces.len() != scene.voxels.len()
+        || scene.external_accelerations.len() != scene.voxels.len()
+        || scene.axis_targets.len() != scene.voxels.len()
+    {
+        return false;
+    }
+
+    let mut dynamic_count = 0usize;
+    for (index, voxel) in scene.voxels.iter().enumerate() {
+        if voxel.kinematic {
+            if scene.aggregate_of[index].is_some() {
+                return false;
+            }
+            continue;
+        }
+        dynamic_count += 1;
+        if scene.aggregate_of[index].is_none()
+            || scene.axis_targets[index].iter().any(Option::is_some)
+            || !voxel.mass.is_finite()
+            || voxel.mass <= 0.0
+            || !scene.positions[index].is_finite()
+        {
+            return false;
+        }
+    }
+    if dynamic_count == 0 {
+        return false;
+    }
+
+    let mut total_members = 0usize;
+    let mut body_bounds = Vec::with_capacity(scene.rigid_aggregates.len());
+    for (id, aggregate) in scene.rigid_aggregates.iter().enumerate() {
+        let Some(aggregate) = aggregate.as_ref() else {
+            continue;
+        };
+        let center = aggregate.center_of_mass_m();
+        let radius = aggregate.bounding_radius_m();
+        if !center.is_finite()
+            || !radius.is_finite()
+            || radius < 0.0
+            || aggregate.has_unresolved_internal_motion()
+        {
+            return false;
+        }
+
+        let mut max_speed = 0.0_f64;
+        let mut max_acceleration = 0.0_f64;
+        let mut min = DVec3::splat(f64::INFINITY);
+        let mut max = DVec3::splat(f64::NEG_INFINITY);
+        let mut torque = DVec3::ZERO;
+        let mut torque_abs_sum = 0.0_f64;
+        let mut member_count = 0usize;
+        for member in aggregate.member_poses() {
+            let index = member.index;
+            if index >= scene.voxels.len()
+                || scene.aggregate_of[index] != Some(id)
+                || scene.voxels[index].kinematic
+                || !member.position_m.is_finite()
+                || !member.velocity_m_s.is_finite()
+                || !member.mass_kg.is_finite()
+                || member.mass_kg <= 0.0
+                || scene.axis_targets[index].iter().any(Option::is_some)
+            {
+                return false;
+            }
+            let external_acceleration = scene.external_accelerations[index];
+            let external_force = scene.external_forces[index];
+            let nodal_force = nodal_loads_n.get(index).copied().unwrap_or(Vec3::ZERO);
+            if !external_acceleration.is_finite()
+                || !external_force.is_finite()
+                || !nodal_force.is_finite()
+            {
+                return false;
+            }
+
+            // Persistent external fields are not part of the frozen wrench
+            // used by advance_registered_rigid_candidates; require their
+            // earlier solver wake path to refine this body first.
+            if external_acceleration != Vec3::ZERO || external_force != Vec3::ZERO {
+                return false;
+            }
+            let force = gravity_m_s2 * member.mass_kg
+                + DVec3::new(
+                    nodal_force.x as f64,
+                    nodal_force.y as f64,
+                    nodal_force.z as f64,
+                );
+            let acceleration = force / member.mass_kg;
+            if !acceleration.is_finite() {
+                return false;
+            }
+            max_speed = max_speed.max(member.velocity_m_s.length());
+            max_acceleration = max_acceleration.max(acceleration.length());
+            let arm = member.position_m - center;
+            torque += arm.cross(force);
+            torque_abs_sum += arm.length() * force.length();
+            let half_extent = DVec3::splat(0.5 * DCELL as f64);
+            min = min.min(member.position_m - half_extent);
+            max = max.max(member.position_m + half_extent);
+            member_count += 1;
+        }
+        if member_count == 0 || member_count != aggregate.member_count() {
+            return false;
+        }
+        total_members = match total_members.checked_add(member_count) {
+            Some(total) => total,
+            None => return false,
+        };
+
+        let inverse_inertia_norm = aggregate.inverse_inertia_frobenius_norm();
+        let angular_momentum = aggregate.angular_momentum_kg_m2_s();
+        let torque_error = 128.0 * f64::EPSILON * torque_abs_sum;
+        let torque_bound = torque.length() + torque_error;
+        if !inverse_inertia_norm.is_finite()
+            || inverse_inertia_norm <= 0.0
+            || !angular_momentum.is_finite()
+            || !torque_bound.is_finite()
+        {
+            return false;
+        }
+        let angular_speed_bound =
+            inverse_inertia_norm * (angular_momentum.length() + torque_bound * dt_s);
+        let rotation_travel = radius * (angular_speed_bound * dt_s).min(2.0);
+        let translation_travel = max_speed * dt_s + max_acceleration * dt_s * dt_s;
+        let travel = translation_travel + rotation_travel + DCELL as f64;
+        if !travel.is_finite() || !min.is_finite() || !max.is_finite() {
+            return false;
+        }
+        let inflation = DVec3::splat(travel);
+        let swept_min = min - inflation;
+        let swept_max = max + inflation;
+        if !swept_min.is_finite() || !swept_max.is_finite() {
+            return false;
+        }
+        body_bounds.push(StepSweepBounds {
+            min: swept_min,
+            max: swept_max,
+        });
+    }
+    if total_members != dynamic_count || body_bounds.is_empty() {
+        return false;
+    }
+
+    if let Some(world_bounds) = scene.world_bounds() {
+        let bounds_min = DVec3::new(
+            world_bounds.min.x as f64,
+            world_bounds.min.y as f64,
+            world_bounds.min.z as f64,
+        );
+        let bounds_max = DVec3::new(
+            world_bounds.max.x as f64,
+            world_bounds.max.y as f64,
+            world_bounds.max.z as f64,
+        );
+        if body_bounds
+            .iter()
+            .any(|body| body.min.cmplt(bounds_min).any() || body.max.cmpgt(bounds_max).any())
+        {
+            return false;
+        }
+    }
+
+    for (index, voxel) in scene.voxels.iter().enumerate() {
+        if !voxel.kinematic {
+            continue;
+        }
+        let center = scene.positions[index];
+        if !center.is_finite() {
+            return false;
+        }
+        let half_extent = DVec3::splat(0.5 * DCELL as f64);
+        let fixed_min = center - half_extent;
+        let fixed_max = center + half_extent;
+        if body_bounds
+            .iter()
+            .any(|body| body.min.cmple(fixed_max).all() && body.max.cmpge(fixed_min).all())
+        {
+            return false;
+        }
+    }
+
+    for index in 0..body_bounds.len() {
+        for other in index + 1..body_bounds.len() {
+            let a = body_bounds[index];
+            let b = body_bounds[other];
+            if a.min.cmple(b.max).all() && a.max.cmpge(b.min).all() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Avoid rebuilding per-REV collision bins when every dynamic REV belongs to
+/// a coarse body and no swept body bounds can meet. Overlapping coarse bounds
+/// wake those bodies first; the caller then runs the unchanged REV-level CCD.
+fn skip_separated_aggregate_collision(
+    scene: &mut Scene,
+    starts: &[DVec3],
+    scratch: &mut CollisionScratch,
+    contacts: &mut Vec<Contact>,
+) -> bool {
+    if !scene.has_registered_rigid_candidates() || scene.voxels.is_empty() {
+        return false;
+    }
+    let mut dynamic_count = 0usize;
+    for (index, voxel) in scene.voxels.iter().enumerate() {
+        if !voxel.kinematic {
+            dynamic_count += 1;
+            if scene.aggregate_of.get(index).copied().flatten().is_none() {
+                return false;
+            }
+        }
+    }
+
+    // Retain static REV contacts too. The fixed-bin cache is already the
+    // narrow broadphase for kinematic geometry, so query it with each coarse
+    // swept bound instead of rebuilding bins for every dynamic REV.
+    if dynamic_count < scene.voxels.len() {
+        ensure_static_bins(scene, starts, scratch);
+        if scratch.static_requires_sparse {
+            return false;
+        }
+    }
+
+    let half_extent = DVec3::splat(DCELL * 0.5 + 2.0e-6);
+    let mut total_members = 0usize;
+    let mut bounds = Vec::with_capacity(scene.rigid_aggregates.len());
+    for (id, aggregate) in scene.rigid_aggregates.iter().enumerate() {
+        let Some(aggregate) = aggregate.as_ref() else {
+            continue;
+        };
+        let mut min = DVec3::splat(f64::INFINITY);
+        let mut max = DVec3::splat(f64::NEG_INFINITY);
+        let mut representative = None;
+        for index in aggregate.member_indices() {
+            if scene.aggregate_of.get(index).copied().flatten() != Some(id)
+                || scene.voxels[index].kinematic
+            {
+                return false;
+            }
+            representative.get_or_insert(index);
+            total_members += 1;
+            for center in [starts[index], scene.positions[index]] {
+                min = min.min(center - half_extent);
+                max = max.max(center + half_extent);
+            }
+        }
+        let Some(representative) = representative else {
+            continue;
+        };
+        bounds.push(AggregateSweepBounds {
+            representative,
+            min,
+            max,
+        });
+    }
+    if total_members != dynamic_count {
+        return false;
+    }
+
+    bounds.sort_unstable_by(|a, b| a.min.x.total_cmp(&b.min.x));
+    let mut possibly_contacting = Vec::new();
+    for (i, a) in bounds.iter().enumerate() {
+        for b in bounds.iter().skip(i + 1) {
+            if b.min.x > a.max.x {
+                break;
+            }
+            if a.max.y >= b.min.y && b.max.y >= a.min.y && a.max.z >= b.min.z && b.max.z >= a.min.z
+            {
+                possibly_contacting.push(a.representative);
+                possibly_contacting.push(b.representative);
+            }
+        }
+
+        let (lo, hi) = bin_bounds(a.min / DCELL, a.max / DCELL);
+        if bin_volume_exceeds_limit(lo, hi) {
+            return false;
+        }
+        'query: for z in lo[2]..=hi[2] {
+            for y in lo[1]..=hi[1] {
+                for x in lo[0]..=hi[0] {
+                    if scratch.static_bins.contains_key(&[x, y, z]) {
+                        possibly_contacting.push(a.representative);
+                        break 'query;
+                    }
+                }
+            }
+        }
+    }
+
+    if possibly_contacting.is_empty() {
+        scratch.candidate_pairs_valid = false;
+        scratch.pairs.clear();
+        contacts.clear();
+        return true;
+    }
+
+    scene.wake_rigid_candidates_for_voxels(&possibly_contacting);
+    false
 }
 
 /// Remove closing normal velocity after position projection. Restitution is
@@ -493,6 +868,18 @@ fn candidate_pairs(
         return;
     }
 
+    let requires_sparse = scratch.static_requires_sparse
+        || scratch
+            .dynamic_bounds_by_index
+            .iter()
+            .flatten()
+            .any(|&(lo, hi)| bin_volume_exceeds_limit(lo, hi));
+    if requires_sparse {
+        candidate_pairs_sparse(scene, starts, scratch);
+        scratch.candidate_pairs_valid = true;
+        return;
+    }
+
     for (_, mut ids) in scratch.bins.drain() {
         ids.clear();
         scratch.bin_pool.push(ids);
@@ -525,6 +912,15 @@ fn candidate_pairs(
                     for b in (a + 1)..ids.len() {
                         let i = ids[a].min(ids[b]);
                         let j = ids[a].max(ids[b]);
+                        if scene.aggregate_of[i].is_some()
+                            && scene.aggregate_of[i] == scene.aggregate_of[j]
+                        {
+                            // Relative geometry inside an aggregate is rigid
+                            // and cannot develop a new self-contact while it
+                            // remains coarse. Any pre-existing contact blocks
+                            // aggregation, and later external contact wakes it.
+                            continue;
+                        }
                         let lo_i = lower_by_index[i];
                         let lo_j = lower_by_index[j];
                         let canonical = [
@@ -553,9 +949,7 @@ fn candidate_pairs(
                                 lo_i[1].max(lo_j[1]),
                                 lo_i[2].max(lo_j[2]),
                             ];
-                            if *key == canonical
-                                && !local_continuum_pair(scene, adjacent, i, j)
-                            {
+                            if *key == canonical && !local_continuum_pair(scene, adjacent, i, j) {
                                 local_pairs.push((i, j));
                             }
                         }
@@ -572,6 +966,92 @@ fn candidate_pairs(
     scratch.pairs.extend(generated_pairs);
     scratch.pairs.sort_unstable();
     scratch.candidate_pairs_valid = true;
+}
+
+#[derive(Clone, Copy)]
+struct SweepBound {
+    index: usize,
+    lower: [i32; 3],
+    upper: [i32; 3],
+    dynamic: bool,
+}
+
+fn bin_volume_exceeds_limit(lower: [i32; 3], upper: [i32; 3]) -> bool {
+    let mut volume = 1u128;
+    for axis in 0..3 {
+        let span = upper[axis] as i64 - lower[axis] as i64 + 1;
+        if span <= 0 {
+            return true;
+        }
+        let Some(next) = volume.checked_mul(span as u128) else {
+            return true;
+        };
+        volume = next;
+        if volume > MAX_BINS_PER_REV {
+            return true;
+        }
+    }
+    false
+}
+
+/// Exact swept-AABB broadphase fallback for exceptional bounds. It retains
+/// every overlapping dynamic/dynamic or dynamic/static pair while using
+/// memory proportional to REV count and actual candidate pairs, not bin volume.
+fn candidate_pairs_sparse(scene: &Scene, starts: &[DVec3], scratch: &mut CollisionScratch) {
+    let mut bounds = Vec::with_capacity(scene.voxels.len());
+    for (index, voxel) in scene.voxels.iter().enumerate() {
+        let (lower, upper, dynamic) = if voxel.kinematic {
+            let a = starts[index].min(scene.positions[index]) / DCELL;
+            let b = starts[index].max(scene.positions[index]) / DCELL;
+            let (lower, upper) = bin_bounds(a, b);
+            (lower, upper, false)
+        } else {
+            let Some((lower, upper)) = scratch.dynamic_bounds_by_index[index] else {
+                continue;
+            };
+            (lower, upper, true)
+        };
+        bounds.push(SweepBound {
+            index,
+            lower,
+            upper,
+            dynamic,
+        });
+    }
+    bounds.sort_unstable_by(|a, b| {
+        a.lower[0]
+            .cmp(&b.lower[0])
+            .then_with(|| a.upper[0].cmp(&b.upper[0]))
+    });
+
+    scratch.pairs.clear();
+    for i in 0..bounds.len() {
+        let a = bounds[i];
+        for &b in &bounds[i + 1..] {
+            if b.lower[0] > a.upper[0] {
+                break;
+            }
+            if (!a.dynamic && !b.dynamic)
+                || a.upper[1] < b.lower[1]
+                || b.upper[1] < a.lower[1]
+                || a.upper[2] < b.lower[2]
+                || b.upper[2] < a.lower[2]
+            {
+                continue;
+            }
+            let (first, second) = (a.index.min(b.index), a.index.max(b.index));
+            if scene.aggregate_of[first].is_some()
+                && scene.aggregate_of[first] == scene.aggregate_of[second]
+            {
+                continue;
+            }
+            if !local_continuum_pair(scene, &scratch.adjacency, first, second) {
+                scratch.pairs.push((first, second));
+            }
+        }
+    }
+    scratch.pairs.sort_unstable();
+    scratch.pairs.dedup();
 }
 
 fn bin_bounds(a: DVec3, b: DVec3) -> ([i32; 3], [i32; 3]) {
@@ -609,6 +1089,95 @@ fn touching_normal(a: DVec3, b: DVec3) -> Option<Vec3> {
     Some(normal)
 }
 
+fn vectors_match_roundoff(a: DVec3, b: DVec3) -> bool {
+    let scale = a.abs().max(b.abs()).max_element().max(1.0);
+    (a - b).abs().max_element() <= 64.0 * f64::EPSILON * scale
+}
+
+fn stable_kinematic_position(
+    scene: &Scene,
+    starts: &[DVec3],
+    targets: &[[Option<f64>; 3]],
+    index: usize,
+) -> bool {
+    if index >= scene.voxels.len()
+        || !scene.voxels[index].kinematic
+        || !vectors_match_roundoff(starts[index], scene.positions[index])
+    {
+        return false;
+    }
+    for axis in 0..3 {
+        let position = scene.positions[index][axis];
+        if scene.axis_targets[index][axis].is_some_and(|target| {
+            !vectors_match_roundoff(DVec3::splat(target), DVec3::splat(position))
+        }) || targets
+            .get(index)
+            .and_then(|target| target[axis])
+            .is_some_and(|target| {
+                !vectors_match_roundoff(DVec3::splat(target), DVec3::splat(position))
+            })
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Ignore a contact against an internal face of a stable tiled kinematic
+/// surface. The adjacent fixed REV must occupy the whole face at both ends of
+/// the sweep; exposed, deformed, or moving faces keep normal contact handling.
+fn internal_kinematic_face_contact(
+    scene: &Scene,
+    starts: &[DVec3],
+    targets: &[[Option<f64>; 3]],
+    adjacency: &[[u32; 6]],
+    i: usize,
+    j: usize,
+    contact_normal: Vec3,
+) -> bool {
+    if scene.voxels[i].kinematic == scene.voxels[j].kinematic {
+        return false;
+    }
+    let (fixed, direction) = if scene.voxels[i].kinematic {
+        (i, contact_normal.as_dvec3())
+    } else {
+        (j, -contact_normal.as_dvec3())
+    };
+    if !stable_kinematic_position(scene, starts, targets, fixed) {
+        return false;
+    }
+
+    let axis = normal_axis(direction.as_vec3());
+    let sign = direction[axis].signum();
+    if sign == 0.0
+        || (0..3).any(|other| other != axis && direction[other].abs() > 1e-6)
+        || (direction[axis].abs() - 1.0).abs() > 1e-6
+    {
+        return false;
+    }
+    let side = 2 * axis + usize::from(sign > 0.0);
+    let Some(&neighbor_u32) = adjacency
+        .get(fixed)
+        .and_then(|directions| directions.get(side))
+    else {
+        return false;
+    };
+    if neighbor_u32 == crate::bond::EMPTY {
+        return false;
+    }
+    let neighbor = neighbor_u32 as usize;
+    if neighbor == i
+        || neighbor == j
+        || !stable_kinematic_position(scene, starts, targets, neighbor)
+    {
+        return false;
+    }
+
+    let offset = direction * DCELL;
+    vectors_match_roundoff(starts[neighbor], starts[fixed] + offset)
+        && vectors_match_roundoff(scene.positions[neighbor], scene.positions[fixed] + offset)
+}
+
 fn ensure_static_bins(scene: &Scene, starts: &[DVec3], scratch: &mut CollisionScratch) -> bool {
     let mut changed = !scratch.static_ready;
     let mut fixed_slot = 0;
@@ -631,6 +1200,7 @@ fn ensure_static_bins(scene: &Scene, starts: &[DVec3], scratch: &mut CollisionSc
         return false;
     }
     scratch.static_bins.clear();
+    scratch.static_requires_sparse = false;
     scratch.static_indices.clear();
     scratch.static_positions.clear();
     scratch
@@ -647,6 +1217,10 @@ fn ensure_static_bins(scene: &Scene, starts: &[DVec3], scratch: &mut CollisionSc
         let b = starts[i].max(scene.positions[i]) / DCELL;
         let (lo, hi) = bin_bounds(a, b);
         scratch.static_lower_by_index[i] = lo;
+        if bin_volume_exceeds_limit(lo, hi) {
+            scratch.static_requires_sparse = true;
+            continue;
+        }
         for z in lo[2]..=hi[2] {
             for y in lo[1]..=hi[1] {
                 for x in lo[0]..=hi[0] {
@@ -654,6 +1228,9 @@ fn ensure_static_bins(scene: &Scene, starts: &[DVec3], scratch: &mut CollisionSc
                 }
             }
         }
+    }
+    if scratch.static_requires_sparse {
+        scratch.static_bins.clear();
     }
     scratch.static_ready = true;
     true
@@ -665,13 +1242,17 @@ fn adjacency(
     cached_topology: &mut [Vec<u32>; 3],
 ) -> bool {
     let topology_unchanged = result.len() == scene.voxels.len()
-        && scene.bonds.iter().zip(cached_topology.iter()).all(|(bonds, cached)| {
-            bonds.len() == cached.len()
-                && bonds
-                    .iter()
-                    .zip(cached)
-                    .all(|(bond, &neighbor)| bond.neighbor == neighbor)
-        });
+        && scene
+            .bonds
+            .iter()
+            .zip(cached_topology.iter())
+            .all(|(bonds, cached)| {
+                bonds.len() == cached.len()
+                    && bonds
+                        .iter()
+                        .zip(cached)
+                        .all(|(bond, &neighbor)| bond.neighbor == neighbor)
+            });
     if topology_unchanged {
         return false;
     }
@@ -851,7 +1432,11 @@ fn separate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{bond::EMPTY, scene::{SceneConfig, VoxelSpawn}, solver};
+    use crate::{
+        bond::EMPTY,
+        scene::{SceneConfig, VoxelSpawn},
+        solver,
+    };
 
     #[test]
     fn rigidly_rotated_continuum_has_no_internal_box_contacts() {
@@ -969,6 +1554,238 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_members_skip_internal_pairs_but_keep_fine_tier_contacts() {
+        let oak = crate::material::Material::component_id("oak").unwrap();
+        let mut spawns = Vec::with_capacity(65);
+        for z in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    spawns.push(VoxelSpawn::at_cell([x, y, z], oak));
+                }
+            }
+        }
+        spawns.push(VoxelSpawn::at_cell([4, 0, 0], oak));
+        let mut config = SceneConfig::default();
+        config.gravity = [0.0; 3];
+        config.atmosphere.pressure_pa = 0.0;
+        let mut scene = Scene::from_voxels(config, spawns).unwrap();
+        // The neighboring fine REV remains a separate body and a collision
+        // candidate when its material bond is broken.
+        scene.bonds[0][3].neighbor = EMPTY;
+        scene.workspace[0][3].rest_neighbor = EMPTY;
+        let members: Vec<_> = (0..64).collect();
+        scene.register_rigid_aggregate_candidate(&members).unwrap();
+
+        let contacts = project(&mut scene, &[]);
+
+        assert!(!contacts
+            .iter()
+            .any(|contact| scene.aggregate_of[contact.i].is_some()
+                && scene.aggregate_of[contact.i] == scene.aggregate_of[contact.j]));
+        assert!(contacts
+            .iter()
+            .any(|contact| (contact.i, contact.j) == (3, 64)));
+    }
+
+    fn clearance_scene(
+        origins: &[[i32; 3]],
+        velocities: &[Vec3],
+        fixed_cells: &[[i32; 3]],
+    ) -> Scene {
+        assert_eq!(origins.len(), velocities.len());
+        let oak = crate::material::Material::component_id("oak").unwrap();
+        let mut spawns = Vec::with_capacity(origins.len() * 64 + fixed_cells.len());
+        for (&origin, &velocity) in origins.iter().zip(velocities) {
+            for z in 0..4 {
+                for y in 0..4 {
+                    for x in 0..4 {
+                        spawns.push(
+                            VoxelSpawn::at_cell([origin[0] + x, origin[1] + y, origin[2] + z], oak)
+                                .with_velocity(velocity),
+                        );
+                    }
+                }
+            }
+        }
+        for &cell in fixed_cells {
+            spawns.push(VoxelSpawn::at_cell(cell, oak).fixed());
+        }
+        let mut config = SceneConfig::default();
+        config.gravity = [0.0; 3];
+        config.atmosphere.pressure_pa = 0.0;
+        let mut scene = Scene::from_voxels(config, spawns).unwrap();
+        for group in 0..origins.len() {
+            let start = group * 64;
+            scene
+                .register_rigid_aggregate_candidate(&(start..start + 64).collect::<Vec<_>>())
+                .unwrap();
+        }
+        scene
+    }
+
+    #[test]
+    fn rigid_candidates_clear_for_separated_moving_bodies() {
+        let scene = clearance_scene(
+            &[[0, 0, 0], [8, 0, 0]],
+            &[Vec3::X * 0.1, Vec3::X * 0.1],
+            &[[30, 0, 0]],
+        );
+
+        assert!(rigid_candidates_clear_for_step(
+            &scene,
+            0.01,
+            DVec3::ZERO,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn rigid_candidates_reject_impending_fixed_floor_contact() {
+        let scene = clearance_scene(&[[0, 0, 10]], &[Vec3::NEG_Z], &[[0, 0, 0]]);
+
+        assert!(!rigid_candidates_clear_for_step(
+            &scene,
+            0.081,
+            DVec3::ZERO,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn rigid_candidates_reject_approaching_aggregate_bodies() {
+        let scene = clearance_scene(&[[0, 0, 0], [12, 0, 0]], &[Vec3::X, Vec3::NEG_X], &[]);
+
+        assert!(!rigid_candidates_clear_for_step(
+            &scene,
+            0.04,
+            DVec3::ZERO,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn rigid_candidates_reject_rotating_long_body_near_floor() {
+        let oak = crate::material::Material::component_id("oak").unwrap();
+        let omega = 25.0_f32;
+        let mut spawns = Vec::with_capacity(49);
+        for z in 5..7 {
+            for y in 0..2 {
+                for x in 0..12 {
+                    let arm_x = (x as f32 - 5.5) * CELL;
+                    let arm_z = (z as f32 - 5.5) * CELL;
+                    spawns.push(VoxelSpawn::at_cell([x, y, z], oak).with_velocity(Vec3::new(
+                        omega * arm_z,
+                        0.0,
+                        -omega * arm_x,
+                    )));
+                }
+            }
+        }
+        spawns.push(VoxelSpawn::at_cell([0, 0, 0], oak).fixed());
+        let mut config = SceneConfig::default();
+        config.gravity = [0.0; 3];
+        config.atmosphere.pressure_pa = 0.0;
+        let mut scene = Scene::from_voxels(config, spawns).unwrap();
+        scene
+            .register_rigid_aggregate_candidate(&(0..48).collect::<Vec<_>>())
+            .unwrap();
+
+        assert!(!rigid_candidates_clear_for_step(
+            &scene,
+            0.04,
+            DVec3::ZERO,
+            &[],
+        ));
+    }
+
+    fn two_separated_aggregate_blocks() -> Scene {
+        let oak = crate::material::Material::component_id("oak").unwrap();
+        let mut spawns = Vec::with_capacity(129);
+        for x_offset in [0, 6] {
+            for z in 0..4 {
+                for y in 0..4 {
+                    for x in 0..4 {
+                        spawns.push(VoxelSpawn::at_cell([x + x_offset, y, z], oak));
+                    }
+                }
+            }
+        }
+        spawns.push(VoxelSpawn::at_cell([30, 0, 0], oak).fixed());
+        let mut config = SceneConfig::default();
+        config.gravity = [0.0; 3];
+        config.atmosphere.pressure_pa = 0.0;
+        let mut scene = Scene::from_voxels(config, spawns).unwrap();
+        scene
+            .register_rigid_aggregate_candidate(&(0..64).collect::<Vec<_>>())
+            .unwrap();
+        scene
+            .register_rigid_aggregate_candidate(&(64..128).collect::<Vec<_>>())
+            .unwrap();
+        scene
+    }
+
+    #[test]
+    fn separated_coarse_bodies_skip_rev_broadphase() {
+        let mut scene = two_separated_aggregate_blocks();
+
+        assert!(project(&mut scene, &[]).is_empty());
+        assert_eq!(scene.rigid_aggregates.iter().flatten().count(), 2);
+        assert!(!scene.collision_scratch.candidate_pairs_valid);
+        assert!(scene.collision_scratch.pairs.is_empty());
+    }
+
+    #[test]
+    fn swept_coarse_bounds_wake_bodies_before_rev_contact_check() {
+        let mut scene = two_separated_aggregate_blocks();
+        // Move the second rigid body into the first during this step. Its swept
+        // aggregate bounds overlap, so the exact 1 cm collision path must run.
+        for position in &mut scene.positions[64..] {
+            position.x -= DCELL * 2.1;
+        }
+
+        let contacts = project(&mut scene, &[]);
+
+        assert!(scene.aggregate_of[..64].iter().all(Option::is_none));
+        assert!(scene.aggregate_of[64..].iter().all(Option::is_none));
+        assert!(contacts
+            .iter()
+            .any(|contact| (contact.i, contact.j) == (3, 64)));
+    }
+
+    #[test]
+    fn swept_coarse_bounds_wake_for_fixed_rev_contact() {
+        let oak = crate::material::Material::component_id("oak").unwrap();
+        let mut spawns = Vec::with_capacity(65);
+        for z in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    spawns.push(VoxelSpawn::at_cell([x, y, z], oak));
+                }
+            }
+        }
+        // Leave a gap so this fixed obstacle is not part of the oak bond
+        // component; the body's swept bound reaches it during the step.
+        spawns.push(VoxelSpawn::at_cell([5, 0, 0], oak).fixed());
+        let mut config = SceneConfig::default();
+        config.gravity = [0.0; 3];
+        config.atmosphere.pressure_pa = 0.0;
+        let mut scene = Scene::from_voxels(config, spawns).unwrap();
+        scene
+            .register_rigid_aggregate_candidate(&(0..64).collect::<Vec<_>>())
+            .unwrap();
+        for position in &mut scene.positions[..64] {
+            position.x += DCELL * 1.1;
+        }
+
+        let contacts = project(&mut scene, &[]);
+
+        assert!(scene.aggregate_of[..64].iter().all(Option::is_none));
+        assert!(contacts
+            .iter()
+            .any(|contact| (contact.i, contact.j) == (3, 64)));
+    }
+
+    #[test]
     fn swept_broadphase_emits_each_dynamic_pair_once() {
         let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
         config.dimensions = [3, 1, 1];
@@ -984,7 +1801,11 @@ mod tests {
         let starts = scene.previous.clone();
         let mut scratch = CollisionScratch::default();
 
-        adjacency(&scene, &mut scratch.adjacency, &mut scratch.adjacency_topology);
+        adjacency(
+            &scene,
+            &mut scratch.adjacency,
+            &mut scratch.adjacency_topology,
+        );
         candidate_pairs(&scene, &starts, &mut scratch, true);
 
         assert!(scratch.pairs.windows(2).all(|pair| pair[0] < pair[1]));
@@ -1013,9 +1834,121 @@ mod tests {
         let starts = scene.previous.clone();
         let mut scratch = CollisionScratch::default();
 
-        adjacency(&scene, &mut scratch.adjacency, &mut scratch.adjacency_topology);
+        adjacency(
+            &scene,
+            &mut scratch.adjacency,
+            &mut scratch.adjacency_topology,
+        );
         candidate_pairs(&scene, &starts, &mut scratch, true);
 
+        assert_eq!(scratch.pairs, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn oversized_dynamic_sweep_uses_sparse_broadphase_without_losing_contact_pair() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [2, 1, 1];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        config.gravity = [0.0; 3];
+        let mut scene = Scene::new(config);
+        scene.bonds[0][0].neighbor = EMPTY;
+        scene.previous.clone_from(&scene.positions);
+        // This finite displacement exceeds the i32 bin-coordinate range, so
+        // conversion saturates and the checked volume guard must still route
+        // to the sparse path before any bin loop starts.
+        scene.positions[1].x += DCELL * 10_000_000_000.0;
+        let starts = scene.previous.clone();
+        let bounds = bin_bounds(
+            starts[1].min(scene.positions[1]) / DCELL,
+            starts[1].max(scene.positions[1]) / DCELL,
+        );
+        assert!(bin_volume_exceeds_limit(bounds.0, bounds.1));
+        let mut scratch = CollisionScratch::default();
+        adjacency(
+            &scene,
+            &mut scratch.adjacency,
+            &mut scratch.adjacency_topology,
+        );
+
+        candidate_pairs(&scene, &starts, &mut scratch, true);
+
+        assert_eq!(scratch.pairs, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn huge_sweep_candidates_match_exhaustive_swept_aabb_overlaps() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [4, 1, 1];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        config.gravity = [0.0; 3];
+        let mut scene = Scene::new(config);
+        for bonds in &mut scene.bonds {
+            bonds.iter_mut().for_each(|bond| bond.neighbor = EMPTY);
+        }
+        scene.previous.clone_from(&scene.positions);
+        scene.positions[1].x += DCELL * 100_000.0;
+        let starts = scene.previous.clone();
+        let mut scratch = CollisionScratch::default();
+        adjacency(
+            &scene,
+            &mut scratch.adjacency,
+            &mut scratch.adjacency_topology,
+        );
+
+        candidate_pairs(&scene, &starts, &mut scratch, true);
+
+        let swept_bounds: Vec<_> = (0..scene.voxels.len())
+            .map(|index| {
+                bin_bounds(
+                    starts[index].min(scene.positions[index]) / DCELL,
+                    starts[index].max(scene.positions[index]) / DCELL,
+                )
+            })
+            .collect();
+        let mut exhaustive = Vec::new();
+        for i in 0..swept_bounds.len() {
+            for j in i + 1..swept_bounds.len() {
+                let (lo_i, hi_i) = swept_bounds[i];
+                let (lo_j, hi_j) = swept_bounds[j];
+                if (0..3).all(|axis| lo_i[axis] <= hi_j[axis] && lo_j[axis] <= hi_i[axis]) {
+                    exhaustive.push((i, j));
+                }
+            }
+        }
+
+        assert!(
+            scratch.bins.is_empty(),
+            "oversized bounds must bypass bin insertion"
+        );
+        assert_eq!(scratch.pairs, exhaustive);
+        assert!(scratch.pairs.len() <= 2 * scene.voxels.len());
+    }
+
+    #[test]
+    fn oversized_fixed_sweep_uses_sparse_broadphase_without_losing_contact_pair() {
+        let mut config = SceneConfig::load("scenes/wood_chop.ron").unwrap();
+        config.dimensions = [2, 1, 1];
+        config.branch_dimensions = [0; 3];
+        config.ground_dimensions = [0; 3];
+        config.gravity = [0.0; 3];
+        let mut scene = Scene::new(config);
+        scene.bonds[0][0].neighbor = EMPTY;
+        scene.set_voxel_kinematic(1, true).unwrap();
+        scene.previous.clone_from(&scene.positions);
+        scene.positions[1].x += DCELL * 100_000.0;
+        let starts = scene.previous.clone();
+        let mut scratch = CollisionScratch::default();
+        adjacency(
+            &scene,
+            &mut scratch.adjacency,
+            &mut scratch.adjacency_topology,
+        );
+
+        candidate_pairs(&scene, &starts, &mut scratch, true);
+
+        assert!(scratch.static_requires_sparse);
         assert_eq!(scratch.pairs, vec![(0, 1)]);
     }
 
@@ -1040,8 +1973,10 @@ mod tests {
                 let b_max = b0.max(b1);
                 let geometrically_overlaps = a_min - 0.5 - 2e-4 <= b_max + 0.5 + 2e-4
                     && b_min - 0.5 - 2e-4 <= a_max + 0.5 + 2e-4;
-                let (a_lo, a_hi) = bin_bounds(DVec3::splat(a_min as f64), DVec3::splat(a_max as f64));
-                let (b_lo, b_hi) = bin_bounds(DVec3::splat(b_min as f64), DVec3::splat(b_max as f64));
+                let (a_lo, a_hi) =
+                    bin_bounds(DVec3::splat(a_min as f64), DVec3::splat(a_max as f64));
+                let (b_lo, b_hi) =
+                    bin_bounds(DVec3::splat(b_min as f64), DVec3::splat(b_max as f64));
                 let bins_overlap =
                     (0..3).all(|axis| a_lo[axis] <= b_hi[axis] && b_lo[axis] <= a_hi[axis]);
                 assert!(
@@ -1126,12 +2061,57 @@ mod tests {
         }
         let final_speed = scene.voxels[0].velocity.x;
         let final_kinetic = 0.5 * f64::from(scene.voxels[0].mass) * f64::from(final_speed).powi(2);
-        assert!(final_speed < initial_speed * 0.95, "speed {initial_speed} -> {final_speed}");
+        assert!(
+            final_speed < initial_speed * 0.95,
+            "speed {initial_speed} -> {final_speed}"
+        );
         assert!(scene.energy.contact_friction_heat > 0.0);
-        assert!((initial_kinetic - final_kinetic - scene.energy.contact_friction_heat).abs()
-            < initial_kinetic * 0.02);
-        assert!((scene.voxels[0].total_internal_energy_j() - initial_internal
-            - scene.energy.contact_friction_heat).abs() < 1e-12);
+        assert!(
+            (initial_kinetic - final_kinetic - scene.energy.contact_friction_heat).abs()
+                < initial_kinetic * 0.02
+        );
+        assert!(
+            (scene.voxels[0].total_internal_energy_j()
+                - initial_internal
+                - scene.energy.contact_friction_heat)
+                .abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn tiled_floor_internal_faces_do_not_kick_sliding_body_but_outer_wall_does() {
+        let oak = crate::material::Material::component_id("oak").unwrap();
+        let mut config = SceneConfig::default();
+        config.gravity = [0.0; 3];
+        config.atmosphere.pressure_pa = 0.0;
+        let mut floor_spawns = Vec::new();
+        for z in [-1, 0] {
+            for x in 0..2 {
+                floor_spawns.push(VoxelSpawn::at_cell([x, 0, z], oak).fixed());
+            }
+        }
+        floor_spawns.push(VoxelSpawn::at_cell([0, 0, 1], oak));
+        let mut floor = Scene::from_voxels(config.clone(), floor_spawns).unwrap();
+        floor.previous.clone_from(&floor.positions);
+        floor.positions[4].x = 0.012;
+        let contacts = project(&mut floor, &[]);
+
+        assert!(contacts.iter().all(|contact| contact.normal.x.abs() < 0.5));
+        assert!((floor.positions[4].x - 0.012).abs() < 1e-12);
+
+        let wall_spawns = vec![
+            VoxelSpawn::at_cell([0, 0, 0], oak).fixed(),
+            VoxelSpawn::at_cell([0, 0, 1], oak),
+        ];
+        let mut wall = Scene::from_voxels(config, wall_spawns).unwrap();
+        wall.positions[1] = DVec3::new(0.014, 0.005, 0.014);
+        wall.previous.clone_from(&wall.positions);
+        let initial_x = wall.positions[1].x;
+        let contacts = project(&mut wall, &[]);
+
+        assert!(contacts.iter().any(|contact| contact.normal.x.abs() > 0.5));
+        assert!(wall.positions[1].x > initial_x);
     }
 
     #[test]

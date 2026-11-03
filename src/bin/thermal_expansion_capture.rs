@@ -34,7 +34,8 @@ fn write_state(
         )?;
     }
     let target_t = INITIAL_TEMPERATURE_K + RISE_K * (step as f32 / RAMP_STEPS as f32).min(1.0);
-    let free_span = initial_span_m * (1.0 + ALPHA_PER_K * (target_t - INITIAL_TEMPERATURE_K)) as f64;
+    let free_span =
+        initial_span_m * (1.0 + ALPHA_PER_K * (target_t - INITIAL_TEMPERATURE_K)) as f64;
     let actual_span = (scene.positions[2] - scene.positions[0]).length();
     let force_n = scene.workspace[0][1].last_force.x.abs() as f64;
     let stress_pa = force_n / 1.0e-4;

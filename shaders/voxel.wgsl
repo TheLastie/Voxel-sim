@@ -1,5 +1,15 @@
 struct Camera { view_proj: mat4x4<f32> };
 @group(0) @binding(0) var<uniform> camera: Camera;
+struct SkinInfluence {
+    bone_indices: vec4<u32>,
+    weights: vec4<f32>,
+};
+struct BoneSkinTransform {
+    translation: vec4<f32>,
+    rotation: vec4<f32>,
+};
+@group(1) @binding(0) var<storage, read> skin_influences: array<SkinInfluence>;
+@group(1) @binding(1) var<storage, read> bone_skin_transforms: array<BoneSkinTransform>;
 struct Input {
     @location(0) vertex: vec3<f32>,
     @location(1) normal: vec3<f32>,
@@ -8,6 +18,7 @@ struct Input {
     @location(4) color: vec4<f32>,
     @location(5) rotation: vec4<f32>,
     @location(6) surface: f32,
+    @location(7) skin_index: u32,
 };
 struct Output {
     @builtin(position) position: vec4<f32>,
@@ -19,11 +30,66 @@ struct Output {
 fn rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
     return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
 }
+fn multiply_quaternions(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(
+        a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz),
+        a.w * b.w - dot(a.xyz, b.xyz),
+    );
+}
 @vertex fn vs(i: Input) -> Output {
     var o: Output;
-    let world_position = i.center + rotate(i.rotation, i.vertex * i.scale);
+    var skinned_center = i.center;
+    var skin_rotation = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var skin_weight_sum = 0.0;
+    var reference_rotation = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    if i.skin_index < arrayLength(&skin_influences) {
+        let influence = skin_influences[i.skin_index];
+        var blended_center = vec3<f32>(0.0);
+        for (var slot = 0u; slot < 4u; slot += 1u) {
+            let weight = max(influence.weights[slot], 0.0);
+            let bone_index = influence.bone_indices[slot];
+            if weight > 0.0 && bone_index < arrayLength(&bone_skin_transforms) {
+                let bone = bone_skin_transforms[bone_index];
+                let delta_rotation = normalize(bone.rotation);
+                blended_center += (bone.translation.xyz + rotate(delta_rotation, i.center)) * weight;
+                var aligned_rotation = delta_rotation;
+                if skin_weight_sum == 0.0 {
+                    reference_rotation = delta_rotation;
+                } else if dot(reference_rotation, aligned_rotation) < 0.0 {
+                    aligned_rotation = -aligned_rotation;
+                }
+                skin_rotation += aligned_rotation * weight;
+                skin_weight_sum += weight;
+            }
+        }
+        if skin_weight_sum > 1e-6 {
+            skinned_center = blended_center / skin_weight_sum;
+            skin_rotation = normalize(skin_rotation);
+        }
+    }
+    var instance_rotation = i.rotation;
+    if skin_weight_sum > 1e-6 {
+        instance_rotation = normalize(multiply_quaternions(skin_rotation, i.rotation));
+    }
+    let world_position = skinned_center + rotate(instance_rotation, i.vertex * i.scale);
     o.position = camera.view_proj * vec4<f32>(world_position, 1.0);
-    o.normal = rotate(i.rotation, i.normal);
+    if i.surface < 0.0 {
+        let axis_normal = abs(i.normal);
+        var axis = 0u;
+        if axis_normal.y > axis_normal.x {
+            axis = 1u;
+        }
+        if axis_normal.z > axis_normal[axis] {
+            axis = 2u;
+        }
+        let positive = i.normal[axis] > 0.0;
+        let face_bit = 1u << (axis * 2u + select(0u, 1u, positive));
+        let face_mask = u32(-i.surface - 1.0);
+        if (face_mask & face_bit) == 0u {
+            o.position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+        }
+    }
+    o.normal = rotate(instance_rotation, i.normal);
     o.world_position = world_position;
     o.surface = i.surface;
     o.color = i.color;

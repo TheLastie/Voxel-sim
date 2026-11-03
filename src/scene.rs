@@ -1,12 +1,12 @@
 use crate::{
-    aggregation::{AggregationError, ConstituentState, RigidAggregate},
+    aggregation::{AggregationError, ConstituentState, RigidAggregate, RigidMemberTranslationPose},
     bond::{Bond, BondWorkspace, EMPTY},
     material::{Material, PhaseState},
     voxel::{Composition, Microstructure, Voxel},
 };
 use glam::{DVec3, Quat, Vec3};
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs};
 
 pub const CELL: f32 = crate::coordinates::CELL_M as f32;
@@ -16,7 +16,7 @@ pub const AREA: f32 = CELL * CELL;
 /// Uniform ambient dry air. Pressure and temperature determine density through
 /// the ideal-gas law; the force model uses a measured bluff-body drag
 /// coefficient for the exposed voxel surface.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AtmosphereConfig {
     pub pressure_pa: f32,
@@ -54,7 +54,7 @@ impl AtmosphereConfig {
 }
 
 /// CPU preconditioner used by the coupled elastic PCG solver.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CpuPreconditioner {
     /// Block incomplete Cholesky with zero fill; reduces iterations but has
@@ -208,8 +208,10 @@ impl VoxelSpawn {
     /// `(0.5 cm, 0.5 cm, 0.5 cm)`.
     pub fn at_cell(cell: [i32; 3], component: u16) -> Self {
         let cell = DVec3::new(cell[0] as f64, cell[1] as f64, cell[2] as f64);
-        Self::new_precise(cell * crate::coordinates::CELL_M
-            + DVec3::splat(crate::coordinates::CELL_M * 0.5), component)
+        Self::new_precise(
+            cell * crate::coordinates::CELL_M + DVec3::splat(crate::coordinates::CELL_M * 0.5),
+            component,
+        )
     }
 
     pub fn with_composition(mut self, composition: Composition) -> Self {
@@ -309,7 +311,7 @@ impl SceneBuilder {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SceneConfig {
     pub dimensions: [usize; 3],
@@ -417,6 +419,11 @@ fn default_tool_direction() -> [f32; 3] {
 }
 /// Positions are separate arrays; material identity exists only in composition.
 pub struct Scene {
+    /// Physical time advanced by the fixed-step solver; never wall-clock time.
+    pub simulated_seconds: f64,
+    /// Runtime scheduler policy; kept out of the positional document format.
+    pub(crate) adaptive_substeps: bool,
+    pub(crate) last_mechanical_substeps: usize,
     /// Capacity-reusing workspace retained between physical steps.
     pub(crate) solver_scratch: crate::solver::SolverScratch,
     /// Capacity-reusing thermal transport workspace retained between substeps.
@@ -430,6 +437,8 @@ pub struct Scene {
     pub(crate) aggregate_of: Vec<Option<usize>>,
     pub config: SceneConfig,
     pub voxels: Vec<Voxel>,
+    /// Optional generated-world identity for each REV, compacted with topology.
+    pub(crate) source_cells: Vec<Option<[i32; 3]>>,
     /// Persistent per-voxel forces in newtons, retained until explicitly reset.
     pub external_forces: Vec<Vec3>,
     /// Persistent per-voxel acceleration inputs in m/s².
@@ -455,6 +464,8 @@ pub struct Scene {
     pub energy: crate::fracture::EnergyLedger,
     pub releases: Vec<crate::fracture::Release>,
     pub substep_index: u64,
+    /// Monotonic revision for data consumed by the renderer.
+    pub render_revision: u64,
     /// Independently recomputed relative residual of the last fine operator.
     pub solver_residual: f32,
     /// Last independently audited solve; enabled by VOXEL_AUDIT_PCG_RESIDUAL.
@@ -481,6 +492,11 @@ impl Scene {
         crate::solver::step(self, tool);
     }
 
+    /// Notify render caches after direct mutation of public render-related arrays.
+    pub fn mark_render_changed(&mut self) {
+        self.render_revision = self.render_revision.wrapping_add(1);
+    }
+
     /// Register a conservative aggregate candidate for one closed bonded
     /// component with no unresolved internal velocity mode. Fine REV data
     /// remains authoritative; fixed-step mechanics advance this candidate
@@ -500,6 +516,48 @@ impl Scene {
             }
         }
 
+        let id = self.rigid_aggregates.len();
+        self.rigid_aggregates.push(Some(aggregate));
+        for &index in members {
+            self.aggregate_of[index] = Some(id);
+        }
+        Ok(id)
+    }
+
+    /// Register members already extracted as a complete component from the
+    /// current cluster labels. This avoids rescanning the entire bond graph
+    /// once per component during an automatic coarse-tier update.
+    pub(crate) fn register_rigid_aggregate_candidate_in_cluster(
+        &mut self,
+        members: &[usize],
+        cluster_id: u32,
+        expected_len: usize,
+    ) -> Result<usize, AggregationError> {
+        if members.is_empty() {
+            return Err(AggregationError::Empty);
+        }
+        if self.clusters.len() != self.voxels.len()
+            || members.len() != expected_len
+            || cluster_id as usize >= self.cluster_count
+        {
+            return Err(AggregationError::DisconnectedSet);
+        }
+        for &index in members {
+            if index >= self.voxels.len() {
+                return Err(AggregationError::IndexOutOfBounds(index));
+            }
+            if self.clusters[index] != cluster_id {
+                return Err(AggregationError::DisconnectedSet);
+            }
+            if self.aggregate_of[index].is_some() {
+                return Err(AggregationError::AlreadyAggregated(index));
+            }
+        }
+
+        let aggregate = self.rigid_aggregate_snapshot_impl(members, false)?;
+        if aggregate.has_unresolved_internal_motion() {
+            return Err(AggregationError::UnresolvedInternalMotion);
+        }
         let id = self.rigid_aggregates.len();
         self.rigid_aggregates.push(Some(aggregate));
         for &index in members {
@@ -556,7 +614,11 @@ impl Scene {
     /// scene state remains authoritative.
     pub(crate) fn wake_rigid_candidates_for_voxels(&mut self, voxels: &[usize]) -> usize {
         let mut ids = Vec::new();
-        ids.extend(voxels.iter().filter_map(|&voxel| self.aggregate_for_voxel(voxel)));
+        ids.extend(
+            voxels
+                .iter()
+                .filter_map(|&voxel| self.aggregate_for_voxel(voxel)),
+        );
         ids.sort_unstable();
         ids.dedup();
 
@@ -629,28 +691,40 @@ impl Scene {
         dt_s: f64,
         gravity_m_s2: DVec3,
         nodal_loads_n: &[Vec3],
+        reference_step_s: Option<f64>,
     ) -> Result<usize, AggregationError> {
         let mut advanced = 0;
         let aggregate_count = self.rigid_aggregates.len();
+        let has_nodal_loads = nodal_loads_n.iter().any(|load| *load != Vec3::ZERO);
         for id in 0..aggregate_count {
             let Some(view) = self.rigid_aggregates[id].as_ref() else {
                 continue;
             };
-            let center = view.center_of_mass_m();
-            let mut force = DVec3::ZERO;
-            let mut torque = DVec3::ZERO;
-            let mut total_mass = 0.0;
-            for member in view.member_poses() {
-                let nodal = nodal_loads_n
-                    .get(member.index)
-                    .copied()
-                    .unwrap_or(Vec3::ZERO);
-                let member_force = gravity_m_s2 * member.mass_kg
-                    + DVec3::new(nodal.x as f64, nodal.y as f64, nodal.z as f64);
-                force += member_force;
-                torque += (member.position_m - center).cross(member_force);
-                total_mass += member.mass_kg;
-            }
+            let (force, torque, total_mass) = if !has_nodal_loads {
+                // Uniform gravity acts through the aggregate center of mass:
+                // its exact resultant is m*g with zero torque. Avoid walking
+                // every retained REV to re-sum that identity and its
+                // roundoff-only moment.
+                let mass = view.mass_kg();
+                (gravity_m_s2 * mass, DVec3::ZERO, mass)
+            } else {
+                let center = view.center_of_mass_m();
+                let mut force = DVec3::ZERO;
+                let mut torque = DVec3::ZERO;
+                let mut total_mass = 0.0;
+                for member in view.member_poses() {
+                    let nodal = nodal_loads_n
+                        .get(member.index)
+                        .copied()
+                        .unwrap_or(Vec3::ZERO);
+                    let member_force = gravity_m_s2 * member.mass_kg
+                        + DVec3::new(nodal.x as f64, nodal.y as f64, nodal.z as f64);
+                    force += member_force;
+                    torque += (member.position_m - center).cross(member_force);
+                    total_mass += member.mass_kg;
+                }
+                (force, torque, total_mass)
+            };
 
             // Boundary removal is performed on fine REVs at the fixed-step
             // boundary. Refine before a coarse body's conservative swept
@@ -658,8 +732,13 @@ impl Scene {
             // ledger always see the constituent state.
             let boundary_members = if let Some(bounds) = self.world_bounds {
                 let acceleration = force / total_mass;
-                let (swept_min, swept_max) =
+                let (mut swept_min, mut swept_max) =
                     view.swept_bounds_under_acceleration(dt_s, acceleration)?;
+                if let Some(h) = reference_step_s {
+                    let drift_bias = acceleration * (0.5 * dt_s * h);
+                    swept_min += drift_bias.min(DVec3::ZERO);
+                    swept_max += drift_bias.max(DVec3::ZERO);
+                }
                 let bounds_min = DVec3::new(
                     bounds.min.x as f64,
                     bounds.min.y as f64,
@@ -686,16 +765,32 @@ impl Scene {
             let mut aggregate = self.rigid_aggregates[id]
                 .take()
                 .expect("active aggregate id collected above");
-            if let Err(error) = aggregate.advance_under_wrench(force, torque, dt_s) {
+            let orientation_before = aggregate.orientation();
+            let advance = match reference_step_s {
+                Some(h) => aggregate
+                    .advance_under_wrench_matching_inertial_step(force, torque, dt_s, h),
+                None => aggregate.advance_under_wrench(force, torque, dt_s),
+            };
+            if let Err(error) = advance {
                 self.rigid_aggregates[id] = Some(aggregate);
                 return Err(error);
             }
-            if let Err(error) = self.write_rigid_aggregate_pose(&aggregate) {
+            let write_result = if aggregate.has_zero_angular_momentum()
+                && aggregate.orientation() == orientation_before
+            {
+                self.write_rigid_aggregate_translation_pose(&aggregate)
+            } else {
+                self.write_rigid_aggregate_pose(&aggregate)
+            };
+            if let Err(error) = write_result {
                 self.rigid_aggregates[id] = Some(aggregate);
                 return Err(error);
             }
             self.rigid_aggregates[id] = Some(aggregate);
             advanced += 1;
+        }
+        if advanced > 0 {
+            self.mark_render_changed();
         }
         Ok(advanced)
     }
@@ -705,9 +800,8 @@ impl Scene {
         aggregate: &RigidAggregate,
     ) -> Result<(), AggregationError> {
         let f32_max = f32::MAX as f64;
-        let fits_f32 = |value: DVec3| {
-            value.is_finite() && value.to_array().iter().all(|x| x.abs() <= f32_max)
-        };
+        let fits_f32 =
+            |value: DVec3| value.is_finite() && value.to_array().iter().all(|x| x.abs() <= f32_max);
         for state in aggregate.member_poses() {
             if state.index >= self.voxels.len() {
                 return Err(AggregationError::IndexOutOfBounds(state.index));
@@ -719,7 +813,10 @@ impl Scene {
                 || !orientation.is_finite()
                 || !orientation.length_squared().is_finite()
                 || orientation.length_squared() <= f64::EPSILON
-                || state.bond_last_force_n.iter().any(|force| !fits_f32(*force))
+                || state
+                    .bond_last_force_n
+                    .iter()
+                    .any(|force| !fits_f32(*force))
             {
                 return Err(AggregationError::InvalidState(state.index));
             }
@@ -741,6 +838,40 @@ impl Scene {
             for axis in 0..3 {
                 self.workspace[axis][i].last_force = to_vec3(state.bond_last_force_n[axis]);
             }
+        }
+        Ok(())
+    }
+
+    fn write_rigid_aggregate_translation_pose(
+        &mut self,
+        aggregate: &RigidAggregate,
+    ) -> Result<(), AggregationError> {
+        let f32_max = f32::MAX as f64;
+        let fits_f32 =
+            |value: DVec3| value.is_finite() && value.to_array().iter().all(|x| x.abs() <= f32_max);
+        for state in aggregate.translation_member_poses() {
+            if state.index >= self.voxels.len() {
+                return Err(AggregationError::IndexOutOfBounds(state.index));
+            }
+            if !fits_f32(state.position_m)
+                || !fits_f32(state.rest_position_m)
+                || !fits_f32(state.velocity_m_s)
+            {
+                return Err(AggregationError::InvalidState(state.index));
+            }
+        }
+
+        let to_vec3 = |value: DVec3| Vec3::new(value.x as f32, value.y as f32, value.z as f32);
+        for RigidMemberTranslationPose {
+            index,
+            position_m,
+            rest_position_m,
+            velocity_m_s,
+        } in aggregate.translation_member_poses()
+        {
+            self.positions[index] = position_m;
+            self.rest_positions[index] = rest_position_m;
+            self.voxels[index].velocity = to_vec3(velocity_m_s);
         }
         Ok(())
     }
@@ -868,16 +999,74 @@ impl Scene {
     /// Create a scene from arbitrary REV states. Bond topology is derived from
     /// adjacent 1 cm lattice cells; no built-in object layout is inserted.
     pub fn from_voxels(config: SceneConfig, spawns: Vec<VoxelSpawn>) -> Result<Self, String> {
+        Self::from_voxels_with_materials(config, Material::table(), spawns)
+    }
+
+    /// Create a scene from separate voxel objects. Adjacent REVs bond only
+    /// inside their source object; contacts between different objects remain
+    /// separate mechanical interactions rather than being silently fused.
+    pub fn from_voxel_objects(
+        config: SceneConfig,
+        objects: Vec<Vec<VoxelSpawn>>,
+    ) -> Result<Self, String> {
+        Self::from_voxel_objects_with_materials(config, Material::table(), objects)
+    }
+
+    /// Variant of [`Scene::from_voxel_objects`] for authored material tables.
+    pub fn from_voxel_objects_with_materials(
+        config: SceneConfig,
+        materials: Vec<Material>,
+        objects: Vec<Vec<VoxelSpawn>>,
+    ) -> Result<Self, String> {
+        let voxel_count = objects
+            .iter()
+            .try_fold(0usize, |total, object| total.checked_add(object.len()))
+            .ok_or_else(|| "scene object voxel count overflow".to_owned())?;
+        let mut spawns = Vec::with_capacity(voxel_count);
+        let mut bonding_groups = Vec::with_capacity(voxel_count);
+        for (object_index, object) in objects.into_iter().enumerate() {
+            let group = u32::try_from(object_index)
+                .map_err(|_| "scene has too many separate voxel objects".to_owned())?;
+            bonding_groups.extend(std::iter::repeat_n(group, object.len()));
+            spawns.extend(object);
+        }
+        Self::from_voxels_with_materials_and_groups(config, materials, spawns, bonding_groups)
+    }
+
+    pub(crate) fn from_voxels_with_materials(
+        config: SceneConfig,
+        materials: Vec<Material>,
+        spawns: Vec<VoxelSpawn>,
+    ) -> Result<Self, String> {
+        let bonding_groups = vec![0; spawns.len()];
+        Self::from_voxels_with_materials_and_groups(config, materials, spawns, bonding_groups)
+    }
+
+    fn from_voxels_with_materials_and_groups(
+        config: SceneConfig,
+        materials: Vec<Material>,
+        spawns: Vec<VoxelSpawn>,
+        bonding_groups: Vec<u32>,
+    ) -> Result<Self, String> {
         config.validate().map_err(str::to_owned)?;
-        let materials = Material::table();
+        if materials.is_empty() {
+            return Err("scene material table must not be empty".into());
+        }
+        if bonding_groups.len() != spawns.len() {
+            return Err("voxel object membership does not match the REV count".into());
+        }
         let mut scene = Self {
             config,
+            simulated_seconds: 0.0,
             solver_scratch: Default::default(),
+            adaptive_substeps: false,
+            last_mechanical_substeps: 0,
             thermal_scratch: Default::default(),
             collision_scratch: Default::default(),
             rigid_aggregates: Vec::new(),
             aggregate_of: vec![None; spawns.len()],
             voxels: Vec::with_capacity(spawns.len()),
+            source_cells: vec![None; spawns.len()],
             external_forces: Vec::with_capacity(spawns.len()),
             external_accelerations: Vec::with_capacity(spawns.len()),
             axis_targets: Vec::with_capacity(spawns.len()),
@@ -898,6 +1087,7 @@ impl Scene {
             energy: Default::default(),
             releases: Vec::new(),
             substep_index: 0,
+            render_revision: 0,
             solver_residual: 0.0,
             solver_residual_audit: None,
             solver_max_audited_residual: None,
@@ -909,7 +1099,12 @@ impl Scene {
             pending_fusion: None,
             boundary_removals: BoundaryRemovalLedger::default(),
         };
-        let mut occupancy = HashMap::with_capacity(spawns.len());
+        // Voxel lattice keys are engine-generated integer coordinates, so
+        // randomized collision resistance is unnecessary here. FxHashMap keeps
+        // the exact same occupancy semantics while reducing the cost of the
+        // three neighbor lookups per REV in large physical patches.
+        let mut occupancy =
+            rustc_hash::FxHashMap::with_capacity_and_hasher(spawns.len(), Default::default());
         let mut keys = Vec::with_capacity(spawns.len());
         for (index, spawn) in spawns.into_iter().enumerate() {
             if !spawn.center.is_finite()
@@ -990,7 +1185,9 @@ impl Scene {
                 let mut neighbor = *key;
                 neighbor[axis] += 1;
                 if let Some(&j) = occupancy.get(&neighbor) {
-                    if scene.voxels[i].kinematic == scene.voxels[j].kinematic {
+                    if bonding_groups[i] == bonding_groups[j]
+                        && scene.voxels[i].kinematic == scene.voxels[j].kinematic
+                    {
                         scene.bonds[axis][i].neighbor = j as u32;
                         scene.workspace[axis][i].rest_neighbor = j as u32;
                         scene.colors[axis * 2 + key[axis].rem_euclid(2) as usize].push(i);
@@ -1002,9 +1199,121 @@ impl Scene {
         Ok(scene)
     }
 
+    /// Restore saved per-REV state while rebuilding only the scene's derived
+    /// topology and workspaces. Constraint and animation runtime state is
+    /// restored by the corresponding editor systems when those systems exist.
+    pub(crate) fn from_saved_voxel_states(
+        config: SceneConfig,
+        materials: Vec<Material>,
+        snapshots: Vec<(DVec3, DVec3, Voxel)>,
+    ) -> Result<Self, String> {
+        let bonding_groups = vec![0; snapshots.len()];
+        Self::from_saved_voxel_states_with_groups(config, materials, snapshots, bonding_groups)
+    }
+
+    /// Restore per-REV state from separate authored objects while keeping
+    /// their internal bonds and object-to-object contacts distinct.
+    pub(crate) fn from_saved_voxel_objects(
+        config: SceneConfig,
+        materials: Vec<Material>,
+        objects: Vec<Vec<(DVec3, DVec3, Voxel)>>,
+    ) -> Result<Self, String> {
+        let voxel_count = objects
+            .iter()
+            .try_fold(0usize, |total, object| total.checked_add(object.len()))
+            .ok_or_else(|| "scene object voxel count overflow".to_owned())?;
+        let mut snapshots = Vec::with_capacity(voxel_count);
+        let mut bonding_groups = Vec::with_capacity(voxel_count);
+        for (object_index, object) in objects.into_iter().enumerate() {
+            let group = u32::try_from(object_index)
+                .map_err(|_| "scene has too many separate voxel objects".to_owned())?;
+            bonding_groups.extend(std::iter::repeat_n(group, object.len()));
+            snapshots.extend(object);
+        }
+        Self::from_saved_voxel_states_with_groups(config, materials, snapshots, bonding_groups)
+    }
+
+    fn from_saved_voxel_states_with_groups(
+        config: SceneConfig,
+        materials: Vec<Material>,
+        snapshots: Vec<(DVec3, DVec3, Voxel)>,
+        bonding_groups: Vec<u32>,
+    ) -> Result<Self, String> {
+        if materials.is_empty() {
+            return Err("scene material table must not be empty".into());
+        }
+        if bonding_groups.len() != snapshots.len() {
+            return Err("saved object membership does not match the REV count".into());
+        }
+        let spawns = snapshots
+            .iter()
+            .map(|(position, rest_position, state)| {
+                state.composition.validate(materials.len())?;
+                if !position.is_finite()
+                    || !rest_position.is_finite()
+                    || !state.mass.is_finite()
+                    || state.mass <= 0.0
+                    || !state.velocity.is_finite()
+                    || !state.internal_energy.is_finite()
+                    || state.internal_energy < 0.0
+                    || !state.internal_energy_remainder_j.is_finite()
+                    || !state.microstructure.orientation.is_finite()
+                    || state.microstructure.orientation.length_squared() < 1e-8
+                    || !state.microstructure.anisotropy.is_finite()
+                    || !(0.0..=1.0).contains(&state.microstructure.anisotropy)
+                {
+                    return Err("saved voxel has invalid physical state".to_owned());
+                }
+                let mut thermal_cells = [0.0; crate::voxel::THERMAL_CELL_COUNT];
+                state.copy_thermal_cell_energies_j(&mut thermal_cells);
+                let thermal_total: f64 = thermal_cells.iter().sum();
+                if thermal_cells
+                    .iter()
+                    .any(|energy| !energy.is_finite() || *energy < 0.0)
+                    || (thermal_total - state.total_internal_energy_j()).abs()
+                        > 1e-9 * thermal_total.abs().max(1.0)
+                {
+                    return Err("saved voxel has inconsistent thermal energy".to_owned());
+                }
+                let material = Material::mixed(&state.composition, &materials);
+                Ok(VoxelSpawn {
+                    center: *position,
+                    composition: state.composition.clone(),
+                    velocity: state.velocity,
+                    microstructure: state.microstructure,
+                    kinematic: state.kinematic,
+                    temperature_kelvin: material
+                        .phase_state(state.mass, state.thermal_energy_f32())
+                        .temperature_kelvin,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut scene =
+            Self::from_voxels_with_materials_and_groups(config, materials, spawns, bonding_groups)?;
+        for (index, (position, rest_position, state)) in snapshots.into_iter().enumerate() {
+            if !position.is_finite() || !rest_position.is_finite() {
+                return Err(format!("saved voxel {index} has a non-finite position"));
+            }
+            let properties = Material::mixed(&state.composition, &scene.materials);
+            scene.reference_temperatures_kelvin[index] = properties
+                .phase_state(state.mass, state.thermal_energy_f32())
+                .temperature_kelvin;
+            scene.positions[index] = position;
+            scene.previous[index] = position;
+            scene.rest_positions[index] = rest_position;
+            scene.properties[index] = properties;
+            scene.voxels[index] = state;
+        }
+        Ok(scene)
+    }
+
     /// Set world bounds. REV centres outside the inclusive box are removed now
     /// and after each subsequent physical step.
-    pub fn set_world_bounds(&mut self, min: impl Into<DVec3>, max: impl Into<DVec3>) -> Result<usize, &'static str> {
+    pub fn set_world_bounds(
+        &mut self,
+        min: impl Into<DVec3>,
+        max: impl Into<DVec3>,
+    ) -> Result<usize, &'static str> {
         let min = min.into();
         let max = max.into();
         if !min.is_finite() || !max.is_finite() || min.cmpgt(max).any() {
@@ -1161,8 +1470,8 @@ impl Scene {
             let separation = self.positions[j] - self.positions[i];
             let projected = separation.dot(face_normal);
             let tangent = separation - face_normal * projected;
-            let face_contact =
-                (projected.abs() - DCELL).abs() <= DCELL * 1e-3 && tangent.abs().max_element() < DCELL;
+            let face_contact = (projected.abs() - DCELL).abs() <= DCELL * 1e-3
+                && tangent.abs().max_element() < DCELL;
             let temperature_ok = self.temperature_kelvin(i).unwrap_or(0.0)
                 >= rule.minimum_temperature_kelvin
                 && self.temperature_kelvin(j).unwrap_or(0.0) >= rule.minimum_temperature_kelvin;
@@ -1483,7 +1792,8 @@ impl Scene {
         let separation = self.positions[b] - self.positions[a];
         let normal_gap = separation.dot(face_normal).abs();
         let tangential_offset = separation - face_normal * separation.dot(face_normal);
-        if (normal_gap - DCELL).abs() > DCELL * 1e-3 || tangential_offset.abs().max_element() >= DCELL
+        if (normal_gap - DCELL).abs() > DCELL * 1e-3
+            || tangential_offset.abs().max_element() >= DCELL
         {
             return Err("fused voxels must be in face contact");
         }
@@ -1517,9 +1827,8 @@ impl Scene {
         let vb = self.voxels[consumed].velocity;
         let kinetic_before =
             0.5 * mass_a * va.length_squared() as f64 + 0.5 * mass_b * vb.length_squared() as f64;
-        let position = (self.positions[survivor] * mass_a
-            + self.positions[consumed] * mass_b)
-            / mass_total;
+        let position =
+            (self.positions[survivor] * mass_a + self.positions[consumed] * mass_b) / mass_total;
         let velocity = (va * mass_a as f32 + vb * mass_b as f32) / mass_total as f32;
         let kinetic_after = 0.5 * merged_mass as f64 * velocity.length_squared() as f64;
         let fusion_heat_j = (kinetic_before - kinetic_after).max(0.0);
@@ -1801,6 +2110,12 @@ impl Scene {
             keep
         });
         old_index = 0;
+        self.source_cells.retain(|_| {
+            let keep = keep[old_index];
+            old_index += 1;
+            keep
+        });
+        old_index = 0;
         self.positions.retain(|_| {
             let keep = keep[old_index];
             old_index += 1;
@@ -1873,6 +2188,24 @@ impl Scene {
         removed_count
     }
 
+    /// Enable conservative mechanical time refinement. `config.substeps` stays
+    /// the upper bound used for interactions. This never changes `fixed_dt`.
+    pub fn set_adaptive_substeps(&mut self, enabled: bool) {
+        if self.adaptive_substeps != enabled {
+            self.wake_all_rigid_candidates();
+            self.solver_scratch = Default::default();
+            self.adaptive_substeps = enabled;
+        }
+    }
+
+    pub fn adaptive_substeps(&self) -> bool {
+        self.adaptive_substeps
+    }
+
+    pub fn last_mechanical_substeps(&self) -> usize {
+        self.last_mechanical_substeps
+    }
+
     /// Physical mass of every REV, including kinematic boundary material.
     pub fn total_mass_kg(&self) -> f64 {
         self.voxels.iter().map(|voxel| voxel.mass as f64).sum()
@@ -1886,59 +2219,72 @@ impl Scene {
         &self,
         members: &[usize],
     ) -> Result<RigidAggregate, AggregationError> {
+        self.rigid_aggregate_snapshot_impl(members, true)
+    }
+
+    fn rigid_aggregate_snapshot_impl(
+        &self,
+        members: &[usize],
+        validate_bond_graph: bool,
+    ) -> Result<RigidAggregate, AggregationError> {
         if members.is_empty() {
             return Err(AggregationError::Empty);
         }
-        let mut member_set = std::collections::HashSet::with_capacity(members.len());
+        let mut member_set =
+            validate_bond_graph.then(|| std::collections::HashSet::with_capacity(members.len()));
         for &index in members {
             if index >= self.voxels.len() {
                 return Err(AggregationError::IndexOutOfBounds(index));
             }
-            if !member_set.insert(index) {
+            if member_set
+                .as_mut()
+                .is_some_and(|members| !members.insert(index))
+            {
                 return Err(AggregationError::DuplicateIndex(index));
             }
-            if self.voxels[index].kinematic
-                || self.axis_targets[index].iter().any(Option::is_some)
+            if self.voxels[index].kinematic || self.axis_targets[index].iter().any(Option::is_some)
             {
                 return Err(AggregationError::ConstrainedMember(index));
             }
         }
 
-        // A rigid aggregate cannot hide a live constraint to the fine tier.
-        // Build its connectedness from the current bond graph rather than
-        // relying on possibly stale derived cluster labels.
-        let mut adjacency: HashMap<usize, Vec<usize>> = HashMap::with_capacity(members.len());
-        for axis in 0..3 {
-            for (i, bond) in self.bonds[axis].iter().enumerate() {
-                if bond.neighbor == EMPTY {
-                    continue;
-                }
-                let j = bond.neighbor as usize;
-                if j >= self.voxels.len() {
-                    return Err(AggregationError::CrossingBond);
-                }
-                let inside_i = member_set.contains(&i);
-                let inside_j = member_set.contains(&j);
-                if inside_i != inside_j {
-                    return Err(AggregationError::CrossingBond);
-                }
-                if inside_i {
-                    adjacency.entry(i).or_default().push(j);
-                    adjacency.entry(j).or_default().push(i);
-                }
-            }
-        }
-        let mut visited = std::collections::HashSet::with_capacity(members.len());
-        let mut stack = vec![members[0]];
-        while let Some(index) = stack.pop() {
-            if visited.insert(index) {
-                if let Some(neighbors) = adjacency.get(&index) {
-                    stack.extend(neighbors.iter().copied());
+        if let Some(member_set) = member_set.as_ref() {
+            // The public snapshot API validates connectivity against the live
+            // bond graph. The automatic path above instead trusts the freshly
+            // rebuilt component labels and validates membership there.
+            let mut adjacency: HashMap<usize, Vec<usize>> = HashMap::with_capacity(members.len());
+            for axis in 0..3 {
+                for (i, bond) in self.bonds[axis].iter().enumerate() {
+                    if bond.neighbor == EMPTY {
+                        continue;
+                    }
+                    let j = bond.neighbor as usize;
+                    if j >= self.voxels.len() {
+                        return Err(AggregationError::CrossingBond);
+                    }
+                    let inside_i = member_set.contains(&i);
+                    let inside_j = member_set.contains(&j);
+                    if inside_i != inside_j {
+                        return Err(AggregationError::CrossingBond);
+                    }
+                    if inside_i {
+                        adjacency.entry(i).or_default().push(j);
+                        adjacency.entry(j).or_default().push(i);
+                    }
                 }
             }
-        }
-        if visited.len() != member_set.len() {
-            return Err(AggregationError::DisconnectedSet);
+            let mut visited = std::collections::HashSet::with_capacity(members.len());
+            let mut stack = vec![members[0]];
+            while let Some(index) = stack.pop() {
+                if visited.insert(index) {
+                    if let Some(neighbors) = adjacency.get(&index) {
+                        stack.extend(neighbors.iter().copied());
+                    }
+                }
+            }
+            if visited.len() != member_set.len() {
+                return Err(AggregationError::DisconnectedSet);
+            }
         }
 
         let constituents: Vec<_> = members
@@ -1952,11 +2298,7 @@ impl Scene {
                 ConstituentState {
                     index,
                     mass_kg: voxel.mass as f64,
-                    position_m: DVec3::new(
-                        position.x as f64,
-                        position.y as f64,
-                        position.z as f64,
-                    ),
+                    position_m: DVec3::new(position.x as f64, position.y as f64, position.z as f64),
                     rest_position_m: DVec3::new(
                         rest_position.x as f64,
                         rest_position.y as f64,
@@ -2002,7 +2344,11 @@ impl Scene {
         let mut member_set = std::collections::HashSet::with_capacity(refined.len());
         let f32_limit = f32::MAX as f64;
         let vector_f32_representable = |value: DVec3| {
-            value.is_finite() && value.to_array().iter().all(|component| component.abs() <= f32_limit)
+            value.is_finite()
+                && value
+                    .to_array()
+                    .iter()
+                    .all(|component| component.abs() <= f32_limit)
         };
         for state in &refined {
             if state.index >= self.voxels.len() {
@@ -2035,7 +2381,9 @@ impl Scene {
                 return Err(AggregationError::InvalidThermalEnergy(state.index));
             }
             if state.thermal_cell_energy_j.as_ref().is_some_and(|cells| {
-                cells.iter().any(|energy| !energy.is_finite() || *energy < 0.0)
+                cells
+                    .iter()
+                    .any(|energy| !energy.is_finite() || *energy < 0.0)
             }) {
                 return Err(AggregationError::InvalidThermalCells(state.index));
             }
@@ -2047,9 +2395,7 @@ impl Scene {
         let current_members: Vec<_> = refined.iter().map(|state| state.index).collect();
         self.rigid_aggregate_snapshot(&current_members)?;
 
-        let to_vec3 = |value: DVec3| {
-            Vec3::new(value.x as f32, value.y as f32, value.z as f32)
-        };
+        let to_vec3 = |value: DVec3| Vec3::new(value.x as f32, value.y as f32, value.z as f32);
         for state in refined {
             let index = state.index;
             self.positions[index] = state.position_m;
@@ -2072,6 +2418,7 @@ impl Scene {
             self.voxels[index].internal_energy_remainder_j =
                 energy - self.voxels[index].internal_energy as f64;
         }
+        self.mark_render_changed();
         Ok(member_set.len())
     }
 
@@ -2120,8 +2467,8 @@ impl Scene {
         scratch.active_seed.resize(voxel_count, false);
         scratch.active_mask.fill(false);
         for (i, voxel) in self.voxels.iter().enumerate() {
-            scratch.macro_temperature[i] = self.properties[i]
-                .temperature(voxel.mass, voxel.thermal_energy_f32());
+            scratch.macro_temperature[i] =
+                self.properties[i].temperature(voxel.mass, voxel.thermal_energy_f32());
             scratch.active_mask[i] = voxel.thermal_cell_energy_j.is_some();
         }
 
@@ -2259,9 +2606,7 @@ impl Scene {
                     .map(|&voxel| self.properties[voxel].thermal_cond),
             );
         }
-        scratch
-            .conductance_sum
-            .resize(thermal_cell_count, 0.0);
+        scratch.conductance_sum.resize(thermal_cell_count, 0.0);
         scratch.temperature.resize(thermal_cell_count, 0.0);
         scratch.energy_delta.resize(thermal_cell_count, 0.0);
         scratch
@@ -2273,29 +2618,26 @@ impl Scene {
             scratch.edges.reserve(edge_capacity);
         }
 
-        let interface_topology_changed =
-            scratch.cached_interface_voxels != scratch.active_voxels
-                || scratch.cached_interface_conductivity.len() != active_voxel_count
-                || scratch
-                    .cached_interface_conductivity
-                    .iter()
-                    .zip(&scratch.active_voxels)
-                    .any(|(cached, &voxel)| {
-                        *cached != self.properties[voxel].thermal_cond.to_bits()
-                    })
-                || scratch.cached_bond_neighbors.len() != voxel_count
-                || scratch
-                    .cached_bond_neighbors
-                    .iter()
-                    .enumerate()
-                    .any(|(i, cached)| {
-                        *cached
-                            != [
-                                self.bonds[0][i].neighbor,
-                                self.bonds[1][i].neighbor,
-                                self.bonds[2][i].neighbor,
-                            ]
-                    });
+        let interface_topology_changed = scratch.cached_interface_voxels != scratch.active_voxels
+            || scratch.cached_interface_conductivity.len() != active_voxel_count
+            || scratch
+                .cached_interface_conductivity
+                .iter()
+                .zip(&scratch.active_voxels)
+                .any(|(cached, &voxel)| *cached != self.properties[voxel].thermal_cond.to_bits())
+            || scratch.cached_bond_neighbors.len() != voxel_count
+            || scratch
+                .cached_bond_neighbors
+                .iter()
+                .enumerate()
+                .any(|(i, cached)| {
+                    *cached
+                        != [
+                            self.bonds[0][i].neighbor,
+                            self.bonds[1][i].neighbor,
+                            self.bonds[2][i].neighbor,
+                        ]
+                });
         if interface_topology_changed {
             scratch.interface_faces.clear();
             for axis in 0..3 {
@@ -2319,8 +2661,7 @@ impl Scene {
                     if ki == 0.0 || kj == 0.0 {
                         continue;
                     }
-                    let base_conductance =
-                        (2.0 * ki * kj / (ki + kj)) * subcell_length;
+                    let base_conductance = (2.0 * ki * kj / (ki + kj)) * subcell_length;
                     let mut lower_nodes = [0u32; 9];
                     let mut upper_nodes = [0u32; 9];
                     let mut pair = 0;
@@ -2332,10 +2673,10 @@ impl Scene {
                             lower[side_axes[1]] = b;
                             let mut upper = lower;
                             upper[axis] = 0;
-                            let lower_cell = lower[0]
-                                + cells_per_axis * (lower[1] + cells_per_axis * lower[2]);
-                            let upper_cell = upper[0]
-                                + cells_per_axis * (upper[1] + cells_per_axis * upper[2]);
+                            let lower_cell =
+                                lower[0] + cells_per_axis * (lower[1] + cells_per_axis * lower[2]);
+                            let upper_cell =
+                                upper[0] + cells_per_axis * (upper[1] + cells_per_axis * upper[2]);
                             lower_nodes[pair] = (slot_i * cells_per_voxel + lower_cell) as u32;
                             upper_nodes[pair] = (slot_j * cells_per_voxel + upper_cell) as u32;
                             pair += 1;
@@ -2350,7 +2691,9 @@ impl Scene {
                     });
                 }
             }
-            scratch.cached_interface_voxels.clone_from(&scratch.active_voxels);
+            scratch
+                .cached_interface_voxels
+                .clone_from(&scratch.active_voxels);
             scratch.cached_interface_conductivity.clear();
             scratch.cached_interface_conductivity.extend(
                 scratch
@@ -2359,21 +2702,23 @@ impl Scene {
                     .map(|&voxel| self.properties[voxel].thermal_cond.to_bits()),
             );
             scratch.cached_bond_neighbors.clear();
-            scratch.cached_bond_neighbors.extend((0..voxel_count).map(|i| {
-                [
-                    self.bonds[0][i].neighbor,
-                    self.bonds[1][i].neighbor,
-                    self.bonds[2][i].neighbor,
-                ]
-            }));
+            scratch
+                .cached_bond_neighbors
+                .extend((0..voxel_count).map(|i| {
+                    [
+                        self.bonds[0][i].neighbor,
+                        self.bonds[1][i].neighbor,
+                        self.bonds[2][i].neighbor,
+                    ]
+                }));
         }
 
         // Connectivity and undamaged conductance are cached. Current bond
         // damage remains live and scales all nine face fluxes every update.
         for face in &scratch.interface_faces {
             let damage = self.bonds[face.axis as usize][face.bond_index as usize].damage;
-            let conductance = (face.base_conductance
-                * (1.0 - damage as f64).clamp(0.0, 1.0)) as f32;
+            let conductance =
+                (face.base_conductance * (1.0 - damage as f64).clamp(0.0, 1.0)) as f32;
             if conductance == 0.0 {
                 continue;
             }
@@ -2396,8 +2741,8 @@ impl Scene {
 
         let mut maximum_rate = 0.0f64;
         for (slot, &world_voxel) in scratch.active_voxels.iter().enumerate() {
-            let cell_mass = self.voxels[world_voxel].mass.max(1e-20) as f64
-                / cells_per_voxel as f64;
+            let cell_mass =
+                self.voxels[world_voxel].mass.max(1e-20) as f64 / cells_per_voxel as f64;
             let cell_capacity =
                 cell_mass * self.properties[world_voxel].heat_capacity.max(1e-12) as f64;
             let first_node = slot * cells_per_voxel;
@@ -2427,8 +2772,7 @@ impl Scene {
                         let first_node = slot * cells_per_voxel;
                         for (cell, temperature) in output.iter_mut().enumerate() {
                             let energy =
-                                cell_energies[first_node + cell].clamp(0.0, f32::MAX as f64)
-                                    as f32;
+                                cell_energies[first_node + cell].clamp(0.0, f32::MAX as f64) as f32;
                             *temperature = property.temperature(cell_mass, energy) as f64;
                         }
                     });
@@ -2458,9 +2802,8 @@ impl Scene {
         }
         for (slot, &voxel) in scratch.active_voxels.iter().enumerate() {
             let first = slot * cells_per_voxel;
-            self.voxels[voxel].set_thermal_cell_energies_j(
-                &scratch.cell_energy[first..first + cells_per_voxel],
-            );
+            self.voxels[voxel]
+                .set_thermal_cell_energies_j(&scratch.cell_energy[first..first + cells_per_voxel]);
         }
         Ok(thermal_steps)
     }
@@ -2607,10 +2950,14 @@ impl Scene {
         Self {
             config,
             solver_scratch: Default::default(),
+            simulated_seconds: 0.0,
+            adaptive_substeps: false,
+            last_mechanical_substeps: 0,
             thermal_scratch: Default::default(),
             collision_scratch: Default::default(),
             rigid_aggregates: Vec::new(),
             aggregate_of: vec![None; n],
+            source_cells: vec![None; n],
             external_forces: vec![Vec3::ZERO; n],
             external_accelerations: vec![Vec3::ZERO; n],
             axis_targets: vec![[None; 3]; n],
@@ -2632,6 +2979,7 @@ impl Scene {
             energy: Default::default(),
             releases: Vec::new(),
             substep_index: 0,
+            render_revision: 0,
             solver_residual: 0.0,
             solver_residual_audit: None,
             solver_max_audited_residual: None,
@@ -2662,6 +3010,90 @@ mod damage_display_tests {
         assert_eq!(scene.incident_bond_damage(), vec![(0.4, 0); 2]);
         scene.bonds[0][0].neighbor = EMPTY;
         assert_eq!(scene.incident_bond_damage(), vec![(1.0, 1); 2]);
+    }
+}
+
+#[cfg(test)]
+mod rigid_aggregate_translation_pose_tests {
+    use super::*;
+
+    #[test]
+    fn pure_translation_updates_only_translational_rev_state() {
+        let oak = Material::component_id("oak").unwrap();
+        let velocity = Vec3::new(0.25, -0.5, 0.75);
+        let mut builder = SceneBuilder::standard().with_gravity(Vec3::ZERO);
+        let mut members = Vec::new();
+        for z in 0..2 {
+            for y in 0..2 {
+                for x in 0..2 {
+                    let cell = [x, y, z];
+                    members.push(members.len());
+                    builder =
+                        builder.add_voxel(VoxelSpawn::at_cell(cell, oak).with_velocity(velocity));
+                }
+            }
+        }
+        let mut scene = builder.build().unwrap();
+
+        // These are retained material/frame quantities. A pure translation
+        // must not transform or rewrite either array.
+        for index in 0..scene.voxels.len() {
+            scene.rotations[index] = Quat::from_rotation_y(index as f32 * 0.07 + 0.1);
+            for axis in 0..3 {
+                scene.workspace[axis][index].last_force =
+                    Vec3::new(index as f32 + 1.0, axis as f32 + 2.0, 0.5);
+            }
+        }
+        scene.register_rigid_aggregate_candidate(&members).unwrap();
+
+        let positions_before = scene.positions.clone();
+        let rest_positions_before = scene.rest_positions.clone();
+        let rotations_before = scene.rotations.clone();
+        let last_forces_before: Vec<_> = scene
+            .workspace
+            .iter()
+            .map(|axis| axis.iter().map(|bond| bond.last_force).collect::<Vec<_>>())
+            .collect();
+        let dt_s = 0.01;
+        let gravity = DVec3::new(0.0, 0.0, -9.81);
+        let orientation_before = scene
+            .registered_rigid_aggregate_candidate(0)
+            .unwrap()
+            .orientation();
+
+        assert_eq!(
+            scene
+                .advance_registered_rigid_candidates(dt_s, gravity, &[], None)
+                .unwrap(),
+            1
+        );
+
+        let displacement = DVec3::new(velocity.x as f64, velocity.y as f64, velocity.z as f64)
+            * dt_s
+            + gravity * (0.5 * dt_s * dt_s);
+        let expected_velocity = velocity + Vec3::new(0.0, 0.0, (gravity.z * dt_s) as f32);
+        for index in 0..scene.voxels.len() {
+            assert!(
+                (scene.positions[index] - (positions_before[index] + displacement)).length()
+                    < 1e-14
+            );
+            assert!(
+                (scene.rest_positions[index] - (rest_positions_before[index] + displacement))
+                    .length()
+                    < 1e-14
+            );
+            assert_eq!(scene.voxels[index].velocity, expected_velocity);
+            assert_eq!(scene.rotations[index], rotations_before[index]);
+        }
+        let aggregate = scene.registered_rigid_aggregate_candidate(0).unwrap();
+        assert_eq!(aggregate.invariants().angular_momentum_kg_m2_s, DVec3::ZERO);
+        assert_eq!(aggregate.orientation(), orientation_before);
+        for (axis, forces) in scene.workspace.iter().zip(last_forces_before) {
+            assert!(axis
+                .iter()
+                .zip(forces)
+                .all(|(bond, before)| bond.last_force == before));
+        }
     }
 }
 

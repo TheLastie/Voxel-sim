@@ -169,7 +169,9 @@ impl Voxel {
             cells[THERMAL_CELL_COUNT - 1] += delta - increment * (THERMAL_CELL_COUNT - 1) as f64;
             let actual: f64 = cells.iter().sum();
             cells[THERMAL_CELL_COUNT - 1] += expected - actual;
-            debug_assert!((cells.iter().sum::<f64>() - expected).abs() <= expected.abs() * 1e-12 + 1e-12);
+            debug_assert!(
+                (cells.iter().sum::<f64>() - expected).abs() <= expected.abs() * 1e-12 + 1e-12
+            );
         } else {
             let total: f64 = cells.iter().sum();
             if total > 0.0 {

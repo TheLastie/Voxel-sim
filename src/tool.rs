@@ -60,7 +60,14 @@ pub struct Tool {
     pub mount: Option<GuideMount>,
 }
 impl Tool {
-    pub fn new(shape: Shape, scene: &Scene, position: impl Into<DVec3>, direction: Vec3, speed: f32) -> Self { let position = position.into();
+    pub fn new(
+        shape: Shape,
+        scene: &Scene,
+        position: impl Into<DVec3>,
+        direction: Vec3,
+        speed: f32,
+    ) -> Self {
+        let position = position.into();
         let d = scene.config.tool_dimensions;
         let (dims, component, color) = match shape {
             Shape::Wedge => (d, 2, [0.65, 0.68, 0.72, 1.0]),
@@ -203,8 +210,9 @@ impl Tool {
         if let Some(m) = self.mount {
             self.rotation = m.rotation;
             let base = self.position + (self.rotation * m.local_base).as_dvec3();
-            self.position +=
-                m.world_base + m.direction.as_dvec3() * (base - m.world_base).dot(m.direction.as_dvec3()) - base;
+            self.position += m.world_base
+                + m.direction.as_dvec3() * (base - m.world_base).dot(m.direction.as_dvec3())
+                - base;
             self.velocity = self.project_translation(self.velocity);
             self.angular_velocity = Vec3::ZERO;
         }
@@ -298,9 +306,8 @@ impl Tool {
         } else {
             self.atmospheric_wrench(scene)
         };
-        let linear_acceleration = self.project_translation(
-            gravity + (self.external_force + initial_air_force) / self.mass,
-        );
+        let linear_acceleration = self
+            .project_translation(gravity + (self.external_force + initial_air_force) / self.mass);
         let angular_acceleration = self.angular_response(self.external_torque + initial_air_torque);
         // The integrator updates velocity before position (semi-implicit Euler),
         // so estimate travel with the same end-of-step velocity it will use.
@@ -329,11 +336,9 @@ impl Tool {
             } else {
                 self.atmospheric_wrench(scene)
             };
-            let linear_acceleration = self.project_translation(
-                gravity + (self.external_force + air_force) / self.mass,
-            );
-            let angular_acceleration =
-                self.angular_response(self.external_torque + air_torque);
+            let linear_acceleration =
+                self.project_translation(gravity + (self.external_force + air_force) / self.mass);
+            let angular_acceleration = self.angular_response(self.external_torque + air_torque);
             let old_position = self.position;
             let old_angular_velocity = self.angular_velocity;
             self.velocity += linear_acceleration * h;
@@ -411,12 +416,9 @@ impl Tool {
             for &center in &centers_cache {
                 let (lo, hi) = obb_bin_bounds(center, axes);
                 let query_bounds = if spatial_occupancy_enabled {
-                    let Some(bounds) = clip_spatial_bounds(
-                        lo,
-                        hi,
-                        spatial_occupancy_min,
-                        spatial_occupancy_dims,
-                    ) else {
+                    let Some(bounds) =
+                        clip_spatial_bounds(lo, hi, spatial_occupancy_min, spatial_occupancy_dims)
+                    else {
                         continue;
                     };
                     bounds
@@ -427,8 +429,7 @@ impl Tool {
                 for z in query_bounds.0[2]..=query_bounds.1[2] {
                     for y in query_bounds.0[1]..=query_bounds.1[1] {
                         let row_offset = if spatial_occupancy_enabled {
-                            ((y - spatial_occupancy_min[1]) as usize
-                                * spatial_occupancy_dims[2])
+                            ((y - spatial_occupancy_min[1]) as usize * spatial_occupancy_dims[2])
                                 + (z - spatial_occupancy_min[2]) as usize
                         } else {
                             0
@@ -666,7 +667,8 @@ impl Tool {
         self.contacted_voxels = contacted_voxels;
     }
 }
-fn key(p: impl Into<DVec3>) -> [i32; 3] { let p = p.into();
+fn key(p: impl Into<DVec3>) -> [i32; 3] {
+    let p = p.into();
     (p / DCELL).floor().as_ivec3().to_array()
 }
 
@@ -832,7 +834,10 @@ fn refresh_spatial_bins(
 fn obb_bin_bounds(center: DVec3, axes: [Vec3; 3]) -> ([i32; 3], [i32; 3]) {
     let half = CELL * 0.5;
     let extent = (axes[0].abs() + axes[1].abs() + axes[2].abs()) * half + Vec3::splat(half + 1e-6);
-    (key(center - extent.as_dvec3()), key(center + extent.as_dvec3()))
+    (
+        key(center - extent.as_dvec3()),
+        key(center + extent.as_dvec3()),
+    )
 }
 
 /// Separating axis test for a rotated tool REV against an axis-aligned scene
@@ -971,8 +976,9 @@ mod tests {
         let e0 = kinetic_energy(&scene, &tool);
         tool.advance(&mut scene, 0.0, &[]);
         let after = momentum(&scene, &tool);
-        let orbital =
-            (scene.positions[0] - com).cross((scene.voxels[0].velocity * scene.voxels[0].mass).as_dvec3()).as_vec3();
+        let orbital = (scene.positions[0] - com)
+            .cross((scene.voxels[0].velocity * scene.voxels[0].mass).as_dvec3())
+            .as_vec3();
         assert!((after.0 - before.0).length() < 1e-7);
         assert!((after.1 + orbital - before.1).length() < 1e-8);
         assert!(scene.voxels[0].velocity.length() > 0.0);

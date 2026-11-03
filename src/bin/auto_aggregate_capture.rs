@@ -27,11 +27,26 @@ fn median(mut values: Vec<f64>) -> f64 {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = env::args().collect();
-    let count_x: usize = args.get(1).map(|x| x.parse()).transpose()?.unwrap_or(BODY_COUNT_X);
-    let count_y: usize = args.get(2).map(|x| x.parse()).transpose()?.unwrap_or(BODY_COUNT_Y);
-    let steps: usize = args.get(3).map(|x| x.parse()).transpose()?.unwrap_or(FIXED_STEPS);
+    let count_x: usize = args
+        .get(1)
+        .map(|x| x.parse())
+        .transpose()?
+        .unwrap_or(BODY_COUNT_X);
+    let count_y: usize = args
+        .get(2)
+        .map(|x| x.parse())
+        .transpose()?
+        .unwrap_or(BODY_COUNT_Y);
+    let steps: usize = args
+        .get(3)
+        .map(|x| x.parse())
+        .transpose()?
+        .unwrap_or(FIXED_STEPS);
     if count_x == 0 || count_y == 0 || steps <= 64 {
-        return Err("body counts must be positive and steps must exceed the 64-step discovery interval".into());
+        return Err(
+            "body counts must be positive and steps must exceed the 64-step discovery interval"
+                .into(),
+        );
     }
     let auto_enabled = env::var_os("VOXEL_DISABLE_AUTO_AGGREGATION").is_none();
     let oak = Material::component_id("oak").ok_or("oak material is unavailable")?;
@@ -65,16 +80,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.cpu_preconditioner = voxel_physics_lab::scene::CpuPreconditioner::IncompleteCholesky0;
     let mut scene = Scene::from_voxels(config, spawns)?;
     let initial_positions = scene.positions.clone();
-    let initial_momentum = scene
+    let gravity_d = glam::DVec3::from_array(scene.config.gravity.map(f64::from));
+    let initial_mechanical_energy_j = scene
         .voxels
         .iter()
-        .fold(glam::DVec3::ZERO, |sum, voxel| {
-            sum + glam::DVec3::new(
-                f64::from(voxel.mass * voxel.velocity.x),
-                f64::from(voxel.mass * voxel.velocity.y),
-                f64::from(voxel.mass * voxel.velocity.z),
-            )
-        });
+        .enumerate()
+        .map(|(index, voxel)| {
+            let velocity = glam::DVec3::new(
+                f64::from(voxel.velocity.x),
+                f64::from(voxel.velocity.y),
+                f64::from(voxel.velocity.z),
+            );
+            0.5 * f64::from(voxel.mass) * velocity.length_squared()
+                - f64::from(voxel.mass) * gravity_d.dot(initial_positions[index])
+        })
+        .sum::<f64>();
+    let initial_momentum = scene.voxels.iter().fold(glam::DVec3::ZERO, |sum, voxel| {
+        sum + glam::DVec3::new(
+            f64::from(voxel.mass * voxel.velocity.x),
+            f64::from(voxel.mass * voxel.velocity.y),
+            f64::from(voxel.mass * voxel.velocity.z),
+        )
+    });
     let mut durations_ms = Vec::with_capacity(steps);
     let mut scan_step_ms = 0.0;
     let mut tool = None;
@@ -88,7 +115,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             scan_step_ms = elapsed_ms;
         }
         if step == 1 || step % 16 == 0 || step == steps {
-            eprintln!("free-fall step={step}/{steps} step_ms={elapsed_ms:.3} broken={}", scene.broken);
+            eprintln!(
+                "free-fall step={step}/{steps} step_ms={elapsed_ms:.3} broken={}",
+                scene.broken
+            );
         }
     }
 
@@ -97,14 +127,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_position_error_m = 0.0_f64;
     let mut max_velocity_error_m_s = 0.0_f64;
     let mut final_momentum = glam::DVec3::ZERO;
+    let mut final_mechanical_energy_j = 0.0_f64;
     for (index, voxel) in scene.voxels.iter().enumerate() {
-        let expected_z = f64::from(initial_positions[index].z)
-            + 0.5 * gravity_z * elapsed_sim_s * elapsed_sim_s;
-        max_position_error_m = max_position_error_m.max(
-            (f64::from(scene.positions[index].z) - expected_z).abs(),
-        );
+        let expected_z =
+            f64::from(initial_positions[index].z) + 0.5 * gravity_z * elapsed_sim_s * elapsed_sim_s;
+        max_position_error_m =
+            max_position_error_m.max((f64::from(scene.positions[index].z) - expected_z).abs());
         max_velocity_error_m_s = max_velocity_error_m_s
             .max((f64::from(voxel.velocity.z) - gravity_z * elapsed_sim_s).abs());
+        let velocity = glam::DVec3::new(
+            f64::from(voxel.velocity.x),
+            f64::from(voxel.velocity.y),
+            f64::from(voxel.velocity.z),
+        );
+        final_mechanical_energy_j += 0.5 * f64::from(voxel.mass) * velocity.length_squared()
+            - f64::from(voxel.mass) * gravity_d.dot(scene.positions[index]);
         final_momentum += glam::DVec3::new(
             f64::from(voxel.mass * voxel.velocity.x),
             f64::from(voxel.mass * voxel.velocity.y),
@@ -113,13 +150,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let expected_momentum = initial_momentum
         + glam::DVec3::new(0.0, 0.0, gravity_z * elapsed_sim_s)
-            * scene.voxels.iter().map(|voxel| f64::from(voxel.mass)).sum::<f64>();
+            * scene
+                .voxels
+                .iter()
+                .map(|voxel| f64::from(voxel.mass))
+                .sum::<f64>();
     let mut aggregate_members = 0usize;
     let mut aggregate_count = 0usize;
     for index in 0..scene.voxels.len() {
         if scene.aggregate_for_voxel(index).is_some() {
             aggregate_members += 1;
-            if index == 0 || scene.aggregate_for_voxel(index - 1) != scene.aggregate_for_voxel(index) {
+            if index == 0
+                || scene.aggregate_for_voxel(index - 1) != scene.aggregate_for_voxel(index)
+            {
                 aggregate_count += 1;
             }
         }
@@ -127,8 +170,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ignore the first 64 updates and the discovery scan when reporting the
     // steady-state throughput after candidate bodies have formed.
     let steady_median_ms = median(durations_ms[64..].to_vec());
+    let mechanical_energy_drift_j = final_mechanical_energy_j - initial_mechanical_energy_j;
+    let free_fall_energy_scale_j = 0.5
+        * scene
+            .voxels
+            .iter()
+            .map(|voxel| f64::from(voxel.mass))
+            .sum::<f64>()
+        * gravity_d.length_squared()
+        * elapsed_sim_s.powi(2);
+    let relative_mechanical_energy_drift =
+        mechanical_energy_drift_j.abs() / free_fall_energy_scale_j.max(1.0e-30);
     println!(
-        "mode={} bodies={} revs={} auto_aggregated_revs={} aggregates={} scan_step_ms={:.3} steady_median_ms={:.3} broken={} max_free_fall_position_error_m={:.3e} max_free_fall_velocity_error_m_s={:.3e} momentum_error_kg_m_s={:.3e}",
+        "mode={} bodies={} revs={} auto_aggregated_revs={} aggregates={} scan_step_ms={:.3} steady_median_ms={:.3} broken={} max_free_fall_position_error_m={:.3e} max_free_fall_velocity_error_m_s={:.3e} momentum_error_kg_m_s={:.3e} mechanical_energy_drift_j={:.3e} relative_mechanical_energy_drift={:.3e}",
         if auto_enabled { "automatic" } else { "control" },
         body_count,
         scene.voxels.len(),
@@ -140,6 +194,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_position_error_m,
         max_velocity_error_m_s,
         (final_momentum - expected_momentum).length(),
+        mechanical_energy_drift_j,
+        relative_mechanical_energy_drift,
     );
     Ok(())
 }

@@ -1,6 +1,7 @@
 use crate::voxel::Composition;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FractureMode {
     Brittle,
     Ductile,
@@ -16,7 +17,7 @@ pub struct PhaseState {
     pub gas_fraction: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Material {
     pub name: String,
     pub density: f32,
@@ -74,6 +75,19 @@ pub struct Material {
     /// Kelvin–Voigt time coefficient η/E (seconds) for solid viscoelasticity.
     /// This is calibrated from tan(delta) at a stated reference frequency.
     pub solid_kelvin_voigt_time_s: f32,
+    /// Internal friction slope tan(phi) in the pressure-dependent shear
+    /// envelope. This is distinct from surface friction between bodies.
+    #[serde(default)]
+    pub internal_friction_coefficient: f32,
+    /// Maximum relative angular excursion of a skeleton joint whose bound
+    /// REVs are made from this material. This is an authoring/animation limit,
+    /// separate from the bulk continuum constitutive law.
+    #[serde(default = "default_skeletal_joint_limit_rad")]
+    pub skeletal_joint_limit_rad: f32,
+}
+
+fn default_skeletal_joint_limit_rad() -> f32 {
+    std::f32::consts::PI
 }
 impl Material {
     /// Resolve a built-in component name to its composition-table index.
@@ -384,9 +398,218 @@ impl Material {
         oak.moisture_content_dry_basis = 0.12;
         // tan(delta)=0.0087 at an estimated 2.05 kHz first bending mode.
         // Kelvin–Voigt η/E = tan(delta)/(2πf_ref), seconds.
-        oak.solid_kelvin_voigt_time_s =
-            0.0087 / (std::f32::consts::TAU * 2_050.0);
+        oak.solid_kelvin_voigt_time_s = 0.0087 / (std::f32::consts::TAU * 2_050.0);
         table.push(oak);
+
+        // Skeleton limits are authoring presets, not natural anatomical joint
+        // limits. The linked REV material controls the maximum pose excursion.
+        for (name, degrees) in [
+            ("air", 180.0_f32),
+            ("wood", 115.0),
+            ("iron", 75.0),
+            ("stone", 25.0),
+            ("water", 180.0),
+            ("aluminum", 80.0),
+            ("copper", 75.0),
+            ("glass", 18.0),
+            ("concrete", 20.0),
+            ("rubber", 165.0),
+            ("oak", 115.0),
+        ] {
+            let material = table
+                .iter_mut()
+                .find(|material| material.name.eq_ignore_ascii_case(name))
+                .expect("skeleton-limit entry names a built-in material");
+            material.skeletal_joint_limit_rad = degrees.to_radians();
+        }
+
+        // Biological presets use the same complete physical record as the
+        // original simulation's materials. Values are coarse, low-rate starter
+        // estimates; the current linear constitutive law cannot reproduce the
+        // full nonlinear, anisotropic, viscoelastic behavior of living tissue.
+        let mut flesh = Self::new(
+            "flesh",
+            1_050.0,
+            1.0e6,
+            1.0e6,
+            0.34e6,
+            0.5e6,
+            0.5e6,
+            0.3e6,
+            0.17e6,
+            0.2e6,
+            3_500.0,
+            0.5,
+            f32::INFINITY,
+            100.0,
+            100.0,
+            f32::INFINITY,
+            0.0,
+            0.0,
+        );
+        flesh.poisson = 0.45;
+        flesh.fracture_mode = FractureMode::Ductile;
+        flesh.hardening_modulus = 0.1e6;
+        flesh.failure_plastic_strain = 0.5;
+        flesh.hardness = 0.2e6;
+        flesh.surface_friction_coefficient = 0.55;
+        flesh.electrical_conductivity = 0.5;
+        flesh.relative_permittivity = 100.0;
+        flesh.thermal_expansion_parallel = 60.0e-6;
+        flesh.thermal_expansion_perpendicular = 60.0e-6;
+        flesh.moisture_content_dry_basis = 0.70;
+        flesh.solid_kelvin_voigt_time_s = 0.025;
+        flesh.internal_friction_coefficient = 0.35;
+        flesh.skeletal_joint_limit_rad = 130.0_f32.to_radians();
+        table.push(flesh);
+
+        let mut muscle = Self::new(
+            "muscle",
+            1_060.0,
+            1.5e6,
+            1.0e6,
+            0.5e6,
+            0.6e6,
+            0.4e6,
+            0.5e6,
+            0.2e6,
+            0.25e6,
+            3_500.0,
+            0.5,
+            f32::INFINITY,
+            120.0,
+            80.0,
+            f32::INFINITY,
+            0.0,
+            0.0,
+        );
+        muscle.poisson = 0.45;
+        muscle.fracture_mode = FractureMode::Ductile;
+        muscle.hardening_modulus = 0.15e6;
+        muscle.failure_plastic_strain = 0.45;
+        muscle.hardness = 0.25e6;
+        muscle.surface_friction_coefficient = 0.45;
+        muscle.electrical_conductivity = 0.5;
+        muscle.relative_permittivity = 100.0;
+        muscle.thermal_expansion_parallel = 60.0e-6;
+        muscle.thermal_expansion_perpendicular = 60.0e-6;
+        muscle.moisture_content_dry_basis = 0.70;
+        muscle.solid_kelvin_voigt_time_s = 0.04;
+        muscle.internal_friction_coefficient = 0.35;
+        muscle.skeletal_joint_limit_rad = 135.0_f32.to_radians();
+        table.push(muscle);
+
+        let mut tendon = Self::new(
+            "tendon",
+            1_120.0,
+            0.8e9,
+            80.0e6,
+            50.0e6,
+            80.0e6,
+            15.0e6,
+            100.0e6,
+            30.0e6,
+            60.0e6,
+            3_500.0,
+            0.45,
+            f32::INFINITY,
+            5_000.0,
+            1_000.0,
+            f32::INFINITY,
+            0.0,
+            0.0,
+        );
+        tendon.poisson = 0.35;
+        tendon.fracture_mode = FractureMode::Mixed;
+        tendon.compressive_strength_perp = 20.0e6;
+        tendon.shear_strength_perp = 12.0e6;
+        tendon.hardening_modulus = 80.0e6;
+        tendon.failure_plastic_strain = 0.12;
+        tendon.hardness = 60.0e6;
+        tendon.surface_friction_coefficient = 0.35;
+        tendon.electrical_conductivity = 0.4;
+        tendon.relative_permittivity = 100.0;
+        tendon.thermal_expansion_parallel = 30.0e-6;
+        tendon.thermal_expansion_perpendicular = 60.0e-6;
+        tendon.moisture_content_dry_basis = 0.65;
+        tendon.solid_kelvin_voigt_time_s = 0.02;
+        tendon.internal_friction_coefficient = 0.2;
+        tendon.skeletal_joint_limit_rad = 60.0_f32.to_radians();
+        table.push(tendon);
+
+        let mut cartilage = Self::new(
+            "cartilage",
+            1_100.0,
+            10.0e6,
+            6.0e6,
+            3.5e6,
+            5.0e6,
+            3.0e6,
+            20.0e6,
+            4.0e6,
+            3.0e6,
+            3_500.0,
+            0.5,
+            f32::INFINITY,
+            300.0,
+            200.0,
+            f32::INFINITY,
+            0.0,
+            0.0,
+        );
+        cartilage.poisson = 0.45;
+        cartilage.fracture_mode = FractureMode::Mixed;
+        cartilage.compressive_strength_perp = 15.0e6;
+        cartilage.shear_strength_perp = 2.5e6;
+        cartilage.hardening_modulus = 1.0e6;
+        cartilage.failure_plastic_strain = 0.3;
+        cartilage.hardness = 3.0e6;
+        cartilage.surface_friction_coefficient = 0.05;
+        cartilage.electrical_conductivity = 0.5;
+        cartilage.relative_permittivity = 100.0;
+        cartilage.thermal_expansion_parallel = 50.0e-6;
+        cartilage.thermal_expansion_perpendicular = 50.0e-6;
+        cartilage.moisture_content_dry_basis = 0.75;
+        cartilage.solid_kelvin_voigt_time_s = 0.08;
+        cartilage.internal_friction_coefficient = 0.25;
+        cartilage.skeletal_joint_limit_rad = 100.0_f32.to_radians();
+        table.push(cartilage);
+
+        let mut bone = Self::new(
+            "bone",
+            1_900.0,
+            17.0e9,
+            12.0e9,
+            5.0e9,
+            100.0e6,
+            70.0e6,
+            170.0e6,
+            50.0e6,
+            80.0e6,
+            1_300.0,
+            0.3,
+            f32::INFINITY,
+            100.0,
+            70.0,
+            f32::INFINITY,
+            0.0,
+            0.0,
+        );
+        bone.fracture_mode = FractureMode::Brittle;
+        bone.compressive_strength_perp = 120.0e6;
+        bone.shear_strength_perp = 35.0e6;
+        bone.failure_plastic_strain = 0.02;
+        bone.hardness = 80.0e6;
+        bone.surface_friction_coefficient = 0.45;
+        bone.electrical_conductivity = 0.02;
+        bone.relative_permittivity = 15.0;
+        bone.thermal_expansion_parallel = 10.0e-6;
+        bone.thermal_expansion_perpendicular = 20.0e-6;
+        bone.moisture_content_dry_basis = 0.15;
+        bone.solid_kelvin_voigt_time_s = 0.004;
+        bone.internal_friction_coefficient = 0.15;
+        bone.skeletal_joint_limit_rad = 26.0_f32.to_radians();
+        table.push(bone);
         table
     }
     #[allow(clippy::too_many_arguments)]
@@ -447,6 +670,8 @@ impl Material {
             fracture_energy_perp,
             moisture_content_dry_basis: 0.0,
             solid_kelvin_voigt_time_s: 0.0,
+            internal_friction_coefficient: 0.0,
+            skeletal_joint_limit_rad: default_skeletal_joint_limit_rad(),
         }
     }
     pub fn mixed(c: &Composition, table: &[Self]) -> Self {
@@ -493,7 +718,9 @@ impl Material {
             fracture_energy,
             fracture_energy_perp,
             moisture_content_dry_basis,
-            solid_kelvin_voigt_time_s
+            solid_kelvin_voigt_time_s,
+            internal_friction_coefficient,
+            skeletal_joint_limit_rad
         );
         // Starter mixture estimate: dynamic viscosity is mass-fraction weighted.
         result.dynamic_viscosity_pa_s = c
@@ -656,15 +883,47 @@ mod tests {
     #[test]
     fn starter_material_names_resolve_to_physical_entries() {
         let table = Material::table();
-        for name in ["aluminum", "copper", "glass", "concrete", "rubber"] {
+        for name in [
+            "aluminum",
+            "copper",
+            "glass",
+            "concrete",
+            "rubber",
+            "flesh",
+            "muscle",
+            "tendon",
+            "cartilage",
+            "bone",
+        ] {
             let id = Material::component_id(name).expect("starter component must resolve");
             let material = &table[id as usize];
             assert_eq!(material.name, name);
             assert!(material.density > 0.0);
             assert!(material.heat_capacity > 0.0);
+            assert!((0.0..=std::f32::consts::PI).contains(&material.skeletal_joint_limit_rad));
         }
         let water_id = Material::component_id("water").unwrap();
         assert!((table[water_id as usize].dynamic_viscosity_pa_s - 1.002e-3).abs() < 1e-8);
+    }
+
+    #[test]
+    fn biological_materials_use_distinct_joint_limits_and_keep_original_fields() {
+        let table = Material::table();
+        let flesh = &table[Material::component_id("flesh").unwrap() as usize];
+        let bone = &table[Material::component_id("bone").unwrap() as usize];
+        assert!(flesh.young < bone.young);
+        assert!(flesh.skeletal_joint_limit_rad > bone.skeletal_joint_limit_rad);
+        for material in [flesh, bone] {
+            assert!(material.young_perp > 0.0);
+            assert!(material.shear > 0.0);
+            assert!(material.tensile_strength > 0.0);
+            assert!(material.compressive_strength > 0.0);
+            assert!(material.shear_strength > 0.0);
+            assert!(material.yield_strength > 0.0);
+            assert!(material.fracture_energy > 0.0);
+            assert!(material.thermal_cond > 0.0);
+            assert!(material.relative_permittivity > 0.0);
+        }
     }
 
     #[test]
@@ -720,6 +979,8 @@ mod tests {
             + 0.75 * copper_material.thermal_expansion_parallel;
         let expected_expansion_perpendicular = 0.25 * iron_material.thermal_expansion_perpendicular
             + 0.75 * copper_material.thermal_expansion_perpendicular;
+        let expected_joint_limit = 0.25 * iron_material.skeletal_joint_limit_rad
+            + 0.75 * copper_material.skeletal_joint_limit_rad;
         let iron_volume = 0.25 / iron_material.density;
         let copper_volume = 0.75 / copper_material.density;
         let expected_conductivity = (iron_volume + copper_volume)
@@ -736,6 +997,7 @@ mod tests {
             (mixture.thermal_expansion_perpendicular - expected_expansion_perpendicular).abs()
                 <= 1e-10
         );
+        assert!((mixture.skeletal_joint_limit_rad - expected_joint_limit).abs() <= 1e-6);
         assert!(
             (mixture.electrical_conductivity - expected_conductivity).abs()
                 <= expected_conductivity * 1e-6
@@ -753,5 +1015,23 @@ mod tests {
         assert_eq!(phase.solid_fraction, 1.0);
         assert_eq!(phase.liquid_fraction, 0.0);
         assert_eq!(phase.gas_fraction, 0.0);
+    }
+
+    #[test]
+    fn internal_friction_slope_mixes_with_the_mass_fractions() {
+        let mut table = Material::table();
+        let iron = Material::component_id("iron").unwrap();
+        let copper = Material::component_id("copper").unwrap();
+        table[iron as usize].internal_friction_coefficient = 0.4;
+        table[copper as usize].internal_friction_coefficient = 0.8;
+        let composition = Composition {
+            components: smallvec::smallvec![(iron, 0.25), (copper, 0.75)],
+        };
+        let mixture = Material::mixed(&composition, &table);
+        assert!((mixture.internal_friction_coefficient - 0.7).abs() < 1e-6);
+        assert_eq!(
+            Material::table()[iron as usize].internal_friction_coefficient,
+            0.0
+        );
     }
 }

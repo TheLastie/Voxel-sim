@@ -41,17 +41,45 @@ struct Writer {
 
 static WRITER: OnceLock<Option<Writer>> = OnceLock::new();
 static ENABLED: OnceLock<bool> = OnceLock::new();
+// 0 follows the launch environment, 1/2 are explicit editor enable/disable.
+static RECORDING_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Whether live native snapshots are enabled by the local output-directory
 /// environment setting. Checking this does not create the directory or thread.
 pub fn enabled() -> bool {
-    *ENABLED.get_or_init(|| std::env::var_os("VOXEL_LIVE_TESTS_DIR").is_some())
+    match RECORDING_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => *ENABLED.get_or_init(|| std::env::var_os("VOXEL_LIVE_TESTS_DIR").is_some()),
+    }
+}
+
+/// Enable snapshots when entering the engine's test workspace, including
+/// after a normal scene has already checked the optional observer setting.
+pub fn enable(directory: &Path) -> Result<(), String> {
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    if let Some(Some(current)) = WRITER.get() {
+        if current.directory != directory {
+            return Err("the active snapshot writer uses another directory".into());
+        }
+    }
+    std::env::set_var("VOXEL_LIVE_TESTS_DIR", directory);
+    RECORDING_MODE.store(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Stop capturing when returning to ordinary scene editing.
+pub fn disable() {
+    RECORDING_MODE.store(2, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn writer() -> Option<&'static Writer> {
+    if !enabled() {
+        return None;
+    }
+    let directory = std::env::var_os("VOXEL_LIVE_TESTS_DIR").map(PathBuf::from)?;
     WRITER
         .get_or_init(|| {
-            let directory = std::env::var_os("VOXEL_LIVE_TESTS_DIR").map(PathBuf::from)?;
             fs::create_dir_all(&directory).ok()?;
             let latest = std::sync::Arc::new((Mutex::new(None), Condvar::new()));
             let written = std::sync::Arc::new((Mutex::new(0), Condvar::new()));

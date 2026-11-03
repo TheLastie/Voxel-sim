@@ -110,7 +110,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(out, "E,{step},1,thermal_strength_fracture")?;
             let temperature = scene.temperature_kelvin(0).unwrap_or(0.0);
             let limits = solver::bond_limits(&scene, 0, 1, Vec3::X);
-            let strain = ((scene.positions[1].x - scene.positions[0].x - CELL as f64) / CELL as f64) as f32;
+            let strain =
+                ((scene.positions[1].x - scene.positions[0].x - CELL as f64) / CELL as f64) as f32;
             let ratio = if limits.tension > 0.0 {
                 strain.abs() * scene.properties[0].young / limits.tension
             } else {

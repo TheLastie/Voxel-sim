@@ -1,22 +1,31 @@
+pub mod aggregation;
+mod banded;
 pub mod bond;
 pub mod collision;
 pub mod coordinates;
-pub mod aggregation;
 mod cuda_solver;
-mod multigrid;
 pub mod electrical;
 pub mod fracture;
+pub mod impact_experiment;
+pub mod live_test_feed;
+pub mod live_tests;
 pub mod material;
+pub mod material_asset;
+mod multigrid;
 pub mod scene;
+pub mod scene_presets;
 pub mod solver;
 pub mod tool;
+#[cfg(feature = "desktop")]
+pub mod ui_text;
 pub mod voxel;
+pub mod voxel_surface;
 pub mod world;
 pub mod world_physics;
 
+pub mod documents;
 pub mod experiments;
-
-pub mod live_tests;
-#[cfg(feature = "desktop")]
-pub mod ui_text;
-pub mod voxel_surface;
+pub mod mesh_import;
+pub mod model_export;
+pub mod model_history;
+pub mod procedural_animation;

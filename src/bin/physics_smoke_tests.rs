@@ -41,7 +41,9 @@ fn free_fall() -> Check {
         solver::step(&mut s, &mut tool);
     }
     // The integrator applies gravity before advancing position (semi-implicit Euler).
-    let expected = start.z + 0.1 + gravity.z as f64 * dt as f64 * dt as f64 * (frames * (frames + 1)) as f64 * 0.5;
+    let expected = start.z
+        + 0.1
+        + gravity.z as f64 * dt as f64 * dt as f64 * (frames * (frames + 1)) as f64 * 0.5;
     let actual = s.positions[0].z;
     let actual_velocity = s.voxels[0].velocity.z;
     let expected_velocity = gravity.z * dt * frames as f32;

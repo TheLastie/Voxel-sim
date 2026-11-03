@@ -54,14 +54,23 @@ fn cube_state(scene: &Scene, indices: &[usize]) -> (DVec3, Vec3, f64, f64, f64) 
     // approximately m*(a^2+a^2)/12, with a=3cm.
     let inertia_y = mass * 2.0 * (OAK_SIDE as f64 * 0.01).powi(2) / 12.0;
     let omega_y = angular_momentum.y.abs() / inertia_y.max(1e-30);
-    (center, velocity, omega_y, temperature_mass / mass.max(1e-30), mass)
+    (
+        center,
+        velocity,
+        omega_y,
+        temperature_mass / mass.max(1e-30),
+        mass,
+    )
 }
 
 fn kinetic_energy(scene: &Scene, indices: &[usize]) -> f64 {
-    indices.iter().map(|&i| {
-        0.5 * f64::from(scene.voxels[i].mass)
-            * f64::from(scene.voxels[i].velocity.length_squared())
-    }).sum()
+    indices
+        .iter()
+        .map(|&i| {
+            0.5 * f64::from(scene.voxels[i].mass)
+                * f64::from(scene.voxels[i].velocity.length_squared())
+        })
+        .sum()
 }
 
 fn scene_internal_energy(scene: &Scene, range: std::ops::Range<usize>) -> f64 {
@@ -71,16 +80,21 @@ fn scene_internal_energy(scene: &Scene, range: std::ops::Range<usize>) -> f64 {
 }
 
 fn scene_kinetic_energy(scene: &Scene) -> f64 {
-    scene.voxels.iter().map(|voxel| {
-        0.5 * f64::from(voxel.mass) * f64::from(voxel.velocity.length_squared())
-    }).sum()
+    scene
+        .voxels
+        .iter()
+        .map(|voxel| 0.5 * f64::from(voxel.mass) * f64::from(voxel.velocity.length_squared()))
+        .sum()
 }
 
 fn gravitational_potential(scene: &Scene) -> f64 {
     let gravity_z = f64::from(scene.config.gravity[2]);
-    scene.voxels.iter().zip(&scene.positions).map(|(voxel, position)| {
-        -f64::from(voxel.mass) * gravity_z * position.z
-    }).sum()
+    scene
+        .voxels
+        .iter()
+        .zip(&scene.positions)
+        .map(|(voxel, position)| -f64::from(voxel.mass) * gravity_z * position.z)
+        .sum()
 }
 
 fn svg_chart(samples: &[Sample], path: &Path) -> std::io::Result<()> {
@@ -96,21 +110,42 @@ fn svg_chart(samples: &[Sample], path: &Path) -> std::io::Result<()> {
     const MID2: f64 = 515.0;
     const LABEL_Y: f64 = 665.0;
     let max_time = samples.last().map_or(DURATION_S, |s| s.time_s).max(1e-9);
-    let max_heat = samples.iter().map(|s| s.friction_heat_j).fold(0.0_f64, f64::max).max(1e-12);
+    let max_heat = samples
+        .iter()
+        .map(|s| s.friction_heat_j)
+        .fold(0.0_f64, f64::max)
+        .max(1e-12);
     let t0 = samples.first().map_or(293.15, |s| s.mean_temperature_k);
-    let max_temp_rise = samples.iter().map(|s| (s.mean_temperature_k - t0).max(0.0))
-        .fold(0.0_f64, f64::max).max(1e-9);
+    let max_temp_rise = samples
+        .iter()
+        .map(|s| (s.mean_temperature_k - t0).max(0.0))
+        .fold(0.0_f64, f64::max)
+        .max(1e-9);
     let polyline = |value: &dyn Fn(&Sample) -> f64, max_y: f64, top: f64, bottom: f64| {
-        samples.iter().map(|s| {
-            let x = LEFT + (RIGHT - LEFT) * s.time_s / max_time;
-            let y = bottom - (bottom - top) * (value(s) / max_y).clamp(0.0, 1.0);
-            format!("{x:.2},{y:.2}")
-        }).collect::<Vec<_>>().join(" ")
+        samples
+            .iter()
+            .map(|s| {
+                let x = LEFT + (RIGHT - LEFT) * s.time_s / max_time;
+                let y = bottom - (bottom - top) * (value(s) / max_y).clamp(0.0, 1.0);
+                format!("{x:.2},{y:.2}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     };
-    let heat = polyline(&|s| s.friction_heat_j * 1000.0, max_heat * 1000.0, TOP1, BOT1);
-    let temp = polyline(&|s| (s.mean_temperature_k - t0).max(0.0) * 1000.0,
-        max_temp_rise * 1000.0, TOP2, BOT2);
-    let svg = format!(r##"<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}">
+    let heat = polyline(
+        &|s| s.friction_heat_j * 1000.0,
+        max_heat * 1000.0,
+        TOP1,
+        BOT1,
+    );
+    let temp = polyline(
+        &|s| (s.mean_temperature_k - t0).max(0.0) * 1000.0,
+        max_temp_rise * 1000.0,
+        TOP2,
+        BOT2,
+    );
+    let svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}">
 <rect width="100%" height="100%" fill="#101923"/><style>text{{font-family:Segoe UI,Arial,sans-serif;fill:#e8eef4}} .muted{{fill:#a8bac9}} .grid{{stroke:#334655;stroke-width:1}} .axis{{stroke:#95a8b6;stroke-width:1.5}}</style>
 <text x="{LEFT}" y="38" font-size="23" font-weight="700">Cube rolling on concrete: measured friction and heating</text>
 <text x="{LEFT}" y="65" class="muted" font-size="14">Oak 3×3×3 cm REV cube · road 2.40 m × 0.09 m · dt 1 ms · sampled every 10 ms · μ pair from material table</text>
@@ -126,7 +161,8 @@ fn svg_chart(samples: &[Sample], path: &Path) -> std::io::Result<()> {
 <polyline points="{temp}" fill="none" stroke="#ff6f76" stroke-width="3" stroke-linejoin="round"/>
 <line x1="850" y1="365" x2="880" y2="365" stroke="#ff6f76" stroke-width="3"/><text x="888" y="370" class="muted" font-size="13">temperature rise · max {max_temp_rise:.3} mK</text>
 <text x="{LEFT}" y="{LABEL_Y}" class="muted" font-size="13">time (s)</text><text x="{RIGHT}" y="{LABEL_Y}" text-anchor="end" class="muted" font-size="13">0 — {max_time:.2} s</text>
-</svg>"##);
+</svg>"##
+    );
     // Scale labels show the actual extrema for each plotted quantity.
     fs::write(path, svg)
 }
@@ -164,8 +200,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     f64::from(cell[1]) * 0.01 + 0.005,
                     f64::from(cell[2]) * 0.01 + 0.005,
                 );
-                let velocity = Vec3::new(INITIAL_SPEED_M_S, 0.0, 0.0)
-                    + omega.cross((pos - center).as_vec3());
+                let velocity =
+                    Vec3::new(INITIAL_SPEED_M_S, 0.0, 0.0) + omega.cross((pos - center).as_vec3());
                 cube_indices.push(spawns.len());
                 spawns.push(VoxelSpawn::at_cell(cell, oak).with_velocity(velocity));
             }
@@ -173,9 +209,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let pair_mu = config.fracture.friction * (0.5 + 0.5);
     let mut scene = Scene::from_voxels(config, spawns)?;
-    let initial_temperature: f64 = cube_indices.iter()
+    let initial_temperature: f64 = cube_indices
+        .iter()
         .map(|&i| f64::from(scene.temperature_kelvin(i).unwrap_or(293.15)))
-        .sum::<f64>() / cube_indices.len() as f64;
+        .sum::<f64>()
+        / cube_indices.len() as f64;
     let initial_kinetic = kinetic_energy(&scene, &cube_indices);
     let oak_start = cube_indices[0];
     let oak_end = oak_start + cube_indices.len();
@@ -197,7 +235,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for step in 0..=steps {
         if step % SAMPLE_INTERVAL == 0 {
-            let (center, velocity, angular_speed, temperature, _) = cube_state(&scene, &cube_indices);
+            let (center, velocity, angular_speed, temperature, _) =
+                cube_state(&scene, &cube_indices);
             samples.push(Sample {
                 time_s: step as f64 * f64::from(DT),
                 x_m: center.x,
@@ -218,9 +257,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let svg_path = Path::new("validation/friction_heat_road.svg");
     let mut csv = String::from("time_s,center_x_m,center_vx_m_s,angular_speed_rad_s,cumulative_friction_heat_j,mean_temperature_k,temperature_rise_mK,broken_bonds\n");
     for s in &samples {
-        csv.push_str(&format!("{:.3},{:.9},{:.9},{:.9},{:.12},{:.6},{:.6},{}\n",
-            s.time_s, s.x_m, s.speed_m_s, s.angular_speed_rad_s, s.friction_heat_j,
-            s.mean_temperature_k, (s.mean_temperature_k-initial_temperature)*1000.0, s.broken_bonds));
+        csv.push_str(&format!(
+            "{:.3},{:.9},{:.9},{:.9},{:.12},{:.6},{:.6},{}\n",
+            s.time_s,
+            s.x_m,
+            s.speed_m_s,
+            s.angular_speed_rad_s,
+            s.friction_heat_j,
+            s.mean_temperature_k,
+            (s.mean_temperature_k - initial_temperature) * 1000.0,
+            s.broken_bonds
+        ));
     }
     fs::write(csv_path, csv)?;
     svg_chart(&samples, svg_path)?;

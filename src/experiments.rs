@@ -257,7 +257,9 @@ pub fn bending() -> TestResult {
         let q = s.rotations[i].slerp(s.rotations[j], 0.5);
         let frame = Mat3::from_cols(q * Vec3::X, q * Vec3::Y, q * Vec3::Z);
         let k = solver::stiffness_matrix(&s, i, j, frame);
-        let u = (frame.as_dmat3().transpose() * (s.positions[j] - s.positions[i]) - DVec3::X * CELL).as_vec3();
+        let u = (frame.as_dmat3().transpose() * (s.positions[j] - s.positions[i])
+            - DVec3::X * CELL)
+            .as_vec3();
         max_axial = max_axial.max((k * u / crate::scene::AREA).x.abs());
     }
     TestResult {
@@ -694,8 +696,9 @@ fn capture_knife_internal(
                 .unwrap()
                 .set_external_force(drive_direction * force)?;
             solver::step_with_targets(&mut scene, &mut tool, &targets);
-            drive_work +=
-                (drive_direction * force).as_dvec3().dot(tool.as_ref().unwrap().position - before);
+            drive_work += (drive_direction * force)
+                .as_dvec3()
+                .dot(tool.as_ref().unwrap().position - before);
             if guided_force_newtons.is_some() && cut_frame.is_none() {
                 let sizes = wood_fragment_sizes(&scene);
                 let rear_x = blade_trailing_face_x(tool.as_ref().unwrap());
@@ -754,7 +757,8 @@ fn capture_knife_internal(
                 let k = solver::stiffness_matrix(&scene, i, j, basis);
                 let u = (basis.as_dmat3().transpose() * (scene.positions[j] - scene.positions[i])
                     - DVec3::X * CELL
-                    - DVec3::from_array(b.plastic_strain.map(f64::from)) * CELL).as_vec3();
+                    - DVec3::from_array(b.plastic_strain.map(f64::from)) * CELL)
+                    .as_vec3();
                 elastic_energy += (0.5 * (1.0 - b.damage) * u.dot(k * u)).max(0.0) as f64;
             }
         }

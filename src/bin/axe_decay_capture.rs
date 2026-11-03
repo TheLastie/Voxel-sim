@@ -1,10 +1,18 @@
 use glam::Vec3;
 use std::{env, error::Error};
-use voxel_physics_lab::{material::Material, scene::{Scene, SceneConfig}, solver, tool::{Shape, Tool}};
+use voxel_physics_lab::{
+    material::Material,
+    scene::{Scene, SceneConfig},
+    solver,
+    tool::{Shape, Tool},
+};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = env::args().collect();
-    let scene_path = args.get(1).map(String::as_str).unwrap_or("scenes/mounted_axe_impact.ron");
+    let scene_path = args
+        .get(1)
+        .map(String::as_str)
+        .unwrap_or("scenes/mounted_axe_impact.ron");
     let load_steps = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(100usize);
     let coast_steps = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(300usize);
     let force = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(150.0f32);
@@ -35,19 +43,41 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into_iter()
         .filter_map(Material::component_id)
         .collect();
-    let wood: Vec<_> = scene.voxels.iter().enumerate()
-        .filter(|(_, voxel)| voxel.composition.components.iter()
-            .any(|&(component, fraction)| wood_ids.contains(&component) && fraction > 0.0))
-        .map(|(index, _)| index).collect();
-    if let Some(lowest_z) = wood.iter().map(|&i| scene.positions[i].z).min_by(f64::total_cmp) {
-        let base: Vec<_> = wood.into_iter()
-            .filter(|&i| (scene.positions[i].z - lowest_z).abs() <= voxel_physics_lab::scene::DCELL * 0.1)
+    let wood: Vec<_> = scene
+        .voxels
+        .iter()
+        .enumerate()
+        .filter(|(_, voxel)| {
+            voxel
+                .composition
+                .components
+                .iter()
+                .any(|&(component, fraction)| wood_ids.contains(&component) && fraction > 0.0)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if let Some(lowest_z) = wood
+        .iter()
+        .map(|&i| scene.positions[i].z)
+        .min_by(f64::total_cmp)
+    {
+        let base: Vec<_> = wood
+            .into_iter()
+            .filter(|&i| {
+                (scene.positions[i].z - lowest_z).abs() <= voxel_physics_lab::scene::DCELL * 0.1
+            })
             .collect();
         scene.fix_voxels(&base)?;
     }
 
     let direction = Vec3::from_array(config.tool_direction).normalize_or_zero();
-    let mut tool = Tool::new(Shape::Wedge, &scene, Vec3::from_array(config.tool_start), direction, config.initial_speed);
+    let mut tool = Tool::new(
+        Shape::Wedge,
+        &scene,
+        Vec3::from_array(config.tool_start),
+        direction,
+        config.initial_speed,
+    );
     let rear = tool.cells.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
     tool.mount_base(Vec3::new(rear, 0.0, 0.0), direction)?;
     let mut tool = Some(tool);
@@ -58,15 +88,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     for step in 1..=total_steps {
         let phase = if step <= load_steps { "load" } else { "coast" };
         if let Some(active) = tool.as_mut() {
-            active.set_external_force(if phase == "load" { direction * force } else { Vec3::ZERO })?;
+            active.set_external_force(if phase == "load" {
+                direction * force
+            } else {
+                Vec3::ZERO
+            })?;
         }
         solver::step(&mut scene, &mut tool);
-        if step == 1 || step == load_steps || step == total_steps || step % 10 == 0 || scene.broken != previous_broken {
-            let wood_max_speed = scene.voxels.iter()
-                .filter(|v| v.composition.components.iter().any(|&(id, f)| wood_ids.contains(&id) && f > 0.0))
-                .map(|v| v.velocity.length()).fold(0.0f32, f32::max);
-            let wood_kinetic = scene.voxels.iter()
-                .filter(|v| v.composition.components.iter().any(|&(id, f)| wood_ids.contains(&id) && f > 0.0))
+        if step == 1
+            || step == load_steps
+            || step == total_steps
+            || step % 10 == 0
+            || scene.broken != previous_broken
+        {
+            let wood_max_speed = scene
+                .voxels
+                .iter()
+                .filter(|v| {
+                    v.composition
+                        .components
+                        .iter()
+                        .any(|&(id, f)| wood_ids.contains(&id) && f > 0.0)
+                })
+                .map(|v| v.velocity.length())
+                .fold(0.0f32, f32::max);
+            let wood_kinetic = scene
+                .voxels
+                .iter()
+                .filter(|v| {
+                    v.composition
+                        .components
+                        .iter()
+                        .any(|&(id, f)| wood_ids.contains(&id) && f > 0.0)
+                })
                 .map(|v| 0.5 * v.mass as f64 * v.velocity.length_squared() as f64)
                 .sum::<f64>();
             let active = tool.as_ref().unwrap();

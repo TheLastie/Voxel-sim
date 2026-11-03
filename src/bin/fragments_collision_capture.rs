@@ -132,7 +132,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             solver::step_with_axis_targets(&mut scene, &mut tool, &targets);
             for i in 0..2 {
                 let rest = scene.rest_positions[i + 1].x - scene.rest_positions[i].x;
-                let strain = ((scene.positions[i + 1].x - scene.positions[i].x - rest) / CELL as f64) as f32;
+                let strain =
+                    ((scene.positions[i + 1].x - scene.positions[i].x - rest) / CELL as f64) as f32;
                 max_stress_ratio = max_stress_ratio.max((strain * young / strength).abs());
             }
             if scene.bonds[0][1].neighbor == EMPTY {

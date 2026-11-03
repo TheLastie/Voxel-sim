@@ -54,6 +54,24 @@ type LaunchKernel = unsafe extern "C" fn(
 // multi-CTA wins starting at 16,384 REV.
 const SINGLE_CTA_REDUCTION_MAX_REVS: u32 = 8_192;
 
+/// Optional canonical per-edge blocks with their active-row slot mapping.
+/// `edge_ids` entries use `u32::MAX` for empty slots; transpose bits select
+/// the reverse orientation for the corresponding slot.
+pub(crate) struct CompactEdgeBlocks<'a> {
+    pub edges: &'a [[f32; 9]],
+    pub edge_ids: &'a [[u32; 6]],
+    pub transpose_masks: &'a [u8],
+}
+
+pub(crate) fn expand_edge_blocks_on_gpu_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VOXEL_CUDA_EXPAND_BLOCKS_ON_GPU")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    })
+}
+
 struct Driver {
     _library: Library,
     init: Init,
@@ -103,14 +121,217 @@ struct CudaSolver {
     context: Handle,
     module: Handle,
     kernels: [Handle; 15],
+    inverse_diagonal_kernel: Option<Handle>,
+    expand_edge_blocks_kernel: Option<Handle>,
     buffers: HashMap<&'static str, (DevicePtr, usize)>,
     cached_neighbors: Vec<[u32; 6]>,
     cached_colors: Option<Vec<u8>>,
+    cached_edge_ids: Vec<[u32; 6]>,
+    cached_transpose_masks: Vec<u8>,
     host_rhs: Vec<f32>,
     stream: Handle,
     pcg_graph: Option<(PcgGraphKey, Handle)>,
     graphs_available: bool,
 }
+
+// Kept in this Rust module so the optional inverse path can be A/B tested
+// without changing the checked-in PTX artifact. Host CUDA matrices are packed
+// row-major. Reading that same byte sequence as column-major gives A^T; the
+// resulting inverse bytes are therefore the row-major packing of inverse(A).
+const INVERSE_DIAGONAL_PTX: &str = r#"
+
+.visible .entry block_inverse_diagonal(
+    .param .u64 diagonal_ptr,
+    .param .u64 inverse_ptr,
+    .param .u32 count
+) {
+    .reg .pred %p<8>;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<6>;
+    .reg .f32 %f<25>;
+    ld.param.u64 %rd1, [diagonal_ptr];
+    ld.param.u64 %rd2, [inverse_ptr];
+    ld.param.u32 %r4, [count];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r0, %r1, %r2, %r3;
+    setp.ge.u32 %p0, %r0, %r4;
+    @%p0 bra INV_DONE;
+
+    mul.wide.u32 %rd3, %r0, 36;
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.f32 %f0, [%rd4];
+    ld.global.f32 %f1, [%rd4+4];
+    ld.global.f32 %f2, [%rd4+8];
+    ld.global.f32 %f3, [%rd4+12];
+    ld.global.f32 %f4, [%rd4+16];
+    ld.global.f32 %f5, [%rd4+20];
+    ld.global.f32 %f6, [%rd4+24];
+    ld.global.f32 %f7, [%rd4+28];
+    ld.global.f32 %f8, [%rd4+32];
+
+    // C = cof(A^T); the output bytes are row-major inverse(A) after scaling.
+    mul.f32 %f9, %f4, %f8;
+    neg.f32 %f23, %f7;
+    fma.rn.f32 %f9, %f23, %f5, %f9;
+    mul.f32 %f10, %f7, %f2;
+    neg.f32 %f23, %f1;
+    fma.rn.f32 %f10, %f23, %f8, %f10;
+    mul.f32 %f11, %f1, %f5;
+    neg.f32 %f23, %f4;
+    fma.rn.f32 %f11, %f23, %f2, %f11;
+    mul.f32 %f12, %f6, %f5;
+    neg.f32 %f23, %f3;
+    fma.rn.f32 %f12, %f23, %f8, %f12;
+    mul.f32 %f13, %f0, %f8;
+    neg.f32 %f23, %f6;
+    fma.rn.f32 %f13, %f23, %f2, %f13;
+    mul.f32 %f14, %f3, %f2;
+    neg.f32 %f23, %f0;
+    fma.rn.f32 %f14, %f23, %f5, %f14;
+    mul.f32 %f15, %f3, %f7;
+    neg.f32 %f23, %f6;
+    fma.rn.f32 %f15, %f23, %f4, %f15;
+    mul.f32 %f16, %f6, %f1;
+    neg.f32 %f23, %f0;
+    fma.rn.f32 %f16, %f23, %f7, %f16;
+    mul.f32 %f17, %f0, %f4;
+    neg.f32 %f23, %f3;
+    fma.rn.f32 %f17, %f23, %f1, %f17;
+
+    // Match glam's determinant expansion using z dot (x cross y).
+    mul.f32 %f18, %f6, %f11;
+    fma.rn.f32 %f18, %f7, %f14, %f18;
+    fma.rn.f32 %f18, %f8, %f17, %f18;
+    setp.eq.f32 %p1, %f18, 0f00000000;
+    setp.ne.f32 %p2, %f18, %f18;
+    abs.f32 %f19, %f18;
+    setp.gtu.f32 %p3, %f19, 0f7f7fffff;
+    or.pred %p4, %p1, %p2;
+    or.pred %p4, %p4, %p3;
+    @%p4 bra INV_INVALID;
+
+    div.rn.f32 %f20, 0f3f800000, %f18;
+    mul.wide.u32 %rd5, %r0, 36;
+    add.u64 %rd5, %rd2, %rd5;
+    mul.f32 %f21, %f9, %f20;
+    st.global.f32 [%rd5], %f21;
+    mul.f32 %f21, %f10, %f20;
+    st.global.f32 [%rd5+4], %f21;
+    mul.f32 %f21, %f11, %f20;
+    st.global.f32 [%rd5+8], %f21;
+    mul.f32 %f21, %f12, %f20;
+    st.global.f32 [%rd5+12], %f21;
+    mul.f32 %f21, %f13, %f20;
+    st.global.f32 [%rd5+16], %f21;
+    mul.f32 %f21, %f14, %f20;
+    st.global.f32 [%rd5+20], %f21;
+    mul.f32 %f21, %f15, %f20;
+    st.global.f32 [%rd5+24], %f21;
+    mul.f32 %f21, %f16, %f20;
+    st.global.f32 [%rd5+28], %f21;
+    mul.f32 %f21, %f17, %f20;
+    st.global.f32 [%rd5+32], %f21;
+    bra INV_DONE;
+
+INV_INVALID:
+    mul.wide.u32 %rd5, %r0, 36;
+    add.u64 %rd5, %rd2, %rd5;
+    mov.f32 %f22, 0f7fc00000;
+    st.global.f32 [%rd5], %f22;
+    st.global.f32 [%rd5+4], %f22;
+    st.global.f32 [%rd5+8], %f22;
+    st.global.f32 [%rd5+12], %f22;
+    st.global.f32 [%rd5+16], %f22;
+    st.global.f32 [%rd5+20], %f22;
+    st.global.f32 [%rd5+24], %f22;
+    st.global.f32 [%rd5+28], %f22;
+    st.global.f32 [%rd5+32], %f22;
+INV_DONE:
+    ret;
+}
+"#;
+
+const EXPAND_EDGE_BLOCKS_PTX: &str = r#"
+.visible .entry expand_edge_blocks(
+    .param .u64 edge_blocks_ptr,
+    .param .u64 edge_ids_ptr,
+    .param .u64 transpose_masks_ptr,
+    .param .u64 output_blocks_ptr,
+    .param .u32 count
+) {
+    .reg .pred %p<5>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<10>;
+    ld.param.u64 %rd1, [edge_blocks_ptr];
+    ld.param.u64 %rd2, [edge_ids_ptr];
+    ld.param.u64 %rd3, [transpose_masks_ptr];
+    ld.param.u64 %rd4, [output_blocks_ptr];
+    ld.param.u32 %r10, [count];
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %ntid.x;
+    mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r3, %r0, %r1, %r2;
+    setp.ge.u32 %p1, %r3, %r10;
+    @%p1 bra EXP_DONE;
+
+    mul.wide.u32 %rd5, %r3, 24;
+    add.u64 %rd6, %rd2, %rd5;
+    mul.wide.u32 %rd7, %r3, 216;
+    add.u64 %rd8, %rd4, %rd7;
+    mul.wide.u32 %rd9, %r3, 1;
+    add.u64 %rd9, %rd3, %rd9;
+    ld.global.u8 %r11, [%rd9];
+    mov.u32 %r4, 0;
+EXP_SLOT:
+    setp.ge.u32 %p1, %r4, 6;
+    @%p1 bra EXP_DONE;
+    mul.wide.u32 %rd5, %r4, 4;
+    add.u64 %rd5, %rd6, %rd5;
+    ld.global.u32 %r5, [%rd5];
+    mul.wide.u32 %rd6, %r4, 36;
+    add.u64 %rd6, %rd8, %rd6;
+    shr.u32 %r12, %r11, %r4;
+    and.b32 %r12, %r12, 1;
+    setp.ne.u32 %p2, %r12, 0;
+    mov.u32 %r6, 0;
+EXP_ELEM:
+    setp.ge.u32 %p3, %r6, 9;
+    @%p3 bra EXP_NEXT_SLOT;
+    setp.eq.u32 %p4, %r5, 0xffffffff;
+    @%p4 bra EXP_ZERO;
+    div.u32 %r13, %r6, 3;
+    rem.u32 %r14, %r6, 3;
+    mul.lo.u32 %r14, %r14, 3;
+    add.u32 %r14, %r14, %r13;
+    selp.u32 %r14, %r14, %r6, %p2;
+    mul.wide.u32 %rd5, %r5, 36;
+    add.u64 %rd5, %rd1, %rd5;
+    mul.wide.u32 %rd7, %r14, 4;
+    add.u64 %rd5, %rd5, %rd7;
+    ld.global.u32 %r15, [%rd5];
+    bra EXP_STORE;
+EXP_ZERO:
+    mov.u32 %r15, 0;
+EXP_STORE:
+    mul.wide.u32 %rd5, %r6, 4;
+    add.u64 %rd5, %rd6, %rd5;
+    st.global.u32 [%rd5], %r15;
+    add.u32 %r6, %r6, 1;
+    bra EXP_ELEM;
+EXP_NEXT_SLOT:
+    // Restore the row metadata bases after the per-element scratch use.
+    mul.wide.u32 %rd6, %r3, 24;
+    add.u64 %rd6, %rd2, %rd6;
+    mul.wide.u32 %rd7, %r3, 216;
+    add.u64 %rd8, %rd4, %rd7;
+    add.u32 %r4, %r4, 1;
+    bra EXP_SLOT;
+EXP_DONE:
+    ret;
+}
+"#;
 
 static CUDA: OnceLock<Result<Mutex<CudaSolver>, String>> = OnceLock::new();
 
@@ -167,6 +388,23 @@ fn optional_symbol<T: Copy>(library: &Library, name: &[u8]) -> Option<T> {
 
 impl CudaSolver {
     fn initialize() -> Result<Self, String> {
+        Self::initialize_with_kernels(
+            inverse_diagonal_on_gpu_enabled(),
+            expand_edge_blocks_on_gpu_enabled(),
+        )
+    }
+
+    #[cfg(test)]
+    fn initialize_with_inverse_diagonal(
+        load_inverse_diagonal_kernel: bool,
+    ) -> Result<Self, String> {
+        Self::initialize_with_kernels(load_inverse_diagonal_kernel, false)
+    }
+
+    fn initialize_with_kernels(
+        load_inverse_diagonal_kernel: bool,
+        load_expand_edge_blocks_kernel: bool,
+    ) -> Result<Self, String> {
         #[cfg(target_os = "linux")]
         let library = unsafe { Library::new("libcuda.so.1") }.map_err(|e| e.to_string())?;
         #[cfg(target_os = "windows")]
@@ -220,8 +458,13 @@ impl CudaSolver {
             )?;
             let mut stream = 0;
             check(
-                unsafe { (driver.stream_create)(&mut stream, 1) },
-                "cuStreamCreate(nonblocking)",
+                // Pageable synchronous HtoD copies may return after staging,
+                // before DMA finishes. A stream created with the nonblocking
+                // flag skips legacy-stream ordering, so subsequent kernels can
+                // read a large upload too early. Preserve the driver's default
+                // legacy ordering without synchronizing the host per upload.
+                unsafe { (driver.stream_create)(&mut stream, 0) },
+                "cuStreamCreate(legacy-ordered)",
             )?;
             let ptx = include_bytes!("cuda/pcg.ptx");
             let mut ptx_z = ptx.to_vec();
@@ -265,6 +508,61 @@ impl CudaSolver {
                     "cuModuleGetFunction",
                 )?;
             }
+            let inverse_diagonal_kernel = if load_inverse_diagonal_kernel {
+                let mut inverse_ptx = b".version 7.0\n.target sm_75\n.address_size 64\n".to_vec();
+                inverse_ptx.extend_from_slice(INVERSE_DIAGONAL_PTX.as_bytes());
+                inverse_ptx.push(0);
+                let mut inverse_module = 0;
+                check(
+                    unsafe {
+                        (driver.module_load_data)(&mut inverse_module, inverse_ptx.as_ptr().cast())
+                    },
+                    "cuModuleLoadData(inverse-diagonal PTX)",
+                )?;
+                let mut kernel = 0;
+                check(
+                    unsafe {
+                        (driver.module_get_function)(
+                            &mut kernel,
+                            inverse_module,
+                            b"block_inverse_diagonal\0".as_ptr().cast(),
+                        )
+                    },
+                    "cuModuleGetFunction(block_inverse_diagonal)",
+                )?;
+                Some(kernel)
+            } else {
+                None
+            };
+            let expand_edge_blocks_kernel = if load_expand_edge_blocks_kernel {
+                let mut expand_ptx = b".version 7.0\n.target sm_75\n.address_size 64\n".to_vec();
+                expand_ptx.extend_from_slice(EXPAND_EDGE_BLOCKS_PTX.as_bytes());
+                expand_ptx.push(0);
+                let mut expand_module = 0;
+                check(
+                    unsafe {
+                        (driver.module_load_data)(
+                            &mut expand_module,
+                            expand_ptx.as_ptr().cast(),
+                        )
+                    },
+                    "cuModuleLoadData(edge-block expansion PTX)",
+                )?;
+                let mut kernel = 0;
+                check(
+                    unsafe {
+                        (driver.module_get_function)(
+                            &mut kernel,
+                            expand_module,
+                            b"expand_edge_blocks\0".as_ptr().cast(),
+                        )
+                    },
+                    "cuModuleGetFunction(expand_edge_blocks)",
+                )?;
+                Some(kernel)
+            } else {
+                None
+            };
             let graphs_available = driver.stream_begin_capture.is_some()
                 && driver.stream_end_capture.is_some()
                 && driver.graph_instantiate_with_flags.is_some()
@@ -276,9 +574,13 @@ impl CudaSolver {
                 context,
                 module,
                 kernels,
+                inverse_diagonal_kernel,
+                expand_edge_blocks_kernel,
                 buffers: HashMap::new(),
                 cached_neighbors: Vec::new(),
                 cached_colors: None,
+                cached_edge_ids: Vec::new(),
+                cached_transpose_masks: Vec::new(),
                 host_rhs: Vec::new(),
                 stream,
                 pcg_graph: None,
@@ -320,6 +622,29 @@ impl CudaSolver {
         Ok(pointer)
     }
 
+    fn upload_compact_edge_metadata(
+        &mut self,
+        edge_ids: &[[u32; 6]],
+        transpose_masks: &[u8],
+    ) -> Result<(DevicePtr, DevicePtr), String> {
+        if self.cached_edge_ids == edge_ids && self.cached_transpose_masks == transpose_masks {
+            if let (Some((edge_ids_ptr, _)), Some((transpose_masks_ptr, _))) = (
+                self.buffers.get("edge_ids"),
+                self.buffers.get("edge_transpose_masks"),
+            ) {
+                return Ok((*edge_ids_ptr, *transpose_masks_ptr));
+            }
+        }
+        let edge_ids_ptr = self.upload("edge_ids", edge_ids)?;
+        let transpose_masks_ptr = self.upload("edge_transpose_masks", transpose_masks)?;
+        self.cached_edge_ids.clear();
+        self.cached_edge_ids.extend_from_slice(edge_ids);
+        self.cached_transpose_masks.clear();
+        self.cached_transpose_masks
+            .extend_from_slice(transpose_masks);
+        Ok((edge_ids_ptr, transpose_masks_ptr))
+    }
+
     fn launch(&self, kernel: usize, grid: u32, params: &mut [*mut c_void]) -> Result<(), String> {
         check(
             unsafe {
@@ -338,6 +663,86 @@ impl CudaSolver {
                 )
             },
             "cuLaunchKernel",
+        )
+    }
+
+    fn launch_inverse_diagonal(
+        &self,
+        diagonal: DevicePtr,
+        inverse: DevicePtr,
+        count: u32,
+    ) -> Result<(), String> {
+        let kernel = self.inverse_diagonal_kernel.ok_or_else(|| {
+            "CUDA inverse-diagonal kernel was not enabled at initialization".to_string()
+        })?;
+        let mut diagonal_arg = diagonal;
+        let mut inverse_arg = inverse;
+        let mut count_arg = count;
+        let mut params = [
+            (&mut diagonal_arg as *mut DevicePtr).cast(),
+            (&mut inverse_arg as *mut DevicePtr).cast(),
+            (&mut count_arg as *mut u32).cast(),
+        ];
+        check(
+            unsafe {
+                (self.driver.launch_kernel)(
+                    kernel,
+                    count.div_ceil(256),
+                    1,
+                    1,
+                    256,
+                    1,
+                    1,
+                    0,
+                    self.stream,
+                    params.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "cuLaunchKernel(block_inverse_diagonal)",
+        )
+    }
+
+    fn launch_expand_edge_blocks(
+        &self,
+        edge_blocks: DevicePtr,
+        edge_ids: DevicePtr,
+        transpose_masks: DevicePtr,
+        output_blocks: DevicePtr,
+        count: u32,
+    ) -> Result<(), String> {
+        let kernel = self.expand_edge_blocks_kernel.ok_or_else(|| {
+            "CUDA edge-block expansion kernel was not enabled at initialization".to_string()
+        })?;
+        let mut edge_blocks_arg = edge_blocks;
+        let mut edge_ids_arg = edge_ids;
+        let mut transpose_masks_arg = transpose_masks;
+        let mut output_blocks_arg = output_blocks;
+        let mut count_arg = count;
+        let mut params = [
+            (&mut edge_blocks_arg as *mut DevicePtr).cast(),
+            (&mut edge_ids_arg as *mut DevicePtr).cast(),
+            (&mut transpose_masks_arg as *mut DevicePtr).cast(),
+            (&mut output_blocks_arg as *mut DevicePtr).cast(),
+            (&mut count_arg as *mut u32).cast(),
+        ];
+        check(
+            unsafe {
+                (self.driver.launch_kernel)(
+                    kernel,
+                    count.div_ceil(256),
+                    1,
+                    1,
+                    256,
+                    1,
+                    1,
+                    0,
+                    self.stream,
+                    params.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "cuLaunchKernel(expand_edge_blocks)",
         )
     }
 
@@ -360,10 +765,7 @@ impl CudaSolver {
                 .driver
                 .graph_exec_destroy
                 .expect("graph support checked during CUDA initialization");
-            check(
-                unsafe { destroy(executable) },
-                "cuGraphExecDestroy",
-            )?;
+            check(unsafe { destroy(executable) }, "cuGraphExecDestroy")?;
         }
         if key.count > SINGLE_CTA_REDUCTION_MAX_REVS {
             let partial_count = key.count.div_ceil(256);
@@ -387,7 +789,9 @@ impl CudaSolver {
             .expect("graph support checked during CUDA initialization");
         let begin_status = unsafe { begin_capture(self.stream, 0) };
         if begin_status != 0 {
-            eprintln!("CUDA PCG graph capture unavailable: status={begin_status}; using direct launches");
+            eprintln!(
+                "CUDA PCG graph capture unavailable: status={begin_status}; using direct launches"
+            );
             self.graphs_available = false;
             return Ok(None);
         }
@@ -620,7 +1024,6 @@ impl CudaSolver {
         ];
         self.launch(6, 1, &mut reduce_params)
     }
-
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -658,9 +1061,7 @@ fn launch_pcg_iteration(
         (&mut count_arg as *mut u32).cast(),
     ];
     if fused_matvec_dot_enabled() && count > SINGLE_CTA_REDUCTION_MAX_REVS {
-        cuda.launch_matvec_dot_ratio(
-            diagonal, p, neighbors, blocks, ap, count, rho, alpha,
-        )?;
+        cuda.launch_matvec_dot_ratio(diagonal, p, neighbors, blocks, ap, count, rho, alpha)?;
     } else {
         cuda.launch(0, grid, &mut matvec_params)?;
         cuda.launch_dot_ratio(p, ap, count, rho, alpha)?;
@@ -686,8 +1087,12 @@ fn launch_pcg_iteration(
     ];
     cuda.launch(8, grid, &mut update_precondition_params)?;
     if colors != 0 {
-        launch_color_correction(cuda, count, grid, inverse, r, z, neighbors, blocks, colors, 1)?;
-        launch_color_correction(cuda, count, grid, inverse, r, z, neighbors, blocks, colors, 0)?;
+        launch_color_correction(
+            cuda, count, grid, inverse, r, z, neighbors, blocks, colors, 1,
+        )?;
+        launch_color_correction(
+            cuda, count, grid, inverse, r, z, neighbors, blocks, colors, 0,
+        )?;
     }
     cuda.launch_dot(r, z, count, rho_next)?;
 
@@ -785,6 +1190,15 @@ fn fused_matvec_dot_enabled() -> bool {
     })
 }
 
+pub(crate) fn inverse_diagonal_on_gpu_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VOXEL_CUDA_INVERSE_DIAGONAL_ON_GPU")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// Solve the engine's assembled block sparse system with CUDA PCG and a
 /// block-Jacobi preconditioner. Matrix and RHS layouts are supplied by the
 /// engine; output is a correction vector in meters.
@@ -796,10 +1210,64 @@ pub(crate) fn solve_pcg(
     inverse_diagonal: &[[f32; 9]],
     max_iterations: usize,
     tolerance: f32,
+    compact: Option<CompactEdgeBlocks<'_>>,
 ) -> Result<(Vec<Vec3>, usize, f32), String> {
     let n = rhs.len();
     if n == 0 {
         return Ok((Vec::new(), 0, 0.0));
+    }
+    if let Some(compact) = compact.as_ref() {
+        if !blocks.is_empty() {
+            return Err("CUDA compact edge blocks require an empty expanded block slice".into());
+        }
+        if compact.edge_ids.len() != n || compact.transpose_masks.len() != n {
+            return Err(format!(
+                "CUDA compact edge mapping has edge_ids={} masks={} for {n} active REVs",
+                compact.edge_ids.len(),
+                compact.transpose_masks.len(),
+            ));
+        }
+        if compact.edges.len() > u32::MAX as usize {
+            return Err("CUDA compact edge count exceeds u32::MAX".into());
+        }
+        for (row, (&edge_ids, &transpose_mask)) in compact
+            .edge_ids
+            .iter()
+            .zip(compact.transpose_masks)
+            .enumerate()
+        {
+            if transpose_mask & !0x3f != 0 {
+                return Err(format!(
+                    "CUDA compact edge row {row} has transpose bits outside six slots"
+                ));
+            }
+            for (slot, edge_id) in edge_ids.into_iter().enumerate() {
+                if edge_id == u32::MAX {
+                    if transpose_mask & (1 << slot) != 0 {
+                        return Err(format!(
+                            "CUDA compact edge row {row} transposes missing slot {slot}"
+                        ));
+                    }
+                } else if edge_id as usize >= compact.edges.len() {
+                    return Err(format!(
+                        "CUDA compact edge row {row} slot {slot} references edge {edge_id} of {}",
+                        compact.edges.len()
+                    ));
+                }
+            }
+        }
+    } else if blocks.len() != n {
+        return Err(format!(
+            "CUDA PCG has {} expanded block rows for {n} active REVs",
+            blocks.len()
+        ));
+    }
+    let inverse_on_gpu = inverse_diagonal_on_gpu_enabled();
+    if inverse_diagonal.len() != n && !(inverse_on_gpu && inverse_diagonal.is_empty()) {
+        return Err(format!(
+            "CUDA PCG inverse diagonal has {} blocks for {n} active REVs",
+            inverse_diagonal.len()
+        ));
     }
     let count = u32::try_from(n)
         .map_err(|_| "CUDA PCG supports at most u32::MAX active REV".to_string())?;
@@ -828,7 +1296,8 @@ pub(crate) fn solve_pcg(
     // correction. Retain the packed host RHS so this transfer does not allocate
     // a fresh Vec on each solve.
     cuda.host_rhs.clear();
-    cuda.host_rhs.extend(rhs.iter().flat_map(|v| [v.x, v.y, v.z]));
+    cuda.host_rhs
+        .extend(rhs.iter().flat_map(|v| [v.x, v.y, v.z]));
     let rhs_len = cuda.host_rhs.len();
     // The packed adjacency is a pure function of the current topology and is
     // shared by all corotational PCG solves until a bond breaks or a REV is
@@ -863,24 +1332,42 @@ pub(crate) fn solve_pcg(
             cuda.cached_colors = Some(colors);
             color_ptr
         } else {
-            eprintln!(
-                "CUDA PCG preconditioner: graph is not bipartite; using block-Jacobi"
-            );
+            eprintln!("CUDA PCG preconditioner: graph is not bipartite; using block-Jacobi");
             cuda.cached_colors = None;
             0
         };
         (neighbor_ptr, color_ptr)
     };
     let diagonal_ptr = cuda.upload("diagonal", diagonal)?;
-    let block_ptr = cuda.upload("blocks", blocks)?;
-    let inverse_ptr = cuda.upload("inverse", inverse_diagonal)?;
+    let block_ptr = if let Some(compact) = compact {
+        let edge_blocks_ptr = cuda.upload("canonical_edge_blocks", compact.edges)?;
+        let (edge_ids_ptr, transpose_masks_ptr) =
+            cuda.upload_compact_edge_metadata(compact.edge_ids, compact.transpose_masks)?;
+        let expanded_blocks =
+            cuda.buffer("blocks", n * std::mem::size_of::<[f32; 54]>())?;
+        cuda.launch_expand_edge_blocks(
+            edge_blocks_ptr,
+            edge_ids_ptr,
+            transpose_masks_ptr,
+            expanded_blocks,
+            count,
+        )?;
+        expanded_blocks
+    } else {
+        cuda.upload("blocks", blocks)?
+    };
+    let inverse_ptr = if inverse_on_gpu {
+        let inverse_ptr = cuda.buffer("inverse", n * std::mem::size_of::<[f32; 9]>())?;
+        cuda.launch_inverse_diagonal(diagonal_ptr, inverse_ptr, count)?;
+        inverse_ptr
+    } else {
+        cuda.upload("inverse", inverse_diagonal)?
+    };
     let residual_replacement = residual_replacement_enabled();
     let rhs_exact = if residual_replacement {
         let pointer = cuda.buffer("rhs_exact", rhs_len * 4)?;
         check(
-            unsafe {
-                (cuda.driver.copy_htod)(pointer, cuda.host_rhs.as_ptr().cast(), rhs_len * 4)
-            },
+            unsafe { (cuda.driver.copy_htod)(pointer, cuda.host_rhs.as_ptr().cast(), rhs_len * 4) },
             "upload exact PCG RHS",
         )?;
         Some(pointer)
@@ -906,9 +1393,7 @@ pub(crate) fn solve_pcg(
         "initialize dx",
     )?;
     check(
-        unsafe {
-            (cuda.driver.copy_htod)(r, cuda.host_rhs.as_ptr().cast(), rhs_len * 4)
-        },
+        unsafe { (cuda.driver.copy_htod)(r, cuda.host_rhs.as_ptr().cast(), rhs_len * 4) },
         "initialize residual",
     )?;
 
@@ -930,10 +1415,28 @@ pub(crate) fn solve_pcg(
     cuda.launch(1, grid, &mut params)?;
     if color_ptr != 0 {
         launch_color_correction(
-            &mut cuda, count, grid, inverse_ptr, r, z, neighbor_ptr, block_ptr, color_ptr, 1,
+            &mut cuda,
+            count,
+            grid,
+            inverse_ptr,
+            r,
+            z,
+            neighbor_ptr,
+            block_ptr,
+            color_ptr,
+            1,
         )?;
         launch_color_correction(
-            &mut cuda, count, grid, inverse_ptr, r, z, neighbor_ptr, block_ptr, color_ptr, 0,
+            &mut cuda,
+            count,
+            grid,
+            inverse_ptr,
+            r,
+            z,
+            neighbor_ptr,
+            block_ptr,
+            color_ptr,
+            0,
         )?;
     }
     cuda.launch_dot(r, z, count, rho_a)?;
@@ -1049,10 +1552,28 @@ pub(crate) fn solve_pcg(
             cuda.launch(1, grid, &mut precondition_params)?;
             if color_ptr != 0 {
                 launch_color_correction(
-                    &mut cuda, count, grid, inverse_ptr, r, z, neighbor_ptr, block_ptr, color_ptr, 1,
+                    &mut cuda,
+                    count,
+                    grid,
+                    inverse_ptr,
+                    r,
+                    z,
+                    neighbor_ptr,
+                    block_ptr,
+                    color_ptr,
+                    1,
                 )?;
                 launch_color_correction(
-                    &mut cuda, count, grid, inverse_ptr, r, z, neighbor_ptr, block_ptr, color_ptr, 0,
+                    &mut cuda,
+                    count,
+                    grid,
+                    inverse_ptr,
+                    r,
+                    z,
+                    neighbor_ptr,
+                    block_ptr,
+                    color_ptr,
+                    0,
                 )?;
             }
             cuda.launch_dot(r, z, count, rho)?;
@@ -1109,6 +1630,7 @@ pub(crate) fn solve_pcg(
 #[cfg(test)]
 mod tests {
     use super::CudaSolver;
+    use glam::{Mat3, Vec3};
 
     #[test]
     fn cuda_adaptive_dot_and_ratio_match_cpu_when_explicitly_requested() {
@@ -1121,7 +1643,7 @@ mod tests {
             "cuCtxSetCurrent(test)",
         )
         .unwrap();
-        for count in [600u32, 16_385] {
+        for count in [600u32, 8_192, 8_193, 16_385, 65_537, 400_000] {
             let left: Vec<f32> = (0..count * 3)
                 .map(|i| (i % 97 + 1) as f32 * 0.03125)
                 .collect();
@@ -1141,7 +1663,11 @@ mod tests {
             let mut dot = f64::NAN;
             cuda.download((&mut dot as *mut f64).cast(), dot_ptr, 8)
                 .unwrap();
-            assert!((dot - expected).abs() <= expected.abs().max(1.0) * 1e-12);
+            assert!(
+                (dot - expected).abs() <= expected.abs().max(1.0) * 1e-12,
+                "CUDA dot mismatch for {count} REV: actual={dot:.17e}, expected={expected:.17e}, error={:.3e}",
+                (dot - expected).abs(),
+            );
 
             let rho = cuda.upload("test_rho", &[expected * 0.75]).unwrap();
             let alpha_ptr = cuda.buffer("test_alpha", 4).unwrap();
@@ -1150,7 +1676,152 @@ mod tests {
             let mut alpha = f32::NAN;
             cuda.download((&mut alpha as *mut f32).cast(), alpha_ptr, 4)
                 .unwrap();
-            assert!((alpha - 0.75).abs() <= 1e-6);
+            assert!(
+                (alpha - 0.75).abs() <= 1e-6,
+                "CUDA dot ratio mismatch for {count} REV: actual={alpha:.9e}, expected=7.5e-1",
+            );
         }
     }
+
+    #[test]
+    fn cuda_inverse_diagonal_matches_glam_and_marks_invalid_blocks() {
+        if std::env::var_os("VOXEL_REQUIRE_CUDA_TEST").is_none() {
+            return;
+        }
+        let mut cuda = CudaSolver::initialize_with_inverse_diagonal(true)
+            .expect("forced CUDA inverse-diagonal PTX module initialization");
+        super::check(
+            unsafe { (cuda.driver.context_set_current)(cuda.context) },
+            "cuCtxSetCurrent(test)",
+        )
+        .unwrap();
+
+        let valid = Mat3::from_cols(
+            Vec3::new(4.0, 1.0, 0.25),
+            Vec3::new(0.5, 3.0, 0.75),
+            Vec3::new(0.2, 0.4, 2.0),
+        );
+        let singular = Mat3::from_cols(Vec3::X, Vec3::X * 2.0, Vec3::Z);
+        let nonfinite = Mat3::from_cols(Vec3::X, Vec3::Y, Vec3::new(0.0, 0.0, f32::INFINITY));
+        let row_packed = |matrix: Mat3| {
+            let [x, y, z] = matrix.to_cols_array_2d();
+            [x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2]]
+        };
+        let diagonal = [
+            row_packed(valid),
+            row_packed(singular),
+            row_packed(nonfinite),
+        ];
+        let diagonal_ptr = cuda.upload("test_inverse_diagonal", &diagonal).unwrap();
+        let inverse_ptr = cuda
+            .buffer(
+                "test_inverse_diagonal_output",
+                std::mem::size_of_val(&diagonal),
+            )
+            .unwrap();
+        let count_arg = diagonal.len() as u32;
+        cuda.launch_inverse_diagonal(diagonal_ptr, inverse_ptr, count_arg)
+            .unwrap();
+
+        let mut actual = [[0.0f32; 9]; 3];
+        cuda.download(
+            actual.as_mut_ptr().cast(),
+            inverse_ptr,
+            std::mem::size_of_val(&actual),
+        )
+        .unwrap();
+        let expected = row_packed(valid.inverse());
+        for (actual, expected) in actual[0].iter().zip(expected) {
+            assert!((actual - expected).abs() <= expected.abs().max(1.0) * 2e-6);
+        }
+        assert!(actual[1].iter().all(|value| value.is_nan()));
+        assert!(actual[2].iter().all(|value| value.is_nan()));
+    }
+
+    #[test]
+    fn cuda_expands_compact_edge_blocks_bitwise() {
+        if std::env::var_os("VOXEL_REQUIRE_CUDA_TEST").is_none() {
+            return;
+        }
+        let mut cuda = CudaSolver::initialize_with_kernels(false, true)
+            .expect("forced CUDA edge-block expansion PTX initialization");
+        super::check(
+            unsafe { (cuda.driver.context_set_current)(cuda.context) },
+            "cuCtxSetCurrent(test)",
+        )
+        .unwrap();
+
+        let edge_blocks = [
+            [
+                1.0,
+                -0.0,
+                3.0,
+                4.0,
+                5.0,
+                6.0,
+                7.0,
+                8.0,
+                f32::from_bits(0x7fc0_1234),
+            ],
+            [-1.0, 2.0, 3.0, 4.0, 5.0, -6.0, 7.0, 8.0, 9.0],
+            [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0],
+        ];
+        let edge_ids = [
+            [0, 1, u32::MAX, u32::MAX, u32::MAX, u32::MAX],
+            [2, 0, 1, u32::MAX, u32::MAX, u32::MAX],
+        ];
+        let transpose_masks = [0b000010, 0b000101];
+        let edge_blocks_ptr = cuda
+            .upload("test_canonical_edge_blocks", &edge_blocks)
+            .unwrap();
+        let (edge_ids_ptr, transpose_masks_ptr) = cuda
+            .upload_compact_edge_metadata(&edge_ids, &transpose_masks)
+            .unwrap();
+        let cached_metadata = cuda
+            .upload_compact_edge_metadata(&edge_ids, &transpose_masks)
+            .unwrap();
+        assert_eq!(cached_metadata, (edge_ids_ptr, transpose_masks_ptr));
+
+        let output_ptr = cuda
+            .buffer("test_expanded_edge_blocks", 2 * std::mem::size_of::<[f32; 54]>())
+            .unwrap();
+        cuda.launch_expand_edge_blocks(
+            edge_blocks_ptr,
+            edge_ids_ptr,
+            transpose_masks_ptr,
+            output_ptr,
+            2,
+        )
+        .unwrap();
+        let mut actual = [[0.0f32; 54]; 2];
+        cuda.download(
+            actual.as_mut_ptr().cast(),
+            output_ptr,
+            std::mem::size_of_val(&actual),
+        )
+        .unwrap();
+
+        let mut expected = [[0.0f32; 54]; 2];
+        for row in 0..edge_ids.len() {
+            for slot in 0..6 {
+                let edge_id = edge_ids[row][slot];
+                if edge_id == u32::MAX {
+                    continue;
+                }
+                for element in 0..9 {
+                    let source_element = if transpose_masks[row] & (1 << slot) != 0 {
+                        (element % 3) * 3 + element / 3
+                    } else {
+                        element
+                    };
+                    expected[row][slot * 9 + element] =
+                        edge_blocks[edge_id as usize][source_element];
+                }
+            }
+        }
+        let actual_bytes: &[u8] = bytemuck::cast_slice(actual.as_flattened());
+        let expected_bytes: &[u8] = bytemuck::cast_slice(expected.as_flattened());
+        assert_eq!(actual_bytes, expected_bytes);
+    }
+
 }

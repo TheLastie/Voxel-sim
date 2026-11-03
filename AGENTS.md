@@ -6,7 +6,7 @@ Build the general-purpose voxel world described in [`WORLD_PARADIGM.md`](WORLD_P
 
 At the start of a task, inspect repository status and confirm the relevant project files are readable and the workspace is writable. Read the relevant Markdown project notes before implementation. Preserve existing user changes.
 
-The long-term performance targets are 30 FPS for the intended CPU workload and 60 FPS for the intended GPU workload. Label measurements by hardware, scene size, solver settings, and whether they measure the physical simulation, rendering, or a synthetic kernel. A CUDA operator microbenchmark is not a GPU simulation benchmark.
+The current targets are 60 FPS in the native application, 300–400 thousand active mechanical REVs with 10 ms of physical time computed in at most 5 ms, and 20–40 billion compressed inactive logical REVs. Preserve the accuracy and energy rules in WORLD_PARADIGM.md. Label measurements by hardware, scene size, solver settings, and whether they measure the physical simulation, rendering, or a synthetic kernel. A CUDA operator microbenchmark is not a GPU simulation benchmark.
 
 ## Engine design
 
@@ -22,12 +22,12 @@ The long-term performance targets are 30 FPS for the intended CPU workload and 6
 
 ## Physical runs and visual output
 
-- Before starting a model run, confirm filesystem access and start or verify the live viewer. Stream the run's CSV to `http://127.0.0.1:8765` so the user can see it while it runs.
-- Save a GIF for every physical capture and expose it from the viewer. Keep the CSV and MP4 where useful for diagnostics and seeking. The browser page should show the GIF and the live solver frame during a run.
+- The primary native visual path for a physical scene is the ordinary editor: open its authored `.vxscene` document with `voxel-editor --scene <path>`. Do not turn experiments into a special test UI or make `voxel-test-viewer` part of the product flow. The viewer and `validation/run-visible-test.ps1` may be used as secondary developer diagnostics for a specific test/probe when they add useful evidence; label observer overhead and never invent or interpolate solver states. Do not start a browser or HTTP viewer for this native workflow.
+- Save a GIF for physical captures requested as recordings. Keep CSV and MP4 where useful for diagnostics and seeking. Live images must come from actual solver states; distinguish snapshot frequency and observer overhead from physical computation and rendering FPS.
 - Maintain one reproducible physical experiment and recording for each engine mechanic in [`MECHANICS_EXPERIMENTS.md`](MECHANICS_EXPERIMENTS.md). Use at least 176 real saved states and a 17.6-second GIF at 10 FPS, twice the earlier 88-frame / 8.8-second recording. Extend the actual physical run to obtain more states; never duplicate or interpolate frames to meet the duration.
 - Keep the run's actual physics results in the recording. Do not synthesize trajectories or hide unstable behavior in a rendered result; report breakage, drift, and other failures beside the visual.
 - If the user gives a delivery deadline, check local time (`Asia/Yekaterinburg`) during the work and prioritize a runnable, inspectable result before that time. Do not imply a target has been achieved without a measurement.
-- For each actual physical model run, make the live stream available to the user and retain a GIF recording that can be opened in the site. Check that the viewer serves the current run before describing it as visible.
+- When a developer explicitly uses the live viewer for diagnostics, expose only the run's actual scene states and results; checks without a physical scene must not be given an invented one. Verify receipt of the current run before describing that diagnostic view as visible. The ordinary authored scene workflow remains in the native editor.
 
 ## Long-running work
 

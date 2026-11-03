@@ -1,6 +1,7 @@
 //! Physical scaling workload: an iron cube loaded by gravity and supported
 //! through contact with a kinematic bottom layer. No prescribed trajectories.
-//! Arguments: side in 1 cm REVs, number of 1 ms updates, ic0|multigrid.
+//! Arguments: side in 1 cm REVs, number of 1 ms updates, ic0|multigrid,
+//! connected|components16 (16 independent supported cubes for A/B runs).
 
 use std::{env, time::Instant};
 use voxel_physics_lab::{
@@ -15,10 +16,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if side < 2 || steps == 0 {
         return Err("side must be at least 2 and steps must be positive".into());
     }
-    let count = side.checked_pow(3).ok_or("voxel count overflow")?;
-    if side > i32::MAX as usize {
-        return Err("voxel coordinate exceeds i32".into());
-    }
+    let fixture = args.get(4).map(String::as_str).unwrap_or("connected");
+    let component_count = match fixture {
+        "connected" => 1,
+        "components16" => 16,
+        _ => return Err("fixture must be connected or components16".into()),
+    };
+    let count = side
+        .checked_pow(3)
+        .and_then(|count| count.checked_mul(component_count))
+        .ok_or("voxel count overflow")?;
+    let side_i32 = i32::try_from(side).map_err(|_| "voxel coordinate exceeds i32")?;
+    let component_stride = side_i32
+        .checked_add(2)
+        .ok_or("voxel coordinate exceeds i32")?;
+    component_stride
+        .checked_mul(3)
+        .and_then(|offset| offset.checked_add(side_i32 - 1))
+        .ok_or("voxel coordinate exceeds i32")?;
     let preconditioner = match args.get(3).map(String::as_str).unwrap_or("ic0") {
         "ic0" => CpuPreconditioner::IncompleteCholesky0,
         "multigrid" => CpuPreconditioner::AggregationMultigrid,
@@ -33,42 +48,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let iron = Material::component_id("iron").ok_or("iron material is unavailable")?;
     let mut spawns = Vec::with_capacity(count);
-    for z in 0..side {
-        for y in 0..side {
-            for x in 0..side {
-                let voxel = VoxelSpawn::at_cell([x as i32, y as i32, z as i32], iron);
-                spawns.push(if z == 0 { voxel.fixed() } else { voxel });
+    for component in 0..component_count {
+        let offset_x = (component % 4) as i32 * component_stride;
+        let offset_y = (component / 4) as i32 * component_stride;
+        for z in 0..side_i32 {
+            for y in 0..side_i32 {
+                for x in 0..side_i32 {
+                    let voxel = VoxelSpawn::at_cell([offset_x + x, offset_y + y, z], iron);
+                    spawns.push(if z == 0 { voxel.fixed() } else { voxel });
+                }
             }
         }
     }
     let prepare = Instant::now();
     let mut scene = Scene::from_voxels(config, spawns)?;
-    eprintln!("mechanics scale: side={side} revs={count} active={} fixed_dt_s=0.001 substeps=4 cpu_preconditioner={preconditioner:?} tolerance={} setup_s={:.3}",
-        count-side*side, scene.config.solver_relative_tolerance, prepare.elapsed().as_secs_f64());
+    eprintln!("mechanics scale: fixture={fixture} components={component_count} side={side} revs={count} active={} fixed_dt_s=0.001 substeps=4 cpu_preconditioner={preconditioner:?} tolerance={} setup_s={:.3}",
+        count-component_count*side*side, scene.config.solver_relative_tolerance, prepare.elapsed().as_secs_f64());
     println!("step,revs,active,wall_ms,residual,broken,mass_kg,kinetic_j,true_residual,applied_residual,position_rounding_l2_m,max_audited_residual");
+    let mut last_step_ms = 0.0;
     for step in 1..=steps {
         let clock = Instant::now();
         scene.tick();
-        let wall_ms = clock.elapsed().as_secs_f64()*1000.0;
+        let wall_ms = clock.elapsed().as_secs_f64() * 1000.0;
+        last_step_ms = wall_ms;
         let mass: f64 = scene.voxels.iter().map(|v| v.mass as f64).sum();
-        let kinetic: f64 = scene.voxels.iter().map(|v|
-            0.5 * v.mass as f64 * v.velocity.as_dvec3().length_squared()).sum();
-        let audit = scene.solver_residual_audit.map(|a| format!("{:.9e},{:.9e},{:.9e}",
-            a.correction_relative,a.applied_relative,a.position_rounding_l2_m))
+        let kinetic: f64 = scene
+            .voxels
+            .iter()
+            .map(|v| 0.5 * v.mass as f64 * v.velocity.as_dvec3().length_squared())
+            .sum();
+        let audit = scene
+            .solver_residual_audit
+            .map(|a| {
+                format!(
+                    "{:.9e},{:.9e},{:.9e}",
+                    a.correction_relative, a.applied_relative, a.position_rounding_l2_m
+                )
+            })
             .unwrap_or_else(|| ",,".into());
-        let worst_audit = scene.solver_max_audited_residual
-            .map(|x| format!("{x:.9e}")).unwrap_or_default();
+        let worst_audit = scene
+            .solver_max_audited_residual
+            .map(|x| format!("{x:.9e}"))
+            .unwrap_or_default();
         println!("{step},{count},{},{wall_ms:.3},{:.9e},{},{mass:.9e},{kinetic:.9e},{audit},{worst_audit}",
-            count-side*side, scene.solver_residual, scene.broken);
+            count-component_count*side*side, scene.solver_residual, scene.broken);
         if !scene.solver_residual.is_finite()
             || scene.solver_residual >= scene.config.solver_relative_tolerance
         {
-            return Err("fine mechanical solve did not reach its unchanged residual tolerance".into());
+            return Err(
+                "fine mechanical solve did not reach its unchanged residual tolerance".into(),
+            );
         }
         if let Some(worst) = scene.solver_max_audited_residual {
             if !worst.is_finite() || worst >= scene.config.solver_relative_tolerance as f64 {
                 return Err("independent fine-operator residual or applied-coordinate residual exceeds tolerance".into());
             }
+        }
+    }
+    if voxel_physics_lab::live_tests::enabled() {
+        voxel_physics_lab::live_tests::observe_scene_force(
+            &scene, "", scene.simulated_seconds, last_step_ms,
+        );
+        if !voxel_physics_lab::live_tests::flush(std::time::Duration::from_secs(2)) {
+            eprintln!("live viewer: final frame was not confirmed written");
         }
     }
     Ok(())

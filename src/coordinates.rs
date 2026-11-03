@@ -41,7 +41,10 @@ pub struct CellPosition {
 
 impl CellPosition {
     pub fn at_cell_center(cell: [i64; 3]) -> Self {
-        Self { cell, offset_m: DVec3::splat(CELL_M * 0.5) }
+        Self {
+            cell,
+            offset_m: DVec3::splat(CELL_M * 0.5),
+        }
     }
 
     pub fn from_cell_offset(cell: [i64; 3], offset_m: DVec3) -> Result<Self, CoordinateError> {
@@ -56,17 +59,20 @@ impl CellPosition {
                 return Err(CoordinateError::CellOverflow);
             }
             let shift = shift as i64;
-            position.cell[axis] = position.cell[axis].checked_add(shift)
+            position.cell[axis] = position.cell[axis]
+                .checked_add(shift)
                 .ok_or(CoordinateError::CellOverflow)?;
             position.offset_m[axis] -= shift as f64 * CELL_M;
             // Correct a possible last-bit boundary error without clamping or
             // discarding displacement. Carry it into the neighbouring cell.
             if position.offset_m[axis] >= CELL_M {
-                position.cell[axis] = position.cell[axis].checked_add(1)
+                position.cell[axis] = position.cell[axis]
+                    .checked_add(1)
                     .ok_or(CoordinateError::CellOverflow)?;
                 position.offset_m[axis] -= CELL_M;
             } else if position.offset_m[axis] < 0.0 {
-                position.cell[axis] = position.cell[axis].checked_sub(1)
+                position.cell[axis] = position.cell[axis]
+                    .checked_sub(1)
                     .ok_or(CoordinateError::CellOverflow)?;
                 position.offset_m[axis] += CELL_M;
             }
@@ -77,9 +83,13 @@ impl CellPosition {
         Ok(position)
     }
 
-    pub fn cell(self) -> [i64; 3] { self.cell }
+    pub fn cell(self) -> [i64; 3] {
+        self.cell
+    }
 
-    pub fn offset_m(self) -> DVec3 { self.offset_m }
+    pub fn offset_m(self) -> DVec3 {
+        self.offset_m
+    }
 
     pub fn translated(self, displacement_m: DVec3) -> Result<Self, CoordinateError> {
         if !displacement_m.is_finite() {
@@ -91,9 +101,10 @@ impl CellPosition {
     /// `self - origin` in metres. Adjacent cells remain adjacent even when
     /// both global indices are too large to be distinguished by f32/f64.
     pub fn relative_to(self, origin: Self) -> DVec3 {
-        let delta = std::array::from_fn::<_,3,_>(|axis|
-            (self.cell[axis] as i128 - origin.cell[axis] as i128) as f64);
-        DVec3::from_array(delta) * CELL_M + (self.offset_m-origin.offset_m)
+        let delta = std::array::from_fn::<_, 3, _>(|axis| {
+            (self.cell[axis] as i128 - origin.cell[axis] as i128) as f64
+        });
+        DVec3::from_array(delta) * CELL_M + (self.offset_m - origin.offset_m)
     }
 
     /// Camera/local-origin projection for rendering, not a physics position.
@@ -111,17 +122,17 @@ mod tests {
         let origin = CellPosition::at_cell_center([100_000_000_000, -100_000_000_000, 0]);
         let movement = DVec3::new(1e-8, -2e-8, 3e-8);
         let moved = origin.translated(movement).unwrap();
-        assert!((moved.relative_to(origin)-movement).length() < 2e-18);
-        assert_ne!(moved,origin);
+        assert!((moved.relative_to(origin) - movement).length() < 2e-18);
+        assert_ne!(moved, origin);
     }
 
     #[test]
     fn crossing_positive_and_negative_cell_boundaries_preserves_displacement() {
-        let origin = CellPosition::at_cell_center([15,-15,3]);
-        let movement = DVec3::new(0.017,-0.019,0.006);
+        let origin = CellPosition::at_cell_center([15, -15, 3]);
+        let movement = DVec3::new(0.017, -0.019, 0.006);
         let moved = origin.translated(movement).unwrap();
-        assert_eq!(moved.cell(),[17,-17,4]);
-        assert!((moved.relative_to(origin)-movement).length() < 1e-17);
+        assert_eq!(moved.cell(), [17, -17, 4]);
+        assert!((moved.relative_to(origin) - movement).length() < 1e-17);
         assert!(moved.offset_m().cmpge(DVec3::ZERO).all());
         assert!(moved.offset_m().cmplt(DVec3::splat(CELL_M)).all());
         let returned = moved.translated(-movement).unwrap();
@@ -130,16 +141,22 @@ mod tests {
 
     #[test]
     fn relative_coordinates_subtract_integer_indices_before_float_conversion() {
-        let a = CellPosition::at_cell_center([i64::MAX-1,i64::MIN+1,0]);
-        let b = CellPosition::at_cell_center([i64::MAX,i64::MIN,0]);
-        assert_eq!(b.relative_to(a),DVec3::new(CELL_M,-CELL_M,0.0));
+        let a = CellPosition::at_cell_center([i64::MAX - 1, i64::MIN + 1, 0]);
+        let b = CellPosition::at_cell_center([i64::MAX, i64::MIN, 0]);
+        assert_eq!(b.relative_to(a), DVec3::new(CELL_M, -CELL_M, 0.0));
     }
 
     #[test]
     fn nonfinite_and_overflowing_translations_are_rejected_without_mutation() {
-        let p = CellPosition::at_cell_center([i64::MAX,0,0]);
-        assert_eq!(p.translated(DVec3::X*CELL_M),Err(CoordinateError::CellOverflow));
-        assert_eq!(p.translated(DVec3::splat(f64::NAN)),Err(CoordinateError::NonFinite));
-        assert_eq!(p.cell(),[i64::MAX,0,0]);
+        let p = CellPosition::at_cell_center([i64::MAX, 0, 0]);
+        assert_eq!(
+            p.translated(DVec3::X * CELL_M),
+            Err(CoordinateError::CellOverflow)
+        );
+        assert_eq!(
+            p.translated(DVec3::splat(f64::NAN)),
+            Err(CoordinateError::NonFinite)
+        );
+        assert_eq!(p.cell(), [i64::MAX, 0, 0]);
     }
 }
