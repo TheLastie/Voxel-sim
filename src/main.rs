@@ -25,6 +25,7 @@ use std::{
 use tool::{Shape, Tool};
 use ui::{EditorInfo, EditorTool, ReticleState, SceneSelectionMode, Ui, UiAction};
 use voxel_physics_lab::world::{GeneratedWorld, GrowthScheduler, WorldCharacter, WORLD_SIDE_M};
+use voxel_physics_lab::scene_welding::ThermalBondingSettings;
 use voxel_physics_lab::world_physics::{self, GrabTarget, PhysicsFrame, PhysicsWorker};
 use winit::{
     event::{DeviceEvent, ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
@@ -78,6 +79,8 @@ enum SceneInstanceEdit {
     Rotation(Vec3),
     Velocity(Vec3),
     Force(Vec3),
+    InitialTemperature(Option<f32>),
+    ThermalBonding(Option<ThermalBondingSettings>),
     Material {
         path: PathBuf,
         voxel_indices: Vec<u32>,
@@ -306,6 +309,10 @@ fn sync_scene_instance_selection(
     ui.selected_scene_model = selected;
     let info = selected.and_then(|index| scene_model_inspector_info(document, index));
     ui.set_selected_scene_model_info(info);
+    ui.set_scene_simulation_inspector_info(
+        selected.and_then(|index| document.simulation_settings.object_temperature_kelvin(index)),
+        document.simulation_settings.thermal_bonding.clone(),
+    );
     let bounds = selected
         .and_then(|index| authored_instance_bounds(document, scene_path, index).ok())
         .map(|bounds| {
@@ -384,6 +391,14 @@ fn apply_scene_instance_edit(
             let mut settings = updated.object_settings(index);
             settings.force_n = force;
             updated.set_object_settings(index, settings)?;
+            Some(index)
+        }
+        SceneInstanceEdit::InitialTemperature(kelvin) => {
+            updated.set_object_initial_temperature(index, kelvin)?;
+            Some(index)
+        }
+        SceneInstanceEdit::ThermalBonding(settings) => {
+            updated.set_thermal_bonding(settings)?;
             Some(index)
         }
         SceneInstanceEdit::Material {
@@ -480,6 +495,12 @@ fn run_scene_instance_edit(
                 SceneInstanceEdit::Force(_) => {
                     "Applied force updated in N. Save the scene to keep the change.".into()
                 }
+                SceneInstanceEdit::InitialTemperature(_) => {
+                    "Initial object temperature updated. Save the scene to keep the change.".into()
+                }
+                SceneInstanceEdit::ThermalBonding(_) => {
+                    "Thermal welding settings updated. Save the scene to keep the change.".into()
+                }
                 SceneInstanceEdit::Material { .. } => {
                     "Material assignment updated. Save the scene to keep the change.".into()
                 }
@@ -572,18 +593,24 @@ fn scene_property_edit(
     scene_path: &Path,
     ui: &Ui,
 ) -> Result<Option<SceneInstanceEdit>, String> {
-    let direct = match action {
+    let direct = match &action {
         UiAction::SetScenePosition { value } => {
-            Some(SceneInstanceEdit::Position(DVec3::from_array(value)))
+            Some(SceneInstanceEdit::Position(DVec3::from_array(*value)))
         }
         UiAction::SetSceneRotation { degrees } => {
-            Some(SceneInstanceEdit::Rotation(Vec3::from_array(degrees)))
+            Some(SceneInstanceEdit::Rotation(Vec3::from_array(*degrees)))
         }
         UiAction::SetSceneVelocity { value } => {
-            Some(SceneInstanceEdit::Velocity(Vec3::from_array(value)))
+            Some(SceneInstanceEdit::Velocity(Vec3::from_array(*value)))
         }
         UiAction::SetSceneForce { value } => {
-            Some(SceneInstanceEdit::Force(Vec3::from_array(value)))
+            Some(SceneInstanceEdit::Force(Vec3::from_array(*value)))
+        }
+        UiAction::SetSceneInitialTemperature { kelvin } => {
+            Some(SceneInstanceEdit::InitialTemperature(*kelvin))
+        }
+        UiAction::SetSceneThermalBonding(settings) => {
+            Some(SceneInstanceEdit::ThermalBonding(settings.clone()))
         }
         _ => None,
     };
@@ -2584,7 +2611,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
             && selected_shape(&args).is_none()
             && !args.iter().any(|arg| arg == "--headless"));
     let path = requested_scene_path.unwrap_or("scenes/mounted_axe.ron");
-    let config = if let Some(document) = native_scene_document.as_ref() {
+    let mut config = if let Some(document) = native_scene_document.as_ref() {
         document.config.clone()
     } else if two_cube_demo || friction_road_demo {
         let mut config = SceneConfig::default();
@@ -3752,9 +3779,12 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                             dragging = true;
                         }
                         match click_action {
-                            Some(action @ (UiAction::SetSceneSelectionMode(_)
+                            Some(action @ (UiAction::SetScenePhysics { .. }
+                                | UiAction::SetSceneSelectionMode(_)
                                 | UiAction::SetScenePosition { .. } | UiAction::SetSceneRotation { .. }
                                 | UiAction::SetSceneVelocity { .. } | UiAction::SetSceneForce { .. }
+                                | UiAction::SetSceneInitialTemperature { .. }
+                                | UiAction::SetSceneThermalBonding(_)
                                 | UiAction::CycleSceneMaterial | UiAction::LoadSceneMaterial
                                 | UiAction::SaveSceneMaterial | UiAction::CreateSceneMaterial
                                 | UiAction::CreateImpactScene { .. })) => pending_scene_action = Some(action),
@@ -5711,6 +5741,58 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                 WindowEvent::RedrawRequested => {
                     if let Some(action) = pending_scene_action.take() {
                         match action {
+                            UiAction::SetScenePhysics {
+                                fixed_dt_seconds,
+                                substeps,
+                                gravity,
+                                restitution,
+                                friction_scale,
+                                solver_iterations,
+                                solver_tolerance,
+                            } => {
+                                if !ui.paused {
+                                    ui.set_status_message("Pause the scene before changing physics settings.");
+                                } else if let Some(document) = active_scene_document.as_ref() {
+                                    let path = active_scene_document_path.as_deref()
+                                        .unwrap_or_else(|| Path::new("Untitled.vxscene"));
+                                    let mut updated = document.clone();
+                                    updated.config.fixed_dt = fixed_dt_seconds;
+                                    updated.config.substeps = substeps as usize;
+                                    updated.config.gravity = gravity;
+                                    updated.config.fracture.restitution = restitution;
+                                    updated.config.fracture.friction = friction_scale;
+                                    updated.config.iterations = solver_iterations;
+                                    updated.config.solver_relative_tolerance = solver_tolerance;
+                                    let result = updated.config.validate()
+                                        .map_err(|error| error.to_string())
+                                        .and_then(|()| updated.build_scene(path));
+                                    match result {
+                                        Ok(rebuilt) => {
+                                            // Dropping the worker discards its paused runtime state; the
+                                            // authored document remains the source for all scene edits.
+                                            authored_physics = None;
+                                            if let Some(source) = authored_render_source.take() {
+                                                renderer.set_authored_physics_frame(&source, None);
+                                            }
+                                            scene = rebuilt;
+                                            config = updated.config.clone();
+                                            active_scene_document = Some(updated);
+                                            if let Some(document) = active_scene_document.as_ref() {
+                                                ui.set_scene_physics_config(&document.config);
+                                            }
+                                            live_simulated_s = 0.0;
+                                            live_wall_s = 0.0;
+                                            accumulator = 0.0;
+                                            last = Instant::now();
+                                            model_revision = model_revision.wrapping_add(1);
+                                            ui.set_status_message("Scene physics settings updated. Save the scene to keep the change.");
+                                        }
+                                        Err(error) => ui.set_status_message(format!("Error: {error}")),
+                                    }
+                                } else {
+                                    ui.set_status_message("Open a scene first.");
+                                }
+                            }
                             UiAction::SetSceneSelectionMode(selection_mode) => {
                                 ui.scene_selection_mode = selection_mode;
                                 ui.set_model_selection(None, None, None);
@@ -6140,6 +6222,13 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                     });
                     let visible_scene = mesh_import_preview_scene.as_ref().unwrap_or(&scene);
                     let import_preview_active = mesh_import_preview_scene.is_some();
+                    if let Some(document) = active_scene_document.as_ref() {
+                        ui.set_scene_physics_config(&document.config);
+                    }
+                    let forward = camera.forward().normalize_or_zero();
+                    let mut view_right = forward.cross(Vec3::Z).normalize_or_zero();
+                    if view_right.length_squared() < 0.5 { view_right = Vec3::X; }
+                    ui.set_view_basis(view_right, view_right.cross(forward).normalize_or_zero());
                     let rects = ui.draw(
                         visible_scene.broken,
                         visible_scene.cluster_count,

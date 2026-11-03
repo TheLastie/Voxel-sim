@@ -1,6 +1,8 @@
+use crate::scene::SceneConfig;
 use crate::tool::Shape;
 use glam::Vec3;
 use std::collections::BTreeMap;
+use voxel_physics_lab::scene_welding::ThermalBondingSettings;
 use winit::keyboard::KeyCode;
 const MAX_PUSH_FORCE_N: f32 = 15_000.0;
 const MAX_SIMULATION_TIME_SCALE: f32 = 31_557_600.0;
@@ -55,10 +57,20 @@ pub struct Ui {
     pub active_scene_name: Option<String>,
     pub scene_model_names: Vec<String>,
     pub scene_hierarchy_scroll: usize,
+    scene_inspector_scroll: f32,
+    inspector_scroll_dragging: bool,
+    scene_physics: ScenePhysicsValues,
+    scene_inspector_collapsed: [bool; 5],
+    view_right: Vec3,
+    view_up: Vec3,
     pub selected_scene_model: Option<usize>,
     pub selected_scene_model_info: Option<SceneModelInspectorInfo>,
+    pub selected_scene_initial_temperature_kelvin: Option<f32>,
+    pub scene_thermal_bonding: Option<ThermalBondingSettings>,
     pub scene_selection_mode: SceneSelectionMode,
     scene_input: Option<SceneInputState>,
+    welding_input: Option<WeldingInputState>,
+    scene_physics_input: Option<ScenePhysicsInputState>,
     /// Scene-object translation increment in 1 cm REV cells.
     pub scene_move_step_cells: i32,
     pub active_model_name: Option<String>,
@@ -198,15 +210,38 @@ pub enum UiAction {
     },
     CancelMeshImport,
     SetSceneSelectionMode(SceneSelectionMode),
-    SetScenePosition { value: [f64; 3] },
-    SetSceneRotation { degrees: [f32; 3] },
-    SetSceneVelocity { value: [f32; 3] },
-    SetSceneForce { value: [f32; 3] },
+    SetScenePosition {
+        value: [f64; 3],
+    },
+    SetSceneRotation {
+        degrees: [f32; 3],
+    },
+    SetSceneVelocity {
+        value: [f32; 3],
+    },
+    SetSceneForce {
+        value: [f32; 3],
+    },
+    SetSceneInitialTemperature {
+        kelvin: Option<f32>,
+    },
+    SetSceneThermalBonding(Option<ThermalBondingSettings>),
+    SetScenePhysics {
+        fixed_dt_seconds: f32,
+        substeps: u32,
+        gravity: [f32; 3],
+        restitution: f32,
+        friction_scale: f32,
+        solver_iterations: usize,
+        solver_tolerance: f32,
+    },
     CycleSceneMaterial,
     LoadSceneMaterial,
     SaveSceneMaterial,
     CreateSceneMaterial,
-    CreateImpactScene { side: usize },
+    CreateImpactScene {
+        side: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -242,6 +277,14 @@ enum SceneInputTarget {
     Rotation,
     Velocity,
     Force,
+    InitialTemperature,
+}
+
+#[derive(Clone, Debug)]
+struct WeldingInputState {
+    values: [String; 6],
+    field: usize,
+    editing: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -250,6 +293,120 @@ struct SceneInputState {
     values: [String; 3],
     axis: usize,
     editing: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ScenePhysicsInputState {
+    values: [String; 9],
+    field: usize,
+    editing: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScenePhysicsValues {
+    fixed_dt: f32,
+    substeps: usize,
+    gravity: [f32; 3],
+    restitution: f32,
+    friction_scale: f32,
+    iterations: usize,
+    tolerance: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SceneInspectorSection {
+    Transform,
+    Dynamics,
+    Material,
+    Welding,
+    Simulation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SceneInspectorItem {
+    Actions,
+    Section(SceneInspectorSection),
+    Position,
+    Rotation,
+    Bounds,
+    Velocity,
+    Force,
+    Temperature,
+    MaterialCycle,
+    MaterialActions,
+    WeldingToggle,
+    WeldingConfigure,
+    PhysicsField(usize),
+    PhysicsApply,
+    Hint,
+    InputHint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SceneInspectorRow {
+    item: SceneInspectorItem,
+    top: f32,
+    height: f32,
+}
+
+impl Default for ScenePhysicsValues {
+    fn default() -> Self {
+        let config = SceneConfig::default();
+        Self {
+            fixed_dt: config.fixed_dt,
+            substeps: config.substeps,
+            gravity: config.gravity,
+            restitution: config.fracture.restitution,
+            friction_scale: config.fracture.friction,
+            iterations: config.iterations,
+            tolerance: config.solver_relative_tolerance,
+        }
+    }
+}
+
+fn scene_physics_action(values: &[String; 9]) -> Result<UiAction, &'static str> {
+    let parse = |index: usize| {
+        values[index]
+            .parse::<f32>()
+            .ok()
+            .filter(|value| value.is_finite())
+    };
+    let fixed_dt_seconds = parse(0)
+        .filter(|value| *value > 0.0)
+        .ok_or("Fixed dt must be finite and greater than zero.")?;
+    let substeps = values[1]
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or("Substeps must be a positive whole number.")?;
+    let gravity = [parse(2), parse(3), parse(4)];
+    if gravity.iter().any(Option::is_none) {
+        return Err("Gravity components must be finite numbers.");
+    }
+    let gravity = gravity.map(Option::unwrap);
+    let restitution = parse(5)
+        .filter(|value| (0.0..=1.0).contains(value))
+        .ok_or("Restitution must be between 0 and 1.")?;
+    let friction_scale = parse(6)
+        .filter(|value| *value >= 0.0)
+        .ok_or("Friction scale must be finite and nonnegative.")?;
+    let solver_iterations = values[7]
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or("Solver iterations must be a positive whole number.")?;
+    let solver_tolerance = parse(8)
+        .filter(|value| *value > 0.0)
+        .ok_or("Solver tolerance must be finite and greater than zero.")?;
+    Ok(UiAction::SetScenePhysics {
+        fixed_dt_seconds,
+        substeps,
+        gravity,
+        restitution,
+        friction_scale,
+        solver_iterations,
+        solver_tolerance,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -318,10 +475,20 @@ impl Ui {
             active_scene_name: None,
             scene_model_names: Vec::new(),
             scene_hierarchy_scroll: 0,
+            scene_inspector_scroll: 0.0,
+            inspector_scroll_dragging: false,
+            scene_physics: ScenePhysicsValues::default(),
+            scene_inspector_collapsed: [false, false, false, true, true],
+            view_right: Vec3::X,
+            view_up: Vec3::Z,
             selected_scene_model: None,
             selected_scene_model_info: None,
+            selected_scene_initial_temperature_kelvin: None,
+            scene_thermal_bonding: None,
             scene_selection_mode: SceneSelectionMode::Object,
             scene_input: None,
+            welding_input: None,
+            scene_physics_input: None,
             scene_move_step_cells: 10,
             active_model_name: None,
             model_voxel_count: 0,
@@ -369,26 +536,47 @@ impl Ui {
         self.start
     }
     pub fn click(&mut self, x: f32, y: f32) -> Option<UiAction> {
-        let (x, y) = self.to_canvas(x, y);
-        if let Some(input) = self.scene_input.as_mut() {
-            if (self.canvas_width * 0.5 - 210.0..=self.canvas_width * 0.5 + 210.0).contains(&x)
-                && (self.canvas_height * 0.5 - 110.0..=self.canvas_height * 0.5 + 110.0)
-                    .contains(&y)
-            {
-                for axis in 0..3 {
-                    let left = self.canvas_width * 0.5 - 190.0 + axis as f32 * 130.0;
-                    if (left..=left + 112.0).contains(&x)
-                        && (self.canvas_height * 0.5 - 8.0..=self.canvas_height * 0.5 + 30.0)
-                            .contains(&y)
+        let (x, mut y) = self.to_canvas(x, y);
+        if let Some(input) = self.welding_input.as_mut() {
+            let left = (self.canvas_width - 500.0) * 0.5;
+            let top = (self.canvas_height - 430.0) * 0.5;
+            if (left..=left + 500.0).contains(&x) && (top..=top + 430.0).contains(&y) {
+                for field in 0..6 {
+                    let row_top = top + 88.0 + field as f32 * 42.0;
+                    if (left + 20.0..=left + 480.0).contains(&x)
+                        && (row_top..=row_top + 34.0).contains(&y)
                     {
-                        input.axis = axis;
+                        input.field = field;
                         input.editing = false;
                         return None;
                     }
                 }
+                if (left + 20.0..=left + 480.0).contains(&x)
+                    && (top + 362.0..=top + 408.0).contains(&y)
+                {
+                    let parsed = input.values[1..]
+                        .iter()
+                        .map(|value| value.parse::<f64>().ok().filter(|v| v.is_finite()))
+                        .collect::<Vec<_>>();
+                    if parsed.iter().any(Option::is_none) || input.values[0].trim().is_empty() {
+                        self.status_message =
+                            Some("Enter a material name and five finite thresholds.".into());
+                        return None;
+                    }
+                    let settings = ThermalBondingSettings {
+                        material_name: input.values[0].trim().to_owned(),
+                        minimum_mass_fraction: parsed[0].unwrap() as f32,
+                        minimum_temperature_kelvin: parsed[1].unwrap() as f32,
+                        minimum_impact_energy_j: parsed[2].unwrap(),
+                        minimum_contact_pressure_pa: parsed[3].unwrap() as f32,
+                        minimum_dwell_seconds: parsed[4].unwrap() as f32,
+                    };
+                    self.welding_input = None;
+                    return Some(UiAction::SetSceneThermalBonding(Some(settings)));
+                }
                 return None;
             }
-            self.scene_input = None;
+            self.welding_input = None;
             return None;
         }
         let dock_top = self.editor_dock_top();
@@ -514,11 +702,17 @@ impl Ui {
                 self.open_settings_from_toolbar();
                 return Some(UiAction::Settings);
             }
-            if self.scene_document_available && (370.0..=434.0).contains(&x) && (0.0..=28.0).contains(&y) {
+            if self.scene_document_available
+                && (370.0..=434.0).contains(&x)
+                && (0.0..=28.0).contains(&y)
+            {
                 self.scene_selection_mode = SceneSelectionMode::Object;
                 return Some(UiAction::SetSceneSelectionMode(SceneSelectionMode::Object));
             }
-            if self.scene_document_available && (438.0..=502.0).contains(&x) && (0.0..=28.0).contains(&y) {
+            if self.scene_document_available
+                && (438.0..=502.0).contains(&x)
+                && (0.0..=28.0).contains(&y)
+            {
                 self.scene_selection_mode = SceneSelectionMode::Voxel;
                 return Some(UiAction::SetSceneSelectionMode(SceneSelectionMode::Voxel));
             }
@@ -836,100 +1030,36 @@ impl Ui {
                     return Some(UiAction::SelectSceneModel(row));
                 }
             }
-            if self.scene_document_available
-                && self
-                    .selected_scene_model
-                    .is_some_and(|index| index < self.scene_model_names.len())
-            {
+            if self.scene_document_available || self.model_document_available {
                 let inspector_left = self.canvas_width - 250.0;
-                if let Some(instance) = self.selected_scene_model_info.as_ref() {
-                    let target = if x >= inspector_left + 10.0 {
-                        match y {
-                            185.0..=200.0 => Some(SceneInputTarget::Position),
-                            201.0..=218.0 => Some(SceneInputTarget::Rotation),
-                            236.0..=252.0 => Some(SceneInputTarget::Velocity),
-                            253.0..=271.0 => Some(SceneInputTarget::Force),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some(target) = target {
-                        let values = match target {
-                            SceneInputTarget::Position => instance.translation_m.map(|v| format!("{v:.3}")),
-                            SceneInputTarget::Rotation => instance.rotation_deg.map(|v| format!("{v:.1}")),
-                            SceneInputTarget::Velocity => instance.velocity_m_s.map(|v| format!("{v:.3}")),
-                            SceneInputTarget::Force => instance.force_n.map(|v| format!("{v:.2}")),
-                        };
-                        self.scene_input = Some(SceneInputState { target, values, axis: 0, editing: false });
-                        return None;
-                    }
-                }
-                let columns = [
-                    inspector_left + 15.0,
-                    inspector_left + 87.0,
-                    inspector_left + 159.0,
-                ];
-                if (326.0..=352.0).contains(&y)
-                    && (inspector_left + 15.0..=inspector_left + 235.0).contains(&x)
+                let [track_top, track_height, thumb_top, thumb_height, max_scroll] =
+                    inspector_scroll_geometry(self);
+                if max_scroll > 0.0
+                    && x >= self.canvas_width - 14.0
+                    && (track_top..=track_top + track_height).contains(&y)
                 {
-                    return Some(UiAction::CycleSceneMaterial);
-                }
-                if (354.0..=380.0).contains(&y) {
-                    if (inspector_left + 15.0..=inspector_left + 86.0).contains(&x) {
-                        return Some(UiAction::LoadSceneMaterial);
+                    self.inspector_scroll_dragging = true;
+                    self.timeline_dragging = true;
+                    if !(thumb_top..=thumb_top + thumb_height).contains(&y) {
+                        self.set_inspector_scroll_from_thumb(
+                            y - thumb_height * 0.5,
+                            track_top,
+                            track_height,
+                            thumb_height,
+                            max_scroll,
+                        );
                     }
-                    if (inspector_left + 87.0..=inspector_left + 158.0).contains(&x) {
-                        return Some(UiAction::SaveSceneMaterial);
-                    }
-                    if (inspector_left + 159.0..=inspector_left + 235.0).contains(&x) {
-                        return Some(UiAction::CreateSceneMaterial);
-                    }
+                    return None;
                 }
-                if (407.0..=433.0).contains(&y) {
-                    for (left, step) in columns.into_iter().zip([1, 10, 100]) {
-                        if (left..=left + 66.0).contains(&x) {
-                            self.scene_move_step_cells = step;
-                            return Some(UiAction::SetSceneMoveStep(step));
-                        }
-                    }
+                if self.inspector_scroll_dragging {
+                    return None;
                 }
-                let move_buttons = [
-                    (0, -1, columns[0], 458.0),
-                    (1, -1, columns[1], 458.0),
-                    (2, -1, columns[2], 458.0),
-                    (0, 1, columns[0], 487.0),
-                    (1, 1, columns[1], 487.0),
-                    (2, 1, columns[2], 487.0),
-                ];
-                for (axis, direction, left, top) in move_buttons {
-                    if (left..=left + 66.0).contains(&x) && (top..=top + 26.0).contains(&y) {
-                        return Some(UiAction::MoveSelectedSceneModel { axis, direction });
-                    }
+                if x >= inspector_left && y >= 144.0 {
+                    y += self.scene_inspector_scroll;
                 }
-                let rotate_buttons = [
-                    (0, -1, columns[0], 545.0),
-                    (1, -1, columns[1], 545.0),
-                    (2, -1, columns[2], 545.0),
-                    (0, 1, columns[0], 574.0),
-                    (1, 1, columns[1], 574.0),
-                    (2, 1, columns[2], 574.0),
-                ];
-                for (axis, direction, left, top) in rotate_buttons {
-                    if (left..=left + 66.0).contains(&x) && (top..=top + 26.0).contains(&y) {
-                        return Some(UiAction::RotateSelectedSceneModel { axis, direction });
-                    }
-                }
-                if (inspector_left + 15.0..=inspector_left + 121.0).contains(&x)
-                    && (610.0..=638.0).contains(&y)
-                {
-                    return Some(UiAction::DuplicateSelectedSceneModel);
-                }
-                if (inspector_left + 129.0..=inspector_left + 235.0).contains(&x)
-                    && (610.0..=638.0).contains(&y)
-                {
-                    return Some(UiAction::RemoveSelectedSceneModel);
-                }
+            }
+            if self.scene_document_available && x >= self.canvas_width - 250.0 && y >= 144.0 {
+                return self.click_scene_inspector(x, y);
             }
             if (8.0..=112.0).contains(&x) && (dock_top + 36.0..=dock_top + 62.0).contains(&y) {
                 self.project_category = 0;
@@ -1113,6 +1243,7 @@ impl Ui {
     pub fn set_active_scene_document(&mut self, name: Option<String>, models: Vec<String>) {
         if self.active_scene_name != name {
             self.scene_hierarchy_scroll = 0;
+            self.scene_inspector_scroll = 0.0;
         }
         self.scene_document_available = name.is_some();
         self.active_scene_name = name;
@@ -1247,6 +1378,7 @@ impl Ui {
     }
     pub fn end_timeline_drag(&mut self) {
         self.timeline_dragging = false;
+        self.inspector_scroll_dragging = false;
     }
     pub fn timeline_is_dragging(&self) -> bool {
         self.timeline_dragging
@@ -1267,6 +1399,18 @@ impl Ui {
             .round() as usize;
         self.selected_animation_time_seconds =
             (frame as f32 / self.animation_frame_rate).min(self.animation_duration_seconds);
+    }
+    fn set_inspector_scroll_from_thumb(
+        &mut self,
+        thumb_top: f32,
+        track_top: f32,
+        track_height: f32,
+        thumb_height: f32,
+        max_scroll: f32,
+    ) {
+        let travel = (track_height - thumb_height).max(1.0);
+        self.scene_inspector_scroll =
+            ((thumb_top - track_top) / travel).clamp(0.0, 1.0) * max_scroll;
     }
     fn clear_rig_authoring_state(&mut self) {
         self.rig_bone_names.clear();
@@ -1348,16 +1492,85 @@ impl Ui {
                 && info.force_n.iter().all(|value| value.is_finite())
         });
     }
+
+    pub fn set_scene_physics_config(&mut self, config: &SceneConfig) {
+        self.scene_physics = ScenePhysicsValues {
+            fixed_dt: config.fixed_dt,
+            substeps: config.substeps,
+            gravity: config.gravity,
+            restitution: config.fracture.restitution,
+            friction_scale: config.fracture.friction,
+            iterations: config.iterations,
+            tolerance: config.solver_relative_tolerance,
+        };
+    }
+    pub fn set_scene_simulation_inspector_info(
+        &mut self,
+        temperature_kelvin: Option<f32>,
+        thermal_bonding: Option<ThermalBondingSettings>,
+    ) {
+        self.selected_scene_initial_temperature_kelvin =
+            temperature_kelvin.filter(|value| value.is_finite() && *value > 0.0);
+        self.scene_thermal_bonding = thermal_bonding;
+    }
     pub fn scene_input_active(&self) -> bool {
         self.scene_input.is_some()
+            || self.welding_input.is_some()
+            || self.scene_physics_input.is_some()
     }
     pub fn scene_input_char(&mut self, character: char) {
+        if let Some(input) = self.scene_physics_input.as_mut() {
+            let value = &mut input.values[input.field];
+            let integer_field = matches!(input.field, 1 | 7);
+            let accepted = character.is_ascii_digit()
+                || (!integer_field && character == '.' && (!input.editing || !value.contains('.')))
+                || (!integer_field
+                    && matches!(character, 'e' | 'E')
+                    && input.editing
+                    && !value.contains(['e', 'E']))
+                || (!integer_field
+                    && matches!(character, '+' | '-')
+                    && value.ends_with(['e', 'E']))
+                || (!integer_field && character == '-' && (!input.editing || value.is_empty()));
+            if accepted {
+                if !input.editing {
+                    value.clear();
+                    input.editing = true;
+                }
+                if value.len() < 24 {
+                    value.push(character);
+                }
+            }
+            return;
+        }
+        if let Some(input) = self.welding_input.as_mut() {
+            let value = &mut input.values[input.field];
+            let accepted = if input.field == 0 {
+                character.is_ascii_alphanumeric()
+                    || character == ' '
+                    || character == '_'
+                    || character == '-'
+            } else {
+                character.is_ascii_digit()
+                    || (character == '.' && (!input.editing || !value.contains('.')))
+            };
+            if accepted {
+                if !input.editing {
+                    value.clear();
+                    input.editing = true;
+                }
+                if value.len() < 32 {
+                    value.push(character);
+                }
+            }
+            return;
+        }
         let Some(input) = self.scene_input.as_mut() else {
             return;
         };
         let value = &mut input.values[input.axis];
         if character.is_ascii_digit()
-            || (character == '.' && !value.contains('.'))
+            || (character == '.' && (!input.editing || !value.contains('.')))
             || (character == '-' && (!input.editing || value.is_empty()))
         {
             if !input.editing {
@@ -1370,6 +1583,108 @@ impl Ui {
         }
     }
     pub fn scene_input_key(&mut self, key: KeyCode) -> Option<UiAction> {
+        if let Some(input) = self.scene_physics_input.as_mut() {
+            match key {
+                KeyCode::Escape => {
+                    self.scene_physics_input = None;
+                    return None;
+                }
+                KeyCode::Tab => {
+                    input.field = (input.field + 1) % input.values.len();
+                    input.editing = false;
+                    return None;
+                }
+                KeyCode::Backspace => {
+                    if input.editing {
+                        input.values[input.field].pop();
+                    } else {
+                        input.values[input.field].clear();
+                        input.editing = true;
+                    }
+                    return None;
+                }
+                KeyCode::Enter | KeyCode::NumpadEnter => {
+                    match scene_physics_action(&input.values) {
+                        Ok(action) => {
+                            if let UiAction::SetScenePhysics {
+                                fixed_dt_seconds,
+                                substeps,
+                                gravity,
+                                restitution,
+                                friction_scale,
+                                solver_iterations,
+                                solver_tolerance,
+                            } = &action
+                            {
+                                self.scene_physics = ScenePhysicsValues {
+                                    fixed_dt: *fixed_dt_seconds,
+                                    substeps: *substeps as usize,
+                                    gravity: *gravity,
+                                    restitution: *restitution,
+                                    friction_scale: *friction_scale,
+                                    iterations: *solver_iterations,
+                                    tolerance: *solver_tolerance,
+                                };
+                            }
+                            self.scene_physics_input = None;
+                            return Some(action);
+                        }
+                        Err(message) => self.status_message = Some(message.to_owned()),
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+        if let Some(input) = self.welding_input.as_mut() {
+            match key {
+                KeyCode::Escape => {
+                    self.welding_input = None;
+                    return None;
+                }
+                KeyCode::Tab => {
+                    input.field = (input.field + 1) % 6;
+                    input.editing = false;
+                    return None;
+                }
+                KeyCode::Backspace => {
+                    if input.editing {
+                        input.values[input.field].pop();
+                    } else {
+                        input.values[input.field].clear();
+                        input.editing = true;
+                    }
+                    return None;
+                }
+                KeyCode::Enter | KeyCode::NumpadEnter => {
+                    let values = input.values.clone();
+                    let parsed = values[1..]
+                        .iter()
+                        .map(|value| value.parse::<f64>().ok().filter(|v| v.is_finite()))
+                        .collect::<Vec<_>>();
+                    if parsed.iter().any(Option::is_none) || values[0].trim().is_empty() {
+                        self.status_message =
+                            Some("Enter a material name and five finite thresholds.".into());
+                        return None;
+                    }
+                    let settings = ThermalBondingSettings {
+                        material_name: values[0].trim().to_owned(),
+                        minimum_mass_fraction: parsed[0].unwrap() as f32,
+                        minimum_temperature_kelvin: parsed[1].unwrap() as f32,
+                        minimum_impact_energy_j: parsed[2].unwrap(),
+                        minimum_contact_pressure_pa: parsed[3].unwrap() as f32,
+                        minimum_dwell_seconds: parsed[4].unwrap() as f32,
+                    };
+                    if let Err(error) = settings.validate() {
+                        self.status_message = Some(error);
+                        return None;
+                    }
+                    self.welding_input = None;
+                    return Some(UiAction::SetSceneThermalBonding(Some(settings)));
+                }
+                _ => return None,
+            }
+        }
         let input = self.scene_input.as_mut()?;
         match key {
             KeyCode::Escape => {
@@ -1406,7 +1721,8 @@ impl Ui {
                         .iter()
                         .any(|value| (value / 90.0 - (value / 90.0).round()).abs() > 1e-6)
                 {
-                    self.status_message = Some("Rotation currently supports 90° increments.".to_owned());
+                    self.status_message =
+                        Some("Rotation currently supports 90° increments.".to_owned());
                     return None;
                 }
                 let action = match target {
@@ -1414,7 +1730,8 @@ impl Ui {
                     SceneInputTarget::Rotation => {
                         let degrees = [x as f32, y as f32, z as f32];
                         if !degrees.iter().all(|value| value.is_finite()) {
-                            self.status_message = Some("Rotation is outside the supported range.".to_owned());
+                            self.status_message =
+                                Some("Rotation is outside the supported range.".to_owned());
                             return None;
                         }
                         UiAction::SetSceneRotation { degrees }
@@ -1422,7 +1739,8 @@ impl Ui {
                     SceneInputTarget::Velocity => {
                         let value = [x as f32, y as f32, z as f32];
                         if !value.iter().all(|value| value.is_finite()) {
-                            self.status_message = Some("Velocity is outside the supported range.".to_owned());
+                            self.status_message =
+                                Some("Velocity is outside the supported range.".to_owned());
                             return None;
                         }
                         UiAction::SetSceneVelocity { value }
@@ -1430,10 +1748,21 @@ impl Ui {
                     SceneInputTarget::Force => {
                         let value = [x as f32, y as f32, z as f32];
                         if !value.iter().all(|value| value.is_finite()) {
-                            self.status_message = Some("Force is outside the supported range.".to_owned());
+                            self.status_message =
+                                Some("Force is outside the supported range.".to_owned());
                             return None;
                         }
                         UiAction::SetSceneForce { value }
+                    }
+                    SceneInputTarget::InitialTemperature => {
+                        if x <= 0.0 || x > f64::from(f32::MAX) {
+                            self.status_message =
+                                Some("Temperature must be above absolute zero.".into());
+                            return None;
+                        }
+                        UiAction::SetSceneInitialTemperature {
+                            kelvin: Some(x as f32),
+                        }
                     }
                 };
                 self.scene_input = None;
@@ -1450,6 +1779,23 @@ impl Ui {
             return false;
         }
         let (x, y) = self.to_canvas(x, y);
+        let inspector_left = self.canvas_width - 250.0;
+        if (self.scene_document_available || self.model_document_available)
+            && (inspector_left..=self.canvas_width).contains(&x)
+            && (144.0..self.canvas_height - 8.0).contains(&y)
+        {
+            let max_scroll = inspector_scroll_geometry(self)[4];
+            if max_scroll > 0.0 {
+                self.scene_inspector_scroll = if amount > 0.0 {
+                    (self.scene_inspector_scroll - 36.0).max(0.0)
+                } else if amount < 0.0 {
+                    (self.scene_inspector_scroll + 36.0).min(max_scroll)
+                } else {
+                    self.scene_inspector_scroll
+                };
+            }
+            return true;
+        }
         if !(0.0..=235.0).contains(&x) {
             return false;
         }
@@ -1475,6 +1821,163 @@ impl Ui {
             self.scene_hierarchy_scroll = (self.scene_hierarchy_scroll + 1).min(max_scroll);
         }
         true
+    }
+
+    fn click_scene_inspector(&mut self, x: f32, y: f32) -> Option<UiAction> {
+        let inspector_left = self.canvas_width - 250.0;
+        let rows = scene_inspector_rows(self);
+        let Some(row) = rows
+            .into_iter()
+            .find(|row| (row.top..=row.top + row.height).contains(&y))
+        else {
+            return None;
+        };
+        match row.item {
+            SceneInspectorItem::Section(section) => {
+                let index = scene_section_index(section);
+                self.scene_inspector_collapsed[index] = !self.scene_inspector_collapsed[index];
+            }
+            SceneInspectorItem::Actions => {
+                let column = ((x - (inspector_left + 10.0)) / 73.0).floor() as usize;
+                return match column {
+                    0 => Some(UiAction::DuplicateSelectedSceneModel),
+                    1 => Some(UiAction::RemoveSelectedSceneModel),
+                    2 => Some(UiAction::FrameSelection),
+                    _ => None,
+                };
+            }
+            SceneInspectorItem::Position
+            | SceneInspectorItem::Rotation
+            | SceneInspectorItem::Velocity
+            | SceneInspectorItem::Force => {
+                let target = match row.item {
+                    SceneInspectorItem::Position => SceneInputTarget::Position,
+                    SceneInspectorItem::Rotation => SceneInputTarget::Rotation,
+                    SceneInspectorItem::Velocity => SceneInputTarget::Velocity,
+                    _ => SceneInputTarget::Force,
+                };
+                let axis = scene_vector_axis(x, inspector_left)?;
+                if let Some(input) = self
+                    .scene_input
+                    .as_mut()
+                    .filter(|input| input.target == target)
+                {
+                    input.axis = axis;
+                    input.editing = false;
+                    return None;
+                }
+                let pending_action = self.commit_inline_editor_before_focus_change()?;
+                if self.scene_input_active() {
+                    return pending_action;
+                }
+                let Some(instance) = self.selected_scene_model_info.as_ref() else {
+                    return None;
+                };
+                let values = match target {
+                    SceneInputTarget::Position => {
+                        instance.translation_m.map(|value| format!("{value:.3}"))
+                    }
+                    SceneInputTarget::Rotation => {
+                        instance.rotation_deg.map(|value| format!("{value:.0}"))
+                    }
+                    SceneInputTarget::Velocity => {
+                        instance.velocity_m_s.map(|value| format!("{value:.3}"))
+                    }
+                    SceneInputTarget::Force => instance.force_n.map(|value| format!("{value:.2}")),
+                    SceneInputTarget::InitialTemperature => unreachable!(),
+                };
+                self.scene_input = Some(SceneInputState {
+                    target,
+                    values,
+                    axis,
+                    editing: false,
+                });
+                return pending_action;
+            }
+            SceneInspectorItem::Temperature => {
+                let pending_action = self.commit_inline_editor_before_focus_change()?;
+                if self.scene_input_active() {
+                    return pending_action;
+                }
+                let value = self
+                    .selected_scene_initial_temperature_kelvin
+                    .unwrap_or(293.15);
+                self.scene_input = Some(SceneInputState {
+                    target: SceneInputTarget::InitialTemperature,
+                    values: [format!("{value:.2}"), "0".into(), "0".into()],
+                    axis: 0,
+                    editing: false,
+                });
+                return pending_action;
+            }
+            SceneInspectorItem::MaterialCycle => return Some(UiAction::CycleSceneMaterial),
+            SceneInspectorItem::MaterialActions => {
+                let column = ((x - (inspector_left + 10.0)) / 73.0).floor() as usize;
+                return match column {
+                    0 => Some(UiAction::LoadSceneMaterial),
+                    1 => Some(UiAction::SaveSceneMaterial),
+                    2 => Some(UiAction::CreateSceneMaterial),
+                    _ => None,
+                };
+            }
+            SceneInspectorItem::WeldingToggle => {
+                if self.scene_thermal_bonding.is_some() {
+                    return Some(UiAction::SetSceneThermalBonding(None));
+                }
+                self.welding_input = Some(default_welding_input());
+            }
+            SceneInspectorItem::WeldingConfigure => {
+                if let Some(settings) = self.scene_thermal_bonding.as_ref() {
+                    self.welding_input = Some(welding_input_from_settings(settings));
+                }
+            }
+            SceneInspectorItem::PhysicsField(field) => {
+                if let Some(input) = self.scene_physics_input.as_mut() {
+                    input.field = field;
+                    input.editing = false;
+                    return None;
+                }
+                let pending_action = self.commit_inline_editor_before_focus_change()?;
+                if self.scene_input_active() {
+                    return pending_action;
+                }
+                let input =
+                    self.scene_physics_input
+                        .get_or_insert_with(|| ScenePhysicsInputState {
+                            values: scene_physics_strings(self.scene_physics),
+                            field,
+                            editing: false,
+                        });
+                input.field = field;
+                input.editing = false;
+                return pending_action;
+            }
+            SceneInspectorItem::PhysicsApply => {
+                if self.scene_physics_input.is_none() {
+                    self.scene_physics_input = Some(ScenePhysicsInputState {
+                        values: scene_physics_strings(self.scene_physics),
+                        field: 0,
+                        editing: false,
+                    });
+                }
+                return self.scene_input_key(KeyCode::Enter);
+            }
+            SceneInspectorItem::Bounds
+            | SceneInspectorItem::Hint
+            | SceneInspectorItem::InputHint => {}
+        }
+        None
+    }
+
+    fn commit_inline_editor_before_focus_change(&mut self) -> Option<Option<UiAction>> {
+        if !self.scene_input_active() {
+            return Some(None);
+        }
+        let action = self.scene_input_key(KeyCode::Enter);
+        if self.scene_input_active() {
+            return None;
+        }
+        Some(action)
     }
     pub fn set_model_history_state(&mut self, can_undo: bool, can_redo: bool) {
         self.can_undo = self.model_document_available && can_undo;
@@ -1571,6 +2074,18 @@ impl Ui {
         self.pointer_canvas(x, y)
     }
     fn pointer_canvas(&mut self, x: f32, y: f32) -> Option<Shape> {
+        if self.inspector_scroll_dragging {
+            let [track_top, track_height, _, thumb_height, max_scroll] =
+                inspector_scroll_geometry(self);
+            self.set_inspector_scroll_from_thumb(
+                y - thumb_height * 0.5,
+                track_top,
+                track_height,
+                thumb_height,
+                max_scroll,
+            );
+            return None;
+        }
         if self.timeline_dragging {
             let inspector_left = self.canvas_width - 250.0;
             let (left, width) = animation_slider_geometry(inspector_left);
@@ -1647,11 +2162,22 @@ impl Ui {
         self.canvas_width = viewport_width / self.canvas_scale;
         self.canvas_height = viewport_height / self.canvas_scale;
         self.canvas_offset = [0.0; 2];
+        let inspector_content_bottom = if self.model_document_available {
+            766.0
+        } else if self.scene_document_available {
+            scene_inspector_content_bottom(self)
+        } else {
+            455.0
+        };
+        self.scene_inspector_scroll = self.scene_inspector_scroll.clamp(
+            0.0,
+            (inspector_content_bottom - (self.canvas_height - 8.0)).max(0.0),
+        );
         let mut r = Vec::new();
         if self.world_active && self.editor_mode && !self.menu_open {
             draw_editor(&mut r, self, editor, self.canvas_width, self.canvas_height);
-            if let Some(input) = self.scene_input.as_ref() {
-                draw_scene_input_modal(&mut r, input, self.canvas_width, self.canvas_height);
+            if let Some(input) = self.welding_input.as_ref() {
+                draw_welding_input_modal(&mut r, input, self.canvas_width, self.canvas_height);
             }
             if self.mesh_import_open {
                 draw_mesh_import_modal(&mut r, self, self.canvas_width, self.canvas_height);
@@ -2009,6 +2535,17 @@ impl Ui {
         )
     }
 
+    pub fn set_view_basis(&mut self, right: Vec3, up: Vec3) {
+        if right.is_finite()
+            && up.is_finite()
+            && right.length_squared() > 0.5
+            && up.length_squared() > 0.5
+        {
+            self.view_right = right.normalize();
+            self.view_up = up.normalize();
+        }
+    }
+
     pub fn scene_viewport(&self) -> Option<[u32; 4]> {
         if !(self.world_active && self.editor_mode && !self.menu_open) {
             return None;
@@ -2071,7 +2608,11 @@ fn draw_editor(
             rect(
                 out,
                 [x, 0.0, 70.0, 27.0],
-                if ui.scene_selection_mode == mode { selected } else { header },
+                if ui.scene_selection_mode == mode {
+                    selected
+                } else {
+                    header
+                },
             );
             text(out, x + 10.0, 7.0, label, 0.82);
         }
@@ -2289,7 +2830,9 @@ fn draw_editor(
     });
     rect(out, [inspector_left + 10.0, 108.0, 230.0, 30.0], selected);
     text(out, inspector_left + 20.0, 116.0, selected_name, 0.9);
-    inspector_section(out, "Details", 148.0, inspector_left + 10.0);
+    if !ui.scene_document_available {
+        inspector_section(out, "Details", 148.0, inspector_left + 10.0);
+    }
     let inspector_text_x = inspector_left + 15.0;
     if ui.model_document_available {
         if !ui.selected_voxel_indices.is_empty() {
@@ -2352,85 +2895,7 @@ fn draw_editor(
             );
         }
     } else if ui.scene_document_available {
-        if let Some(instance) = ui.selected_scene_model_info.as_ref() {
-            text(
-                out,
-                inspector_text_x,
-                177.0,
-                &format!(
-                    "Asset {}",
-                    instance.name.chars().take(24).collect::<String>()
-                ),
-                0.62,
-            );
-            text(
-                out,
-                inspector_text_x,
-                194.0,
-                &format!(
-                    "Position {:.2}, {:.2}, {:.2} m",
-                    instance.translation_m[0], instance.translation_m[1], instance.translation_m[2]
-                ),
-                0.62,
-            );
-            text(out, inspector_left + 211.0, 194.0, "Edit", 0.48);
-            text(
-                out,
-                inspector_text_x,
-                211.0,
-                &format!(
-                    "Rotation {:.0}, {:.0}, {:.0} deg",
-                    instance.rotation_deg[0], instance.rotation_deg[1], instance.rotation_deg[2]
-                ),
-                0.62,
-            );
-            text(out, inspector_left + 211.0, 211.0, "Edit", 0.48);
-            text(
-                out,
-                inspector_text_x,
-                228.0,
-                &format!(
-                    "Scale {:.2}, {:.2}, {:.2}",
-                    instance.scale[0], instance.scale[1], instance.scale[2]
-                ),
-                0.62,
-            );
-            text(
-                out,
-                inspector_text_x,
-                245.0,
-                &format!(
-                    "Velocity {:.2}, {:.2}, {:.2} m/s",
-                    instance.velocity_m_s[0],
-                    instance.velocity_m_s[1],
-                    instance.velocity_m_s[2]
-                ),
-                0.58,
-            );
-            text(out, inspector_left + 211.0, 245.0, "Edit", 0.48);
-            text(
-                out,
-                inspector_text_x,
-                262.0,
-                &format!(
-                    "Force {:.1}, {:.1}, {:.1} N",
-                    instance.force_n[0],
-                    instance.force_n[1],
-                    instance.force_n[2]
-                ),
-                0.58,
-            );
-            text(out, inspector_left + 211.0, 262.0, "Edit", 0.48);
-            text(out, inspector_text_x, 279.0, &format!("Material: {}", instance.material_name.chars().take(20).collect::<String>()), 0.60);
-        } else {
-            text(
-                out,
-                inspector_text_x,
-                196.0,
-                "Select a model instance",
-                0.66,
-            );
-        }
+        draw_scene_inspector_contents(out, ui, inspector_left, header, selected);
     } else {
         text(
             out,
@@ -2707,129 +3172,7 @@ fn draw_editor(
                 }
             }
         }
-    } else if ui.scene_document_available {
-        inspector_section(out, "Scene", 296.0, inspector_left + 10.0);
-        let has_selection = ui
-            .selected_scene_model
-            .is_some_and(|index| index < ui.scene_model_names.len());
-        if has_selection {
-            rect(out, [inspector_left + 15.0, 326.0, 220.0, 26.0], header);
-            let material_target = match ui.scene_selection_mode {
-                SceneSelectionMode::Object => "Whole object".to_owned(),
-                SceneSelectionMode::Voxel => format!(
-                    "Selected voxels ({})",
-                    ui.selected_voxel_indices.len()
-                ),
-            };
-            text(
-                out,
-                inspector_left + 22.0,
-                333.0,
-                &format!("Cycle built-in → {material_target}"),
-                0.58,
-            );
-            for (left, label) in [(inspector_left + 15.0, "Load"), (inspector_left + 87.0, "Save"), (inspector_left + 159.0, "Create")] {
-                rect(out, [left, 354.0, 66.0, 26.0], header);
-                text(out, left + 8.0, 361.0, label, 0.62);
-            }
-            text(out, inspector_text_x, 389.0, "Move step (cm)", 0.65);
-            for (column, (step, label)) in [(1, "1 cm"), (10, "10 cm"), (100, "1 m")]
-                .into_iter()
-                .enumerate()
-            {
-                let left = inspector_left + 15.0 + column as f32 * 72.0;
-                rect(
-                    out,
-                    [left, 407.0, 66.0, 26.0],
-                    if ui.scene_move_step_cells == step {
-                        selected
-                    } else {
-                        header
-                    },
-                );
-                text(out, left + 12.0, 413.0, label, 0.65);
-            }
-
-            let transform_columns = [
-                inspector_left + 15.0,
-                inspector_left + 87.0,
-                inspector_left + 159.0,
-            ];
-            text(out, inspector_text_x, 440.0, "Move", 0.65);
-            for (axis, left) in transform_columns.into_iter().enumerate() {
-                let label = ["X -", "Y -", "Z -"][axis];
-                rect(out, [left, 458.0, 66.0, 26.0], header);
-                text(out, left + 23.0, 464.0, label, 0.62);
-                let label = ["X +", "Y +", "Z +"][axis];
-                rect(out, [left, 487.0, 66.0, 26.0], header);
-                text(out, left + 23.0, 493.0, label, 0.62);
-            }
-
-            text(out, inspector_text_x, 527.0, "Rotate 90°", 0.65);
-            for (axis, left) in transform_columns.into_iter().enumerate() {
-                let label = ["X-90", "Y-90", "Z-90"][axis];
-                rect(out, [left, 545.0, 66.0, 26.0], header);
-                text(out, left + 14.0, 551.0, label, 0.62);
-                let label = ["X+90", "Y+90", "Z+90"][axis];
-                rect(out, [left, 574.0, 66.0, 26.0], header);
-                text(out, left + 14.0, 580.0, label, 0.62);
-            }
-
-            rect(out, [inspector_left + 15.0, 610.0, 106.0, 28.0], selected);
-            text(out, inspector_left + 28.0, 617.0, "Duplicate", 0.68);
-            rect(
-                out,
-                [inspector_left + 129.0, 610.0, 106.0, 28.0],
-                [0.35, 0.16, 0.16, 1.0],
-            );
-            text(out, inspector_left + 154.0, 617.0, "Delete", 0.68);
-            text(
-                out,
-                inspector_text_x,
-                650.0,
-                "Ctrl+D copy | Delete remove",
-                0.6,
-            );
-            text(
-                out,
-                inspector_text_x,
-                668.0,
-                "Numpad move | E/Q turn Z",
-                0.6,
-            );
-            text(out, inspector_text_x, 686.0, "Save: File > Save Scene", 0.6);
-        } else if !ui.scene_model_names.is_empty() {
-            text(
-                out,
-                inspector_text_x,
-                326.0,
-                &format!("Instances {}", ui.scene_model_names.len()),
-                0.68,
-            );
-            text(
-                out,
-                inspector_text_x,
-                353.0,
-                "Select an instance in the view",
-                0.64,
-            );
-            text(
-                out,
-                inspector_text_x,
-                373.0,
-                "or choose it in Hierarchy",
-                0.64,
-            );
-        } else {
-            text(
-                out,
-                inspector_text_x,
-                353.0,
-                "Add a voxel model from File",
-                0.64,
-            );
-        }
-    } else {
+    } else if !ui.scene_document_available {
         inspector_section(out, "Live world", 296.0, inspector_left + 10.0);
     }
     if let Some(info) =
@@ -2883,13 +3226,7 @@ fn draw_editor(
         if simulation_target {
             text(out, inspector_text_x, 430.0, "Play starts the world", 0.62);
         }
-        text(
-            out,
-            inspector_text_x,
-            448.0,
-            "F2 switches workspaces",
-            0.62,
-        );
+        text(out, inspector_text_x, 448.0, "F2 switches workspaces", 0.62);
     }
 
     rect(out, [235.0, 67.0, scene_width, 31.0], header);
@@ -3016,7 +3353,107 @@ fn draw_editor(
     for (index, line) in lines.iter().enumerate() {
         text(out, 20.0, dock_top + 81.0 + index as f32 * 22.0, line, 0.72);
     }
+    draw_coordinate_grid(out, ui);
     draw_animation_timeline(out, ui, inspector_left, canvas_height);
+    clip_and_scroll_scene_inspector(out, ui);
+    draw_scene_inspector_scrollbar(out, ui);
+}
+
+fn coordinate_grid_bounds(ui: &Ui) -> [f32; 4] {
+    [247.0, ui.editor_dock_top() - 116.0, 104.0, 104.0]
+}
+
+fn coordinate_projection(direction: Vec3, right: Vec3, up: Vec3) -> [f32; 2] {
+    [direction.dot(right), -direction.dot(up)]
+}
+
+fn coordinate_line(
+    out: &mut Vec<Rect>,
+    from: [f32; 2],
+    to: [f32; 2],
+    thickness: f32,
+    color: [f32; 4],
+) {
+    let delta = [to[0] - from[0], to[1] - from[1]];
+    let steps = delta[0].abs().max(delta[1].abs()).ceil().max(1.0) as usize;
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        rect(
+            out,
+            [
+                from[0] + delta[0] * t - thickness * 0.5,
+                from[1] + delta[1] * t - thickness * 0.5,
+                thickness,
+                thickness,
+            ],
+            color,
+        );
+    }
+}
+
+/// Camera-relative orientation grid. Its spacing is schematic, not world distance.
+fn draw_coordinate_grid(out: &mut Vec<Rect>, ui: &Ui) {
+    let [left, top, width, height] = coordinate_grid_bounds(ui);
+    rect(out, [left, top, width, height], [0.035, 0.045, 0.055, 0.80]);
+    let origin = [left + width * 0.5, top + height * 0.5];
+    let project = |world: Vec3| {
+        let p = coordinate_projection(world, ui.view_right, ui.view_up);
+        [origin[0] + p[0], origin[1] + p[1]]
+    };
+    // The world uses Z up: the small ground grid lies in XY.
+    for line in -2..=2 {
+        let offset = line as f32 * 10.0;
+        let color = [0.24, 0.29, 0.33, 0.52];
+        coordinate_line(
+            out,
+            project(Vec3::new(-20.0, offset, 0.0)),
+            project(Vec3::new(20.0, offset, 0.0)),
+            1.0,
+            color,
+        );
+        coordinate_line(
+            out,
+            project(Vec3::new(offset, -20.0, 0.0)),
+            project(Vec3::new(offset, 20.0, 0.0)),
+            1.0,
+            color,
+        );
+    }
+    let axes = [
+        (Vec3::X, "X", [0.92, 0.29, 0.26, 1.0]),
+        (Vec3::Y, "Y", [0.36, 0.80, 0.35, 1.0]),
+        (Vec3::Z, "Z", [0.34, 0.62, 1.0, 1.0]),
+    ];
+    for (axis, label, color) in axes {
+        let mut dim = color;
+        dim[3] = 0.30;
+        coordinate_line(out, origin, project(-axis * 26.0), 1.0, dim);
+        let end = project(axis * 32.0);
+        coordinate_line(out, origin, end, 2.0, color);
+        rect(out, [end[0] - 2.0, end[1] - 2.0, 4.0, 4.0], color);
+        let mut label_position = project(axis * 41.0);
+        if (end[0] - origin[0]).hypot(end[1] - origin[1]) < 3.0 {
+            label_position = [origin[0] + 10.0, origin[1] + 10.0];
+        }
+        let start = out.len();
+        text(
+            out,
+            label_position[0] - 3.0,
+            label_position[1] - 5.0,
+            label,
+            0.72,
+        );
+        for glyph in &mut out[start..] {
+            glyph.color[0] = color[0];
+            glyph.color[1] = color[1];
+            glyph.color[2] = color[2];
+        }
+    }
+    rect(
+        out,
+        [origin[0] - 2.0, origin[1] - 2.0, 4.0, 4.0],
+        [0.83, 0.91, 0.93, 1.0],
+    );
 }
 
 fn draw_animation_timeline(out: &mut Vec<Rect>, ui: &Ui, inspector_left: f32, canvas_height: f32) {
@@ -3352,31 +3789,649 @@ fn inspector_section(out: &mut Vec<Rect>, title: &str, y: f32, x: f32) {
     text(out, x + 8.0, y + 6.0, title, 0.72);
 }
 
-fn draw_scene_input_modal(out: &mut Vec<Rect>, input: &SceneInputState, width: f32, height: f32) {
-    let left = (width - 440.0) * 0.5;
-    let top = (height - 220.0) * 0.5;
-    rect(out, [0.0, 0.0, width, height], [0.0, 0.0, 0.0, 0.55]);
-    rect(out, [left, top, 440.0, 220.0], [0.07, 0.085, 0.095, 1.0]);
-    let (title, unit) = match input.target {
-        SceneInputTarget::Position => ("Set scene position", "metres (m)"),
-        SceneInputTarget::Rotation => ("Set scene rotation", "degrees (90-degree steps)"),
-        SceneInputTarget::Velocity => ("Set scene velocity", "metres per second (m/s)"),
-        SceneInputTarget::Force => ("Set scene force", "newtons (N)"),
+/// Clip numeric text to its own field, keeping the insertion end visible while typing.
+fn clipped_inspector_text(
+    out: &mut Vec<Rect>,
+    area: [f32; 4],
+    value: &str,
+    scale: f32,
+    editing: bool,
+) {
+    let start = out.len();
+    text(out, area[0], area[1], value, scale);
+    let right = out[start..]
+        .iter()
+        .map(|r| r.rect[0] + r.rect[2])
+        .fold(area[0], f32::max);
+    let shift = if editing {
+        (right - area[0] - area[2]).max(0.0)
+    } else {
+        0.0
     };
-    text(out, left + 20.0, top + 20.0, title, 1.05);
-    text(out, left + 20.0, top + 49.0, unit, 0.72);
-    for axis in 0..3 {
-        let x = left + 30.0 + axis as f32 * 130.0;
-        text(out, x + 38.0, top + 83.0, ["X", "Y", "Z"][axis], 0.72);
+    for glyph in &mut out[start..] {
+        let x = glyph.rect[0] - shift;
+        let y = glyph.rect[1];
+        let clipped_x = x.max(area[0]);
+        let clipped_y = y.max(area[1]);
+        glyph.rect = [
+            clipped_x,
+            clipped_y,
+            ((x + glyph.rect[2]).min(area[0] + area[2]) - clipped_x).max(0.0),
+            ((y + glyph.rect[3]).min(area[1] + area[3]) - clipped_y).max(0.0),
+        ];
+    }
+    let mut write = start;
+    for read in start..out.len() {
+        if out[read].rect[2] > 0.0 && out[read].rect[3] > 0.0 {
+            out[write] = out[read];
+            write += 1;
+        }
+    }
+    out.truncate(write);
+}
+
+fn draw_scene_inspector_contents(
+    out: &mut Vec<Rect>,
+    ui: &Ui,
+    left: f32,
+    header: [f32; 4],
+    selected: [f32; 4],
+) {
+    let rows = scene_inspector_rows(ui);
+    let has_selection = ui
+        .selected_scene_model
+        .is_some_and(|index| index < ui.scene_model_names.len());
+    let axis_labels = ["X", "Y", "Z"];
+    for row in rows {
+        let y = row.top;
+        match row.item {
+            SceneInspectorItem::Section(section) => {
+                let index = scene_section_index(section);
+                let title = match section {
+                    SceneInspectorSection::Transform => "Transform",
+                    SceneInspectorSection::Dynamics => "Dynamics",
+                    SceneInspectorSection::Material => "Material",
+                    SceneInspectorSection::Welding => "Thermal welding",
+                    SceneInspectorSection::Simulation => "Simulation / physics",
+                };
+                let marker = if ui.scene_inspector_collapsed[index] {
+                    ">"
+                } else {
+                    "v"
+                };
+                rect(out, [left + 10.0, y, 230.0, row.height], header);
+                text(out, left + 19.0, y + 7.0, marker, 0.62);
+                text(out, left + 34.0, y + 7.0, title, 0.68);
+            }
+            SceneInspectorItem::Actions => {
+                for (column, label) in ["Duplicate", "Delete", "Frame"].into_iter().enumerate() {
+                    let x = left + 10.0 + column as f32 * 73.0;
+                    rect(
+                        out,
+                        [x, y, 69.0, row.height],
+                        if column == 1 {
+                            [0.30, 0.13, 0.13, 1.0]
+                        } else {
+                            header
+                        },
+                    );
+                    text(out, x + 7.0, y + 8.0, label, 0.56);
+                }
+            }
+            SceneInspectorItem::Position
+            | SceneInspectorItem::Rotation
+            | SceneInspectorItem::Velocity
+            | SceneInspectorItem::Force => {
+                let (label, target, values) = match row.item {
+                    SceneInspectorItem::Position => (
+                        "Position (m)",
+                        SceneInputTarget::Position,
+                        ui.selected_scene_model_info
+                            .as_ref()
+                            .map(|info| info.translation_m.map(|v| format!("{v:.3}"))),
+                    ),
+                    SceneInspectorItem::Rotation => (
+                        "Rotation (90° steps)",
+                        SceneInputTarget::Rotation,
+                        ui.selected_scene_model_info
+                            .as_ref()
+                            .map(|info| info.rotation_deg.map(|v| format!("{v:.0}"))),
+                    ),
+                    SceneInspectorItem::Velocity => (
+                        "Velocity (m/s)",
+                        SceneInputTarget::Velocity,
+                        ui.selected_scene_model_info
+                            .as_ref()
+                            .map(|info| info.velocity_m_s.map(|v| format!("{v:.3}"))),
+                    ),
+                    _ => (
+                        "Force (N)",
+                        SceneInputTarget::Force,
+                        ui.selected_scene_model_info
+                            .as_ref()
+                            .map(|info| info.force_n.map(|v| format!("{v:.2}"))),
+                    ),
+                };
+                text(out, left + 14.0, y + 3.0, label, 0.64);
+                let active = ui
+                    .scene_input
+                    .as_ref()
+                    .filter(|input| input.target == target);
+                let original =
+                    values.unwrap_or_else(|| [String::new(), String::new(), String::new()]);
+                for axis in 0..3 {
+                    let x = left + 12.0 + axis as f32 * 76.0;
+                    let focused = active.is_some_and(|input| input.axis == axis);
+                    rect(
+                        out,
+                        [x, y + 21.0, 71.0, 24.0],
+                        if focused {
+                            [0.12, 0.32, 0.31, 1.0]
+                        } else {
+                            [0.035, 0.05, 0.06, 1.0]
+                        },
+                    );
+                    let value =
+                        active.map_or(original[axis].as_str(), |input| input.values[axis].as_str());
+                    let cursor = focused.then_some("|").unwrap_or("");
+                    text(out, x + 5.0, y + 27.0, axis_labels[axis], 0.58);
+                    clipped_inspector_text(
+                        out,
+                        [x + 17.0, y + 26.0, 50.0, 17.0],
+                        &format!("{value}{cursor}"),
+                        0.62,
+                        focused,
+                    );
+                }
+            }
+            SceneInspectorItem::Temperature => {
+                text(out, left + 14.0, y + 8.0, "Initial temperature (K)", 0.55);
+                let active = ui
+                    .scene_input
+                    .as_ref()
+                    .filter(|input| input.target == SceneInputTarget::InitialTemperature);
+                let value = active.map_or_else(
+                    || {
+                        ui.selected_scene_initial_temperature_kelvin
+                            .map_or_else(|| "Default".to_owned(), |v| format!("{v:.1}"))
+                    },
+                    |input| input.values[0].clone(),
+                );
+                let focused = active.is_some();
+                rect(
+                    out,
+                    [left + 154.0, y + 3.0, 81.0, row.height - 6.0],
+                    if focused {
+                        [0.12, 0.32, 0.31, 1.0]
+                    } else {
+                        [0.035, 0.05, 0.06, 1.0]
+                    },
+                );
+                text(
+                    out,
+                    left + 158.0,
+                    y + 9.0,
+                    &format!(
+                        "{}{}",
+                        value.chars().take(11).collect::<String>(),
+                        if focused { "|" } else { "" }
+                    ),
+                    0.49,
+                );
+            }
+            SceneInspectorItem::Bounds => {
+                if let Some(bounds) = ui.selected_bounds_m {
+                    let size =
+                        std::array::from_fn::<_, 3, _>(|axis| bounds[1][axis] - bounds[0][axis]);
+                    let scale = if size.iter().copied().fold(0.0f64, f64::max) < 1.0 {
+                        100.0
+                    } else {
+                        1.0
+                    };
+                    let unit = if scale == 100.0 { "cm" } else { "m" };
+                    text(
+                        out,
+                        left + 14.0,
+                        y + 6.0,
+                        &format!(
+                            "Size {:.1} × {:.1} × {:.1} {unit}",
+                            size[0] * scale,
+                            size[1] * scale,
+                            size[2] * scale
+                        ),
+                        0.54,
+                    );
+                }
+            }
+            SceneInspectorItem::MaterialCycle => {
+                let material = ui
+                    .selected_scene_model_info
+                    .as_ref()
+                    .map_or("Unknown", |info| info.material_name.as_str());
+                rect(
+                    out,
+                    [left + 10.0, y + 2.0, 230.0, row.height - 4.0],
+                    selected,
+                );
+                text(
+                    out,
+                    left + 18.0,
+                    y + 9.0,
+                    &format!(
+                        "Cycle material · {}",
+                        material.chars().take(22).collect::<String>()
+                    ),
+                    0.56,
+                );
+            }
+            SceneInspectorItem::MaterialActions => {
+                for (column, label) in ["Load", "Save", "New"].into_iter().enumerate() {
+                    let x = left + 10.0 + column as f32 * 73.0;
+                    rect(out, [x, y + 1.0, 69.0, row.height - 2.0], header);
+                    text(out, x + 20.0, y + 8.0, label, 0.58);
+                }
+            }
+            SceneInspectorItem::WeldingToggle => {
+                let label = if ui.scene_thermal_bonding.is_some() {
+                    "Enabled · click to disable"
+                } else {
+                    "Disabled · configure to enable"
+                };
+                rect(
+                    out,
+                    [left + 10.0, y + 1.0, 230.0, row.height - 2.0],
+                    if ui.scene_thermal_bonding.is_some() {
+                        selected
+                    } else {
+                        header
+                    },
+                );
+                text(out, left + 18.0, y + 8.0, label, 0.56);
+            }
+            SceneInspectorItem::WeldingConfigure => {
+                rect(out, [left + 10.0, y + 1.0, 230.0, row.height - 2.0], header);
+                text(out, left + 18.0, y + 8.0, "Edit welding thresholds…", 0.56);
+            }
+            SceneInspectorItem::PhysicsField(field) => {
+                let labels = [
+                    "Time step (s)",
+                    "Substeps",
+                    "Gravity X (m/s²)",
+                    "Gravity Y (m/s²)",
+                    "Gravity Z (m/s²)",
+                    "Restitution",
+                    "Friction scale",
+                    "Solver iterations",
+                    "Solver tolerance",
+                ];
+                let values = ui
+                    .scene_physics_input
+                    .as_ref()
+                    .map(|input| &input.values)
+                    .cloned()
+                    .unwrap_or_else(|| scene_physics_strings(ui.scene_physics));
+                let focused = ui
+                    .scene_physics_input
+                    .as_ref()
+                    .is_some_and(|input| input.field == field);
+                text(out, left + 14.0, y + 7.0, labels[field], 0.52);
+                rect(
+                    out,
+                    [left + 147.0, y + 2.0, 88.0, row.height - 4.0],
+                    if focused {
+                        [0.12, 0.32, 0.31, 1.0]
+                    } else {
+                        [0.035, 0.05, 0.06, 1.0]
+                    },
+                );
+                text(
+                    out,
+                    left + 152.0,
+                    y + 7.0,
+                    &format!(
+                        "{}{}",
+                        values[field].chars().take(13).collect::<String>(),
+                        if focused { "|" } else { "" }
+                    ),
+                    0.48,
+                );
+            }
+            SceneInspectorItem::PhysicsApply => {
+                rect(
+                    out,
+                    [left + 10.0, y + 1.0, 230.0, row.height - 2.0],
+                    selected,
+                );
+                text(out, left + 29.0, y + 8.0, "Apply simulation settings", 0.65);
+            }
+            SceneInspectorItem::Hint => {
+                text(
+                    out,
+                    left + 14.0,
+                    y + 8.0,
+                    if has_selection {
+                        "Inspector data is loading"
+                    } else {
+                        "Select a model instance to edit"
+                    },
+                    0.55,
+                );
+            }
+            SceneInspectorItem::InputHint => {
+                text(
+                    out,
+                    left + 14.0,
+                    y + 5.0,
+                    "Click value · type · Enter applies · Esc cancels",
+                    0.48,
+                );
+            }
+        }
+    }
+}
+
+fn scene_section_index(section: SceneInspectorSection) -> usize {
+    match section {
+        SceneInspectorSection::Transform => 0,
+        SceneInspectorSection::Dynamics => 1,
+        SceneInspectorSection::Material => 2,
+        SceneInspectorSection::Welding => 3,
+        SceneInspectorSection::Simulation => 4,
+    }
+}
+
+fn push_scene_row(
+    rows: &mut Vec<SceneInspectorRow>,
+    y: &mut f32,
+    item: SceneInspectorItem,
+    height: f32,
+) {
+    rows.push(SceneInspectorRow {
+        item,
+        top: *y,
+        height,
+    });
+    *y += height;
+}
+
+fn scene_inspector_rows(ui: &Ui) -> Vec<SceneInspectorRow> {
+    let selected = ui
+        .selected_scene_model
+        .is_some_and(|index| index < ui.scene_model_names.len());
+    let has_inspector_data = selected && ui.selected_scene_model_info.is_some();
+    let mut rows = Vec::new();
+    let mut y = 148.0;
+    if selected {
+        push_scene_row(&mut rows, &mut y, SceneInspectorItem::Actions, 28.0);
+        y += 4.0;
+    }
+
+    let sections = [
+        SceneInspectorSection::Transform,
+        SceneInspectorSection::Dynamics,
+        SceneInspectorSection::Material,
+        SceneInspectorSection::Welding,
+        SceneInspectorSection::Simulation,
+    ];
+    if !selected {
+        push_scene_row(&mut rows, &mut y, SceneInspectorItem::Hint, 30.0);
+    }
+    for section in sections {
+        if !selected
+            && matches!(
+                section,
+                SceneInspectorSection::Transform
+                    | SceneInspectorSection::Dynamics
+                    | SceneInspectorSection::Material
+            )
+        {
+            continue;
+        }
+        push_scene_row(
+            &mut rows,
+            &mut y,
+            SceneInspectorItem::Section(section),
+            24.0,
+        );
+        if ui.scene_inspector_collapsed[scene_section_index(section)] {
+            y += 4.0;
+            continue;
+        }
+        match section {
+            SceneInspectorSection::Transform if has_inspector_data => {
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::Position, 48.0);
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::Rotation, 48.0);
+                if ui.selected_bounds_m.is_some() {
+                    push_scene_row(&mut rows, &mut y, SceneInspectorItem::Bounds, 22.0);
+                }
+            }
+            SceneInspectorSection::Transform => {
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::Hint, 26.0);
+            }
+            SceneInspectorSection::Dynamics if has_inspector_data => {
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::Velocity, 48.0);
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::Force, 48.0);
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::Temperature, 28.0);
+            }
+            SceneInspectorSection::Dynamics => {
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::Hint, 26.0);
+            }
+            SceneInspectorSection::Material if selected => {
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::MaterialCycle, 28.0);
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::MaterialActions, 28.0);
+            }
+            SceneInspectorSection::Material => {
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::Hint, 26.0);
+            }
+            SceneInspectorSection::Welding => {
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::WeldingToggle, 28.0);
+                if ui.scene_thermal_bonding.is_some() {
+                    push_scene_row(
+                        &mut rows,
+                        &mut y,
+                        SceneInspectorItem::WeldingConfigure,
+                        28.0,
+                    );
+                }
+            }
+            SceneInspectorSection::Simulation => {
+                for field in 0..9 {
+                    push_scene_row(
+                        &mut rows,
+                        &mut y,
+                        SceneInspectorItem::PhysicsField(field),
+                        23.0,
+                    );
+                }
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::PhysicsApply, 28.0);
+            }
+        }
+        y += 5.0;
+    }
+    if ui.scene_input.is_some() || ui.scene_physics_input.is_some() {
+        push_scene_row(&mut rows, &mut y, SceneInspectorItem::InputHint, 20.0);
+    }
+    rows
+}
+
+fn scene_inspector_content_bottom(ui: &Ui) -> f32 {
+    scene_inspector_rows(ui)
+        .last()
+        .map_or(170.0, |row| row.top + row.height + 8.0)
+}
+
+fn scene_physics_strings(values: ScenePhysicsValues) -> [String; 9] {
+    [
+        format!("{:.5}", values.fixed_dt),
+        values.substeps.to_string(),
+        format!("{:.3}", values.gravity[0]),
+        format!("{:.3}", values.gravity[1]),
+        format!("{:.3}", values.gravity[2]),
+        format!("{:.3}", values.restitution),
+        format!("{:.3}", values.friction_scale),
+        values.iterations.to_string(),
+        format!("{:.2e}", values.tolerance),
+    ]
+}
+
+fn scene_vector_axis(x: f32, inspector_left: f32) -> Option<usize> {
+    let left = inspector_left + 12.0;
+    (0..3).find(|axis| {
+        let column_left = left + *axis as f32 * 76.0;
+        (column_left..=column_left + 71.0).contains(&x)
+    })
+}
+
+fn default_welding_input() -> WeldingInputState {
+    let settings = ThermalBondingSettings {
+        material_name: "iron".into(),
+        minimum_mass_fraction: 0.5,
+        minimum_temperature_kelvin: 1000.0,
+        minimum_impact_energy_j: 0.0,
+        minimum_contact_pressure_pa: 1.0e6,
+        minimum_dwell_seconds: 0.02,
+    };
+    welding_input_from_settings(&settings)
+}
+
+fn welding_input_from_settings(settings: &ThermalBondingSettings) -> WeldingInputState {
+    WeldingInputState {
+        values: [
+            settings.material_name.clone(),
+            settings.minimum_mass_fraction.to_string(),
+            settings.minimum_temperature_kelvin.to_string(),
+            settings.minimum_impact_energy_j.to_string(),
+            settings.minimum_contact_pressure_pa.to_string(),
+            settings.minimum_dwell_seconds.to_string(),
+        ],
+        field: 0,
+        editing: false,
+    }
+}
+
+fn draw_welding_input_modal(
+    out: &mut Vec<Rect>,
+    input: &WeldingInputState,
+    width: f32,
+    height: f32,
+) {
+    let left = (width - 500.0) * 0.5;
+    let top = (height - 430.0) * 0.5;
+    rect(out, [0.0, 0.0, width, height], [0.0, 0.0, 0.0, 0.58]);
+    rect(out, [left, top, 500.0, 430.0], [0.07, 0.085, 0.095, 1.0]);
+    text(
+        out,
+        left + 20.0,
+        top + 18.0,
+        "Thermal welding thresholds",
+        1.0,
+    );
+    text(
+        out,
+        left + 20.0,
+        top + 48.0,
+        "Tab selects a field; Enter applies; Esc cancels",
+        0.62,
+    );
+    let labels = [
+        "Material component",
+        "Minimum mass fraction (0–1)",
+        "Minimum temperature (K)",
+        "Minimum impact energy (J; 0 disables)",
+        "Minimum contact pressure (Pa)",
+        "Minimum dwell time (s)",
+    ];
+    for (index, label) in labels.into_iter().enumerate() {
+        let y = top + 88.0 + index as f32 * 42.0;
+        text(out, left + 22.0, y + 1.0, label, 0.62);
         rect(
             out,
-            [x, top + 102.0, 112.0, 38.0],
-            if input.axis == axis { [0.12, 0.32, 0.31, 1.0] } else { [0.035, 0.05, 0.06, 1.0] },
+            [left + 258.0, y - 5.0, 220.0, 30.0],
+            if input.field == index {
+                [0.12, 0.32, 0.31, 1.0]
+            } else {
+                [0.035, 0.05, 0.06, 1.0]
+            },
         );
-        let value = input.values[axis].chars().take(15).collect::<String>();
-        text(out, x + 8.0, top + 114.0, &value, 0.72);
+        text(
+            out,
+            left + 268.0,
+            y + 3.0,
+            &input.values[index].chars().take(27).collect::<String>(),
+            0.62,
+        );
     }
-    text(out, left + 20.0, top + 166.0, "Tab changes axis | Enter applies | Esc cancels", 0.7);
+    rect(
+        out,
+        [left + 20.0, top + 362.0, 460.0, 42.0],
+        [0.15, 0.52, 0.44, 1.0],
+    );
+    text(out, left + 205.0, top + 374.0, "Apply settings", 0.75);
+}
+
+fn inspector_scroll_geometry(ui: &Ui) -> [f32; 5] {
+    let track_top = 144.0;
+    let track_bottom = (ui.canvas_height - 8.0).max(track_top + 1.0);
+    let track_height = track_bottom - track_top;
+    let content_bottom = if ui.model_document_available {
+        766.0
+    } else if ui.scene_document_available {
+        scene_inspector_content_bottom(ui)
+    } else {
+        455.0
+    };
+    let content_height = (content_bottom - track_top).max(track_height);
+    let max_scroll = (content_bottom - track_bottom).max(0.0);
+    let thumb_height = (track_height * track_height / content_height).clamp(24.0, track_height);
+    let scroll = ui.scene_inspector_scroll.clamp(0.0, max_scroll);
+    let thumb_top = track_top + (scroll / max_scroll.max(1.0)) * (track_height - thumb_height);
+    [track_top, track_height, thumb_top, thumb_height, max_scroll]
+}
+
+fn clip_and_scroll_scene_inspector(out: &mut [Rect], ui: &Ui) {
+    let [track_top, track_height, _, _, max_scroll] = inspector_scroll_geometry(ui);
+    let scroll = ui.scene_inspector_scroll.clamp(0.0, max_scroll);
+    let left = ui.canvas_width - 250.0;
+    let right = ui.canvas_width - 12.0;
+    let bottom = track_top + track_height;
+    for item in out {
+        if item.rect[0] < left || item.rect[0] >= ui.canvas_width || item.rect[1] < track_top {
+            continue;
+        }
+        item.rect[1] -= scroll;
+        let x0 = item.rect[0].max(left).min(right);
+        let x1 = (item.rect[0] + item.rect[2]).min(right);
+        let y0 = item.rect[1].max(track_top).min(bottom);
+        let y1 = (item.rect[1] + item.rect[3]).min(bottom);
+        if x1 <= x0 || y1 <= y0 {
+            item.rect = [x0, y0, 0.0, 0.0];
+            item.color[3] = 0.0;
+        } else {
+            item.rect = [x0, y0, x1 - x0, y1 - y0];
+        }
+    }
+}
+
+fn draw_scene_inspector_scrollbar(out: &mut Vec<Rect>, ui: &Ui) {
+    if !ui.scene_document_available && !ui.model_document_available {
+        return;
+    }
+    let [track_top, track_height, thumb_top, thumb_height, max_scroll] =
+        inspector_scroll_geometry(ui);
+    if max_scroll <= 0.0 {
+        return;
+    }
+    let x = ui.canvas_width - 9.0;
+    rect(
+        out,
+        [x, track_top, 4.0, track_height],
+        [0.035, 0.05, 0.06, 1.0],
+    );
+    rect(
+        out,
+        [x - 2.0, thumb_top, 8.0, thumb_height],
+        [0.30, 0.58, 0.54, 1.0],
+    );
 }
 
 fn menu_button(out: &mut Vec<Rect>, x: f32, y: f32, w: f32, h: f32, label: &str, primary: bool) {
@@ -3667,6 +4722,19 @@ mod scene_inspector_tests {
         ui.click(x * ui.canvas_scale, y * ui.canvas_scale)
     }
 
+    fn click_scene_row(ui: &mut Ui, item: SceneInspectorItem, x_offset: f32) -> Option<UiAction> {
+        let row = scene_inspector_rows(ui)
+            .into_iter()
+            .find(|row| row.item == item)
+            .unwrap();
+        let left = ui.canvas_width - 250.0;
+        click_canvas(
+            ui,
+            left + x_offset,
+            row.top - ui.scene_inspector_scroll + row.height * 0.5,
+        )
+    }
+
     fn has_text_pixel(ui: &Ui, rects: &[Rect], logical_area: [f32; 4]) -> bool {
         let area = [
             logical_area[0] * ui.canvas_scale,
@@ -3685,9 +4753,8 @@ mod scene_inspector_tests {
         })
     }
 
-    fn enter_vector(ui: &mut Ui, y: f32, values: [&str; 3]) -> Option<UiAction> {
-        let inspector_left = ui.canvas_width - 250.0;
-        click_canvas(ui, inspector_left + 20.0, y);
+    fn enter_vector(ui: &mut Ui, item: SceneInspectorItem, values: [&str; 3]) -> Option<UiAction> {
+        click_scene_row(ui, item, 30.0);
         assert!(ui.scene_input_active());
         for (axis, value) in values.into_iter().enumerate() {
             for character in value.chars() {
@@ -3703,28 +4770,35 @@ mod scene_inspector_tests {
     #[test]
     fn scene_input_enter_emits_typed_transform_and_dynamics_actions() {
         let mut ui = scene_ui(1280.0, 720.0);
-        assert!(matches!(enter_vector(&mut ui, 194.0, ["1.25", "-2.5", "3.75"]),
-            Some(UiAction::SetScenePosition { value }) if value == [1.25, -2.5, 3.75]));
-        assert!(matches!(enter_vector(&mut ui, 211.0, ["90", "-180", "270"]),
-            Some(UiAction::SetSceneRotation { degrees }) if degrees == [90.0, -180.0, 270.0]));
-        assert!(matches!(enter_vector(&mut ui, 245.0, ["0.5", "-1.25", "2"]),
-            Some(UiAction::SetSceneVelocity { value }) if value == [0.5, -1.25, 2.0]));
-        assert!(matches!(enter_vector(&mut ui, 262.0, ["10", "-20", "30"]),
-            Some(UiAction::SetSceneForce { value }) if value == [10.0, -20.0, 30.0]));
+        assert!(
+            matches!(enter_vector(&mut ui, SceneInspectorItem::Position, ["1.25", "-2.5", "3.75"]),
+            Some(UiAction::SetScenePosition { value }) if value == [1.25, -2.5, 3.75])
+        );
+        assert!(
+            matches!(enter_vector(&mut ui, SceneInspectorItem::Rotation, ["90", "-180", "270"]),
+            Some(UiAction::SetSceneRotation { degrees }) if degrees == [90.0, -180.0, 270.0])
+        );
+        assert!(
+            matches!(enter_vector(&mut ui, SceneInspectorItem::Velocity, ["0.5", "-1.25", "2"]),
+            Some(UiAction::SetSceneVelocity { value }) if value == [0.5, -1.25, 2.0])
+        );
+        assert!(
+            matches!(enter_vector(&mut ui, SceneInspectorItem::Force, ["10", "-20", "30"]),
+            Some(UiAction::SetSceneForce { value }) if value == [10.0, -20.0, 30.0])
+        );
         assert!(!ui.scene_input_active());
     }
 
     #[test]
     fn scene_input_rejects_invalid_numbers_and_non_lattice_rotation() {
         let mut ui = scene_ui(1280.0, 720.0);
-        let inspector_left = ui.canvas_width - 250.0;
-        click_canvas(&mut ui, inspector_left + 20.0, 194.0);
+        click_scene_row(&mut ui, SceneInspectorItem::Position, 100.0);
         ui.scene_input_char('-');
         assert!(ui.scene_input_key(KeyCode::Enter).is_none());
         assert!(ui.scene_input_active());
         assert!(ui.scene_input_key(KeyCode::Escape).is_none());
 
-        click_canvas(&mut ui, inspector_left + 20.0, 211.0);
+        click_scene_row(&mut ui, SceneInspectorItem::Rotation, 100.0);
         for (axis, value) in ["45", "0", "0"].into_iter().enumerate() {
             for character in value.chars() {
                 ui.scene_input_char(character);
@@ -3738,13 +4812,267 @@ mod scene_inspector_tests {
     }
 
     #[test]
+    fn inline_axis_clicks_preserve_pending_values_and_escape_cancels() {
+        let mut ui = scene_ui(1280.0, 720.0);
+        click_scene_row(&mut ui, SceneInspectorItem::Position, 30.0);
+        for c in "1.25".chars() {
+            ui.scene_input_char(c);
+        }
+        assert!(click_scene_row(&mut ui, SceneInspectorItem::Position, 110.0).is_none());
+        for c in "-2.5".chars() {
+            ui.scene_input_char(c);
+        }
+        assert!(click_scene_row(&mut ui, SceneInspectorItem::Position, 185.0).is_none());
+        for c in "3.75".chars() {
+            ui.scene_input_char(c);
+        }
+        assert!(matches!(ui.scene_input_key(KeyCode::Enter),
+            Some(UiAction::SetScenePosition { value }) if value == [1.25, -2.5, 3.75]));
+        click_scene_row(&mut ui, SceneInspectorItem::Velocity, 30.0);
+        ui.scene_input_char('9');
+        assert!(ui.scene_input_key(KeyCode::Escape).is_none());
+        assert!(!ui.scene_input_active());
+        assert_eq!(
+            ui.selected_scene_model_info.as_ref().unwrap().velocity_m_s,
+            [0.0; 3]
+        );
+    }
+
+    #[test]
+    fn foldouts_reflow_rows_and_empty_scene_omits_object_properties() {
+        let mut ui = scene_ui(1920.0, 1080.0);
+        assert!(scene_inspector_content_bottom(&ui) < ui.canvas_height - 8.0);
+        assert!(!scene_inspector_rows(&ui)
+            .iter()
+            .any(|r| matches!(r.item, SceneInspectorItem::PhysicsField(_))));
+        click_scene_row(
+            &mut ui,
+            SceneInspectorItem::Section(SceneInspectorSection::Transform),
+            30.0,
+        );
+        assert!(!scene_inspector_rows(&ui)
+            .iter()
+            .any(|r| r.item == SceneInspectorItem::Position));
+        assert!(matches!(
+            click_scene_row(&mut ui, SceneInspectorItem::MaterialCycle, 25.0),
+            Some(UiAction::CycleSceneMaterial)
+        ));
+        ui.selected_scene_model = None;
+        let rows = scene_inspector_rows(&ui);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.item == SceneInspectorItem::Hint)
+                .count(),
+            1
+        );
+        assert!(!rows
+            .iter()
+            .any(|r| r.item == SceneInspectorItem::Section(SceneInspectorSection::Transform)));
+    }
+
+    #[test]
+    fn physics_field_clicks_preserve_buffer_and_accept_scientific_notation() {
+        let mut ui = scene_ui(1280.0, 720.0);
+        ui.scene_inspector_collapsed[4] = false;
+        ui.scene_inspector_scroll = 400.0;
+        click_scene_row(&mut ui, SceneInspectorItem::PhysicsField(0), 170.0);
+        for c in "0.002".chars() {
+            ui.scene_input_char(c);
+        }
+        assert!(click_scene_row(&mut ui, SceneInspectorItem::PhysicsField(8), 170.0).is_none());
+        for c in "1e-5".chars() {
+            ui.scene_input_char(c);
+        }
+        assert!(
+            matches!(ui.scene_input_key(KeyCode::Enter), Some(UiAction::SetScenePhysics {
+            fixed_dt_seconds, solver_tolerance, ..
+        }) if fixed_dt_seconds == 0.002 && solver_tolerance == 1e-5)
+        );
+    }
+
+    #[test]
+    fn long_numeric_values_are_clipped_to_the_field() {
+        let mut rects = Vec::new();
+        let area = [12.0, 20.0, 50.0, 17.0];
+        for editing in [false, true] {
+            rects.clear();
+            clipped_inspector_text(
+                &mut rects,
+                area,
+                "-12345678901234567890.12345|",
+                0.62,
+                editing,
+            );
+            assert!(!rects.is_empty());
+            assert!(rects.iter().all(|r| r.rect[0] >= area[0]
+                && r.rect[1] >= area[1]
+                && r.rect[0] + r.rect[2] <= area[0] + area[2] + 0.001
+                && r.rect[1] + r.rect[3] <= area[1] + area[3] + 0.001));
+        }
+    }
+
+    #[test]
+    fn coordinate_grid_stays_inside_scene_viewport_at_common_resolutions() {
+        for (width, height) in [
+            (1920.0, 1080.0),
+            (1280.0, 720.0),
+            (640.0, 480.0),
+            (1280.0, 400.0),
+            (800.0, 1100.0),
+        ] {
+            let ui = scene_ui(width, height);
+            let [x, y, w, h] = coordinate_grid_bounds(&ui);
+            assert!(x >= 235.0 && x + w <= ui.canvas_width - 250.0);
+            assert!(y >= 98.0 && y + h <= ui.editor_dock_top());
+            let mut rects = Vec::new();
+            draw_coordinate_grid(&mut rects, &ui);
+            assert!(rects.iter().all(|r| r.rect[0] >= x
+                && r.rect[1] >= y
+                && r.rect[0] + r.rect[2] <= x + w
+                && r.rect[1] + r.rect[3] <= y + h));
+            assert!(rects.iter().any(|r| r.color == [0.92, 0.29, 0.26, 1.0]));
+            assert!(rects.iter().any(|r| r.color == [0.36, 0.80, 0.35, 1.0]));
+            assert!(rects.iter().any(|r| r.color == [0.34, 0.62, 1.0, 1.0]));
+        }
+    }
+
+    #[test]
+    fn coordinate_grid_projection_tracks_camera_rotation_and_keeps_z_up() {
+        let mut ui = scene_ui(1280.0, 720.0);
+        ui.set_view_basis(Vec3::X, Vec3::Z);
+        assert_eq!(
+            coordinate_projection(Vec3::X, ui.view_right, ui.view_up),
+            [1.0, 0.0]
+        );
+        assert_eq!(
+            coordinate_projection(Vec3::Z, ui.view_right, ui.view_up),
+            [0.0, -1.0]
+        );
+        ui.set_view_basis(Vec3::Y, Vec3::Z);
+        assert_eq!(
+            coordinate_projection(Vec3::X, ui.view_right, ui.view_up),
+            [0.0, 0.0]
+        );
+        assert_eq!(
+            coordinate_projection(Vec3::Y, ui.view_right, ui.view_up),
+            [1.0, 0.0]
+        );
+        ui.set_view_basis(Vec3::NAN, Vec3::ZERO);
+        assert_eq!(ui.view_right, Vec3::Y);
+        assert_eq!(ui.view_up, Vec3::Z);
+    }
+
+    #[test]
     fn scene_selection_mode_buttons_emit_object_and_voxel_actions() {
         let mut ui = scene_ui(1280.0, 720.0);
-        assert!(matches!(click_canvas(&mut ui, 375.0, 12.0),
-            Some(UiAction::SetSceneSelectionMode(SceneSelectionMode::Object))));
-        assert!(matches!(click_canvas(&mut ui, 443.0, 12.0),
-            Some(UiAction::SetSceneSelectionMode(SceneSelectionMode::Voxel))));
+        assert!(matches!(
+            click_canvas(&mut ui, 375.0, 12.0),
+            Some(UiAction::SetSceneSelectionMode(SceneSelectionMode::Object))
+        ));
+        assert!(matches!(
+            click_canvas(&mut ui, 443.0, 12.0),
+            Some(UiAction::SetSceneSelectionMode(SceneSelectionMode::Voxel))
+        ));
         assert_eq!(ui.scene_selection_mode, SceneSelectionMode::Voxel);
+    }
+
+    #[test]
+    fn scene_inspector_wheel_and_thumb_scroll_keep_hit_testing_aligned() {
+        let mut ui = scene_ui(640.0, 480.0);
+        let scale = ui.canvas_scale;
+        let inspector_left = ui.canvas_width - 250.0;
+        ui.scene_inspector_collapsed = [false; 5];
+        let start = ui.scene_inspector_scroll;
+        assert!(ui.scroll_scene_hierarchy(-1.0, (inspector_left + 120.0) * scale, 220.0 * scale));
+        assert!(ui.scene_inspector_scroll > start);
+        assert!(matches!(
+            click_scene_row(&mut ui, SceneInspectorItem::MaterialCycle, 25.0),
+            Some(UiAction::CycleSceneMaterial)
+        ));
+
+        let [track_top, track_height, thumb_top, thumb_height, max_scroll] =
+            inspector_scroll_geometry(&ui);
+        assert!(max_scroll > 0.0);
+        assert!(thumb_height < track_height);
+        assert!(ui
+            .draw(0, 0, 60.0, 0.0, None, None, 640.0, 480.0, None)
+            .iter()
+            .any(|item| item.color == [0.30, 0.58, 0.54, 1.0]
+                && item.rect[0] > (ui.canvas_width - 12.0) * scale));
+        let thumb_center = thumb_top + thumb_height * 0.5;
+        assert!(ui
+            .click((ui.canvas_width - 8.0) * scale, thumb_center * scale)
+            .is_none());
+        assert!(ui.timeline_is_dragging());
+        ui.pointer(
+            (ui.canvas_width - 8.0) * scale,
+            (track_top + track_height) * scale,
+        );
+        assert!((ui.scene_inspector_scroll - max_scroll).abs() < 0.1);
+        ui.end_timeline_drag();
+        assert!(!ui.timeline_is_dragging());
+    }
+
+    #[test]
+    fn scene_physics_dialog_emits_validated_runtime_settings() {
+        let mut ui = scene_ui(1280.0, 720.0);
+        click_scene_row(
+            &mut ui,
+            SceneInspectorItem::Section(SceneInspectorSection::Simulation),
+            30.0,
+        );
+        let row = scene_inspector_rows(&ui)
+            .into_iter()
+            .find(|row| row.item == SceneInspectorItem::PhysicsField(0))
+            .unwrap();
+        ui.scene_inspector_scroll = row.top - 160.0;
+        click_scene_row(&mut ui, SceneInspectorItem::PhysicsField(0), 170.0);
+        assert!(ui.scene_input_active());
+        let input = ui.scene_physics_input.as_mut().unwrap();
+        input.values = [
+            "0.002".into(),
+            "3".into(),
+            "0".into(),
+            "1".into(),
+            "-9.81".into(),
+            "0.5".into(),
+            "1.25".into(),
+            "64".into(),
+            "0.00001".into(),
+        ];
+        assert!(
+            matches!(ui.scene_input_key(KeyCode::Enter), Some(UiAction::SetScenePhysics {
+            fixed_dt_seconds, substeps, gravity, restitution, friction_scale,
+            solver_iterations, solver_tolerance,
+        }) if fixed_dt_seconds == 0.002 && substeps == 3 && gravity == [0.0, 1.0, -9.81]
+            && restitution == 0.5 && friction_scale == 1.25 && solver_iterations == 64
+            && solver_tolerance == 0.00001)
+        );
+        assert!(!ui.scene_input_active());
+        assert!(scene_physics_action(&[
+            "0".into(),
+            "3".into(),
+            "0".into(),
+            "0".into(),
+            "-9.81".into(),
+            "0.5".into(),
+            "1.0".into(),
+            "64".into(),
+            "0.00001".into(),
+        ])
+        .is_err());
+        assert!(scene_physics_action(&[
+            "0.001".into(),
+            "3".into(),
+            "0".into(),
+            "0".into(),
+            "-9.81".into(),
+            "1.5".into(),
+            "1.0".into(),
+            "64".into(),
+            "0.00001".into(),
+        ])
+        .is_err());
     }
 
     #[test]
@@ -3762,31 +5090,58 @@ mod scene_inspector_tests {
         for (width, height) in sizes {
             let mut ui = scene_ui(width, height);
             let rects = ui.draw(0, 0, 60.0, 0.0, None, None, width, height, None);
-            assert!(rects.iter().all(|item| {
-                item.rect[0] >= 0.0
-                    && item.rect[1] >= 0.0
-                    && item.rect[0] + item.rect[2] <= width + 1.0
-                    && item.rect[1] + item.rect[3] <= height + 1.0
-            }));
+            assert!(
+                rects.iter().all(|item| {
+                    item.rect[0] >= 0.0
+                        && item.rect[1] >= 0.0
+                        && item.rect[0] + item.rect[2] <= width + 1.0
+                        && item.rect[1] + item.rect[3] <= height + 1.0
+                }),
+                "out-of-canvas inspector rect at {width}×{height}: {:?}",
+                rects
+                    .iter()
+                    .find(|item| {
+                        item.rect[0] < 0.0
+                            || item.rect[1] < 0.0
+                            || item.rect[0] + item.rect[2] > width + 1.0
+                            || item.rect[1] + item.rect[3] > height + 1.0
+                    })
+                    .map(|item| item.rect)
+            );
             let [vx, vy, vw, vh] = ui.scene_viewport().expect("scene viewport available");
             assert!(vw > 0 && vh > 0, "empty viewport at {width}×{height}");
-            assert!(vx + vw <= width as u32 && vy + vh <= height as u32,
-                "viewport outside {width}×{height}: {vx},{vy} {vw}×{vh}");
-            let inspector_left = ui.canvas_width - 250.0;
-            assert!(matches!(click_canvas(&mut ui, inspector_left + 25.0, 339.0),
-                Some(UiAction::CycleSceneMaterial)));
-            assert!(matches!(click_canvas(&mut ui, inspector_left + 35.0, 367.0),
-                Some(UiAction::LoadSceneMaterial)));
-            assert!(matches!(click_canvas(&mut ui, inspector_left + 105.0, 367.0),
-                Some(UiAction::SaveSceneMaterial)));
-            assert!(matches!(click_canvas(&mut ui, inspector_left + 180.0, 367.0),
-                Some(UiAction::CreateSceneMaterial)));
-            assert!(matches!(enter_vector(&mut ui, 194.0, ["1", "2", "3"]),
-                Some(UiAction::SetScenePosition { .. })));
-            assert!(matches!(click_canvas(&mut ui, 375.0, 12.0),
-                Some(UiAction::SetSceneSelectionMode(SceneSelectionMode::Object))));
-            assert!(matches!(click_canvas(&mut ui, 443.0, 12.0),
-                Some(UiAction::SetSceneSelectionMode(SceneSelectionMode::Voxel))));
+            assert!(
+                vx + vw <= width as u32 && vy + vh <= height as u32,
+                "viewport outside {width}×{height}: {vx},{vy} {vw}×{vh}"
+            );
+            assert!(matches!(
+                click_scene_row(&mut ui, SceneInspectorItem::MaterialCycle, 25.0),
+                Some(UiAction::CycleSceneMaterial)
+            ));
+            assert!(matches!(
+                click_scene_row(&mut ui, SceneInspectorItem::MaterialActions, 35.0),
+                Some(UiAction::LoadSceneMaterial)
+            ));
+            assert!(matches!(
+                click_scene_row(&mut ui, SceneInspectorItem::MaterialActions, 105.0),
+                Some(UiAction::SaveSceneMaterial)
+            ));
+            assert!(matches!(
+                click_scene_row(&mut ui, SceneInspectorItem::MaterialActions, 180.0),
+                Some(UiAction::CreateSceneMaterial)
+            ));
+            assert!(matches!(
+                enter_vector(&mut ui, SceneInspectorItem::Position, ["1", "2", "3"]),
+                Some(UiAction::SetScenePosition { .. })
+            ));
+            assert!(matches!(
+                click_canvas(&mut ui, 375.0, 12.0),
+                Some(UiAction::SetSceneSelectionMode(SceneSelectionMode::Object))
+            ));
+            assert!(matches!(
+                click_canvas(&mut ui, 443.0, 12.0),
+                Some(UiAction::SetSceneSelectionMode(SceneSelectionMode::Voxel))
+            ));
         }
     }
 
@@ -3799,12 +5154,15 @@ mod scene_inspector_tests {
             ui.set_active_model_document(Some("Model".to_owned()), 64, 1);
             ui.set_rig_authoring_state(vec!["root".to_owned()], Some(0), 0);
             let rects = ui.draw(0, 0, 60.0, 0.0, None, None, width, height, None);
-            assert!(rects.iter().all(|item| {
-                item.rect[0] >= 0.0
-                    && item.rect[1] >= 0.0
-                    && item.rect[0] + item.rect[2] <= width + 1.0
-                    && item.rect[1] + item.rect[3] <= height + 1.0
-            }), "model editor clipped at {width}×{height}");
+            assert!(
+                rects.iter().all(|item| {
+                    item.rect[0] >= 0.0
+                        && item.rect[1] >= 0.0
+                        && item.rect[0] + item.rect[2] <= width + 1.0
+                        && item.rect[1] + item.rect[3] <= height + 1.0
+                }),
+                "model editor clipped at {width}×{height}"
+            );
             let [vx, vy, vw, vh] = ui.scene_viewport().expect("model viewport available");
             assert!(vw > 0 && vh > 0);
             assert!(vx + vw <= width as u32 && vy + vh <= height as u32);
@@ -3817,35 +5175,76 @@ mod scene_inspector_tests {
             let mut ui = scene_ui(width, height);
             let rects = ui.draw(0, 0, 60.0, 0.0, None, None, width, height, None);
             let left = ui.canvas_width - 250.0;
-            assert!(!rects.iter().any(|item| {
-                item.color == [0.085, 0.11, 0.12, 1.0]
-                    && item.rect[0] < (left + 240.0) * ui.canvas_scale
-                    && item.rect[0] + item.rect[2] > (left + 10.0) * ui.canvas_scale
-                    && item.rect[1] < 275.0 * ui.canvas_scale
-                    && item.rect[1] + item.rect[3] > 185.0 * ui.canvas_scale
-            }), "opaque row fill overlays inspector values at {width}×{height}");
-            for (y, h) in [
-                (194.0, 15.0),
-                (211.0, 15.0),
-                (228.0, 15.0),
-                (245.0, 15.0),
-                (262.0, 15.0),
-                (279.0, 15.0),
-            ] {
+            assert!(
+                !rects.iter().any(|item| {
+                    item.color == [0.085, 0.11, 0.12, 1.0]
+                        && item.rect[0] < (left + 240.0) * ui.canvas_scale
+                        && item.rect[0] + item.rect[2] > (left + 10.0) * ui.canvas_scale
+                        && item.rect[1] < 275.0 * ui.canvas_scale
+                        && item.rect[1] + item.rect[3] > 185.0 * ui.canvas_scale
+                }),
+                "opaque row fill overlays inspector values at {width}×{height}"
+            );
+            let rows = scene_inspector_rows(&ui);
+            for row in rows.iter().filter(|r| {
+                matches!(
+                    r.item,
+                    SceneInspectorItem::Position
+                        | SceneInspectorItem::Rotation
+                        | SceneInspectorItem::Velocity
+                        | SceneInspectorItem::Force
+                )
+            }) {
                 assert!(
-                    has_text_pixel(&ui, &rects, [left + 15.0, y, 190.0, h]),
-                    "inspector row at y={y} is missing or covered at {width}×{height}");
+                    has_text_pixel(&ui, &rects, [left + 15.0, row.top, 190.0, row.height]),
+                    "inspector row {:?} missing at {width}x{height}",
+                    row.item
+                );
             }
-            for (y, h) in [
-                (418.0, 8.0),
-                (429.0, 8.0),
-                (462.0, 9.0),
-                (480.0, 9.0),
-            ] {
-                assert!(
-                    !has_text_pixel(&ui, &rects, [left + 55.0, y, 40.0, h]),
-                    "legacy status text overlaps scene controls at y={y}, {width}×{height}");
-            }
+            assert!(rows.windows(2).all(|w| w[0].top + w[0].height <= w[1].top));
         }
+    }
+
+    #[test]
+    fn scene_inspector_draws_exactly_one_layout_without_legacy_controls() {
+        let mut ui = scene_ui(1280.0, 720.0);
+        let full = ui.draw(0, 0, 60.0, 0.0, None, None, 1280.0, 720.0, None);
+        let left = ui.canvas_width - 250.0;
+        let mut expected = Vec::new();
+        draw_scene_inspector_contents(
+            &mut expected,
+            &ui,
+            left,
+            [0.12, 0.14, 0.16, 1.0],
+            [0.16, 0.31, 0.38, 1.0],
+        );
+        clip_and_scroll_scene_inspector(&mut expected, &ui);
+        let scale = ui.canvas_scale;
+        for r in &mut expected {
+            let x = (r.rect[0] * scale).round();
+            let y = (r.rect[1] * scale).round();
+            let right = ((r.rect[0] + r.rect[2]) * scale).round();
+            let bottom = ((r.rect[1] + r.rect[3]) * scale).round();
+            r.rect = [x, y, (right - x).max(1.0), (bottom - y).max(1.0)];
+        }
+        let body = |r: &&Rect| {
+            r.rect[0] >= left * scale
+                && r.rect[1] >= 144.0 * scale
+                && r.rect[2] > 0.0
+                && r.rect[3] > 0.0
+        };
+        let actual: Vec<_> = full
+            .iter()
+            .filter(body)
+            .map(|r| (r.rect, r.color))
+            .collect();
+        let expected: Vec<_> = expected
+            .iter()
+            .filter(body)
+            .map(|r| (r.rect, r.color))
+            .collect();
+        assert!(actual == expected,
+            "another panel is painted over the inspector: actual {} quads, expected {}; first mismatch {:?}",
+            actual.len(), expected.len(), actual.iter().zip(&expected).position(|(a, b)| a != b));
     }
 }

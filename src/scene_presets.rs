@@ -74,7 +74,9 @@ pub fn create_impact_scene(path: &Path, side: usize) -> Result<SceneDocument, St
             scale: Vec3::ONE,
         })?;
         let mut settings = document.object_settings(index);
-        settings.initial_velocity_m_s = Some(Vec3::X * if index == 0 { 2.0 } else { -2.0 });
+        // Small authoring example: 0.2 m/s is visible at the 1 cm REV scale.
+        // Object velocity stays editable in the normal scene Inspector.
+        settings.initial_velocity_m_s = Some(Vec3::X * if index == 0 { 0.2 } else { -0.2 });
         document.set_object_settings(index, settings)?;
     }
     save_document(path, &document)?;
