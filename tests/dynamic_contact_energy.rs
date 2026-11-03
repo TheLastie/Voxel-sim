@@ -16,7 +16,7 @@ struct ImpactSetup {
     right: Vec<usize>,
 }
 
-fn make_scene(adaptive: bool) -> ImpactSetup {
+fn make_scene(adaptive: bool, dt: f32) -> ImpactSetup {
     let iron = Material::component_id("iron").unwrap();
     let side = SIDE as i32;
     let gap_cells = (GAP / f64::from(CELL)).round() as i32;
@@ -24,7 +24,7 @@ fn make_scene(adaptive: bool) -> ImpactSetup {
     let velocity = Vec3::new(SPEED, 0.0, 0.0);
     let mut builder = SceneBuilder::standard()
         .with_gravity(Vec3::ZERO)
-        .with_timestep(DT, 4);
+        .with_timestep(dt, 4);
     for z in 0..side {
         for y in 0..side {
             for x in 0..side {
@@ -85,6 +85,14 @@ fn kinetic_energy_j(scene: &Scene) -> f64 {
     })
 }
 
+fn maximum_speed(scene: &Scene) -> f32 {
+    scene
+        .voxels
+        .iter()
+        .map(|voxel| voxel.velocity.length())
+        .fold(0.0_f32, f32::max)
+}
+
 fn internal_energy_j(scene: &Scene) -> f64 {
     scene.voxels.iter().map(|voxel| voxel.total_internal_energy_j()).sum()
 }
@@ -109,8 +117,8 @@ fn x_surface_gap(scene: &Scene, left: &[usize], right: &[usize]) -> f64 {
     right_min - left_max
 }
 
-fn assert_impact_energy_is_bounded(adaptive: bool) {
-    let ImpactSetup { mut scene, left, right } = make_scene(adaptive);
+fn assert_impact_energy_is_bounded(adaptive: bool, dt: f32, steps: usize) {
+    let ImpactSetup { mut scene, left, right } = make_scene(adaptive, dt);
     let initial_momentum = momentum(&scene);
     let initial_kinetic = kinetic_energy_j(&scene);
     let initial_internal = internal_energy_j(&scene);
@@ -119,15 +127,21 @@ fn assert_impact_energy_is_bounded(adaptive: bool) {
     let initial_relative_vx = center_velocity_x(&scene, &left) - center_velocity_x(&scene, &right);
     let momentum_tolerance = (scene.total_mass_kg() * (2.0 * SPEED as f64) * 1.0e-4).max(1.0e-9);
     let energy_tolerance = (initial_kinetic * 0.10).max(1.0e-10);
+    let energy_roundoff = (initial_kinetic * 8.0 * f64::from(f32::EPSILON)).max(1.0e-10);
     let initial_contact_heat =
         scene.energy.contact_friction_heat + scene.energy.contact_restitution_heat;
+    let initial_max_speed = maximum_speed(&scene);
+    let initial_broken = scene.broken;
+    let initial_count = scene.voxels.len();
     let mut max_momentum_error = 0.0_f64;
     let mut minimum_gap = x_surface_gap(&scene, &left, &right);
     let mut max_energy_excess = f64::NEG_INFINITY;
+    let mut max_energy_deficit = f64::NEG_INFINITY;
     let mut max_energy_step = 0;
+    let mut max_loss_step = 0;
 
     assert!(initial_kinetic.is_finite() && initial_kinetic > 0.0);
-    for step in 0..STEPS {
+    for step in 0..steps {
         scene.tick();
         assert!(
             scene.positions.iter().all(|p| p.is_finite())
@@ -147,6 +161,13 @@ fn assert_impact_energy_is_bounded(adaptive: bool) {
             - initial_plastic
             + scene.energy.surface_work
             + scene.energy.pending_release;
+        if std::env::var_os("VOXEL_CONTACT_ENERGY_TRACE").is_some() {
+            eprintln!("step={} gap={:.9e} relative_vx={:.9e} kinetic={:.9e} heat={:.9e} elastic={:.9e} solver_heat={:.9e} restitution_heat={:.9e} residual={:.9e}", step+1,
+                x_surface_gap(&scene, &left, &right), center_velocity_x(&scene, &left)-center_velocity_x(&scene, &right),
+                kinetic_energy_j(&scene), internal_energy_j(&scene)-initial_internal,
+                scene.elastic_bond_energy_j()-initial_elastic, scene.energy.implicit_solver_heat,
+                scene.energy.contact_restitution_heat, accounted-initial_kinetic);
+        }
         assert!(
             accounted.is_finite(),
             "nonfinite accounted energy in adaptive={adaptive} at step {}: {accounted}",
@@ -156,14 +177,25 @@ fn assert_impact_energy_is_bounded(adaptive: bool) {
             max_energy_excess = accounted - initial_kinetic;
             max_energy_step = step + 1;
         }
+        if initial_kinetic - accounted > max_energy_deficit {
+            max_energy_deficit = initial_kinetic - accounted;
+            max_loss_step = step + 1;
+        }
     }
 
     let final_relative_vx = center_velocity_x(&scene, &left) - center_velocity_x(&scene, &right);
+    let final_kinetic = kinetic_energy_j(&scene);
+    let final_max_speed = maximum_speed(&scene);
+    assert_eq!(scene.voxels.len(), initial_count, "cold impact consumed voxels");
+    assert_eq!(scene.cluster_count, 2, "cold impact bonded the separate cubes");
+    assert_eq!(scene.broken, initial_broken, "low-speed iron impact broke material bonds");
+    assert!(final_relative_vx < -0.05,
+        "cold cubes did not separate after impact: dt={dt} relative_vx={final_relative_vx:.9e}");
     let contact_heat = scene.energy.contact_friction_heat
         + scene.energy.contact_restitution_heat
         - initial_contact_heat;
     assert!(
-        minimum_gap <= 1.0e-3
+        minimum_gap >= -1.0e-6
             && (final_relative_vx - initial_relative_vx).abs() > 1.0e-3
             && contact_heat > 0.0,
         "collision was not observed in adaptive={adaptive}: minimum_gap={minimum_gap:.6e} m relative_vx={initial_relative_vx:.6}->{final_relative_vx:.6} m/s contact_heat={contact_heat:.6e} J"
@@ -172,18 +204,36 @@ fn assert_impact_energy_is_bounded(adaptive: bool) {
         max_momentum_error <= momentum_tolerance,
         "momentum drift in adaptive={adaptive}: max_error={max_momentum_error:.9e} kg*m/s tolerance={momentum_tolerance:.9e} kg*m/s"
     );
+    eprintln!(
+        "iron impact adaptive={adaptive}: KE {initial_kinetic:.6e}->{final_kinetic:.6e} J; max accounted loss={max_energy_deficit:.6e} J at step {max_loss_step}, gain={max_energy_excess:.6e} J; internal delta={:.6e} J; solver/restitution heat={:.6e}/{:.6e} J; elastic delta={:.6e} J; momentum drift={max_momentum_error:.6e} kg*m/s; min surface gap={minimum_gap:.6e} m; broken={}",
+        internal_energy_j(&scene) - initial_internal,
+        scene.energy.implicit_solver_heat,
+        scene.energy.contact_restitution_heat,
+        scene.elastic_bond_energy_j() - initial_elastic,
+        scene.broken - initial_broken,
+    );
     assert!(
-        max_energy_excess <= energy_tolerance,
-        "energy created in adaptive={adaptive} at step {max_energy_step}: input_kinetic={initial_kinetic:.9e} J max_excess={max_energy_excess:.9e} J tolerance={energy_tolerance:.9e} J"
+        max_energy_excess <= energy_roundoff,
+        "energy created in adaptive={adaptive} at step {max_energy_step}: initial_kinetic={initial_kinetic:.9e} J final_kinetic={final_kinetic:.9e} J max_excess={max_energy_excess:.9e} J roundoff={energy_roundoff:.9e} J initial_max_speed={initial_max_speed:.6} m/s final_max_speed={final_max_speed:.6} m/s broken_delta={}",
+        scene.broken - initial_broken,
+    );
+    assert!(
+        max_energy_deficit <= energy_tolerance,
+        "unaccounted energy loss in adaptive={adaptive} at step {max_loss_step}: initial_kinetic={initial_kinetic:.9e} J max_loss={max_energy_deficit:.9e} J tolerance={energy_tolerance:.9e} J"
     );
 }
 
 #[test]
 fn fixed_step_iron_impact_conserves_momentum_and_does_not_create_energy() {
-    assert_impact_energy_is_bounded(false);
+    assert_impact_energy_is_bounded(false, DT, STEPS);
 }
 
 #[test]
 fn adaptive_step_iron_impact_conserves_momentum_and_does_not_create_energy() {
-    assert_impact_energy_is_bounded(true);
+    assert_impact_energy_is_bounded(true, DT, STEPS);
+}
+
+#[test]
+fn editor_timestep_iron_impact_preserves_separate_bodies_and_energy() {
+    assert_impact_energy_is_bounded(false, 0.01, 12);
 }

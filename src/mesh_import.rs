@@ -449,7 +449,7 @@ fn voxelize(
             let enclosed_cells = fill_interior(grid.dimensions, &mut occupancy);
             if !watertight && enclosed_cells == 0 {
                 return Err(
-                    "no enclosed voxel volume at this cell size; use Shell or repair the mesh"
+                    "mesh is not watertight or encloses no voxel volume at this cell size; use Shell, increase resolution, or repair the mesh"
                         .into(),
                 );
             }

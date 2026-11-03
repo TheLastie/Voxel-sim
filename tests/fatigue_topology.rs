@@ -194,18 +194,20 @@ fn fatigue_generated_fragments_collide_through_solver_contact() {
                 + 0.5 * voxel.mass as f64 * voxel.velocity.length_squared() as f64
         })
         .sum();
-    let mut contact_heat_before = scene.energy.contact_restitution_heat;
+    let contact_heat = |scene: &voxel_physics_lab::scene::Scene| {
+        scene.energy.contact_restitution_heat + scene.energy.implicit_solver_heat
+    };
+    let contact_heat_before = contact_heat(&scene);
     for _ in 0..8 {
         solver::step(&mut scene, &mut None);
-        if scene.energy.contact_restitution_heat > contact_heat_before {
+        if contact_heat(&scene) > contact_heat_before {
             break;
         }
-        contact_heat_before = scene.energy.contact_restitution_heat;
     }
 
     assert!(
-        scene.energy.contact_restitution_heat > 0.0,
-        "fracture-generated pieces did not produce a restitutive contact"
+        contact_heat(&scene) > contact_heat_before,
+        "fracture-generated pieces did not dissipate energy through contact"
     );
     let momentum_after = scene
         .voxels

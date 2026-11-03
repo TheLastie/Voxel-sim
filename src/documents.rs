@@ -7,6 +7,7 @@
 use crate::{
     material::{FractureMode, Material},
     scene::{Scene, SceneConfig},
+    scene_welding::SceneSimulationSettings,
     voxel::{Composition, Microstructure, Voxel},
 };
 use bincode::Options;
@@ -23,7 +24,7 @@ use std::{
 };
 
 const MAGIC: &[u8; 4] = b"VXED";
-const FORMAT_VERSION: u16 = 5;
+const FORMAT_VERSION: u16 = 6;
 const HEADER_BYTES: usize = 28;
 const MAX_PAYLOAD_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DOCUMENT_ITEMS: u64 = 8_000_000;
@@ -1705,7 +1706,7 @@ impl EditorDocument for VoxelModelDocument {
                     .map_err(|error| format!("decode version 3 voxel model: {error}"))?;
                 Ok(old.into())
             }
-            4 | FORMAT_VERSION => codec()
+            4..=FORMAT_VERSION => codec()
                 .deserialize(payload)
                 .map_err(|error| format!("decode native document: {error}")),
             _ => Err(format!("unsupported .vxm schema version {version}")),
@@ -2018,6 +2019,8 @@ pub struct SceneDocument {
     /// Per-instance editor values, keyed by the stable index in `models`.
     /// Defaults are implicit so existing scenes need no placeholder records.
     pub scene_object_settings: Vec<SceneObjectSettings>,
+    /// Runtime authoring settings; legacy scenes default to disabled welding.
+    pub simulation_settings: SceneSimulationSettings,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -2093,6 +2096,15 @@ struct LegacySceneDocument {
     models: Vec<ModelInstanceDocument>,
 }
 
+/// Version 5 had per-instance editor settings but no simulation settings.
+#[derive(Serialize, Deserialize)]
+struct LegacySceneV5Document {
+    name: String,
+    config: SceneConfig,
+    models: Vec<ModelInstanceDocument>,
+    scene_object_settings: Vec<SceneObjectSettings>,
+}
+
 impl SceneDocument {
     pub fn new(name: impl Into<String>, config: SceneConfig) -> Result<Self, String> {
         config.validate().map_err(str::to_owned)?;
@@ -2101,6 +2113,7 @@ impl SceneDocument {
             config,
             models: Vec::new(),
             scene_object_settings: Vec::new(),
+            simulation_settings: SceneSimulationSettings::default(),
         };
         document.validate()?;
         Ok(document)
@@ -2119,6 +2132,37 @@ impl SceneDocument {
             .find(|settings| settings.model_index == index)
             .cloned()
             .unwrap_or_else(|| SceneObjectSettings::defaults_for(index))
+    }
+
+    pub fn set_simulation_settings(
+        &mut self,
+        settings: SceneSimulationSettings,
+    ) -> Result<(), String> {
+        settings.validate(self.models.len())?;
+        self.simulation_settings = settings;
+        Ok(())
+    }
+
+    pub fn set_object_initial_temperature(
+        &mut self,
+        model_index: usize,
+        temperature_kelvin: Option<f32>,
+    ) -> Result<(), String> {
+        if model_index >= self.models.len() {
+            return Err(format!("model instance index {model_index} is out of bounds"));
+        }
+        let mut settings = self.simulation_settings.clone();
+        settings.set_object_temperature_kelvin(model_index, temperature_kelvin)?;
+        self.set_simulation_settings(settings)
+    }
+
+    pub fn set_thermal_bonding(
+        &mut self,
+        settings: Option<crate::scene_welding::ThermalBondingSettings>,
+    ) -> Result<(), String> {
+        let mut simulation = self.simulation_settings.clone();
+        simulation.thermal_bonding = settings;
+        self.set_simulation_settings(simulation)
     }
 
     /// Keep relative asset references pointing at their existing files when a
@@ -2194,6 +2238,7 @@ impl SceneDocument {
                 true
             }
         });
+        self.simulation_settings.remove_object(index);
         Ok(removed)
     }
 
@@ -2293,6 +2338,13 @@ impl SceneDocument {
         if !settings.is_default() {
             self.scene_object_settings.push(settings);
         }
+        if let Some(temperature_kelvin) = self
+            .simulation_settings
+            .object_temperature_kelvin(index)
+        {
+            self.simulation_settings
+                .set_object_temperature_kelvin(duplicate_index, Some(temperature_kelvin))?;
+        }
         Ok(duplicate_index)
     }
 
@@ -2303,11 +2355,13 @@ impl SceneDocument {
     pub fn build_scene(&self, scene_path: &Path) -> Result<Scene, String> {
         self.validate()?;
         if self.models.is_empty() {
-            return Scene::from_voxel_objects_with_materials(
+            let mut scene = Scene::from_voxel_objects_with_materials(
                 self.config.clone(),
                 Material::table(),
                 Vec::new(),
-            );
+            )?;
+            self.apply_simulation_settings(&mut scene)?;
+            return Ok(scene);
         }
 
         let asset_directory = scene_path.parent().unwrap_or_else(|| Path::new("."));
@@ -2422,6 +2476,25 @@ impl SceneDocument {
                             .ok_or_else(|| "model voxel refers to a missing material".to_owned())?;
                     }
                 }
+                if let Some(temperature_kelvin) = self
+                    .simulation_settings
+                    .object_temperature_kelvin(instance_index)
+                {
+                    let resolved_material = Material::mixed(&state.composition, &materials);
+                    let cell_mass = state.mass / crate::voxel::THERMAL_CELL_COUNT as f32;
+                    let energy_per_cell_j = f64::from(
+                        resolved_material.energy_at_temperature(cell_mass, temperature_kelvin),
+                    );
+                    if !energy_per_cell_j.is_finite() || energy_per_cell_j < 0.0 {
+                        return Err(format!(
+                            "initial temperature {temperature_kelvin} K is outside the supported EOS range for model instance {instance_index}"
+                        ));
+                    }
+                    state.set_thermal_cell_energies_j(&[
+                        energy_per_cell_j;
+                        crate::voxel::THERMAL_CELL_COUNT
+                    ]);
+                }
                 state.velocity = rotation_f32 * state.velocity;
                 if let Some(velocity) = settings.initial_velocity_m_s {
                     state.velocity = velocity;
@@ -2468,7 +2541,15 @@ impl SceneDocument {
                 scene_voxel_index += 1;
             }
         }
+        self.apply_simulation_settings(&mut scene)?;
         Ok(scene)
+    }
+
+    fn apply_simulation_settings(&self, scene: &mut Scene) -> Result<(), String> {
+        if let Some(rule) = &self.simulation_settings.thermal_bonding {
+            rule.apply(scene)?;
+        }
+        Ok(())
     }
 }
 
@@ -2565,7 +2646,9 @@ impl EditorDocument for SceneDocument {
     const KIND: DocumentKind = DocumentKind::Scene;
 
     fn record_count(&self) -> usize {
-        self.models.len() + self.scene_object_settings.len()
+        self.models.len()
+            + self.scene_object_settings.len()
+            + self.simulation_settings.object_initial_temperatures.len()
     }
 
     fn decode_payload(version: u16, payload: &[u8]) -> Result<Self, String> {
@@ -2579,6 +2662,19 @@ impl EditorDocument for SceneDocument {
                     config: old.config,
                     models: old.models,
                     scene_object_settings: Vec::new(),
+                    simulation_settings: SceneSimulationSettings::default(),
+                })
+            }
+            5 => {
+                let old: LegacySceneV5Document = codec()
+                    .deserialize(payload)
+                    .map_err(|error| format!("decode version 5 scene: {error}"))?;
+                Ok(Self {
+                    name: old.name,
+                    config: old.config,
+                    models: old.models,
+                    scene_object_settings: old.scene_object_settings,
+                    simulation_settings: SceneSimulationSettings::default(),
                 })
             }
             FORMAT_VERSION => codec()
@@ -2610,6 +2706,7 @@ impl EditorDocument for SceneDocument {
             }
             settings.validate()?;
         }
+        self.simulation_settings.validate(self.models.len())?;
         Ok(())
     }
 }
@@ -3087,9 +3184,32 @@ mod tests {
             }],
         };
         scene.set_object_settings(0, settings.clone()).unwrap();
+        scene.set_object_initial_temperature(0, Some(525.0)).unwrap();
+        scene
+            .set_thermal_bonding(Some(crate::scene_welding::ThermalBondingSettings {
+                material_name: "iron".into(),
+                minimum_mass_fraction: 0.8,
+                minimum_temperature_kelvin: 900.0,
+                minimum_impact_energy_j: 0.01,
+                minimum_contact_pressure_pa: 2.0e6,
+                minimum_dwell_seconds: 0.02,
+            }))
+            .unwrap();
         let payload = codec().serialize(&scene).unwrap();
         let decoded = SceneDocument::decode_payload(FORMAT_VERSION, &payload).unwrap();
         assert_eq!(decoded.object_settings(0), settings);
+        assert_eq!(decoded.simulation_settings, scene.simulation_settings);
+
+        let legacy_v5 = LegacySceneV5Document {
+            name: scene.name.clone(),
+            config: scene.config.clone(),
+            models: scene.models.clone(),
+            scene_object_settings: scene.scene_object_settings.clone(),
+        };
+        let old_v5_payload = codec().serialize(&legacy_v5).unwrap();
+        let migrated_v5 = SceneDocument::decode_payload(5, &old_v5_payload).unwrap();
+        assert_eq!(migrated_v5.object_settings(0), settings);
+        assert_eq!(migrated_v5.simulation_settings, SceneSimulationSettings::default());
 
         let legacy = LegacySceneDocument {
             name: scene.name.clone(),
@@ -3100,6 +3220,7 @@ mod tests {
         for version in 1..=4 {
             let migrated = SceneDocument::decode_payload(version, &old_payload).unwrap();
             assert!(migrated.scene_object_settings.is_empty());
+            assert_eq!(migrated.simulation_settings, SceneSimulationSettings::default());
             assert_eq!(migrated.models.len(), 1);
         }
     }
@@ -3506,6 +3627,27 @@ mod tests {
             let new_energy = scene.voxels[0].thermal_cell_energy_at(index) as f32;
             assert!((new_material.temperature(new_cell_mass, new_energy) - expected_temperature).abs() < 0.02);
         }
+
+        document.set_object_initial_temperature(0, Some(510.0)).unwrap();
+        document
+            .set_thermal_bonding(Some(crate::scene_welding::ThermalBondingSettings {
+                material_name: "iron".into(),
+                minimum_mass_fraction: 1.0,
+                minimum_temperature_kelvin: 450.0,
+                minimum_impact_energy_j: 0.0,
+                minimum_contact_pressure_pa: 1.0,
+                minimum_dwell_seconds: 0.01,
+            }))
+            .unwrap();
+        let hot_scene = document.build_scene(&directory.join("thermal.vxscene")).unwrap();
+        let hot_material =
+            &hot_scene.materials[hot_scene.voxels[0].composition.components[0].0 as usize];
+        let hot_cell_mass = hot_scene.voxels[0].mass / crate::voxel::THERMAL_CELL_COUNT as f32;
+        for cell_index in 0..crate::voxel::THERMAL_CELL_COUNT {
+            let cell_energy = hot_scene.voxels[0].thermal_cell_energy_at(cell_index) as f32;
+            assert!((hot_material.temperature(hot_cell_mass, cell_energy) - 510.0).abs() < 0.02);
+        }
+        assert!(hot_scene.thermal_bonding_rule().is_some());
         fs::remove_dir_all(directory).unwrap();
     }
 

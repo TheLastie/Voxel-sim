@@ -382,20 +382,41 @@ pub(crate) fn bond_formation_offset(scene: &Scene, i: usize, j: usize, axis: usi
     (current - bond_thermal_rest(scene, i, j, frame)).to_array()
 }
 
-fn bond_elastic_displacement(scene: &Scene, i: usize, j: usize, axis: usize, frame: Mat3) -> Vec3 {
-    (frame.as_dmat3().transpose() * (scene.positions[j] - scene.positions[i])
+fn bond_elastic_displacement_at(
+    scene: &Scene,
+    positions: &[DVec3],
+    i: usize,
+    j: usize,
+    axis: usize,
+    frame: Mat3,
+) -> Vec3 {
+    (frame.as_dmat3().transpose() * (positions[j] - positions[i])
         - bond_thermal_rest(scene, i, j, frame)
         - DVec3::from_array(scene.bonds[axis][i].formation_offset.map(f64::from)))
     .as_vec3()
+}
+
+fn bond_elastic_displacement(scene: &Scene, i: usize, j: usize, axis: usize, frame: Mat3) -> Vec3 {
+    bond_elastic_displacement_at(scene, &scene.positions, i, j, axis, frame)
 }
 
 /// Recover the current stored elastic energy of an intact bond (joules).
 /// This is also used when a topology operation removes the bond before its
 /// strain energy can be dissipated through fracture or melting.
 pub(crate) fn bond_stored_elastic_energy_j(scene: &Scene, i: usize, j: usize, axis: usize) -> f64 {
+    bond_stored_elastic_energy_at_positions_j(scene, &scene.positions, i, j, axis)
+}
+
+pub(crate) fn bond_stored_elastic_energy_at_positions_j(
+    scene: &Scene,
+    positions: &[DVec3],
+    i: usize,
+    j: usize,
+    axis: usize,
+) -> f64 {
     let bond = scene.bonds[axis][i];
     let frame = basis(axis, scene.rotations[i].slerp(scene.rotations[j], 0.5));
-    let displacement = bond_elastic_displacement(scene, i, j, axis, frame)
+    let displacement = bond_elastic_displacement_at(scene, positions, i, j, axis, frame)
         - Vec3::from_array(bond.plastic_strain) * CELL;
     let stiffness = stiffness_matrix(scene, i, j, frame);
     (0.5 * (1.0 - bond.damage) * displacement.dot(stiffness * displacement)).max(0.0) as f64
@@ -1357,6 +1378,14 @@ fn advance_step_with_axis_targets_and_loads(
         substep_start_positions.clone_from(&scene.positions);
         substep_start_velocities.clear();
         substep_start_velocities.extend(scene.voxels.iter().map(|voxel| voxel.velocity));
+        // The energy budget starts before drift. A prediction made from an
+        // impact's nonuniform velocities can already contain strain; treating
+        // that trial strain as incoming energy counts it a second time.
+        let substep_elastic_energy_before = if coarse_clear {
+            0.0
+        } else {
+            scene.elastic_bond_energy_j()
+        };
         scene.previous.clone_from(&scene.positions);
         if let Some(start) = detail_start {
             pre_solve_detail_time[0] += start.elapsed();
@@ -1550,6 +1579,7 @@ fn advance_step_with_axis_targets_and_loads(
                 }
             }
         }
+        solver_scratch.pair_contacts.clear();
         for contact in &contacts {
             let axis = if contact.normal.x.abs() > 0.5 {
                 0
@@ -1559,6 +1589,13 @@ fn advance_step_with_axis_targets_and_loads(
                 2
             };
             let fixed = |i: usize| scene.voxels[i].kinematic || targets[i][axis].is_some();
+            if !fixed(contact.i) && !fixed(contact.j) {
+                solver_scratch.pair_contacts.push(crate::contact_constraint::PairContact {
+                    i: contact.i, j: contact.j, axis,
+                    sign: f64::from(contact.normal[axis]), active: true,
+                });
+                continue;
+            }
             let (dynamic, support, sign) = if fixed(contact.i) && !fixed(contact.j) {
                 (contact.j, contact.i, contact.normal[axis])
             } else if fixed(contact.j) && !fixed(contact.i) {
@@ -1623,6 +1660,15 @@ fn advance_step_with_axis_targets_and_loads(
         }
         stage_time[0] += phase_start.elapsed();
         phase_start = Instant::now();
+        let mut contact_solver_energy_before = if solver_scratch.pair_contacts.iter().any(|p| p.active)
+            || solver_scratch.contact_axis_normals.iter().any(|axes| *axes != [0.0; 3]) {
+            let kinetic = scene.voxels.iter().enumerate()
+                .filter(|(i, voxel)| !voxel.kinematic && scene.aggregate_of[*i].is_none())
+                .map(|(i, voxel)| 0.5 * f64::from(voxel.mass)
+                    * f64::from((substep_start_velocities[i] + tool_contact_velocity[i]).length_squared()))
+                .sum::<f64>();
+            Some((kinetic, substep_elastic_energy_before))
+        } else { None };
         for iteration in 0..scene.config.corotation_iterations {
             let mut contact_pass = 0usize;
             loop {
@@ -1770,6 +1816,66 @@ fn advance_step_with_axis_targets_and_loads(
                         }
                     }
                 }
+                if solver_scratch.pair_contacts.iter().any(|p| p.active) {
+                    let projection = crate::contact_constraint::ContactProjection::build(
+                        &solver_scratch.pair_contacts, &solver_scratch.free, &solver_scratch.active_index);
+                    let reactions = projection.reactions(&solver_scratch.pair_contacts,
+                        &solver_scratch.contact_reactions);
+                    let scale = reactions.iter().map(|r| r.abs()).fold(1e-6_f64, f64::max);
+                    for (pair, reaction) in solver_scratch.pair_contacts.iter_mut().zip(reactions) {
+                        if pair.active && reaction < -f64::from(scene.config.solver_relative_tolerance) * scale {
+                            pair.active = false;
+                            released = true;
+                        }
+                    }
+                }
+                // Discover contacts from the coupled iterate without modifying
+                // it. New blocking pairs become constraints on the SAME solve.
+                collision::detect_into(scene, targets, &mut contacts);
+                let mut blocked_pair = false;
+                for c in &contacts {
+                    let axis = if c.normal.x.abs() > 0.5 {0} else if c.normal.y.abs() > 0.5 {1} else {2};
+                    if scene.voxels[c.i].kinematic || scene.voxels[c.j].kinematic
+                        || targets[c.i][axis].is_some() || targets[c.j][axis].is_some() { continue; }
+                    let sign = f64::from(c.normal[axis]);
+                    if (scene.positions[c.j][axis] - scene.positions[c.i][axis]) * sign >= DCELL - 1e-8 { continue; }
+                    if let Some(pair) = solver_scratch.pair_contacts.iter_mut()
+                        .find(|p| p.i == c.i && p.j == c.j && p.axis == axis && p.sign == sign) {
+                        if !pair.active { pair.active = true; blocked_pair = true; }
+                    } else {
+                        solver_scratch.pair_contacts.push(crate::contact_constraint::PairContact {
+                            i:c.i, j:c.j, axis, sign, active:true,
+                        });
+                        blocked_pair = true;
+                    }
+                }
+                if blocked_pair {
+                    // A fast impact can cross the contact threshold during an
+                    // initially unconstrained solve. Preserve the pre-solve
+                    // mechanical energy so that this same-step contact solve
+                    // can return its numerical dissipation as heat.
+                    if contact_solver_energy_before.is_none() {
+                        let kinetic_before = substep_start_velocities
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, voxel_velocity)| {
+                                !scene.voxels[*i].kinematic
+                                    && scene.aggregate_of[*i].is_none()
+                                    && voxel_velocity.is_finite()
+                            })
+                            .map(|(i, velocity)| {
+                                0.5 * f64::from(scene.voxels[i].mass)
+                                    * f64::from(velocity.length_squared())
+                            })
+                            .sum::<f64>();
+                        contact_solver_energy_before =
+                            Some((kinetic_before, substep_elastic_energy_before));
+                    }
+                    collision::project_into(scene, targets, &mut contacts);
+                    solver_scratch.contact_feasible_positions.clone_from(&scene.positions);
+                    contact_pass += 1;
+                    continue;
+                }
                 if !released {
                     break;
                 }
@@ -1804,10 +1910,37 @@ fn advance_step_with_axis_targets_and_loads(
         for i in 0..voxel_count {
             pre_contact_velocities[i] = drift_velocity[i] + tool_contact_velocity[i];
         }
+        if !coarse_clear { collision::detect_into(scene, targets, &mut contacts); }
+        contact_work_mode.fill(0);
+        for contact in &contacts {
+            let mode = if contact.new_impact { 2 } else { 1 };
+            contact_work_mode[contact.i] = contact_work_mode[contact.i].max(mode);
+            contact_work_mode[contact.j] = contact_work_mode[contact.j].max(mode);
+        }
+        let implicit_contact_heat = contact_solver_energy_before.map_or(0.0, |(kinetic_before, elastic_before)| {
+            let mut kinetic_after = 0.0;
+            let mut applied_work = 0.0;
+            for i in 0..voxel_count {
+                if scene.voxels[i].kinematic || scene.aggregate_of[i].is_some() { continue; }
+                let velocity = drift_velocity[i] + tool_contact_velocity[i]
+                    + ((solved_positions[i] - predicted[i]) / f64::from(h)).as_vec3();
+                kinetic_after += 0.5 * f64::from(scene.voxels[i].mass)
+                    * f64::from(velocity.length_squared());
+                let force = applied_loads[i] + gravity * scene.voxels[i].mass;
+                let displacement = match contact_work_mode[i] {
+                    0 | 2 => (substep_start_velocities[i] + velocity) * (0.5 * h),
+                    _ => (solved_positions[i] - substep_start_positions[i]).as_vec3(),
+                };
+                applied_work += f64::from(force.dot(displacement));
+            }
+            let elastic_after = scene.elastic_bond_energy_j();
+            (kinetic_before + elastic_before + applied_work
+                - kinetic_after - elastic_after).max(0.0)
+        });
         if coarse_clear {
             contacts.clear();
         } else {
-            collision::project_into(scene, targets, &mut contacts);
+            collision::detect_into(scene, targets, &mut contacts);
         }
         if scene.has_registered_rigid_candidates() {
             let mut contacted_candidates = Vec::new();
@@ -1996,6 +2129,59 @@ fn advance_step_with_axis_targets_and_loads(
                 }
             }
             load_integrated_velocities[i] = scene.voxels[i].velocity;
+        }
+        normal_impulses_ns.resize(contacts.len(), 0.0);
+        normal_impulses_ns.fill(0.0);
+        if solver_scratch.pair_contacts.iter().any(|pair| pair.active) {
+            let projection = crate::contact_constraint::ContactProjection::build(
+                &solver_scratch.pair_contacts,
+                &solver_scratch.free,
+                &solver_scratch.active_index,
+            );
+            let reactions = projection.reactions(
+                &solver_scratch.pair_contacts,
+                &solver_scratch.contact_reactions,
+            );
+            for (pair, reaction) in solver_scratch.pair_contacts.iter().zip(reactions) {
+                if !pair.active || reaction <= 0.0 {
+                    continue;
+                }
+                if let Some((index, _)) = contacts.iter().enumerate().find(|(_, contact)| {
+                    contact.i == pair.i
+                        && contact.j == pair.j
+                        && contact.normal[pair.axis] * pair.sign as f32 > 0.5
+                }) {
+                    normal_impulses_ns[index] =
+                        normal_impulses_ns[index].max(reaction as f32 * h);
+                }
+            }
+        }
+        let (implicit_contact_heat, restitution_heat) = resolve_coupled_restitution(
+            scene, &solver_scratch, &contacts, &pre_contact_velocities, h,
+            &mut normal_impulses_ns, implicit_contact_heat,
+        );
+        let heat = implicit_contact_heat + restitution_heat;
+        if heat > 0.0 {
+            let mut receivers = Vec::new();
+            for pair in solver_scratch.pair_contacts.iter().filter(|pair| pair.active) {
+                let closing = f64::from(pre_contact_velocities[pair.j][pair.axis]
+                    - pre_contact_velocities[pair.i][pair.axis]) * pair.sign;
+                if closing < -1.0e-10 { receivers.extend([pair.i, pair.j]); }
+            }
+            for contact in contacts.iter().filter(|contact| contact.new_impact) {
+                let closing = (pre_contact_velocities[contact.j]
+                    - pre_contact_velocities[contact.i]).dot(contact.normal);
+                if closing < -1.0e-10 { receivers.extend([contact.i, contact.j]); }
+            }
+            receivers.retain(|&i| !scene.voxels[i].kinematic);
+            receivers.sort_unstable();
+            receivers.dedup();
+            if !receivers.is_empty() {
+                let heat_per_voxel = heat / receivers.len() as f64;
+                for i in receivers { scene.voxels[i].add_internal_energy_j(heat_per_voxel); }
+                scene.energy.implicit_solver_heat += implicit_contact_heat;
+                scene.energy.contact_restitution_heat += restitution_heat;
+            }
         }
         collision::resolve_velocities_with_precontact_into(
             scene,
@@ -3233,9 +3419,10 @@ mod tests {
         assert_eq!(s.cluster_count, 1);
         let residual =
             total_energy(&s) - initial_energy - (s.energy.external_work - initial_external_work);
+        let energy_roundoff = 2.0 * f64::from(f32::EPSILON) * initial_energy;
         assert!(
-            residual.abs() < 1e-7,
-            "automatic fusion energy residual={residual:.12e} J"
+            residual <= 1.0e-12 && residual >= -energy_roundoff,
+            "automatic fusion energy residual={residual:.12e} J exceeds f32 accounting precision {energy_roundoff:.12e} J"
         );
     }
     #[test]
@@ -3967,6 +4154,7 @@ mod residual_audit_tests {
 
 #[derive(Default)]
 pub(crate) struct SolverScratch {
+    pair_contacts: Vec<crate::contact_constraint::PairContact>,
     adaptive_gravity: Option<Vec3>,
     adaptive_energies: Vec<f32>,
     adaptive_loads: Vec<Vec3>,
@@ -5695,6 +5883,266 @@ fn try_banded_solve(
 /// Primal form of the coupled vector XPBD system for a frozen corotational frame.
 /// Eliminates multipliers: (M/h² + Jᵀ K J) dx = -Jᵀ K C.
 /// This is algebraically the same compliant solve, with global coupling retained.
+/// Solve the same inertial/elastic quadratic on the contact nullspace. The
+/// material matrix and its IC(0) factor retain their six-neighbor stencil;
+/// contact projection couples bodies without masquerading as a breakable bond.
+/// Difference form keeps rigid translation in the exact nullspace of K.
+/// Forming diagonal*x + off_diagonal*x in f32 loses the much smaller inertia
+/// term for stiff metal at a coarse step, producing a false net impulse.
+fn apply_contact_operator(
+    scene: &Scene,
+    h: f32,
+    scratch: &SolverScratch,
+    vector: &[Vec3],
+    out: &mut [Vec3],
+    work: &mut [DVec3],
+) {
+    for (slot, &i) in scratch.active.iter().enumerate() {
+        work[slot] = (vector[slot] * scratch.free[i]).as_dvec3()
+            * (f64::from(scene.voxels[i].mass) / f64::from(h).powi(2));
+    }
+    for c in &scratch.constraints {
+        let slot_i = scratch.active_index[c.i];
+        let slot_j = scratch.active_index[c.j];
+        let vi = if slot_i == u32::MAX { DVec3::ZERO }
+            else { (vector[slot_i as usize] * scratch.free[c.i]).as_dvec3() };
+        let vj = if slot_j == u32::MAX { DVec3::ZERO }
+            else { (vector[slot_j as usize] * scratch.free[c.j]).as_dvec3() };
+        let force = c.k.as_dmat3() * (vi - vj);
+        if slot_i != u32::MAX { work[slot_i as usize] += force * scratch.free[c.i].as_dvec3(); }
+        if slot_j != u32::MAX { work[slot_j as usize] -= force * scratch.free[c.j].as_dvec3(); }
+    }
+    for (out, value) in out.iter_mut().zip(work) { *out = value.as_vec3(); }
+}
+
+fn solve_contact_increment(
+    scene: &Scene,
+    h: f32,
+    scratch: &SolverScratch,
+    pairs: &[crate::contact_constraint::PairContact],
+    relative_targets: &[f64],
+    input_rhs: &[Vec3],
+) -> (Vec<Vec3>, usize, f32) {
+    use crate::contact_constraint::ContactProjection;
+    let projection = ContactProjection::build(pairs, &scratch.free, &scratch.active_index);
+    let n = scratch.active.len();
+    let particular = projection.particular(pairs, relative_targets, n);
+    let mut particular_force = vec![Vec3::ZERO; n];
+    let mut operator_work = vec![DVec3::ZERO; n];
+    apply_contact_operator(scene, h, scratch, &particular, &mut particular_force, &mut operator_work);
+    let mut rhs: Vec<_> = input_rhs.iter().zip(&particular_force).map(|(b, a)| *b - *a).collect();
+    projection.project(&mut rhs);
+    let dot = |a: &[Vec3], b: &[Vec3]| a.iter().zip(b)
+        .map(|(a,b)| a.as_dvec3().dot(b.as_dvec3())).sum::<f64>();
+    let mut apply = |v: &[Vec3], out: &mut [Vec3]| {
+        apply_contact_operator(scene, h, scratch, v, out, &mut operator_work);
+        projection.project(out);
+    };
+    let mut dx = vec![Vec3::ZERO; n];
+    let mut r = rhs.clone();
+    let mut z = vec![Vec3::ZERO; n];
+    let mut work = vec![Vec3::ZERO; n];
+    let precondition = |r: &[Vec3], z: &mut [Vec3], work: &mut [Vec3]| {
+        // Projecting an SPD preconditioner on both sides is SPD on ker(C).
+        // IC(0) is reused across the contact-set passes; the contact rows never
+        // alter its material graph or cause independent component solves.
+        if scene.config.cpu_preconditioner == CpuPreconditioner::IncompleteCholesky0 {
+            apply_preconditioner(scene.config.cpu_preconditioner, scratch.cpu_preconditioner_bipartite,
+                &mut None, &scratch.factor_diagonal, &scratch.factor_diagonal_inverse,
+                &scratch.factor_edges, &scratch.active, &scratch.ic0_component_ranges,
+                &scratch.ic0_component_batches, &scratch.ic0_red_slots, &scratch.ic0_lower_links,
+                &scratch.ic0_lower_link_count, &scratch.ic0_upper_links,
+                &scratch.ic0_upper_link_count, r, work, z);
+        } else {
+            for (slot, &i) in scratch.active.iter().enumerate() {
+                let diagonal = scratch.factor_diagonal[i];
+                z[slot] = solve_lower_transpose(diagonal, solve_lower(diagonal, r[slot]));
+            }
+        }
+        projection.project(z);
+    };
+    let rhs_norm = dot(&rhs, &rhs).sqrt();
+    precondition(&r, &mut z, &mut work);
+    let mut p = z.clone();
+    let mut ap = vec![Vec3::ZERO; n];
+    let mut rz = dot(&r, &z);
+    let tolerance = f64::from(scene.config.solver_relative_tolerance);
+    let mut iterations = 0;
+    for _ in 0..scene.config.iterations {
+        if rhs_norm <= 1e-20 || dot(&r, &r).sqrt() <= tolerance * rhs_norm { break; }
+        apply(&p, &mut ap);
+        let denom = dot(&p, &ap);
+        if !denom.is_finite() || denom <= 0.0 { break; }
+        let alpha = (rz / denom) as f32;
+        for i in 0..n { dx[i] += alpha * p[i]; r[i] -= alpha * ap[i]; }
+        iterations += 1;
+        // Validate convergence against the assembled operator, not only the
+        // recursive residual; stiff metal is sensitive to f32 cancellation.
+        if dot(&r, &r).sqrt() <= tolerance * rhs_norm || iterations % 32 == 0 {
+            projection.project(&mut dx);
+            apply(&dx, &mut ap);
+            for i in 0..n { r[i] = rhs[i] - ap[i]; }
+            if dot(&r, &r).sqrt() <= tolerance * rhs_norm { break; }
+            precondition(&r, &mut z, &mut work);
+            p.clone_from(&z); rz = dot(&r, &z);
+            continue;
+        }
+        precondition(&r, &mut z, &mut work);
+        let next = dot(&r, &z);
+        if !next.is_finite() || rz <= 0.0 { break; }
+        let beta = (next / rz) as f32;
+        for i in 0..n { p[i] = z[i] + beta * p[i]; }
+        rz = next;
+    }
+    projection.project(&mut dx);
+    apply(&dx, &mut ap);
+    for i in 0..n { r[i] = rhs[i] - ap[i]; }
+    let residual = if rhs_norm > 1e-20 { (dot(&r,&r).sqrt()/rhs_norm) as f32 } else { 0.0 };
+    for (value, offset) in dx.iter_mut().zip(particular) { *value += offset; }
+    if input_rhs.iter().all(|value| *value == Vec3::ZERO) {
+        // Solve the rigid translation modes analytically. A relative residual
+        // scaled by metal stiffness does not bound the much smaller inertial
+        // residual; contact impulses on a closed free system sum to zero.
+        deflate_contact_translation(scene, scratch, pairs, &mut dx);
+    }
+    (dx, iterations, residual)
+}
+
+fn deflate_contact_translation(
+    scene: &Scene,
+    scratch: &SolverScratch,
+    pairs: &[crate::contact_constraint::PairContact],
+    delta: &mut [Vec3],
+) {
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i { parent[i] = parent[parent[i]]; i = parent[i]; }
+        i
+    }
+    let mut parent: Vec<_> = (0..scene.voxels.len()).collect();
+    for (i, j) in scratch.constraints.iter().map(|c| (c.i, c.j))
+        .chain(pairs.iter().filter(|p| p.active).map(|p| (p.i, p.j))) {
+        let a = root(&mut parent, i);
+        let b = root(&mut parent, j);
+        parent[b] = a;
+    }
+    let mut mass = vec![0.0; parent.len()];
+    let mut momentum = vec![DVec3::ZERO; parent.len()];
+    let mut fixed = vec![Vec3::ZERO; parent.len()];
+    for (i, voxel) in scene.voxels.iter().enumerate() {
+        let group = root(&mut parent, i);
+        fixed[group] = fixed[group].max(Vec3::ONE - scratch.free[i]);
+        let slot = scratch.active_index[i];
+        if slot != u32::MAX {
+            mass[group] += f64::from(voxel.mass);
+            momentum[group] += delta[slot as usize].as_dvec3() * f64::from(voxel.mass);
+        }
+    }
+    for (slot, &i) in scratch.active.iter().enumerate() {
+        let group = root(&mut parent, i);
+        if mass[group] > 0.0 {
+            delta[slot] -= (momentum[group] / mass[group]).as_vec3()
+                * (Vec3::ONE - fixed[group]);
+        }
+    }
+}
+
+/// Resolve an impact manifold with the same dynamic compliance as the bond
+/// solve. A local REV-only impulse would stop just the surface layer and then
+/// let backward Euler dissipate the bulk motion before it could rebound.
+fn resolve_coupled_restitution(
+    scene: &mut Scene,
+    scratch: &SolverScratch,
+    contacts: &[collision::Contact],
+    incoming: &[Vec3],
+    h: f32,
+    normal_impulses: &mut [f32],
+    implicit_heat: f64,
+) -> (f64, f64) {
+    use crate::contact_constraint::{ContactProjection, PairContact};
+    let mut pairs = Vec::new();
+    let mut indices = Vec::new();
+    let mut incoming_normal = Vec::new();
+    let mut current_normal = Vec::new();
+    for (index, contact) in contacts.iter().enumerate() {
+        if !contact.new_impact { continue; }
+        let axis = if contact.normal.x.abs() > 0.5 { 0 }
+            else if contact.normal.y.abs() > 0.5 { 1 } else { 2 };
+        if scratch.free[contact.i][axis] == 0.0 || scratch.free[contact.j][axis] == 0.0 {
+            continue;
+        }
+        let before = f64::from((incoming[contact.j] - incoming[contact.i]).dot(contact.normal));
+        if before >= -1.0e-6 { continue; }
+        pairs.push(PairContact { i: contact.i, j: contact.j, axis,
+            sign: f64::from(contact.normal[axis]), active: true });
+        indices.push(index);
+        incoming_normal.push(before);
+        current_normal.push(f64::from((scene.voxels[contact.j].velocity
+            - scene.voxels[contact.i].velocity).dot(contact.normal)));
+    }
+    if pairs.is_empty() { return (implicit_heat, 0.0); }
+    let zero_rhs = vec![Vec3::ZERO; scratch.active.len()];
+    let targets = |restitution: f64| incoming_normal.iter().zip(&current_normal)
+        .map(|(before, current)| -restitution * before - current).collect::<Vec<_>>();
+    let (mut delta, _, _) = solve_contact_increment(scene, h, scratch, &pairs,
+        &targets(f64::from(scene.config.fracture.restitution)), &zero_rhs);
+    let kinetic = |increment: &[Vec3]| scratch.active.iter().enumerate().map(|(slot, &i)| {
+        let v = scene.voxels[i].velocity.as_dvec3() + increment[slot].as_dvec3();
+        0.5 * f64::from(scene.voxels[i].mass) * v.length_squared()
+    }).sum::<f64>();
+    let before = kinetic(&zero_rhs);
+    let budget = before + implicit_heat;
+    if kinetic(&delta) > budget {
+        // Reserve rebound before depositing dissipation as heat. If a contact
+        // target is incompatible with the available mechanical energy, reduce
+        // only its restitution; no ambient thermal energy funds the rebound.
+        let (base, _, _) = solve_contact_increment(scene, h, scratch, &pairs, &targets(0.0), &zero_rhs);
+        if kinetic(&base) > budget {
+            // The exact local mass projection in the ordinary impulse pass is
+            // the passive fallback for an unresolved compliance solve.
+            return (implicit_heat, 0.0);
+        }
+        let mut low = 0.0_f64;
+        let mut high = 1.0_f64;
+        let candidate = delta.clone();
+        for _ in 0..40 {
+            let fraction = (low + high) * 0.5;
+            for i in 0..delta.len() {
+                delta[i] = base[i] + (candidate[i] - base[i]) * fraction as f32;
+            }
+            if kinetic(&delta) <= budget { low = fraction; } else { high = fraction; }
+        }
+        for i in 0..delta.len() { delta[i] = base[i] + (candidate[i] - base[i]) * low as f32; }
+    }
+    let after = kinetic(&delta);
+    let mut gradient = vec![Vec3::ZERO; scratch.active.len()];
+    let mut operator_work = vec![DVec3::ZERO; scratch.active.len()];
+    apply_contact_operator(scene, h, scratch, &delta, &mut gradient, &mut operator_work);
+    let mut full_gradient = vec![DVec3::ZERO; scene.voxels.len()];
+    for (slot, &i) in scratch.active.iter().enumerate() { full_gradient[i] = gradient[slot].as_dvec3(); }
+    let projection = ContactProjection::build(&pairs, &scratch.free, &scratch.active_index);
+    for (&index, reaction) in indices.iter().zip(projection.reactions(&pairs, &full_gradient)) {
+        normal_impulses[index] += (reaction.max(0.0) * f64::from(h).powi(2)) as f32;
+    }
+    for (slot, &i) in scratch.active.iter().enumerate() { scene.voxels[i].velocity += delta[slot]; }
+    let loss = before - after;
+    if loss >= 0.0 { (implicit_heat, loss) }
+    else { ((implicit_heat + loss).max(0.0), 0.0) }
+}
+
+fn solve_projected_contact(scene: &mut Scene, h: f32, scratch: &mut SolverScratch) -> usize {
+    let rhs: Vec<_> = scratch.active.iter().map(|&i| scratch.rhs[i]).collect();
+    let (dx, iterations, residual) = solve_contact_increment(
+        scene, h, scratch, &scratch.pair_contacts, &vec![0.0; scratch.pair_contacts.len()], &rhs);
+    scene.solver_residual = residual;
+    for (slot, &i) in scratch.active.iter().enumerate() { scene.positions[i] += dx[slot].as_dvec3(); }
+    scratch.dx = dx;
+    for c in &scratch.constraints {
+        let force = c.k * (scene.positions[c.j] - scene.positions[c.i] - c.rest).as_vec3();
+        scene.workspace[c.axis][c.i].lambda = -c.frame.transpose() * force * (h*h);
+    }
+    iterations
+}
+
 fn solve_coupled(
     scene: &mut Scene,
     h: f32,
@@ -5781,7 +6229,8 @@ fn solve_coupled(
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
         .unwrap_or(scene.config.cuda_iterations);
-    let try_cuda = *cuda_enabled_for_step
+    let coupled_contact = scratch.pair_contacts.iter().any(|p| p.active);
+    let try_cuda = !coupled_contact && *cuda_enabled_for_step
         && match backend.as_str() {
             "cpu" => false,
             "cuda" => true,
@@ -6056,7 +6505,7 @@ fn solve_coupled(
             projection * scratch.diagonal[i] * projection + Mat3::IDENTITY - projection;
     }
     let assembly_time = assembly_start.elapsed();
-    if !try_cuda && scene.config.cpu_preconditioner == CpuPreconditioner::IncompleteCholesky0 {
+    if !coupled_contact && !try_cuda && scene.config.cpu_preconditioner == CpuPreconditioner::IncompleteCholesky0 {
         if let Some((factor_time, solve_time)) = try_banded_solve(scene, h, scratch) {
             return (0, [assembly_time, factor_time, solve_time]);
         }
@@ -6272,6 +6721,11 @@ fn solve_coupled(
             }
         }
         factor_time += start.elapsed();
+    }
+    if coupled_contact {
+        let start = Instant::now();
+        let iterations = solve_projected_contact(scene, h, scratch);
+        return (iterations, [assembly_time, factor_time, start.elapsed()]);
     }
     let apply_one = |v: &[Vec3], slot: usize| {
         let i = active[slot];

@@ -2,6 +2,7 @@ pub mod aggregation;
 mod banded;
 pub mod bond;
 pub mod collision;
+mod contact_constraint;
 pub mod coordinates;
 mod cuda_solver;
 pub mod electrical;
@@ -14,6 +15,7 @@ pub mod material_asset;
 mod multigrid;
 pub mod scene;
 pub mod scene_presets;
+pub mod scene_welding;
 pub mod solver;
 pub mod tool;
 #[cfg(feature = "desktop")]

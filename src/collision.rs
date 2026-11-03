@@ -65,6 +65,16 @@ pub(crate) fn project_into(
     targets: &[[Option<f64>; 3]],
     contacts: &mut Vec<Contact>,
 ) {
+    contacts_into(scene, targets, contacts, true);
+}
+
+/// Discover the manifold without adding a second, unaccounted displacement
+/// after the implicit mechanical solve.
+pub(crate) fn detect_into(scene: &mut Scene, targets: &[[Option<f64>; 3]], contacts: &mut Vec<Contact>) {
+    contacts_into(scene, targets, contacts, false);
+}
+
+fn contacts_into(scene: &mut Scene, targets: &[[Option<f64>; 3]], contacts: &mut Vec<Contact>, project: bool) {
     let profiling = std::env::var_os("VOXEL_PROFILE_COLLISION").is_some();
     let mut phase_start = Instant::now();
     let mut scratch = std::mem::take(&mut scene.collision_scratch);
@@ -110,7 +120,7 @@ pub(crate) fn project_into(
                     continue;
                 }
                 let separation = (scene.positions[j] - scene.positions[i]).dot(normal.as_dvec3());
-                if separation < DCELL {
+                if project && separation < DCELL {
                     // Do not add a visible separation gap to bonded material.
                     // A 1 um offset on a 1 cm stiff REV becomes real bond strain
                     // at fracture evaluation and creates repeated support work.
@@ -141,7 +151,7 @@ pub(crate) fn project_into(
                 ) {
                     continue;
                 }
-                changed |= separate(scene, i, j, normal, penetration, targets);
+                if project { changed |= separate(scene, i, j, normal, penetration, targets); }
                 contacts.push(Contact {
                     i,
                     j,
@@ -560,7 +570,6 @@ pub(crate) fn resolve_velocities_with_precontact_into(
     physical_velocities: &mut Vec<Vec3>,
 ) {
     normal_impulses.resize(contacts.len(), 0.0);
-    normal_impulses.fill(0.0);
     physical_velocities.resize(pre_contact_velocities.len(), Vec3::ZERO);
     physical_velocities.copy_from_slice(pre_contact_velocities);
     for iteration in 0..4 {
@@ -573,8 +582,13 @@ pub(crate) fn resolve_velocities_with_precontact_into(
             let closing = (scene.voxels[c.j].velocity - scene.voxels[c.i].velocity).dot(c.normal);
             let physical_closing =
                 (physical_velocities[c.j] - physical_velocities[c.i]).dot(c.normal);
-            let mut normal_impulse = 0.0;
-            if denom > 0.0 && closing < -1e-6 {
+            // A positive impulse supplied by the coupled position/elastic
+            // contact solve already handled this normal degree of freedom.
+            // Keep it for friction and thermal welding, but do not apply a
+            // second velocity impulse or count the same impact heat twice.
+            let constrained_normal_impulse = normal_impulses[contact_index].max(0.0);
+            let mut normal_impulse = constrained_normal_impulse;
+            if constrained_normal_impulse <= 0.0 && denom > 0.0 && closing < -1e-6 {
                 // A resting manifold must not bounce on each new gravity step.
                 // Restitution applies only if this pair started with a gap.
                 let restitution = if c.new_impact && iteration == 0 {
@@ -583,7 +597,7 @@ pub(crate) fn resolve_velocities_with_precontact_into(
                     0.0
                 };
                 normal_impulse = -(1.0 + restitution) * closing / denom;
-                normal_impulses[contact_index] += normal_impulse;
+                normal_impulses[contact_index] = normal_impulse;
                 let physical_impulse = if c.new_impact {
                     normal_impulse
                 } else if physical_closing < -1e-6 {

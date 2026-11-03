@@ -19,6 +19,9 @@ fn scene(dimensions: [usize; 3], ground: [usize; 3], gravity: Vec3) -> Scene {
     config.branch_dimensions = [0; 3];
     config.ground_dimensions = ground;
     config.gravity = gravity.to_array();
+    // These analytic references contain gravity/applied force only. Ambient
+    // air drag is a separate engine force, so compare the integrator in vacuum.
+    config.atmosphere.pressure_pa = 0.0;
     config.fixed_dt = 0.001;
     config.substeps = 1;
     config.iterations = 24;
@@ -200,7 +203,8 @@ mod tests {
 
     #[test]
     fn ballistic_motion_matches_integrator() {
-        assert!(free_fall().passed);
+        let result = free_fall();
+        assert!(result.passed, "{}", result.detail);
     }
 
     #[test]
@@ -210,7 +214,8 @@ mod tests {
 
     #[test]
     fn constant_force_has_the_expected_mass_response() {
-        assert!(constant_force().passed);
+        let result = constant_force();
+        assert!(result.passed, "{}", result.detail);
     }
 
     #[test]

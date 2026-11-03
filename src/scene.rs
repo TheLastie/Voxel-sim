@@ -1605,12 +1605,22 @@ impl Scene {
 
     /// Current recoverable elastic strain energy stored in intact bonds (joules).
     pub fn elastic_bond_energy_j(&self) -> f64 {
+        self.elastic_bond_energy_at_positions_j(&self.positions)
+    }
+
+    /// Elastic strain energy evaluated against an earlier positional snapshot.
+    /// Used only when a previously unconstrained solve discovers a new contact.
+    pub(crate) fn elastic_bond_energy_at_positions_j(&self, positions: &[DVec3]) -> f64 {
+        if positions.len() != self.voxels.len() {
+            return 0.0;
+        }
         let mut energy_j = 0.0;
         for axis in 0..3 {
             for (i, bond) in self.bonds[axis].iter().enumerate() {
                 if bond.neighbor != EMPTY {
-                    energy_j += crate::solver::bond_stored_elastic_energy_j(
+                    energy_j += crate::solver::bond_stored_elastic_energy_at_positions_j(
                         self,
+                        positions,
                         i,
                         bond.neighbor as usize,
                         axis,
