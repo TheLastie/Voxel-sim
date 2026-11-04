@@ -106,6 +106,8 @@ pub struct Ui {
     pub status_message: Option<String>,
     /// Simulation seconds per wall-clock second. 1.0 is real time.
     pub simulation_time_scale: f32,
+    /// Latest completed worker cost for 10 ms of simulated physical time.
+    pub physics_cost_ms_per_10ms: Option<f64>,
     pub walk_speed_mps: f32,
     pub look_sensitivity: f32,
     paused_before_menu: bool,
@@ -437,6 +439,10 @@ pub enum ReticleState {
 }
 
 impl Ui {
+    pub fn set_physics_cost_ms_per_10ms(&mut self, cost: Option<f64>) {
+        self.physics_cost_ms_per_10ms = cost.filter(|value| value.is_finite() && *value >= 0.0);
+    }
+
     pub fn new(speed: f32, start: Vec3, direction: Vec3) -> Self {
         Self {
             standalone_editor_app: false,
@@ -520,6 +526,7 @@ impl Ui {
             brush_size_cells: 3,
             status_message: None,
             simulation_time_scale: 1.0,
+            physics_cost_ms_per_10ms: None,
             walk_speed_mps: 4.5,
             look_sensitivity: 0.005,
             paused_before_menu: false,
@@ -2708,8 +2715,12 @@ fn draw_editor(
             out,
             770.0,
             40.0,
-            &format!("Simulation {:.2}×", ui.simulation_time_scale),
-            0.8,
+            &format!(
+                "{} · {:.2}×",
+                physics_cost_label(ui.physics_cost_ms_per_10ms),
+                ui.simulation_time_scale
+            ),
+            0.68,
         );
     }
 
@@ -3357,6 +3368,15 @@ fn draw_editor(
     draw_animation_timeline(out, ui, inspector_left, canvas_height);
     clip_and_scroll_scene_inspector(out, ui);
     draw_scene_inspector_scrollbar(out, ui);
+}
+
+fn physics_cost_label(cost_ms_per_10ms: Option<f64>) -> String {
+    match cost_ms_per_10ms {
+        Some(cost) if cost.is_finite() && cost >= 0.0 => {
+            format!("10 ms physics: {cost:.2} ms / 5 ms")
+        }
+        _ => "10 ms physics: — / 5 ms".to_owned(),
+    }
 }
 
 fn coordinate_grid_bounds(ui: &Ui) -> [f32; 4] {
@@ -4698,6 +4718,14 @@ fn text(out: &mut Vec<Rect>, x: f32, y: f32, s: &str, scale: f32) {
 #[cfg(test)]
 mod scene_inspector_tests {
     use super::*;
+
+    #[test]
+    fn physics_cost_label_distinguishes_unmeasured_from_zero_and_shows_budget() {
+        assert_eq!(physics_cost_label(None), "10 ms physics: — / 5 ms");
+        assert_eq!(physics_cost_label(Some(0.0)), "10 ms physics: 0.00 ms / 5 ms");
+        assert_eq!(physics_cost_label(Some(2.5)), "10 ms physics: 2.50 ms / 5 ms");
+        assert_eq!(physics_cost_label(Some(f64::NAN)), "10 ms physics: — / 5 ms");
+    }
 
     fn scene_ui(width: f32, height: f32) -> Ui {
         let mut ui = Ui::new(1.0, Vec3::ZERO, Vec3::Z);

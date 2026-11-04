@@ -260,8 +260,9 @@ fn initialize(params: &Value) -> Result<Value, (i64, String)> {
 fn tool_definitions() -> Vec<Value> {
     vec![
         tool_definition("list_documents", "List saved .vxm and .vxscene assets beneath the project root.", json!({"type":"object","properties":{},"additionalProperties":false}), true),
+        tool_definition("batch_actions", "Run up to 64 validated MCP tool calls sequentially. All tool names, arguments, and IDs are validated before the first action runs. Earlier successful file writes remain if a later action fails; this is not a transaction. Telemetry waits share a 10-second total budget.", json!({"type":"object","properties":{"actions":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64},"name":{"type":"string","minLength":1},"arguments":{"type":"object"}},"required":["name","arguments"],"additionalProperties":false}},"stop_on_error":{"type":"boolean","default":true}},"required":["actions"],"additionalProperties":false}), false),
         tool_definition("get_runtime_status", "Read the running native engine's status, session identity, and telemetry freshness. Read-only; errors clearly when the runtime is absent or stale.", json!({"type":"object","properties":{},"additionalProperties":false}), true),
-        tool_definition("read_runtime_metrics", "Read a bounded batch of live engine telemetry after a sequence cursor. Returns explicit freshness, session identity, and sequence-gap markers. Read-only.", json!({"type":"object","properties":{"after_sequence":{"type":"integer","minimum":0,"default":0},"max_samples":{"type":"integer","minimum":1,"maximum":64,"default":16},"wait_ms":{"type":"integer","minimum":0,"maximum":10000,"default":0},"topic":{"type":"string","enum":["app","physics"]}},"additionalProperties":false}), true),
+        tool_definition("read_runtime_metrics", "Read a bounded batch of live engine telemetry after a sequence cursor. Returns explicit freshness, session identity, and sequence-gap markers. Read-only.", json!({"type":"object","properties":{"after_sequence":{"type":"integer","minimum":0,"default":0},"max_samples":{"type":"integer","minimum":1,"maximum":64,"default":16},"wait_ms":{"type":"integer","minimum":0,"maximum":10000,"default":0},"topic":{"type":"string","enum":["app","physics","event","objects"]}},"additionalProperties":false}), true),
         tool_definition("get_runtime_objects", "Read a snapshot of objects currently known to the native runtime. Read-only.", json!({"type":"object","properties":{},"additionalProperties":false}), true),
         tool_definition("inspect_document", "Validate and summarize a .vxm or .vxscene, including its materials, groups, constraints, skeleton, keyframes, and referenced assets.", json!({"type":"object","properties":{"path":{"type":"string","description":"Project-relative document path"}},"required":["path"],"additionalProperties":false}), true),
         tool_definition("voxelize_mesh", "Convert an OBJ or GLB mesh inside the project root into a native .vxm shell or filled voxel model.", json!({"type":"object","properties":{"source_path":{"type":"string"},"output_path":{"type":"string"},"model_name":{"type":"string"},"scale":{"type":"number","minimum":0.01,"maximum":100},"mode":{"type":"string","enum":["shell","filled"]}},"required":["source_path","output_path"],"additionalProperties":false}), false),
@@ -317,6 +318,55 @@ fn call_tool(app: &App, params: &Value) -> Result<Value, (i64, String)> {
     if let Err(error) = validate_tool_arguments(name, &args) {
         return Ok(tool_error(&error));
     }
+    if name == "batch_actions" {
+        if let Err(error) = validate_batch_actions(&args) {
+            return Ok(tool_error(&error));
+        }
+        return Ok(batch_actions(app, &args));
+    }
+    Ok(call_tool_validated(app, name, &args))
+}
+
+fn validate_batch_actions(args: &Value) -> Result<(), String> {
+    let actions = args["actions"]
+        .as_array()
+        .ok_or("actions must be an array")?;
+    if actions.is_empty() || actions.len() > 64 {
+        return Err("actions must contain between 1 and 64 items".into());
+    }
+    let mut ids = HashSet::new();
+    let mut total_wait_ms = 0_u64;
+    for (index, action) in actions.iter().enumerate() {
+        let object = action.as_object().ok_or_else(|| format!("actions[{index}] must be an object"))?;
+        if let Some(extra) = object.keys().find(|key| !["id", "name", "arguments"].contains(&key.as_str())) {
+            return Err(format!("actions[{index}] has unknown field {extra:?}"));
+        }
+        if let Some(id) = object.get("id") {
+            let id = id.as_str().filter(|id| !id.trim().is_empty() && id.len() <= 64)
+                .ok_or_else(|| format!("actions[{index}].id must be a non-empty string of at most 64 bytes"))?;
+            if !ids.insert(id) {
+                return Err(format!("duplicate action id {id:?}"));
+            }
+        }
+        let name = object.get("name").and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| format!("actions[{index}].name must be a non-empty string"))?;
+        if name == "batch_actions" {
+            return Err("nested batch_actions are not supported".into());
+        }
+        let arguments = object.get("arguments").ok_or_else(|| format!("actions[{index}].arguments is required"))?;
+        validate_tool_arguments(name, arguments).map_err(|error| format!("actions[{index}] ({name}): {error}"))?;
+        if name == "read_runtime_metrics" {
+            total_wait_ms += arguments.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
+            if total_wait_ms > 10_000 {
+                return Err("combined read_runtime_metrics wait_ms exceeds the 10,000 ms batch limit".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn call_tool_validated(app: &App, name: &str, args: &Value) -> Value {
     let result = match name {
         "list_documents" => list_documents(app),
         "get_runtime_status" => runtime_query(app, "status", json!({})),
@@ -333,12 +383,61 @@ fn call_tool(app: &App, params: &Value) -> Result<Value, (i64, String)> {
         "sample_animation" => sample_animation(app, &args),
         "edit_voxel_model" => edit_voxel_model(app, &args),
         "edit_scene" => edit_scene(app, &args),
-        _ => return Err((-32602, format!("unknown tool: {name}"))),
+        _ => return tool_error(&format!("unknown tool: {name}")),
     };
-    Ok(match result {
+    match result {
         Ok(value) => tool_result(value),
         Err(error) => tool_error(&error),
-    })
+    }
+}
+
+fn batch_actions(app: &App, args: &Value) -> Value {
+    let actions = args["actions"].as_array().expect("batch schema validated");
+    let stop_on_error = args["stop_on_error"].as_bool().unwrap_or(true);
+    let mut results = Vec::with_capacity(actions.len());
+    let mut failed = false;
+    for (index, action) in actions.iter().enumerate() {
+        let id = action.get("id").cloned().unwrap_or(Value::Null);
+        let name = action["name"].as_str().expect("batch prevalidated");
+        let result = call_tool_validated(app, name, &action["arguments"]);
+        if result["isError"] == true {
+            failed = true;
+            results.push(json!({"index":index,"id":id,"name":name,"status":"error","error":result["content"][0]["text"]}));
+            if stop_on_error {
+                for (skipped_index, skipped) in actions.iter().enumerate().skip(index + 1) {
+                    results.push(json!({"index":skipped_index,"id":skipped.get("id").cloned().unwrap_or(Value::Null),"name":skipped["name"],"status":"skipped","reason":"stop_on_error"}));
+                }
+                break;
+            }
+        } else {
+            results.push(json!({"index":index,"id":id,"name":name,"status":"success","result":result["structuredContent"]}));
+        }
+    }
+    compact_batch_results(&mut results);
+    let response = json!({"action_count":actions.len(),"executed_count":results.iter().filter(|r| r["status"] != "skipped").count(),"success_count":results.iter().filter(|r| r["status"] == "success").count(),"error_count":results.iter().filter(|r| r["status"] == "error").count(),"skipped_count":results.iter().filter(|r| r["status"] == "skipped").count(),"results":results});
+    let mut output = tool_result(response);
+    output["isError"] = json!(failed);
+    output
+}
+
+fn compact_batch_results(results: &mut [Value]) {
+    const MAX_RESPONSE_BYTES: usize = 1_000_000;
+    loop {
+        let mut output = tool_result(json!({"results":results}));
+        if output.to_string().len() <= MAX_RESPONSE_BYTES {
+            break;
+        }
+        let Some(result) = results.iter_mut().rev().find(|result| {
+            result["status"] == "success" && result["result_omitted"] != true
+        }) else {
+            break;
+        };
+        let original = std::mem::replace(&mut result["result"], Value::Null);
+        let original_bytes = original.to_string().len();
+        let path = original.get("path").cloned();
+        result["result"] = json!({"result_omitted":true,"original_bytes":original_bytes,"path":path,"reason":"batch response size limit"});
+        result["result_omitted"] = json!(true);
+    }
 }
 
 fn runtime_query(app: &App, command: &str, mut request: Value) -> Result<Value, String> {
@@ -354,81 +453,77 @@ fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
         .into_iter()
         .find(|definition| definition["name"].as_str() == Some(name))
     else {
-        return Ok(());
+        return Err(format!("unknown tool: {name}"));
     };
-    let schema = &definition["inputSchema"];
-    let object = args
-        .as_object()
-        .ok_or_else(|| "tool arguments must be a JSON object".to_owned())?;
-    if let Some(required) = schema["required"].as_array() {
-        for field in required.iter().filter_map(Value::as_str) {
-            if !object.contains_key(field) {
-                return Err(format!("missing required argument {field:?}"));
+    validate_schema_value(&definition["inputSchema"], args, "arguments")
+}
+
+fn validate_schema_value(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
+    let kind = schema["type"].as_str().unwrap_or_default();
+    let valid_type = match kind {
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some(),
+        "number" => value.as_f64().is_some_and(f64::is_finite),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        _ => true,
+    };
+    if !valid_type {
+        return Err(format!("{path} must be a {kind}"));
+    }
+    if let Some(choices) = schema["enum"].as_array() {
+        if !choices.contains(value) {
+            return Err(format!("{path} must be one of {choices:?}"));
+        }
+    }
+    if let Some(text) = value.as_str() {
+        if schema["minLength"].as_u64().is_some_and(|min| text.len() < min as usize)
+            || schema["maxLength"].as_u64().is_some_and(|max| text.len() > max as usize)
+        {
+            return Err(format!("{path} has an invalid string length"));
+        }
+    }
+    if let Some(number) = value.as_f64() {
+        if schema["minimum"].as_f64().is_some_and(|min| number < min) {
+            return Err(format!("{path} is below its minimum"));
+        }
+        if schema["maximum"].as_f64().is_some_and(|max| number > max) {
+            return Err(format!("{path} is above its maximum"));
+        }
+        if schema["exclusiveMinimum"].as_f64().is_some_and(|min| number <= min) {
+            return Err(format!("{path} must be greater than its minimum"));
+        }
+    }
+    if let Some(values) = value.as_array() {
+        if schema["minItems"].as_u64().is_some_and(|min| values.len() < min as usize)
+            || schema["maxItems"].as_u64().is_some_and(|max| values.len() > max as usize)
+        {
+            return Err(format!("{path} has an invalid array length"));
+        }
+        if schema.get("items").is_some() {
+            for (index, item) in values.iter().enumerate() {
+                validate_schema_value(&schema["items"], item, &format!("{path}[{index}]"))?;
             }
         }
     }
-    let properties = schema["properties"]
-        .as_object()
-        .ok_or("tool input schema has no properties object")?;
-    if schema["additionalProperties"] == false {
-        if let Some(unknown) = object.keys().find(|key| !properties.contains_key(*key)) {
-            return Err(format!("unknown argument {unknown:?}"));
-        }
-    }
-    for (key, value) in object {
-        let Some(property) = properties.get(key) else {
-            continue;
-        };
-        let kind = property["type"].as_str().unwrap_or_default();
-        let valid_type = match kind {
-            "string" => value.is_string(),
-            "integer" => value.as_i64().is_some(),
-            "number" => value.as_f64().is_some_and(f64::is_finite),
-            "array" => value.is_array(),
-            "object" => value.is_object(),
-            _ => true,
-        };
-        if !valid_type {
-            return Err(format!("argument {key:?} must be a {kind}"));
-        }
-        if let Some(choices) = property["enum"].as_array() {
-            if !choices.contains(value) {
-                return Err(format!("argument {key:?} must be one of {choices:?}"));
+    if let Some(object) = value.as_object() {
+        let properties = schema["properties"].as_object();
+        if let Some(required) = schema["required"].as_array() {
+            for field in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(field) {
+                    return Err(format!("{path} is missing required argument {field:?}"));
+                }
             }
         }
-        if let Some(number) = value.as_f64() {
-            if property["minimum"].as_f64().is_some_and(|min| number < min) {
-                return Err(format!("argument {key:?} is below its minimum"));
-            }
-            if property["maximum"].as_f64().is_some_and(|max| number > max) {
-                return Err(format!("argument {key:?} is above its maximum"));
-            }
-            if property["exclusiveMinimum"]
-                .as_f64()
-                .is_some_and(|min| number <= min)
-            {
-                return Err(format!("argument {key:?} must be greater than its minimum"));
+        if schema["additionalProperties"] == false {
+            if let Some(unknown) = object.keys().find(|key| !properties.is_some_and(|props| props.contains_key(*key))) {
+                return Err(format!("{path} has unknown argument {unknown:?}"));
             }
         }
-        if let Some(values) = value.as_array() {
-            if property["minItems"]
-                .as_u64()
-                .is_some_and(|min| values.len() < min as usize)
-                || property["maxItems"]
-                    .as_u64()
-                    .is_some_and(|max| values.len() > max as usize)
-            {
-                return Err(format!("argument {key:?} has an invalid array length"));
-            }
-            let item_type = property["items"]["type"].as_str().unwrap_or_default();
-            let valid_items = values.iter().all(|item| match item_type {
-                "integer" => item.as_i64().is_some(),
-                "number" => item.as_f64().is_some_and(f64::is_finite),
-                "string" => item.is_string(),
-                _ => true,
-            });
-            if !valid_items {
-                return Err(format!("argument {key:?} contains an invalid array item"));
+        for (key, member) in object {
+            if let Some(property_schema) = properties.and_then(|props| props.get(key)) {
+                validate_schema_value(property_schema, member, &format!("{path}.{key}"))?;
             }
         }
     }
@@ -1601,6 +1696,7 @@ mod runtime_mcp_tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
         fs::write(
             root.join(SETTINGS_FILE),
             json!({"version":1,"mcp_enabled":enabled}).to_string(),
@@ -1640,6 +1736,90 @@ mod runtime_mcp_tests {
         )
         .unwrap_err()
         .contains("unknown argument"));
+        assert!(validate_tool_arguments(
+            "read_runtime_metrics",
+            &json!({"topic":"event"})
+        ).is_ok());
+    }
+
+    #[test]
+    fn batch_actions_chain_create_and_inspect() {
+        let app = app(true);
+        let response = call_tool(&app, &json!({"name":"batch_actions","arguments":{"actions":[
+            {"id":"create","name":"create_model","arguments":{"output_path":"batch.vxm"}},
+            {"id":"inspect","name":"inspect_document","arguments":{"path":"batch.vxm"}}
+        ]}})).unwrap();
+        assert_eq!(response["isError"], false, "batch response: {response}");
+        let content = &response["structuredContent"];
+        assert_eq!(content["action_count"], 2);
+        assert_eq!(content["success_count"], 2, "batch response: {response}");
+        assert_eq!(content["results"][1]["result"]["valid"], true, "batch response: {response}");
+        let _ = fs::remove_dir_all(app.root);
+    }
+
+    #[test]
+    fn batch_prevalidates_every_action_before_writing() {
+        let app = app(true);
+        let response = call_tool(&app, &json!({"name":"batch_actions","arguments":{"actions":[
+            {"name":"create_model","arguments":{"output_path":"must-not-exist.vxm"}},
+            {"name":"create_scene","arguments":{}}
+        ]}})).unwrap();
+        assert_eq!(response["isError"], true);
+        assert!(!app.root.join("must-not-exist.vxm").exists());
+        let _ = fs::remove_dir_all(app.root);
+    }
+
+    #[test]
+    fn batch_stops_or_continues_after_runtime_action_errors() {
+        let app = app(true);
+        let actions = json!([
+            {"name":"inspect_document","arguments":{"path":"missing.vxm"}},
+            {"name":"create_model","arguments":{"output_path":"after-error.vxm"}}
+        ]);
+        let stopped = call_tool(&app, &json!({"name":"batch_actions","arguments":{"actions":actions.clone()}})).unwrap();
+        assert_eq!(stopped["structuredContent"]["results"][1]["status"], "skipped", "batch response: {stopped}");
+        assert!(!app.root.join("after-error.vxm").exists());
+
+        let continued = call_tool(&app, &json!({"name":"batch_actions","arguments":{"stop_on_error":false,"actions":actions}})).unwrap();
+        assert_eq!(continued["structuredContent"]["error_count"], 1, "batch response: {continued}");
+        assert_eq!(continued["structuredContent"]["success_count"], 1, "batch response: {continued}");
+        assert!(app.root.join("after-error.vxm").is_file());
+        let _ = fs::remove_dir_all(app.root);
+    }
+
+    #[test]
+    fn batch_response_budget_marks_omitted_results_without_losing_receipts() {
+        let mut results = vec![json!({"index":0,"id":"large","name":"list_documents","status":"success","result":{"documents":"x".repeat(1_100_000),"path":"project"}})];
+        compact_batch_results(&mut results);
+        assert_eq!(results[0]["status"], "success");
+        assert_eq!(results[0]["result_omitted"], true);
+        assert_eq!(results[0]["result"]["path"], "project");
+        assert!(tool_result(json!({"results":results})).to_string().len() <= 1_000_000);
+    }
+
+    #[test]
+    fn batch_rejects_nested_unknown_disabled_and_excess_wait_before_execution() {
+        let app = app(true);
+        for (actions, message) in [
+            (json!([{"name":"batch_actions","arguments":{"actions":[]}}]), "nested"),
+            (json!([{"name":"no_such_tool","arguments":{}}]), "unknown tool"),
+            (json!([{"name":"read_runtime_metrics","arguments":{"wait_ms":10000}},{"name":"read_runtime_metrics","arguments":{"wait_ms":1}}]), "combined"),
+        ] {
+            let mut with_write = vec![json!({"name":"create_model","arguments":{"output_path":"must-not-exist.vxm"}})];
+            with_write.extend(actions.as_array().unwrap().iter().cloned());
+            let response = call_tool(&app, &json!({"name":"batch_actions","arguments":{"actions":with_write}})).unwrap();
+            assert_eq!(response["isError"], true);
+            assert!(response["content"][0]["text"].as_str().unwrap().contains(message));
+            assert!(!app.root.join("must-not-exist.vxm").exists());
+        }
+        fs::write(app.root.join(SETTINGS_FILE), json!({"version":1,"mcp_enabled":false}).to_string()).unwrap();
+        let disabled = call_tool(&app, &json!({"name":"batch_actions","arguments":{"actions":[
+            {"name":"create_model","arguments":{"output_path":"must-not-exist.vxm"}}
+        ]}})).unwrap();
+        assert_eq!(disabled["isError"], true);
+        assert!(disabled["content"][0]["text"].as_str().unwrap().contains("disabled"));
+        assert!(!app.root.join("must-not-exist.vxm").exists());
+        let _ = fs::remove_dir_all(app.root);
     }
 
     #[test]

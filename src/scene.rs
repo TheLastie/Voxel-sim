@@ -429,6 +429,7 @@ pub struct StepDiagnostics {
     pub contact_pcg_calls: usize,
     pub contact_pcg_iterations_including_restitution: usize,
     pub contact_gpu_operator_calls: usize,
+    pub contact_gpu_preconditioner_calls: usize,
     pub contact_gpu_operator_fallbacks: usize,
     pub contact_pcg_unconverged_calls: usize,
     pub contact_pcg_max_true_residual: Option<f32>,

@@ -2687,6 +2687,10 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
     if args.iter().any(|arg| arg == "--cuda-contact-operator") {
         std::env::set_var("VOXEL_CUDA_CONTACT_OPERATOR", "1");
     }
+    if args.iter().any(|arg| arg == "--cuda-contact-ic0") {
+        std::env::set_var("VOXEL_CUDA_CONTACT_OPERATOR", "1");
+        std::env::set_var("VOXEL_CUDA_CONTACT_IC0", "1");
+    }
     let creation = impact_scene_creation_args(&args)?;
     let created_scene_path = creation.as_ref().map(|(path, _)| path.clone());
     if let Some((path, options)) = creation.as_ref() {
@@ -6186,6 +6190,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
 
                     if active_scene_document.is_none() {
                         authored_physics = None;
+                        ui.set_physics_cost_ms_per_10ms(None);
                         if let Some(source) = authored_render_source.take() { renderer.set_authored_physics_frame(&source, None); }
                     } else if !ui.paused && authored_physics.is_none() {
                         let source = AuthoredPhysicsRenderSource::from_scene(&scene);
@@ -6208,6 +6213,9 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                     }
                     if let Some(physics) = authored_physics.as_mut() {
                         physics.advance(f64::from(elapsed) * f64::from(ui.simulation_time_scale), ui.paused);
+                        ui.set_physics_cost_ms_per_10ms(
+                            physics.frame.full_worker_ms_per_10ms_simulated,
+                        );
                         if let Some(error) = physics.failure_message() {
                             ui.paused = true;
                             if reported_physics_failure != Some(physics.frame.generation) {
@@ -6265,6 +6273,9 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                         });
                         physics.set_grab_target(grab_target);
                         physics.advance(f64::from(elapsed)*f64::from(ui.simulation_time_scale),ui.paused);
+                        ui.set_physics_cost_ms_per_10ms(
+                            physics.frame.full_worker_ms_per_10ms_simulated,
+                        );
                         if let Some(error) = physics.failure_message() {
                             ui.paused = true;
                             if reported_physics_failure != Some(physics.frame.generation) {
@@ -6541,6 +6552,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                             "physics_mode":if physics.is_some(){"worker"}else{"authoring"},
                             "automatic_aggregation_disabled":std::env::var_os("VOXEL_DISABLE_AUTO_AGGREGATION").is_some(),
                             "cuda_contact_operator_requested":std::env::var("VOXEL_CUDA_CONTACT_OPERATOR").as_deref()==Ok("1"),
+                            "cuda_contact_ic0_requested":std::env::var("VOXEL_CUDA_CONTACT_IC0").as_deref()==Ok("1"),
                         }));
                         if physics.is_none() {
                             let key=(scene.positions.as_ptr() as usize,scene.render_revision);

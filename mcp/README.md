@@ -54,6 +54,15 @@ existing directory beneath that root. Parent directories are never created.
 - `edit_scene` — add, move, duplicate, or remove model instances in `.vxscene`.
 - `edit_model_skeleton` — create a root/child bone hierarchy, clips and
   keyframes, generate automatic weights, or adjust an individual REV weight.
+- `batch_actions` — run 1–64 existing MCP tools sequentially in one call.
+  Every action name and argument schema is checked before any action runs;
+  optional IDs must be unique. Results include per-action status and counts.
+  `stop_on_error` defaults to `true`; set it to `false` to continue after an
+  action error. Telemetry long polls share a 10-second total wait limit. A
+  batch is not atomic: successful file writes remain if a later action fails.
+  Batching does not add controls for changing the live editor or physics state;
+  it only combines the saved-file tools and read-only telemetry queries listed
+  here.
 - `author_animation` — create a root, ordered child-bone hierarchy, named clip,
   quaternion keyframes, and automatic REV weights in one call. The source model
   stays unchanged and the result is written as a new validated `.vxm`.
@@ -75,6 +84,23 @@ and one connected body; the vertical axis is detected automatically:
   "arguments": {
     "source_path": "mcp/examples/spider.vxm",
     "output_path": "mcp/examples/spider_walk_ik.vxm"
+  }
+}
+```
+
+Create a model, make a second copy with an edit, and inspect both results in one
+sequential batch. The new model is written first; the edit reads that file and
+writes to a separate path, preserving the existing no-overwrite rule:
+
+```json
+{
+  "name": "batch_actions",
+  "arguments": {
+    "actions": [
+      {"id": "starter", "name": "create_model", "arguments": {"output_path": "mcp/examples/batch.vxm"}},
+      {"id": "edited", "name": "edit_voxel_model", "arguments": {"source_path": "mcp/examples/batch.vxm", "output_path": "mcp/examples/batch-edited.vxm", "operation": "stamp_shape", "shape": "block", "min_cell": [0, 1, 0], "max_cell": [1, 1, 0]}},
+      {"id": "check", "name": "inspect_document", "arguments": {"path": "mcp/examples/batch-edited.vxm"}}
+    ]
   }
 }
 ```

@@ -126,6 +126,9 @@ pub struct PhysicsFrame {
     pub revision: u64,
     pub simulated_seconds: f64,
     pub step_ms: f64,
+    /// Latest completed worker-batch cost normalized to 10 ms of simulation.
+    /// Includes pose capture and any metrics publish performed by that batch.
+    pub full_worker_ms_per_10ms_simulated: Option<f64>,
     pub broken: usize,
 }
 
@@ -199,6 +202,7 @@ impl PhysicsFrame {
             completed_steps: 0,
             simulated_seconds,
             step_ms,
+            full_worker_ms_per_10ms_simulated: None,
             broken: scene.broken,
         }
     }
@@ -430,12 +434,20 @@ impl PhysicsWorker {
                                 previous_observer_ms = observer_start.elapsed().as_secs_f64()*1000.0;
                                 last_metrics = std::time::Instant::now();
                             }
+                            let completed_simulated_seconds = completed_steps as f64 * fixed_dt;
+                            let full_worker_wall_ms = start.elapsed().as_secs_f64() * 1000.0;
+                            if performance.push_batch(
+                                batch_active_fine_peak,
+                                completed_simulated_seconds,
+                                batch_ms,
+                                full_worker_wall_ms,
+                            ) {
+                                frame.full_worker_ms_per_10ms_simulated = Some(
+                                    full_worker_wall_ms * 0.01 / completed_simulated_seconds,
+                                );
+                            }
                             if output.send(frame).is_err() {
                                 break;
-                            }
-                            if crate::runtime_metrics::is_active() {
-                                performance.push_batch(batch_active_fine_peak, completed_steps as f64 * fixed_dt,
-                                    batch_ms, start.elapsed().as_secs_f64()*1000.0);
                             }
                         }
                         Ok(PhysicsWorkerRequest::ReturnScene) | Err(_) => {

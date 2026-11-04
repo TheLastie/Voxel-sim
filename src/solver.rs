@@ -22,6 +22,7 @@ struct ContactPcgProfile {
     total: Duration,
     gpu_setup: Duration,
     gpu_operator_calls: usize,
+    gpu_preconditioner_calls: usize,
     gpu_operator_fallbacks: usize,
     unconverged_calls: usize,
     max_true_residual: Option<f32>,
@@ -45,6 +46,7 @@ fn record_contact_pcg_profile(profile: ContactPcgProfile) {
         total.total += profile.total;
         total.gpu_setup += profile.gpu_setup;
         total.gpu_operator_calls += profile.gpu_operator_calls;
+        total.gpu_preconditioner_calls += profile.gpu_preconditioner_calls;
         total.gpu_operator_fallbacks += profile.gpu_operator_fallbacks;
         total.unconverged_calls += profile.unconverged_calls;
         if let Some(residual) = profile.max_true_residual {
@@ -2773,6 +2775,7 @@ fn advance_step_with_axis_targets_and_loads(
             contact_pcg_calls: contact_profile.calls,
             contact_pcg_iterations_including_restitution: contact_profile.iterations,
             contact_gpu_operator_calls: contact_profile.gpu_operator_calls,
+            contact_gpu_preconditioner_calls: contact_profile.gpu_preconditioner_calls,
             contact_gpu_operator_fallbacks: contact_profile.gpu_operator_fallbacks,
             contact_pcg_unconverged_calls: contact_profile.unconverged_calls,
             contact_pcg_max_true_residual: contact_profile.max_true_residual,
@@ -6707,6 +6710,45 @@ fn contact_gpu_operator_requested(active_count: usize) -> bool {
         && std::env::var("VOXEL_CUDA_CONTACT_OPERATOR").as_deref() == Ok("1")
 }
 
+fn prepare_contact_gpu_ic0(
+    session: &mut crate::cuda_solver::ContactOperatorSession,
+    scratch: &SolverScratch,
+) -> Result<(), String> {
+    let inverse: Vec<_> = scratch.active.iter()
+        .map(|&i| scratch.factor_diagonal_inverse[i].to_cols_array()).collect();
+    let edges: Vec<_> = scratch.factor_edges.iter().map(Mat3::to_cols_array).collect();
+    session.prepare_ic0(crate::cuda_solver::ContactIc0Input {
+        inverse_diagonal: &inverse,
+        edge_factors: &edges,
+        lower_links: &scratch.ic0_lower_links,
+        lower_counts: &scratch.ic0_lower_link_count,
+        upper_links: &scratch.ic0_upper_links,
+        upper_counts: &scratch.ic0_upper_link_count,
+    })
+}
+
+fn apply_contact_cpu_preconditioner(
+    scene: &Scene,
+    scratch: &SolverScratch,
+    rhs: &[Vec3],
+    work: &mut [Vec3],
+    out: &mut [Vec3],
+) {
+    if scene.config.cpu_preconditioner == CpuPreconditioner::IncompleteCholesky0 {
+        apply_preconditioner(scene.config.cpu_preconditioner, scratch.cpu_preconditioner_bipartite,
+            &mut None, &scratch.factor_diagonal, &scratch.factor_diagonal_inverse,
+            &scratch.factor_edges, &scratch.active, &scratch.ic0_component_ranges,
+            &scratch.ic0_component_batches, &scratch.ic0_red_slots, &scratch.ic0_lower_links,
+            &scratch.ic0_lower_link_count, &scratch.ic0_upper_links,
+            &scratch.ic0_upper_link_count, rhs, work, out);
+    } else {
+        for (slot, &i) in scratch.active.iter().enumerate() {
+            let diagonal = scratch.factor_diagonal[i];
+            out[slot] = solve_lower_transpose(diagonal, solve_lower(diagonal, rhs[slot]));
+        }
+    }
+}
+
 fn contact_gpu_requires_cpu_retry(
     used_gpu: bool,
     residual: f32,
@@ -6780,9 +6822,10 @@ fn solve_contact_increment_backend(
     let reduction_time = std::cell::Cell::new(Duration::ZERO);
     let mut update_time = Duration::ZERO;
     let gpu_calls = std::cell::Cell::new(0usize);
+    let gpu_preconditioner_calls = std::cell::Cell::new(0usize);
     let gpu_fallbacks = std::cell::Cell::new(0usize);
     let gpu_setup_started = profiling.then(Instant::now);
-    let mut gpu = if allow_gpu {
+    let gpu = if allow_gpu {
         match prepare_contact_gpu_operator(scene, h, scratch) {
             Ok(session) => Some(session),
             Err(error) => {
@@ -6794,6 +6837,30 @@ fn solve_contact_increment_backend(
             }
         }
     } else { None };
+    let gpu = std::cell::RefCell::new(gpu);
+    let gpu_ic0_ready = std::cell::Cell::new(false);
+    if scene.config.cpu_preconditioner == CpuPreconditioner::IncompleteCholesky0
+        && std::env::var("VOXEL_CUDA_CONTACT_IC0").as_deref() == Ok("1") {
+        if let Some(session) = gpu.borrow_mut().as_mut() {
+            match prepare_contact_gpu_ic0(session, scratch) {
+                Ok(()) => {
+                    gpu_ic0_ready.set(true);
+                    crate::runtime_metrics::publish("event", serde_json::json!({
+                        "kind":"contact_gpu_ic0_prepared",
+                        "active_fine_revs":scratch.active.len(),
+                        "dependency_levels_forward_reverse":session.ic0_level_counts(),
+                    }));
+                }
+                Err(error) => {
+                    gpu_fallbacks.set(gpu_fallbacks.get() + 1);
+                    crate::runtime_metrics::publish("event", serde_json::json!({
+                        "kind":"contact_gpu_ic0_unavailable", "error":error,
+                        "action":"cpu_preconditioner"
+                    }));
+                }
+            }
+        }
+    }
     let gpu_setup_time = if allow_gpu {
         gpu_setup_started.map(|start| start.elapsed()).unwrap_or_default()
     } else { Duration::ZERO };
@@ -6805,7 +6872,7 @@ fn solve_contact_increment_backend(
     let particular = projection.particular(pairs, relative_targets, n);
     let mut particular_force = vec![Vec3::ZERO; n];
     let mut operator_work = vec![DVec3::ZERO; n];
-    let mut gpu_reference = vec![Vec3::ZERO; if gpu.is_some() { n } else { 0 }];
+    let mut gpu_reference = vec![Vec3::ZERO; if gpu.borrow().is_some() { n } else { 0 }];
     let operator_start = profiling.then(Instant::now);
     apply_contact_operator(scene, h, scratch, &particular, &mut particular_force, &mut operator_work);
     if let Some(start) = operator_start { operator_time.set(start.elapsed()); }
@@ -6823,7 +6890,7 @@ fn solve_contact_increment_backend(
     let mut apply = |v: &[Vec3], out: &mut [Vec3], true_residual: bool| {
         let operator_start = profiling.then(Instant::now);
         let device_result = if true_residual { None }
-            else { gpu.as_mut().map(|session| session.apply(v, out)) };
+            else { gpu.borrow_mut().as_mut().map(|session| session.apply(v, out)) };
         match device_result {
             Some(Ok(())) => {
                 if !gpu_verified || verify_all_gpu_vectors {
@@ -6833,7 +6900,8 @@ fn solve_contact_increment_backend(
                     apply_contact_operator(scene, h, scratch, v, &mut gpu_reference, &mut operator_work);
                     if *out != gpu_reference {
                         out.copy_from_slice(&gpu_reference);
-                        gpu = None;
+                        *gpu.borrow_mut() = None;
+                        gpu_ic0_ready.set(false);
                         gpu_fallbacks.set(gpu_fallbacks.get() + 1);
                         crate::runtime_metrics::publish("event", serde_json::json!({
                             "kind":"contact_gpu_operator_mismatch", "action":"cpu_fallback"
@@ -6842,10 +6910,11 @@ fn solve_contact_increment_backend(
                         gpu_verified = true;
                     }
                 }
-                if gpu.is_some() { gpu_calls.set(gpu_calls.get() + 1); }
+                if gpu.borrow().is_some() { gpu_calls.set(gpu_calls.get() + 1); }
             }
             Some(Err(error)) => {
-                gpu = None;
+                *gpu.borrow_mut() = None;
+                gpu_ic0_ready.set(false);
                 gpu_fallbacks.set(gpu_fallbacks.get() + 1);
                 crate::runtime_metrics::publish("event", serde_json::json!({
                     "kind":"contact_gpu_operator_error", "error":error, "action":"cpu_fallback"
@@ -6863,23 +6932,45 @@ fn solve_contact_increment_backend(
     let mut r = rhs.clone();
     let mut z = vec![Vec3::ZERO; n];
     let mut work = vec![Vec3::ZERO; n];
-    let precondition = |r: &[Vec3], z: &mut [Vec3], work: &mut [Vec3]| {
+    let mut gpu_ic0_verified = false;
+    let mut gpu_ic0_reference = vec![Vec3::ZERO; if gpu_ic0_ready.get() { n } else { 0 }];
+    let mut precondition = |r: &[Vec3], z: &mut [Vec3], work: &mut [Vec3]| {
         let started = profiling.then(Instant::now);
         // Projecting an SPD preconditioner on both sides is SPD on ker(C).
         // IC(0) is reused across the contact-set passes; the contact rows never
         // alter its material graph or cause independent component solves.
-        if scene.config.cpu_preconditioner == CpuPreconditioner::IncompleteCholesky0 {
-            apply_preconditioner(scene.config.cpu_preconditioner, scratch.cpu_preconditioner_bipartite,
-                &mut None, &scratch.factor_diagonal, &scratch.factor_diagonal_inverse,
-                &scratch.factor_edges, &scratch.active, &scratch.ic0_component_ranges,
-                &scratch.ic0_component_batches, &scratch.ic0_red_slots, &scratch.ic0_lower_links,
-                &scratch.ic0_lower_link_count, &scratch.ic0_upper_links,
-                &scratch.ic0_upper_link_count, r, work, z);
-        } else {
-            for (slot, &i) in scratch.active.iter().enumerate() {
-                let diagonal = scratch.factor_diagonal[i];
-                z[slot] = solve_lower_transpose(diagonal, solve_lower(diagonal, r[slot]));
+        let result = if gpu_ic0_ready.get() {
+            gpu.borrow_mut().as_mut().map(|session| session.apply_ic0(r, z))
+        } else { None };
+        match result {
+            Some(Ok(())) => {
+                if !gpu_ic0_verified || verify_all_gpu_vectors {
+                    apply_contact_cpu_preconditioner(scene, scratch, r, work, &mut gpu_ic0_reference);
+                    if *z != gpu_ic0_reference {
+                        z.copy_from_slice(&gpu_ic0_reference);
+                        gpu_ic0_ready.set(false);
+                        gpu_fallbacks.set(gpu_fallbacks.get() + 1);
+                        crate::runtime_metrics::publish("event", serde_json::json!({
+                            "kind":"contact_gpu_ic0_mismatch", "action":"cpu_preconditioner"
+                        }));
+                    } else { gpu_ic0_verified = true; }
+                }
+                if gpu_ic0_ready.get() {
+                    gpu_preconditioner_calls.set(gpu_preconditioner_calls.get() + 1);
+                }
             }
+            Some(Err(error)) => {
+                // Device failures may poison the shared CUDA context; stop
+                // both optional paths before reusing any candidate output.
+                *gpu.borrow_mut() = None;
+                gpu_ic0_ready.set(false);
+                gpu_fallbacks.set(gpu_fallbacks.get() + 1);
+                crate::runtime_metrics::publish("event", serde_json::json!({
+                    "kind":"contact_gpu_ic0_error", "error":error, "action":"cpu_fallback"
+                }));
+                apply_contact_cpu_preconditioner(scene, scratch, r, work, z);
+            }
+            None => apply_contact_cpu_preconditioner(scene, scratch, r, work, z),
         }
         if let Some(start) = started { preconditioner_time.set(preconditioner_time.get() + start.elapsed()); }
         let projection_start = profiling.then(Instant::now);
@@ -6911,6 +7002,7 @@ fn solve_contact_increment_backend(
                 "iteration_limit":scene.config.iterations,
                 "elapsed_seconds":progress_started.elapsed().as_secs_f64(),
                 "gpu_operator_calls":gpu_calls.get(),
+                "gpu_preconditioner_calls":gpu_preconditioner_calls.get(),
             }));
             next_progress = Instant::now() + Duration::from_millis(500);
         }
@@ -6958,11 +7050,13 @@ fn solve_contact_increment_backend(
         total: total_started.map(|start| start.elapsed()).unwrap_or_default(),
         gpu_setup: gpu_setup_time,
         gpu_operator_calls: gpu_calls.get(),
+        gpu_preconditioner_calls: gpu_preconditioner_calls.get(),
         gpu_operator_fallbacks: gpu_fallbacks.get(),
         unconverged_calls: usize::from(!residual.is_finite() || residual > scene.config.solver_relative_tolerance),
         max_true_residual: residual.is_finite().then_some(residual),
     });
-    (dx, iterations, residual, gpu_calls.get() > 0)
+    (dx, iterations, residual,
+        gpu_calls.get() > 0 || gpu_preconditioner_calls.get() > 0)
 }
 
 fn deflate_contact_translation(

@@ -135,6 +135,8 @@ struct CudaSolver {
     pcg_graph: Option<(PcgGraphKey, Handle)>,
     graphs_available: bool,
     contact_kernel: Option<Handle>,
+    ic0_module: Option<Handle>,
+    ic0_kernel: Option<Handle>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -154,6 +156,15 @@ pub(crate) struct ContactOperatorInput<'a> {
     pub edges: &'a [ContactOperatorEdge],
 }
 
+pub(crate) struct ContactIc0Input<'a> {
+    pub inverse_diagonal: &'a [[f32; 9]],
+    pub edge_factors: &'a [[f32; 9]],
+    pub lower_links: &'a [[[u32; 2]; 6]],
+    pub lower_counts: &'a [u8],
+    pub upper_links: &'a [[[u32; 2]; 6]],
+    pub upper_counts: &'a [u8],
+}
+
 /// Owns the shared CUDA mutex for the whole contact solve, so no other CUDA
 /// solver can replace these persistent topology buffers between matvecs.
 pub(crate) struct ContactOperatorSession {
@@ -169,7 +180,11 @@ pub(crate) struct ContactOperatorSession {
     output: DevicePtr,
     host_vector: Vec<f32>,
     host_output: Vec<f32>,
+    ic0: Option<cuda_contact_preconditioner::PreparedIc0>,
 }
+
+#[path = "cuda_contact_preconditioner.rs"]
+mod cuda_contact_preconditioner;
 
 // Kept in this Rust module so the optional inverse path can be A/B tested
 // without changing the checked-in PTX artifact. Host CUDA matrices are packed
@@ -549,7 +564,24 @@ impl ContactOperatorSession {
         Ok(Self {
             cuda, count, mass, row_free, incidence, edge_slots, edge_free, stiffness,
             vector, output, host_vector: vec![0.0; count * 3], host_output: vec![0.0; count * 3],
+            ic0: None,
         })
+    }
+
+    pub(crate) fn prepare_ic0(&mut self, input: ContactIc0Input<'_>) -> Result<(), String> {
+        self.ic0 = None;
+        let prepared = cuda_contact_preconditioner::prepare(&mut self.cuda, self.count, input)?;
+        self.ic0 = Some(prepared);
+        Ok(())
+    }
+
+    pub(crate) fn apply_ic0(&mut self, rhs: &[Vec3], out: &mut [Vec3]) -> Result<(), String> {
+        let prepared = self.ic0.as_mut().ok_or_else(|| "CUDA IC0 has not been prepared".to_string())?;
+        cuda_contact_preconditioner::apply(&mut self.cuda, self.count, prepared, rhs, out)
+    }
+
+    pub(crate) fn ic0_level_counts(&self) -> Option<[usize; 2]> {
+        self.ic0.as_ref().map(cuda_contact_preconditioner::level_counts)
     }
 
     pub(crate) fn apply(&mut self, vector: &[Vec3], output: &mut [Vec3]) -> Result<(), String> {
@@ -828,6 +860,8 @@ impl CudaSolver {
                 pcg_graph: None,
                 graphs_available,
                 contact_kernel: None,
+                ic0_module: None,
+                ic0_kernel: None,
             })
         }
     }
@@ -1923,7 +1957,7 @@ pub(crate) fn solve_pcg(
 
 #[cfg(test)]
 mod tests {
-    use super::{ContactOperatorEdge, ContactOperatorInput, ContactOperatorSession, CudaSolver};
+    use super::{ContactIc0Input, ContactOperatorEdge, ContactOperatorInput, ContactOperatorSession, CudaSolver};
     use glam::{Mat3, Vec3};
 
     #[test]
@@ -2027,6 +2061,102 @@ mod tests {
         let mut actual = [Vec3::ZERO];
         session.apply(&[vector], &mut actual).unwrap();
         assert_eq!(actual[0], expected);
+    }
+
+    #[test]
+    fn cuda_contact_ic0_matches_ordered_cpu_apply_and_rejects_bad_topology() {
+        if std::env::var_os("VOXEL_REQUIRE_CUDA_TEST").is_none() { return; }
+        let matrices = [
+            Mat3::from_cols(Vec3::new(0.7, 0.1, -0.05), Vec3::new(0.2, 0.9, 0.03), Vec3::new(-0.1, 0.04, 0.8)),
+            Mat3::from_cols(Vec3::new(0.8, -0.04, 0.07), Vec3::new(0.12, 0.75, 0.02), Vec3::new(0.03, -0.08, 0.95)),
+            Mat3::from_cols(Vec3::new(0.6, 0.02, 0.11), Vec3::new(-0.07, 0.85, 0.06), Vec3::new(0.09, 0.01, 0.72)),
+            Mat3::from_cols(Vec3::new(0.91, 0.05, 0.02), Vec3::new(-0.02, 0.68, 0.08), Vec3::new(0.04, 0.03, 0.77)),
+            Mat3::from_cols(Vec3::new(0.73, -0.03, 0.06), Vec3::new(0.09, 0.88, -0.02), Vec3::new(-0.05, 0.07, 0.82)),
+            Mat3::from_cols(Vec3::new(0.82, 0.02, -0.04), Vec3::new(0.06, 0.79, 0.03), Vec3::new(0.01, -0.05, 0.9)),
+        ];
+        let inverse: Vec<[f32; 9]> = matrices.iter().map(Mat3::to_cols_array).collect();
+        let factors = [
+            Mat3::from_cols(Vec3::new(0.11, -0.03, 0.02), Vec3::new(0.04, 0.08, -0.01), Vec3::new(-0.02, 0.05, 0.07)).to_cols_array(),
+            Mat3::from_cols(Vec3::new(-0.06, 0.02, 0.04), Vec3::new(0.03, 0.09, 0.01), Vec3::new(0.07, -0.02, 0.05)).to_cols_array(),
+            Mat3::from_cols(Vec3::new(0.05, 0.01, -0.03), Vec3::new(-0.04, 0.06, 0.02), Vec3::new(0.03, 0.08, 0.04)).to_cols_array(),
+        ];
+        let mut lower = [[[u32::MAX; 2]; 6]; 6];
+        let mut lower_counts = [0u8; 6];
+        let mut upper = [[[u32::MAX; 2]; 6]; 6];
+        let mut upper_counts = [0u8; 6];
+        // A chain, an isolated row, then a disconnected two-row component.
+        lower[1][0] = [0, 0]; lower_counts[1] = 1;
+        lower[2][0] = [1, 1]; lower_counts[2] = 1;
+        lower[5][0] = [2, 4]; lower_counts[5] = 1;
+        upper[0][0] = [0, 1]; upper_counts[0] = 1;
+        upper[1][0] = [1, 2]; upper_counts[1] = 1;
+        upper[4][0] = [2, 5]; upper_counts[4] = 1;
+        let rhs = [
+            Vec3::new(0.75, -0.5, 0.125), Vec3::new(-0.25, 0.875, 0.375),
+            Vec3::new(0.625, 0.25, -0.75), Vec3::new(-0.125, 0.5, 0.875),
+            Vec3::new(0.375, -0.625, 0.25), Vec3::new(0.5, 0.125, -0.375),
+        ];
+        let mut session = ContactOperatorSession::new(ContactOperatorInput {
+            masses_over_h2: &[1.0; 6], free: &[[1.0; 3]; 6],
+            incidence: &[[u32::MAX; 6]; 6], edges: &[],
+        }).expect("forced CUDA contact session");
+        session.prepare_ic0(ContactIc0Input {
+            inverse_diagonal: &inverse, edge_factors: &factors,
+            lower_links: &lower, lower_counts: &lower_counts,
+            upper_links: &upper, upper_counts: &upper_counts,
+        }).expect("prepare CUDA IC0");
+        assert_eq!(session.ic0_level_counts(), Some([3, 3]));
+        let mut work = [Vec3::ZERO; 6];
+        let mut expected = [Vec3::ZERO; 6];
+        for row in 0..6 {
+            let mut value = rhs[row];
+            for &[edge, neighbor] in &lower[row][..lower_counts[row] as usize] {
+                value -= Mat3::from_cols_array(&factors[edge as usize]) * work[neighbor as usize];
+            }
+            work[row] = Mat3::from_cols_array(&inverse[row]) * value;
+        }
+        for row in (0..6).rev() {
+            let mut value = work[row];
+            for &[edge, neighbor] in &upper[row][..upper_counts[row] as usize] {
+                value -= Mat3::from_cols_array(&factors[edge as usize]).transpose() * expected[neighbor as usize];
+            }
+            expected[row] = Mat3::from_cols_array(&inverse[row]).transpose() * value;
+        }
+        let mut actual = [Vec3::ZERO; 6];
+        session.apply_ic0(&rhs, &mut actual).expect("CUDA IC0 apply");
+        assert_eq!(actual, expected, "CUDA IC0 must preserve glam f32 arithmetic");
+
+        let mut cyclic = lower;
+        cyclic[0][0] = [0, 1];
+        lower_counts[0] = 1;
+        assert!(session.prepare_ic0(ContactIc0Input {
+            inverse_diagonal: &inverse, edge_factors: &factors,
+            lower_links: &cyclic, lower_counts: &lower_counts,
+            upper_links: &upper, upper_counts: &upper_counts,
+        }).unwrap_err().contains("cycle"));
+        assert!(session.prepare_ic0(ContactIc0Input {
+            inverse_diagonal: &inverse, edge_factors: &factors,
+            lower_links: &lower, lower_counts: &[7, 0, 0, 0, 0, 0],
+            upper_links: &upper, upper_counts: &upper_counts,
+        }).is_err());
+        assert!(session.prepare_ic0(ContactIc0Input {
+            inverse_diagonal: &inverse, edge_factors: &factors,
+            lower_links: &lower, lower_counts: &[1, 1, 1, 0, 0, 1],
+            upper_links: &upper, upper_counts: &upper_counts,
+        }).is_err());
+        assert!(session.apply_ic0(&rhs, &mut actual).unwrap_err().contains("not been prepared"));
+        let mut nonfinite = inverse.clone();
+        nonfinite[0][0] = f32::NAN;
+        assert!(session.prepare_ic0(ContactIc0Input {
+            inverse_diagonal: &nonfinite, edge_factors: &factors,
+            lower_links: &lower, lower_counts: &[0; 6],
+            upper_links: &upper, upper_counts: &upper_counts,
+        }).unwrap_err().contains("non-finite"));
+        assert!(session.prepare_ic0(ContactIc0Input {
+            inverse_diagonal: &inverse, edge_factors: &factors,
+            lower_links: &lower[..5], lower_counts: &lower_counts,
+            upper_links: &upper, upper_counts: &upper_counts,
+        }).unwrap_err().contains("inconsistent"));
     }
 
     #[test]
