@@ -21,6 +21,7 @@ type DeviceGet = unsafe extern "C" fn(*mut i32, i32) -> Status;
 type ContextCreate = unsafe extern "C" fn(*mut Handle, u32, i32) -> Status;
 type ContextSetCurrent = unsafe extern "C" fn(Handle) -> Status;
 type ModuleLoadData = unsafe extern "C" fn(*mut Handle, *const c_void) -> Status;
+type ModuleLoadDataEx = unsafe extern "C" fn(*mut Handle, *const c_void, u32, *mut i32, *mut *mut c_void) -> Status;
 type ModuleGetFunction = unsafe extern "C" fn(*mut Handle, Handle, *const i8) -> Status;
 type MemAlloc = unsafe extern "C" fn(*mut DevicePtr, usize) -> Status;
 type MemFree = unsafe extern "C" fn(DevicePtr) -> Status;
@@ -79,6 +80,7 @@ struct Driver {
     context_create: ContextCreate,
     context_set_current: ContextSetCurrent,
     module_load_data: ModuleLoadData,
+    module_load_data_ex: ModuleLoadDataEx,
     module_get_function: ModuleGetFunction,
     mem_alloc: MemAlloc,
     mem_free: MemFree,
@@ -132,6 +134,41 @@ struct CudaSolver {
     stream: Handle,
     pcg_graph: Option<(PcgGraphKey, Handle)>,
     graphs_available: bool,
+    contact_kernel: Option<Handle>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ContactOperatorEdge {
+    pub slots: [u32; 2],
+    /// Endpoint free masks, in xyz order.
+    pub free: [[f32; 3]; 2],
+    /// Constraint stiffness in glam Mat3 column-major order.
+    pub stiffness: [f32; 9],
+}
+
+pub(crate) struct ContactOperatorInput<'a> {
+    pub masses_over_h2: &'a [f64],
+    pub free: &'a [[f32; 3]],
+    /// Six incident edge IDs per active row; unused slots are `u32::MAX`.
+    pub incidence: &'a [[u32; 6]],
+    pub edges: &'a [ContactOperatorEdge],
+}
+
+/// Owns the shared CUDA mutex for the whole contact solve, so no other CUDA
+/// solver can replace these persistent topology buffers between matvecs.
+pub(crate) struct ContactOperatorSession {
+    cuda: std::sync::MutexGuard<'static, CudaSolver>,
+    count: usize,
+    mass: DevicePtr,
+    row_free: DevicePtr,
+    incidence: DevicePtr,
+    edge_slots: DevicePtr,
+    edge_free: DevicePtr,
+    stiffness: DevicePtr,
+    vector: DevicePtr,
+    output: DevicePtr,
+    host_vector: Vec<f32>,
+    host_output: Vec<f32>,
 }
 
 // Kept in this Rust module so the optional inverse path can be A/B tested
@@ -253,6 +290,117 @@ INV_DONE:
 }
 "#;
 
+const CONTACT_OPERATOR_PTX: &str = r#"
+.visible .entry contact_difference_operator(
+    .param .u64 mass_ptr, .param .u64 row_free_ptr, .param .u64 incidence_ptr,
+    .param .u64 edge_slots_ptr, .param .u64 edge_free_ptr,
+    .param .u64 stiffness_ptr, .param .u64 vector_ptr,
+    .param .u64 output_ptr, .param .u32 count
+) {
+    .reg .pred %p<8>;
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<8>;
+    .reg .f64 %d<12>;
+    .local .align 8 .b8 delta[24];
+    .local .align 8 .b8 result[24];
+    ld.param.u64 %rd1, [mass_ptr]; ld.param.u64 %rd2, [row_free_ptr];
+    ld.param.u64 %rd3, [incidence_ptr]; ld.param.u64 %rd4, [edge_slots_ptr];
+    ld.param.u64 %rd5, [edge_free_ptr]; ld.param.u64 %rd6, [stiffness_ptr];
+    ld.param.u64 %rd7, [vector_ptr]; ld.param.u64 %rd8, [output_ptr];
+    ld.param.u32 %r1, [count];
+    mov.u32 %r2, %ctaid.x; mov.u32 %r3, %ntid.x; mov.u32 %r4, %tid.x;
+    mad.lo.u32 %r0, %r2, %r3, %r4;
+    setp.ge.u32 %p0, %r0, %r1; @%p0 bra CONTACT_DONE;
+    mul.wide.u32 %rd9, %r0, 24; add.u64 %rd10, %rd3, %rd9;
+    mul.wide.u32 %rd11, %r0, 12; add.u64 %rd12, %rd7, %rd11;
+    add.u64 %rd13, %rd2, %rd11;
+    mul.wide.u32 %rd14, %r0, 8; add.u64 %rd14, %rd1, %rd14;
+    ld.global.f64 %d0, [%rd14];
+    // Initial inertial term, evaluated in f64 after f32 free-mask multiplication.
+    mov.u32 %r5, 0;
+CONTACT_INIT:
+    setp.ge.u32 %p1, %r5, 3; @%p1 bra CONTACT_EDGES_START;
+    mul.wide.u32 %rd14, %r5, 4; add.u64 %rd15, %rd12, %rd14;
+    ld.global.f32 %f0, [%rd15]; add.u64 %rd16, %rd13, %rd14;
+    ld.global.f32 %f1, [%rd16]; mul.rn.f32 %f2, %f0, %f1;
+    cvt.f64.f32 %d1, %f2; mul.rn.f64 %d2, %d1, %d0;
+    mul.wide.u32 %rd16, %r5, 8; mov.u64 %rd15, result;
+    add.u64 %rd15, %rd15, %rd16; st.local.f64 [%rd15], %d2;
+    cvt.f64.f32 %d3, %f2; mov.u64 %rd15, delta;
+    add.u64 %rd15, %rd15, %rd16; st.local.f64 [%rd15], %d3;
+    add.u32 %r5, %r5, 1; bra CONTACT_INIT;
+CONTACT_EDGES_START:
+    mov.u32 %r6, 0;
+CONTACT_EDGE_LOOP:
+    setp.ge.u32 %p2, %r6, 6; @%p2 bra CONTACT_STORE_START;
+    mul.wide.u32 %rd14, %r6, 4; add.u64 %rd15, %rd10, %rd14;
+    ld.global.u32 %r7, [%rd15]; setp.eq.u32 %p3, %r7, 0xffffffff; @%p3 bra CONTACT_NEXT_EDGE;
+    mul.wide.u32 %rd14, %r7, 8; add.u64 %rd15, %rd4, %rd14;
+    ld.global.u32 %r8, [%rd15]; ld.global.u32 %r9, [%rd15+4];
+    // Mask each endpoint in f32, promote both, then subtract in f64.
+    mov.u32 %r5, 0;
+CONTACT_DIFF:
+    setp.ge.u32 %p4, %r5, 3; @%p4 bra CONTACT_FORCE_START;
+    mul.wide.u32 %rd16, %r5, 4; mul.wide.u32 %rd17, %r8, 12;
+    add.u64 %rd18, %rd7, %rd17; add.u64 %rd18, %rd18, %rd16;
+    setp.eq.u32 %p7, %r8, 0xffffffff; @%p7 mov.f32 %f0, 0f00000000; @!%p7 ld.global.f32 %f0, [%rd18]; mul.wide.u32 %rd17, %r9, 12;
+    add.u64 %rd19, %rd7, %rd17; add.u64 %rd19, %rd19, %rd16;
+    setp.eq.u32 %p7, %r9, 0xffffffff; @%p7 mov.f32 %f1, 0f00000000; @!%p7 ld.global.f32 %f1, [%rd19]; mul.wide.u32 %rd17, %r7, 24;
+    add.u64 %rd18, %rd5, %rd17; add.u64 %rd18, %rd18, %rd16;
+    ld.global.f32 %f2, [%rd18]; add.u64 %rd19, %rd18, 12;
+    ld.global.f32 %f3, [%rd19]; mul.rn.f32 %f4, %f0, %f2;
+    mul.rn.f32 %f5, %f1, %f3; cvt.f64.f32 %d8, %f4; cvt.f64.f32 %d9, %f5;
+    sub.rn.f64 %d3, %d8, %d9;
+    mul.wide.u32 %rd16, %r5, 8; mov.u64 %rd15, delta;
+    add.u64 %rd15, %rd15, %rd16; st.local.f64 [%rd15], %d3;
+    add.u32 %r5, %r5, 1; bra CONTACT_DIFF;
+CONTACT_FORCE_START:
+    mov.u32 %r10, 0;
+CONTACT_FORCE_AXIS:
+    setp.ge.u32 %p5, %r10, 3; @%p5 bra CONTACT_NEXT_EDGE;
+    mov.f64 %d4, 0d0000000000000000; mov.u32 %r11, 0;
+CONTACT_FORCE_COL:
+    setp.ge.u32 %p6, %r11, 3; @%p6 bra CONTACT_FORCE_DONE;
+    // stiffness is column-major: element(column,row) = column*3 + row.
+    mul.wide.u32 %rd16, %r7, 36; mul.wide.u32 %rd17, %r10, 4;
+    mul.wide.u32 %rd18, %r11, 12; add.u64 %rd16, %rd16, %rd17;
+    add.u64 %rd16, %rd16, %rd18; add.u64 %rd16, %rd6, %rd16;
+    ld.global.f32 %f0, [%rd16]; cvt.f64.f32 %d5, %f0;
+    mul.wide.u32 %rd19, %r11, 8; mov.u64 %rd18, delta;
+    add.u64 %rd18, %rd18, %rd19; ld.local.f64 %d6, [%rd18]; mul.rn.f64 %d7, %d5, %d6;
+    add.rn.f64 %d4, %d4, %d7; add.u32 %r11, %r11, 1; bra CONTACT_FORCE_COL;
+CONTACT_FORCE_DONE:
+    // Orientation follows the CPU endpoint test: c.i == row means add.
+    setp.eq.u32 %p7, %r0, %r8; @%p7 bra CONTACT_ADD_FORCE;
+    neg.f64 %d4, %d4;
+CONTACT_ADD_FORCE:
+    mul.wide.u32 %rd16, %r10, 8;
+    // Multiply by the row endpoint's free mask in f64.
+    mul.wide.u32 %rd17, %r10, 4; mul.wide.u32 %rd18, %r0, 12;
+    add.u64 %rd18, %rd2, %rd18; add.u64 %rd18, %rd18, %rd17;
+    ld.global.f32 %f0, [%rd18]; cvt.f64.f32 %d6, %f0;
+    mul.rn.f64 %d4, %d4, %d6; mov.u64 %rd15, result;
+    add.u64 %rd15, %rd15, %rd16; ld.local.f64 %d5, [%rd15];
+    add.rn.f64 %d5, %d5, %d4; mov.u64 %rd15, result;
+    add.u64 %rd15, %rd15, %rd16; st.local.f64 [%rd15], %d5;
+    add.u32 %r10, %r10, 1; bra CONTACT_FORCE_AXIS;
+CONTACT_NEXT_EDGE:
+    add.u32 %r6, %r6, 1; bra CONTACT_EDGE_LOOP;
+CONTACT_STORE_START:
+    mov.u32 %r5, 0;
+CONTACT_STORE:
+    setp.ge.u32 %p7, %r5, 3; @%p7 bra CONTACT_DONE;
+    mul.wide.u32 %rd14, %r5, 8; mov.u64 %rd15, result;
+    add.u64 %rd15, %rd15, %rd14; ld.local.f64 %d0, [%rd15]; cvt.rn.f32.f64 %f0, %d0;
+    mul.wide.u32 %rd14, %r5, 4; add.u64 %rd15, %rd8, %rd11;
+    add.u64 %rd15, %rd15, %rd14; st.global.f32 [%rd15], %f0;
+    add.u32 %r5, %r5, 1; bra CONTACT_STORE;
+CONTACT_DONE:
+    ret;
+}
+"#;
+
 const EXPAND_EDGE_BLOCKS_PTX: &str = r#"
 .visible .entry expand_edge_blocks(
     .param .u64 edge_blocks_ptr,
@@ -334,6 +482,99 @@ EXP_DONE:
 "#;
 
 static CUDA: OnceLock<Result<Mutex<CudaSolver>, String>> = OnceLock::new();
+
+impl ContactOperatorSession {
+    pub(crate) fn new(input: ContactOperatorInput<'_>) -> Result<Self, String> {
+        let count = input.masses_over_h2.len();
+        if count == 0 || count > u32::MAX as usize {
+            return Err(format!("CUDA contact operator requires 1..=u32::MAX rows, got {count}"));
+        }
+        if input.free.len() != count || input.incidence.len() != count {
+            return Err("CUDA contact operator row arrays have inconsistent lengths".into());
+        }
+        for (row, mask) in input.free.iter().enumerate() {
+            if !mask.iter().all(|x| x.is_finite() && (0.0..=1.0).contains(x)) {
+                return Err(format!("CUDA contact row {row} has an invalid free mask"));
+            }
+            if !input.masses_over_h2[row].is_finite() || input.masses_over_h2[row] < 0.0 {
+                return Err(format!("CUDA contact row {row} has invalid mass/h^2"));
+            }
+        }
+        for (edge_id, edge) in input.edges.iter().enumerate() {
+            if edge.slots.iter().any(|&slot| slot != u32::MAX && slot as usize >= count)
+                || !edge.free.iter().flatten().all(|x| x.is_finite() && (0.0..=1.0).contains(x))
+                || !edge.stiffness.iter().all(|x| x.is_finite())
+            {
+                return Err(format!("CUDA contact edge {edge_id} has invalid endpoints or coefficients"));
+            }
+        }
+        for (row, edges) in input.incidence.iter().enumerate() {
+            let mut padding = false;
+            let mut degree = 0;
+            for &edge_id in edges {
+                if edge_id == u32::MAX { padding = true; continue; }
+                if padding || edge_id as usize >= input.edges.len() {
+                    return Err(format!("CUDA contact row {row} has invalid incidence padding or edge ID"));
+                }
+                let edge = input.edges[edge_id as usize];
+                if edge.slots[0] != row as u32 && edge.slots[1] != row as u32 {
+                    return Err(format!("CUDA contact row {row} references a nonincident edge"));
+                }
+                degree += 1;
+            }
+            if degree > 6 { return Err(format!("CUDA contact row {row} exceeds six incident edges")); }
+        }
+
+        let store = CUDA.get_or_init(|| CudaSolver::initialize().map(Mutex::new));
+        let mut cuda = match store {
+            Ok(cuda) => cuda.lock().map_err(|_| "CUDA solver lock poisoned".to_string())?,
+            Err(error) => return Err(error.clone()),
+        };
+        check(unsafe { (cuda.driver.context_set_current)(cuda.context) }, "cuCtxSetCurrent(contact operator)")?;
+        cuda.ensure_contact_kernel()?;
+        let slots: Vec<[u32; 2]> = input.edges.iter().map(|edge| edge.slots).collect();
+        let edge_free: Vec<[f32; 6]> = input.edges.iter().map(|edge| [
+            edge.free[0][0], edge.free[0][1], edge.free[0][2],
+            edge.free[1][0], edge.free[1][1], edge.free[1][2],
+        ]).collect();
+        let stiffness: Vec<[f32; 9]> = input.edges.iter().map(|edge| edge.stiffness).collect();
+        let mass = cuda.upload("contact_mass", input.masses_over_h2)?;
+        let row_free = cuda.upload("contact_row_free", input.free)?;
+        let incidence = cuda.upload("contact_incidence", input.incidence)?;
+        let edge_slots = cuda.upload("contact_edge_slots", &slots)?;
+        let edge_free = cuda.upload("contact_edge_free", &edge_free)?;
+        let stiffness = cuda.upload("contact_stiffness", &stiffness)?;
+        let vector = cuda.buffer("contact_vector", count * 12)?;
+        let output = cuda.buffer("contact_output", count * 12)?;
+        Ok(Self {
+            cuda, count, mass, row_free, incidence, edge_slots, edge_free, stiffness,
+            vector, output, host_vector: vec![0.0; count * 3], host_output: vec![0.0; count * 3],
+        })
+    }
+
+    pub(crate) fn apply(&mut self, vector: &[Vec3], output: &mut [Vec3]) -> Result<(), String> {
+        if vector.len() != self.count || output.len() != self.count {
+            return Err(format!("CUDA contact matvec expected {} rows, got {} and {}", self.count, vector.len(), output.len()));
+        }
+        self.host_vector.clear();
+        self.host_vector.extend(vector.iter().flat_map(|v| [v.x, v.y, v.z]));
+        if !self.host_vector.iter().all(|x| x.is_finite()) {
+            return Err("CUDA contact matvec input contains non-finite values".into());
+        }
+        let count = u32::try_from(self.count).map_err(|_| "CUDA contact row count exceeds u32::MAX".to_string())?;
+        self.cuda.upload("contact_vector", &self.host_vector)?;
+        self.cuda.launch_contact_operator(self.mass, self.row_free, self.incidence,
+            self.edge_slots, self.edge_free, self.stiffness, self.vector, self.output, count)?;
+        self.cuda.download(self.host_output.as_mut_ptr().cast(), self.output, self.host_output.len() * 4)?;
+        if !self.host_output.iter().all(|x| x.is_finite()) {
+            return Err("CUDA contact matvec produced non-finite output".into());
+        }
+        for (dst, xyz) in output.iter_mut().zip(self.host_output.chunks_exact(3)) {
+            *dst = Vec3::new(xyz[0], xyz[1], xyz[2]);
+        }
+        Ok(())
+    }
+}
 
 fn bipartite_colors(neighbors: &[[u32; 6]]) -> Option<Vec<u8>> {
     let mut colors = vec![u8::MAX; neighbors.len()];
@@ -420,6 +661,7 @@ impl CudaSolver {
                 context_create: symbol(&library, b"cuCtxCreate_v2\0")?,
                 context_set_current: symbol(&library, b"cuCtxSetCurrent\0")?,
                 module_load_data: symbol(&library, b"cuModuleLoadData\0")?,
+                module_load_data_ex: symbol(&library, b"cuModuleLoadDataEx\0")?,
                 module_get_function: symbol(&library, b"cuModuleGetFunction\0")?,
                 mem_alloc: symbol(&library, b"cuMemAlloc_v2\0")?,
                 mem_free: symbol(&library, b"cuMemFree_v2\0")?,
@@ -585,6 +827,7 @@ impl CudaSolver {
                 stream,
                 pcg_graph: None,
                 graphs_available,
+                contact_kernel: None,
             })
         }
     }
@@ -608,6 +851,32 @@ impl CudaSolver {
         )?;
         self.buffers.insert(name, (pointer, bytes));
         Ok(pointer)
+    }
+
+    fn ensure_contact_kernel(&mut self) -> Result<Handle, String> {
+        if let Some(kernel) = self.contact_kernel { return Ok(kernel); }
+        let mut ptx = b".version 7.0\n.target sm_75\n.address_size 64\n".to_vec();
+        ptx.extend_from_slice(CONTACT_OPERATOR_PTX.as_bytes());
+        ptx.push(0);
+        let mut module = 0;
+        let mut jit_log = vec![0i8; 8192];
+        let mut log_capacity = jit_log.len() as u32;
+        let mut options = [5i32, 6i32];
+        let mut values = [jit_log.as_mut_ptr().cast::<c_void>(), (&mut log_capacity as *mut u32).cast()];
+        let status = unsafe { (self.driver.module_load_data_ex)(
+            &mut module, ptx.as_ptr().cast(), options.len() as u32,
+            options.as_mut_ptr(), values.as_mut_ptr(),
+        ) };
+        if status != 0 {
+            let diagnostic = unsafe { std::ffi::CStr::from_ptr(jit_log.as_ptr()) }.to_string_lossy();
+            return Err(format!("cuModuleLoadData(contact operator PTX) failed with CUDA status {status}: {diagnostic}"));
+        }
+        let mut kernel = 0;
+        check(unsafe { (self.driver.module_get_function)(
+            &mut kernel, module, b"contact_difference_operator\0".as_ptr().cast(),
+        ) }, "cuModuleGetFunction(contact_difference_operator)")?;
+        self.contact_kernel = Some(kernel);
+        Ok(kernel)
     }
 
     fn upload<T>(&mut self, name: &'static str, values: &[T]) -> Result<DevicePtr, String> {
@@ -885,6 +1154,31 @@ impl CudaSolver {
             unsafe { (self.driver.copy_dtoh)(output, input, bytes) },
             "cuMemcpyDtoH",
         )
+    }
+
+    fn launch_contact_operator(
+        &self,
+        mass: DevicePtr,
+        row_free: DevicePtr,
+        incidence: DevicePtr,
+        edge_slots: DevicePtr,
+        edge_free: DevicePtr,
+        stiffness: DevicePtr,
+        vector: DevicePtr,
+        output: DevicePtr,
+        count: u32,
+    ) -> Result<(), String> {
+        let kernel = self.contact_kernel.ok_or_else(|| "CUDA contact operator kernel is not loaded".to_string())?;
+        let mut args = [mass, row_free, incidence, edge_slots, edge_free, stiffness, vector, output];
+        let mut count_arg = count;
+        let mut params: Vec<*mut c_void> = args.iter_mut()
+            .map(|arg| (arg as *mut DevicePtr).cast())
+            .collect();
+        params.push((&mut count_arg as *mut u32).cast());
+        check(unsafe {
+            (self.driver.launch_kernel)(kernel, count.div_ceil(256), 1, 1, 256, 1, 1, 0,
+                self.stream, params.as_mut_ptr(), std::ptr::null_mut())
+        }, "cuLaunchKernel(contact_difference_operator)")
     }
 
     fn launch_dot(
@@ -1629,8 +1923,111 @@ pub(crate) fn solve_pcg(
 
 #[cfg(test)]
 mod tests {
-    use super::CudaSolver;
+    use super::{ContactOperatorEdge, ContactOperatorInput, ContactOperatorSession, CudaSolver};
     use glam::{Mat3, Vec3};
+
+    #[test]
+    fn cuda_contact_difference_operator_matches_f64_cpu_reference() {
+        if std::env::var_os("VOXEL_REQUIRE_CUDA_TEST").is_none() {
+            return;
+        }
+        let free = [[1.0, 1.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]];
+        let edges = [
+            ContactOperatorEdge {
+                slots: [0, 1], free: [free[0], free[1]],
+                stiffness: [3.0, 0.5, -0.25, 0.5, 2.0, 0.125, -0.25, 0.125, 1.0],
+            },
+            ContactOperatorEdge {
+                slots: [1, 2], free: [free[1], free[2]],
+                stiffness: [1.5, 0.25, 0.0, 0.25, 4.0, 0.5, 0.0, 0.5, 2.5],
+            },
+        ];
+        let incidence = [[0, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX],
+            [0, 1, u32::MAX, u32::MAX, u32::MAX, u32::MAX],
+            [1, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX]];
+        let masses = [2.0e6, 3.0e6, 4.0e6];
+        let vectors = [Vec3::new(0.25, -0.5, 0.75), Vec3::new(-0.125, 0.4, 0.2), Vec3::new(0.8, -0.2, 0.3)];
+        let no_edges: [ContactOperatorEdge; 0] = [];
+        let no_incidence = [[u32::MAX; 6]; 3];
+        let mut inertial = ContactOperatorSession::new(ContactOperatorInput {
+            masses_over_h2: &masses, free: &free, incidence: &no_incidence, edges: &no_edges,
+        }).expect("CUDA contact inertial-only session");
+        let mut inertial_result = vec![Vec3::ZERO; 3];
+        inertial.apply(&vectors, &mut inertial_result).expect("CUDA inertial-only matvec");
+        for row in 0..3 {
+            let expected = ((vectors[row] * Vec3::from_array(free[row])).as_dvec3()
+                * masses[row]).as_vec3();
+            assert_eq!(inertial_result[row], expected);
+        }
+        drop(inertial);
+        let mut session = ContactOperatorSession::new(ContactOperatorInput {
+            masses_over_h2: &masses, free: &free, incidence: &incidence, edges: &edges,
+        }).expect("CUDA contact operator session");
+        let mut actual = vec![Vec3::ZERO; 3];
+        session.apply(&vectors, &mut actual).expect("CUDA contact matvec");
+        let mut expected = vec![glam::DVec3::ZERO; 3];
+        for row in 0..3 {
+            let masked = vectors[row] * Vec3::from_array(free[row]);
+            expected[row] = masked.as_dvec3() * masses[row];
+            for &edge_id in incidence[row].iter().take_while(|&&id| id != u32::MAX) {
+                let edge = edges[edge_id as usize];
+                let vi = if edge.slots[0] == u32::MAX { glam::DVec3::ZERO } else {
+                    (vectors[edge.slots[0] as usize] * Vec3::from_array(edge.free[0])).as_dvec3()
+                };
+                let vj = if edge.slots[1] == u32::MAX { glam::DVec3::ZERO } else {
+                    (vectors[edge.slots[1] as usize] * Vec3::from_array(edge.free[1])).as_dvec3()
+                };
+                let force = Mat3::from_cols_array(&edge.stiffness).as_dmat3() * (vi - vj);
+                if edge.slots[0] == row as u32 {
+                    expected[row] += force * glam::DVec3::from_array(free[row].map(f64::from));
+                } else {
+                    expected[row] -= force * glam::DVec3::from_array(free[row].map(f64::from));
+                }
+            }
+        }
+        for (a, e) in actual.iter().zip(expected) {
+            let expected = e.as_vec3();
+            assert!((*a - expected).abs().max_element() <= 2.0e-6 * expected.abs().max_element().max(1.0),
+                "actual={a:?}, expected={expected:?}");
+        }
+        drop(session);
+
+        // Subtraction must happen after promotion. A f32 subtraction would
+        // erase the small endpoint and lose the force of this rank-one bond.
+        let free = [[1.0; 3]; 2];
+        let stiffness = [1.0, -1.0, 0.0, -1.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let edges = [ContactOperatorEdge { slots: [0, 1], free, stiffness }];
+        let incidence = [[0, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX]; 2];
+        let mut session = ContactOperatorSession::new(ContactOperatorInput {
+            masses_over_h2: &[0.0; 2], free: &free, incidence: &incidence, edges: &edges,
+        }).unwrap();
+        let vectors = [Vec3::new(1.0e9, 1.0e9, 0.0), Vec3::new(0.125, 0.25, 0.0)];
+        let force = (Mat3::from_cols_array(&stiffness).as_dmat3()
+            * (vectors[0].as_dvec3() - vectors[1].as_dvec3())).as_vec3();
+        let mut actual = [Vec3::ZERO; 2];
+        session.apply(&vectors, &mut actual).unwrap();
+        assert_eq!(force, Vec3::new(0.125, -0.125, 0.0));
+        assert_eq!(actual, [force, -force]);
+        drop(session);
+
+        // An absent endpoint must never be loaded. A fractional mask also
+        // distinguishes masking each force from masking the running sum.
+        let free = [[0.5, 0.0, 1.0]];
+        let edges = [ContactOperatorEdge {
+            slots: [0, u32::MAX], free: [free[0], [0.0; 3]], stiffness,
+        }];
+        let incidence = [[0, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX]];
+        let mut session = ContactOperatorSession::new(ContactOperatorInput {
+            masses_over_h2: &[2.0], free: &free, incidence: &incidence, edges: &edges,
+        }).unwrap();
+        let vector = Vec3::new(2.0e5, -3.0e5, 4.0e5);
+        let masked = (vector * Vec3::from_array(free[0])).as_dvec3();
+        let expected = (masked * 2.0 + Mat3::from_cols_array(&stiffness).as_dmat3()
+            * masked * glam::DVec3::new(0.5, 0.0, 1.0)).as_vec3();
+        let mut actual = [Vec3::ZERO];
+        session.apply(&[vector], &mut actual).unwrap();
+        assert_eq!(actual[0], expected);
+    }
 
     #[test]
     fn cuda_adaptive_dot_and_ratio_match_cpu_when_explicitly_requested() {

@@ -425,6 +425,13 @@ pub struct StepDiagnostics {
     pub mechanical_substeps: usize,
     pub active_fine_revs_last_solve: usize,
     pub pcg_iterations_total: usize,
+    /// All projected contact solves, including restitution corrections.
+    pub contact_pcg_calls: usize,
+    pub contact_pcg_iterations_including_restitution: usize,
+    pub contact_gpu_operator_calls: usize,
+    pub contact_gpu_operator_fallbacks: usize,
+    pub contact_pcg_unconverged_calls: usize,
+    pub contact_pcg_max_true_residual: Option<f32>,
     pub relative_solver_residual: f32,
     pub contacts_peak: usize,
     pub new_impact_observations: usize,

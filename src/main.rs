@@ -2684,6 +2684,9 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
     if args.iter().any(|arg| arg == "--profile-steps") {
         std::env::set_var("VOXEL_PROFILE_STEP", "1");
     }
+    if args.iter().any(|arg| arg == "--cuda-contact-operator") {
+        std::env::set_var("VOXEL_CUDA_CONTACT_OPERATOR", "1");
+    }
     let creation = impact_scene_creation_args(&args)?;
     let created_scene_path = creation.as_ref().map(|(path, _)| path.clone());
     if let Some((path, options)) = creation.as_ref() {
@@ -6537,6 +6540,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                             "camera_position_m":camera.position().to_array(),
                             "physics_mode":if physics.is_some(){"worker"}else{"authoring"},
                             "automatic_aggregation_disabled":std::env::var_os("VOXEL_DISABLE_AUTO_AGGREGATION").is_some(),
+                            "cuda_contact_operator_requested":std::env::var("VOXEL_CUDA_CONTACT_OPERATOR").as_deref()==Ok("1"),
                         }));
                         if physics.is_none() {
                             let key=(scene.positions.as_ptr() as usize,scene.render_revision);

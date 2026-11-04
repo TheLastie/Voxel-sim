@@ -8,6 +8,91 @@ use glam::{DVec3, Mat3, Quat, Vec3};
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
 
+/// Per-thread observations include restitution correction solves as well as
+/// the main mechanical solve. They never participate in physical decisions.
+#[derive(Clone, Copy, Default)]
+struct ContactPcgProfile {
+    calls: usize,
+    iterations: usize,
+    operator: Duration,
+    projection: Duration,
+    preconditioner: Duration,
+    reductions: Duration,
+    updates: Duration,
+    total: Duration,
+    gpu_setup: Duration,
+    gpu_operator_calls: usize,
+    gpu_operator_fallbacks: usize,
+    unconverged_calls: usize,
+    max_true_residual: Option<f32>,
+}
+
+thread_local! {
+    static CONTACT_PCG_PROFILE: std::cell::Cell<ContactPcgProfile> =
+        std::cell::Cell::new(ContactPcgProfile::default());
+}
+
+fn record_contact_pcg_profile(profile: ContactPcgProfile) {
+    CONTACT_PCG_PROFILE.with(|slot| {
+        let mut total = slot.get();
+        total.calls += profile.calls;
+        total.iterations += profile.iterations;
+        total.operator += profile.operator;
+        total.projection += profile.projection;
+        total.preconditioner += profile.preconditioner;
+        total.reductions += profile.reductions;
+        total.updates += profile.updates;
+        total.total += profile.total;
+        total.gpu_setup += profile.gpu_setup;
+        total.gpu_operator_calls += profile.gpu_operator_calls;
+        total.gpu_operator_fallbacks += profile.gpu_operator_fallbacks;
+        total.unconverged_calls += profile.unconverged_calls;
+        if let Some(residual) = profile.max_true_residual {
+            total.max_true_residual = Some(total.max_true_residual.map_or(residual, |old| old.max(residual)));
+        }
+        slot.set(total);
+    });
+}
+
+#[cfg(test)]
+mod contact_profile_tests {
+    use super::*;
+
+    #[test]
+    fn gpu_retry_preserves_the_cpu_iteration_limit_policy() {
+        assert!(!contact_gpu_requires_cpu_retry(true, 0.01, 1e-5, 80, 80));
+        assert!(contact_gpu_requires_cpu_retry(true, 0.01, 1e-5, 2, 80));
+        assert!(contact_gpu_requires_cpu_retry(true, f32::NAN, 1e-5, 80, 80));
+        assert!(contact_gpu_requires_cpu_retry(true, f32::INFINITY, 1e-5, 80, 80));
+        assert!(!contact_gpu_requires_cpu_retry(true, 1e-6, 1e-5, 2, 80));
+        assert!(!contact_gpu_requires_cpu_retry(false, f32::NAN, 1e-5, 2, 80));
+    }
+
+    #[test]
+    fn contact_profile_accumulates_without_crossing_solver_threads() {
+        CONTACT_PCG_PROFILE.with(|slot| slot.set(ContactPcgProfile::default()));
+        record_contact_pcg_profile(ContactPcgProfile {
+            calls: 1, iterations: 7, operator: Duration::from_micros(12),
+            gpu_operator_calls: 3, ..Default::default()
+        });
+        std::thread::spawn(|| {
+            assert_eq!(CONTACT_PCG_PROFILE.with(std::cell::Cell::get).calls, 0);
+            record_contact_pcg_profile(ContactPcgProfile { calls: 9, ..Default::default() });
+        }).join().unwrap();
+        record_contact_pcg_profile(ContactPcgProfile {
+            calls: 2, iterations: 5, operator: Duration::from_micros(8),
+            gpu_operator_fallbacks: 1, ..Default::default()
+        });
+        let profile = CONTACT_PCG_PROFILE.with(std::cell::Cell::get);
+        assert_eq!(profile.calls, 3);
+        assert_eq!(profile.iterations, 12);
+        assert_eq!(profile.operator, Duration::from_micros(20));
+        assert_eq!(profile.gpu_operator_calls, 3);
+        assert_eq!(profile.gpu_operator_fallbacks, 1);
+        CONTACT_PCG_PROFILE.with(|slot| slot.set(ContactPcgProfile::default()));
+    }
+}
+
 // A controlled 4,203-active-REV physical capture was 7.3x faster with the
 // serial path than with Rayon (same 177 states and identical solver results).
 // Use the pool for larger zones; keep the threshold overridable for A/B runs.
@@ -1514,6 +1599,7 @@ fn advance_step_with_axis_targets_and_loads(
     targets: &[[Option<f64>; 3]],
     loads: &[Vec3],
 ) {
+    CONTACT_PCG_PROFILE.with(|slot| slot.set(ContactPcgProfile::default()));
     assert!(targets.is_empty() || targets.len() == scene.voxels.len());
     assert!(loads.is_empty() || loads.len() == scene.voxels.len());
     scene.solver_residual_audit = None;
@@ -2677,12 +2763,19 @@ fn advance_step_with_axis_targets_and_loads(
         .adaptive_energies
         .extend(scene.voxels.iter().map(|v| v.thermal_energy_f32()));
     if profile_step {
+        let contact_profile = CONTACT_PCG_PROFILE.with(std::cell::Cell::get);
         scene.last_step_diagnostics = Some(crate::scene::StepDiagnostics {
             scope: "last_fixed_step",
             fixed_dt_seconds: f64::from(scene.config.fixed_dt),
             mechanical_substeps: effective_substeps,
             active_fine_revs_last_solve: solver_scratch.active.len(),
             pcg_iterations_total: total_pcg_iterations,
+            contact_pcg_calls: contact_profile.calls,
+            contact_pcg_iterations_including_restitution: contact_profile.iterations,
+            contact_gpu_operator_calls: contact_profile.gpu_operator_calls,
+            contact_gpu_operator_fallbacks: contact_profile.gpu_operator_fallbacks,
+            contact_pcg_unconverged_calls: contact_profile.unconverged_calls,
+            contact_pcg_max_true_residual: contact_profile.max_true_residual,
             relative_solver_residual: scene.solver_residual,
             contacts_peak,
             new_impact_observations,
@@ -2705,6 +2798,13 @@ fn advance_step_with_axis_targets_and_loads(
                 ("prediction_tool_without_energy_capture", stage_time[0].saturating_sub(energy_capture_time)),
                 ("mechanics_without_contact_energy_accounting", stage_time[1].saturating_sub(contact_energy_time)),
                 ("collision_without_free_implicit_energy_accounting", stage_time[2].saturating_sub(free_energy_time)),
+                ("contact_pcg_operator", contact_profile.operator),
+                ("contact_pcg_projection", contact_profile.projection),
+                ("contact_pcg_preconditioner", contact_profile.preconditioner),
+                ("contact_pcg_reductions", contact_profile.reductions),
+                ("contact_pcg_updates", contact_profile.updates),
+                ("contact_pcg_total", contact_profile.total),
+                ("contact_gpu_setup", contact_profile.gpu_setup),
             ].into_iter().map(|(name, time)| (name, time.as_secs_f64()*1000.0)).collect(),
         });
     }
@@ -6578,6 +6678,46 @@ mod contact_operator_row_tests {
 
 }
 
+fn prepare_contact_gpu_operator(
+    scene: &Scene,
+    h: f32,
+    scratch: &SolverScratch,
+) -> Result<crate::cuda_solver::ContactOperatorSession, String> {
+    use crate::cuda_solver::{ContactOperatorEdge, ContactOperatorInput, ContactOperatorSession};
+    let masses: Vec<_> = scratch.active.iter().map(|&i| {
+        f64::from(scene.voxels[i].mass) / f64::from(h).powi(2)
+    }).collect();
+    let free: Vec<_> = scratch.active.iter().map(|&i| scratch.free[i].to_array()).collect();
+    let incidence: Vec<_> = scratch.active.iter().map(|&i| scratch.incidence[i]).collect();
+    let edges: Vec<_> = scratch.constraints.iter().map(|edge| ContactOperatorEdge {
+        slots: [scratch.active_index[edge.i], scratch.active_index[edge.j]],
+        free: [scratch.free[edge.i].to_array(), scratch.free[edge.j].to_array()],
+        stiffness: edge.k.to_cols_array(),
+    }).collect();
+    ContactOperatorSession::new(ContactOperatorInput {
+        masses_over_h2: &masses,
+        free: &free,
+        incidence: &incidence,
+        edges: &edges,
+    })
+}
+
+fn contact_gpu_operator_requested(active_count: usize) -> bool {
+    active_count >= PARALLEL_MIN_VOXELS
+        && std::env::var("VOXEL_CUDA_CONTACT_OPERATOR").as_deref() == Ok("1")
+}
+
+fn contact_gpu_requires_cpu_retry(
+    used_gpu: bool,
+    residual: f32,
+    tolerance: f32,
+    iterations: usize,
+    iteration_limit: usize,
+) -> bool {
+    used_gpu && (!residual.is_finite()
+        || (residual > tolerance && iterations < iteration_limit))
+}
+
 fn solve_contact_increment(
     scene: &Scene,
     h: f32,
@@ -6586,26 +6726,145 @@ fn solve_contact_increment(
     relative_targets: &[f64],
     input_rhs: &[Vec3],
 ) -> (Vec<Vec3>, usize, f32) {
+    let requested = contact_gpu_operator_requested(scratch.active.len());
+    let (delta, iterations, residual, used_gpu) = solve_contact_increment_backend(
+        scene, h, scratch, pairs, relative_targets, input_rhs, requested);
+    if contact_gpu_requires_cpu_retry(used_gpu, residual,
+        scene.config.solver_relative_tolerance, iterations, scene.config.iterations) {
+        // No candidate state has been applied yet. Discard an unverified GPU
+        // solve and rerun the same physical system entirely on the CPU.
+        record_contact_pcg_profile(ContactPcgProfile {
+            gpu_operator_fallbacks: 1,
+            ..Default::default()
+        });
+        let (cpu_delta, cpu_iterations, cpu_residual, _) = solve_contact_increment_backend(
+            scene, h, scratch, pairs, relative_targets, input_rhs, false);
+        let max_delta_error = delta.iter().zip(&cpu_delta)
+            .map(|(gpu, cpu)| (*gpu - *cpu).abs().max_element()).fold(0.0_f32, f32::max);
+        crate::runtime_metrics::publish("event", serde_json::json!({
+            "kind":"contact_gpu_full_cpu_retry",
+            "candidate_true_residual":residual,
+            "cpu_true_residual":cpu_residual,
+            "tolerance":scene.config.solver_relative_tolerance,
+            "candidate_iterations":iterations,
+            "cpu_iterations":cpu_iterations,
+            "max_delta_difference":max_delta_error,
+        }));
+        return (cpu_delta, cpu_iterations, cpu_residual);
+    }
+    // Reaching the configured iteration limit is the same explicit stopping
+    // policy on CPU and GPU. It is recorded as unconverged, never as success.
+    // A CPU retry would repeat the same limited correction; outer contact and
+    // corotation passes still use the CPU-evaluated true residual.
+    (delta, iterations, residual)
+}
+
+fn solve_contact_increment_backend(
+    scene: &Scene,
+    h: f32,
+    scratch: &SolverScratch,
+    pairs: &[crate::contact_constraint::PairContact],
+    relative_targets: &[f64],
+    input_rhs: &[Vec3],
+    allow_gpu: bool,
+) -> (Vec<Vec3>, usize, f32, bool) {
     use crate::contact_constraint::ContactProjection;
+    let profiling = crate::runtime_metrics::is_active()
+        || std::env::var_os("VOXEL_PROFILE_STEP").is_some();
+    let total_started = profiling.then(Instant::now);
+    let progress_started = Instant::now();
+    let mut next_progress = progress_started + Duration::from_millis(500);
+    let operator_time = std::cell::Cell::new(Duration::ZERO);
+    let projection_time = std::cell::Cell::new(Duration::ZERO);
+    let preconditioner_time = std::cell::Cell::new(Duration::ZERO);
+    let reduction_time = std::cell::Cell::new(Duration::ZERO);
+    let mut update_time = Duration::ZERO;
+    let gpu_calls = std::cell::Cell::new(0usize);
+    let gpu_fallbacks = std::cell::Cell::new(0usize);
+    let gpu_setup_started = profiling.then(Instant::now);
+    let mut gpu = if allow_gpu {
+        match prepare_contact_gpu_operator(scene, h, scratch) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                gpu_fallbacks.set(1);
+                crate::runtime_metrics::publish("event", serde_json::json!({
+                    "kind":"contact_gpu_unavailable", "error":error
+                }));
+                None
+            }
+        }
+    } else { None };
+    let gpu_setup_time = if allow_gpu {
+        gpu_setup_started.map(|start| start.elapsed()).unwrap_or_default()
+    } else { Duration::ZERO };
+    let mut gpu_verified = false;
+    let verify_all_gpu_vectors =
+        std::env::var("VOXEL_CUDA_CONTACT_VERIFY_ALL").as_deref() == Ok("1");
     let projection = ContactProjection::build(pairs, &scratch.free, &scratch.active_index);
     let n = scratch.active.len();
     let particular = projection.particular(pairs, relative_targets, n);
     let mut particular_force = vec![Vec3::ZERO; n];
     let mut operator_work = vec![DVec3::ZERO; n];
+    let mut gpu_reference = vec![Vec3::ZERO; if gpu.is_some() { n } else { 0 }];
+    let operator_start = profiling.then(Instant::now);
     apply_contact_operator(scene, h, scratch, &particular, &mut particular_force, &mut operator_work);
+    if let Some(start) = operator_start { operator_time.set(start.elapsed()); }
     let mut rhs: Vec<_> = input_rhs.iter().zip(&particular_force).map(|(b, a)| *b - *a).collect();
+    let projection_start = profiling.then(Instant::now);
     projection.project(&mut rhs);
-    let dot = |a: &[Vec3], b: &[Vec3]| a.iter().zip(b)
-        .map(|(a,b)| a.as_dvec3().dot(b.as_dvec3())).sum::<f64>();
-    let mut apply = |v: &[Vec3], out: &mut [Vec3]| {
-        apply_contact_operator(scene, h, scratch, v, out, &mut operator_work);
+    if let Some(start) = projection_start { projection_time.set(start.elapsed()); }
+    let dot = |a: &[Vec3], b: &[Vec3]| {
+        let started = profiling.then(Instant::now);
+        let result = a.iter().zip(b)
+            .map(|(a,b)| a.as_dvec3().dot(b.as_dvec3())).sum::<f64>();
+        if let Some(start) = started { reduction_time.set(reduction_time.get() + start.elapsed()); }
+        result
+    };
+    let mut apply = |v: &[Vec3], out: &mut [Vec3], true_residual: bool| {
+        let operator_start = profiling.then(Instant::now);
+        let device_result = if true_residual { None }
+            else { gpu.as_mut().map(|session| session.apply(v, out)) };
+        match device_result {
+            Some(Ok(())) => {
+                if !gpu_verified || verify_all_gpu_vectors {
+                    // Validate the first actual Krylov vector on the CPU;
+                    // diagnostics can request this check for every vector.
+                    // Exact f32 outputs are required for this optional path.
+                    apply_contact_operator(scene, h, scratch, v, &mut gpu_reference, &mut operator_work);
+                    if *out != gpu_reference {
+                        out.copy_from_slice(&gpu_reference);
+                        gpu = None;
+                        gpu_fallbacks.set(gpu_fallbacks.get() + 1);
+                        crate::runtime_metrics::publish("event", serde_json::json!({
+                            "kind":"contact_gpu_operator_mismatch", "action":"cpu_fallback"
+                        }));
+                    } else {
+                        gpu_verified = true;
+                    }
+                }
+                if gpu.is_some() { gpu_calls.set(gpu_calls.get() + 1); }
+            }
+            Some(Err(error)) => {
+                gpu = None;
+                gpu_fallbacks.set(gpu_fallbacks.get() + 1);
+                crate::runtime_metrics::publish("event", serde_json::json!({
+                    "kind":"contact_gpu_operator_error", "error":error, "action":"cpu_fallback"
+                }));
+                apply_contact_operator(scene, h, scratch, v, out, &mut operator_work);
+            }
+            None => apply_contact_operator(scene, h, scratch, v, out, &mut operator_work),
+        }
+        if let Some(start) = operator_start { operator_time.set(operator_time.get() + start.elapsed()); }
+        let projection_start = profiling.then(Instant::now);
         projection.project(out);
+        if let Some(start) = projection_start { projection_time.set(projection_time.get() + start.elapsed()); }
     };
     let mut dx = vec![Vec3::ZERO; n];
     let mut r = rhs.clone();
     let mut z = vec![Vec3::ZERO; n];
     let mut work = vec![Vec3::ZERO; n];
     let precondition = |r: &[Vec3], z: &mut [Vec3], work: &mut [Vec3]| {
+        let started = profiling.then(Instant::now);
         // Projecting an SPD preconditioner on both sides is SPD on ker(C).
         // IC(0) is reused across the contact-set passes; the contact rows never
         // alter its material graph or cause independent component solves.
@@ -6622,7 +6881,10 @@ fn solve_contact_increment(
                 z[slot] = solve_lower_transpose(diagonal, solve_lower(diagonal, r[slot]));
             }
         }
+        if let Some(start) = started { preconditioner_time.set(preconditioner_time.get() + start.elapsed()); }
+        let projection_start = profiling.then(Instant::now);
         projection.project(z);
+        if let Some(start) = projection_start { projection_time.set(projection_time.get() + start.elapsed()); }
     };
     let rhs_norm = dot(&rhs, &rhs).sqrt();
     precondition(&r, &mut z, &mut work);
@@ -6633,18 +6895,33 @@ fn solve_contact_increment(
     let mut iterations = 0;
     for _ in 0..scene.config.iterations {
         if rhs_norm <= 1e-20 || dot(&r, &r).sqrt() <= tolerance * rhs_norm { break; }
-        apply(&p, &mut ap);
+        apply(&p, &mut ap, false);
         let denom = dot(&p, &ap);
         if !denom.is_finite() || denom <= 0.0 { break; }
         let alpha = (rz / denom) as f32;
+        let update_start = profiling.then(Instant::now);
         for i in 0..n { dx[i] += alpha * p[i]; r[i] -= alpha * ap[i]; }
+        if let Some(start) = update_start { update_time += start.elapsed(); }
         iterations += 1;
+        if profiling && crate::runtime_metrics::is_active() && Instant::now() >= next_progress {
+            crate::runtime_metrics::publish("event", serde_json::json!({
+                "kind":"contact_pcg_progress",
+                "active_fine_revs":n,
+                "iteration":iterations,
+                "iteration_limit":scene.config.iterations,
+                "elapsed_seconds":progress_started.elapsed().as_secs_f64(),
+                "gpu_operator_calls":gpu_calls.get(),
+            }));
+            next_progress = Instant::now() + Duration::from_millis(500);
+        }
         // Validate convergence against the assembled operator, not only the
         // recursive residual; stiff metal is sensitive to f32 cancellation.
         if dot(&r, &r).sqrt() <= tolerance * rhs_norm || iterations % 32 == 0 {
             projection.project(&mut dx);
-            apply(&dx, &mut ap);
+            apply(&dx, &mut ap, true);
+            let update_start = profiling.then(Instant::now);
             for i in 0..n { r[i] = rhs[i] - ap[i]; }
+            if let Some(start) = update_start { update_time += start.elapsed(); }
             if dot(&r, &r).sqrt() <= tolerance * rhs_norm { break; }
             precondition(&r, &mut z, &mut work);
             p.clone_from(&z); rz = dot(&r, &z);
@@ -6654,11 +6931,13 @@ fn solve_contact_increment(
         let next = dot(&r, &z);
         if !next.is_finite() || rz <= 0.0 { break; }
         let beta = (next / rz) as f32;
+        let update_start = profiling.then(Instant::now);
         for i in 0..n { p[i] = z[i] + beta * p[i]; }
+        if let Some(start) = update_start { update_time += start.elapsed(); }
         rz = next;
     }
     projection.project(&mut dx);
-    apply(&dx, &mut ap);
+    apply(&dx, &mut ap, true);
     for i in 0..n { r[i] = rhs[i] - ap[i]; }
     let residual = if rhs_norm > 1e-20 { (dot(&r,&r).sqrt()/rhs_norm) as f32 } else { 0.0 };
     for (value, offset) in dx.iter_mut().zip(particular) { *value += offset; }
@@ -6668,7 +6947,22 @@ fn solve_contact_increment(
         // residual; contact impulses on a closed free system sum to zero.
         deflate_contact_translation(scene, scratch, pairs, &mut dx);
     }
-    (dx, iterations, residual)
+    record_contact_pcg_profile(ContactPcgProfile {
+        calls: 1,
+        iterations,
+        operator: operator_time.get(),
+        projection: projection_time.get(),
+        preconditioner: preconditioner_time.get(),
+        reductions: reduction_time.get(),
+        updates: update_time,
+        total: total_started.map(|start| start.elapsed()).unwrap_or_default(),
+        gpu_setup: gpu_setup_time,
+        gpu_operator_calls: gpu_calls.get(),
+        gpu_operator_fallbacks: gpu_fallbacks.get(),
+        unconverged_calls: usize::from(!residual.is_finite() || residual > scene.config.solver_relative_tolerance),
+        max_true_residual: residual.is_finite().then_some(residual),
+    });
+    (dx, iterations, residual, gpu_calls.get() > 0)
 }
 
 fn deflate_contact_translation(
