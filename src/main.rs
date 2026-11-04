@@ -2617,20 +2617,77 @@ pub fn run_editor() -> Result<(), Box<dyn std::error::Error>> {
     run_with_app_kind(true)
 }
 
+fn impact_scene_creation_args(
+    args: &[String],
+) -> Result<Option<(PathBuf, voxel_physics_lab::scene_presets::ImpactSceneOptions)>, String> {
+    fn value<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
+        let mut matches = args.iter().enumerate().filter(|(_, arg)| arg.as_str() == flag);
+        let Some((index, _)) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(format!("{flag} may appear only once"));
+        }
+        args.get(index + 1)
+            .filter(|arg| !arg.starts_with("--"))
+            .map(|arg| Some(arg.as_str()))
+            .ok_or_else(|| format!("{flag} requires a value"))
+    }
+    let Some(path) = value(args, "--create-impact-scene")? else { return Ok(None); };
+    let mut options = voxel_physics_lab::scene_presets::ImpactSceneOptions::default();
+    if let Some(v) = value(args, "--side")? {
+        options.side = v.parse().map_err(|_| "invalid --side")?;
+    }
+    if let Some(v) = value(args, "--impact-gap-m")? {
+        options.gap_m = v.parse().map_err(|_| "invalid --impact-gap-m")?;
+    }
+    if let Some(v) = value(args, "--impact-speed-m-s")? {
+        options.approach_speed_m_s = v.parse().map_err(|_| "invalid --impact-speed-m-s")?;
+    }
+    if let Some(v) = value(args, "--impact-dt-ms")? {
+        options.fixed_dt_s = v.parse::<f32>().map_err(|_| "invalid --impact-dt-ms")? * 0.001;
+    }
+    if let Some(v) = value(args, "--impact-substeps")? {
+        options.substeps = v.parse().map_err(|_| "invalid --impact-substeps")?;
+    }
+    options.validate()?;
+    Ok(Some((PathBuf::from(path), options)))
+}
+
+#[cfg(test)]
+mod impact_cli_tests {
+    use super::*;
+    fn args(text: &str) -> Vec<String> { text.split_whitespace().map(str::to_owned).collect() }
+    #[test]
+    fn impact_creation_parameters_have_explicit_units() {
+        let (_, options) = impact_scene_creation_args(&args("editor --create-impact-scene scene.vxscene --side 55 --impact-gap-m 0 --impact-speed-m-s 0.01 --impact-dt-ms 10 --impact-substeps 4")).unwrap().unwrap();
+        assert_eq!(options.side.pow(3)*2,332_750);
+        assert_eq!(options.gap_m,0.0);
+        assert_eq!(options.approach_speed_m_s,0.01);
+        assert!((options.fixed_dt_s-0.01).abs()<1e-8);
+        assert_eq!(options.substeps,4);
+    }
+    #[test]
+    fn malformed_impact_arguments_fail_before_authoring() {
+        for text in ["--create-impact-scene", "--create-impact-scene scene.vxscene --side", "--create-impact-scene a.vxscene --side 2 --side 3", "--create-impact-scene a.vxscene --impact-speed-m-s NaN", "--create-impact-scene a.vxscene --impact-substeps 0"] {
+            assert!(impact_scene_creation_args(&args(text)).is_err(),"{text}");
+        }
+        assert!(impact_scene_creation_args(&args("editor --scene existing.vxscene")).unwrap().is_none());
+    }
+}
+
 fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
-    let created_scene_path = args
-        .windows(2)
-        .find(|pair| pair[0] == "--create-impact-scene")
-        .map(|pair| PathBuf::from(&pair[1]));
-    if let Some(path) = created_scene_path.as_ref() {
-        let side = args
-            .windows(2)
-            .find(|pair| pair[0] == "--side")
-            .map(|pair| pair[1].parse::<usize>())
-            .transpose()?
-            .unwrap_or(16);
-        voxel_physics_lab::scene_presets::create_impact_scene(path, side)?;
+    if args.iter().any(|arg| arg == "--disable-auto-aggregation") {
+        std::env::set_var("VOXEL_DISABLE_AUTO_AGGREGATION", "1");
+    }
+    if args.iter().any(|arg| arg == "--profile-steps") {
+        std::env::set_var("VOXEL_PROFILE_STEP", "1");
+    }
+    let creation = impact_scene_creation_args(&args)?;
+    let created_scene_path = creation.as_ref().map(|(path, _)| path.clone());
+    if let Some((path, options)) = creation.as_ref() {
+        voxel_physics_lab::scene_presets::create_impact_scene_with_options(path, options)?;
     }
     let requested_model_path = args
         .windows(2)
@@ -2792,6 +2849,13 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
     if two_cube_demo || friction_road_demo {
         ui.simulation_time_scale = 1.0;
     }
+    if args.iter().any(|arg| arg == "--run-scene") {
+        if initial_native_scene_path.is_none() {
+            return Err("--run-scene requires an authored .vxscene".into());
+        }
+        ui.paused = false;
+        ui.simulation_time_scale = 1.0;
+    }
     if let Some(pair) = args.windows(2).find(|pair| pair[0] == "--time-scale") {
         let scale = pair[1].parse::<f32>()?;
         if !scale.is_finite() || scale < 0.0 {
@@ -2805,7 +2869,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
             .and_then(|s| s.parse().ok())
             .unwrap_or(60);
         let shape = selected_shape(&args).unwrap_or(Shape::Wedge);
-        let mut tool = if two_cube_demo || friction_road_demo {
+        let mut tool = if two_cube_demo || friction_road_demo || initial_native_scene_path.is_some() {
             None
         } else {
             Some(launch(shape, &scene, &ui))
@@ -6472,6 +6536,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                             "worker_failure":physics.and_then(PhysicsWorker::failure_message),
                             "camera_position_m":camera.position().to_array(),
                             "physics_mode":if physics.is_some(){"worker"}else{"authoring"},
+                            "automatic_aggregation_disabled":std::env::var_os("VOXEL_DISABLE_AUTO_AGGREGATION").is_some(),
                         }));
                         if physics.is_none() {
                             let key=(scene.positions.as_ptr() as usize,scene.render_revision);
