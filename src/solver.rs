@@ -1082,7 +1082,7 @@ pub fn release_voxel(scene: &mut Scene, voxel: usize) -> Result<(), &'static str
 /// Cells solve their rotations directly. Pair contacts still use the translation-only
 /// solve, which needs fitted frames; it then returns the change of that fit.
 fn update_frames(scene: &mut Scene, scratch: &mut SolverScratch) -> f32 {
-    if scene.cell_dofs && !scratch.pair_contacts.iter().any(|pair| pair.active) {
+    if scene.cell_dofs {
         // Rotations are solved; report a change so the second pass still runs.
         // Skipping it when theta^2 is small gave 172/230 ms (actor on/off) against
         // 233/95 ms, and the cause of the slower resting case is not understood.
@@ -4948,6 +4948,8 @@ pub(crate) struct SolverScratch {
     spin_at_substep_start: Vec<DVec3>,
     cell_factor: Option<CellFactor>,
     cell_factor_iterations: usize,
+    two_level: Option<crate::cell_two_level::TwoLevel>,
+    two_level_work: crate::cell_two_level::TwoLevelWork,
     last_force_residual_n: f64,
     mechanical_mask: Vec<bool>,
     mechanical_revs: Vec<usize>,
@@ -4988,6 +4990,75 @@ fn inject_test_solve_failure(scene: &mut Scene) {
             scene.solver_residual = f32::INFINITY;
         }
     });
+}
+
+/// Two free iron cubes colliding: the cell solver, with contacts between free
+/// bodies handled in the 6-DOF system, must agree with the translation-only solver
+/// on a collision that has no torque, and conserve momentum without creating energy.
+#[cfg(test)]
+#[test]
+fn colliding_cubes_agree_between_cell_and_translation_solvers() {
+    use crate::material::Material;
+    use crate::scene::{SceneConfig, VoxelSpawn};
+
+    let iron = Material::component_id("iron").unwrap();
+    let run = |cells: bool| {
+        FORCE_CELL_DOFS.with(|force| force.set(Some(cells)));
+        let mut config = SceneConfig::default();
+        config.fixed_dt = 0.01;
+        config.substeps = 4;
+        config.gravity = [0.0; 3];
+        config.atmosphere.pressure_pa = 0.0;
+        let mut spawns = Vec::new();
+        for x in 0..3 {
+            for y in 0..3 {
+                for z in 0..3 {
+                    spawns.push(VoxelSpawn::at_cell([x, y, z], iron).with_velocity(Vec3::new(0.4, 0.0, 0.0)));
+                    spawns.push(VoxelSpawn::at_cell([x + 4, y, z], iron).with_velocity(Vec3::new(-0.4, 0.0, 0.0)));
+                }
+            }
+        }
+        let mut scene = Scene::from_voxels(config, spawns).unwrap();
+        scene.adaptive_substeps = false;
+        let momentum_before: Vec3 = scene.voxels.iter().map(|v| v.velocity * v.mass).sum();
+        let mass: f32 = scene.voxels.iter().map(|v| v.mass).sum();
+        for _ in 0..40 {
+            step(&mut scene, &mut None);
+            assert!(scene.solver_residual.is_finite());
+        }
+        FORCE_CELL_DOFS.with(|force| force.set(None));
+        let momentum: Vec3 = scene.voxels.iter().map(|v| v.velocity * v.mass).sum();
+        let kinetic: f64 = scene
+            .voxels
+            .iter()
+            .map(|v| 0.5 * f64::from(v.mass) * f64::from(v.velocity.length_squared()))
+            .sum();
+        let heat: f64 = scene.voxels.iter().map(|v| v.total_internal_energy_j()).sum();
+        let centre = scene.positions.iter().copied().sum::<DVec3>() / scene.positions.len() as f64;
+        let overlap = scene
+            .positions
+            .iter()
+            .enumerate()
+            .flat_map(|(i, a)| scene.positions.iter().skip(i + 1).map(move |b| (*a - *b).length()))
+            .fold(f64::INFINITY, f64::min);
+        (momentum_before, momentum, mass, kinetic, heat, centre, overlap)
+    };
+    let (before, after_cells, mass, kinetic_cells, _, centre_cells, overlap_cells) = run(true);
+    let (_, after_old, _, kinetic_old, _, centre_old, _) = run(false);
+    // Momentum is conserved by both paths.
+    for after in [after_cells, after_old] {
+        assert!((after - before).length() < 1.0e-4 * mass * 0.4, "momentum {before:?} -> {after:?}");
+    }
+    // No cell centres end closer than a REV: the contact removed the overlap.
+    assert!(overlap_cells > 0.0099, "cells interpenetrated: {overlap_cells}");
+    // Kinetic energy does not rise, and the two solvers agree within the 10% tolerance.
+    let initial: f64 = 0.5 * f64::from(mass) * 0.4 * 0.4;
+    assert!(kinetic_cells <= initial * 1.0001, "cells created energy: {kinetic_cells} > {initial}");
+    assert!(
+        (kinetic_cells - kinetic_old).abs() <= 0.1 * initial,
+        "kinetic energy differs: cells {kinetic_cells}, translation {kinetic_old}"
+    );
+    assert!((centre_cells - centre_old).length() < 1.0e-3, "centre {centre_cells:?} vs {centre_old:?}");
 }
 
 #[cfg(test)]
@@ -7136,7 +7207,9 @@ fn apply_contact_cpu_preconditioner(
     work: &mut [Vec3],
     out: &mut [Vec3],
 ) {
-    if scene.config.cpu_preconditioner == CpuPreconditioner::IncompleteCholesky0 {
+    // Cells never build the translation-only IC(0) factor, so the restitution
+    // solve that follows uses block Jacobi on the same translation blocks.
+    if scene.config.cpu_preconditioner == CpuPreconditioner::IncompleteCholesky0 && !scene.cell_dofs {
         apply_preconditioner(scene.config.cpu_preconditioner, scratch.cpu_preconditioner_bipartite,
             &mut None, &scratch.factor_diagonal, &scratch.factor_diagonal_inverse,
             &scratch.factor_edges, &scratch.active, &scratch.ic0_component_ranges,
@@ -7946,7 +8019,17 @@ fn update_support_friction(
 /// forbids them.
 const CELL_DOF_MAX_REVS: usize = 4096;
 
+/// Lets a test force cell rotations on the current thread regardless of size.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_CELL_DOFS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 fn decide_cell_dofs(scene: &Scene) -> bool {
+    #[cfg(test)]
+    if let Some(forced) = FORCE_CELL_DOFS.with(std::cell::Cell::get) {
+        return forced;
+    }
     if std::env::var_os("VOXEL_BOND_ONLY").is_some() {
         return false;
     }
@@ -8052,10 +8135,10 @@ fn cell_spin_energy_j(scene: &Scene, i: usize) -> f64 {
     0.5 * inertia * scene.angular_velocities[i].length_squared()
 }
 
-type Block6 = [[f64; 6]; 6];
-type Vec6 = [f64; 6];
+pub(crate) type Block6 = [[f64; 6]; 6];
+pub(crate) type Vec6 = [f64; 6];
 
-fn block6_from(tl: glam::DMat3, tr: glam::DMat3, bl: glam::DMat3, br: glam::DMat3) -> Block6 {
+pub(crate) fn block6_from(tl: glam::DMat3, tr: glam::DMat3, bl: glam::DMat3, br: glam::DMat3) -> Block6 {
     let mut out = [[0.0; 6]; 6];
     for row in 0..3 {
         for col in 0..3 {
@@ -8068,7 +8151,7 @@ fn block6_from(tl: glam::DMat3, tr: glam::DMat3, bl: glam::DMat3, br: glam::DMat
     out
 }
 
-fn block6_add(a: &mut Block6, b: &Block6) {
+pub(crate) fn block6_add(a: &mut Block6, b: &Block6) {
     for row in 0..6 {
         for col in 0..6 {
             a[row][col] += b[row][col];
@@ -8076,16 +8159,16 @@ fn block6_add(a: &mut Block6, b: &Block6) {
     }
 }
 
-fn block6_mul_vec(a: &Block6, v: &Vec6) -> Vec6 {
+pub(crate) fn block6_mul_vec(a: &Block6, v: &Vec6) -> Vec6 {
     std::array::from_fn(|row| (0..6).map(|col| a[row][col] * v[col]).sum())
 }
 
-fn block6_transpose_mul_vec(a: &Block6, v: &Vec6) -> Vec6 {
+pub(crate) fn block6_transpose_mul_vec(a: &Block6, v: &Vec6) -> Vec6 {
     std::array::from_fn(|col| (0..6).map(|row| a[row][col] * v[row]).sum())
 }
 
 /// Lower Cholesky factor of a symmetric block, or None if it is not positive.
-fn block6_cholesky(a: &Block6) -> Option<Block6> {
+pub(crate) fn block6_cholesky(a: &Block6) -> Option<Block6> {
     let mut l = [[0.0; 6]; 6];
     for row in 0..6 {
         for col in 0..=row {
@@ -8106,7 +8189,7 @@ fn block6_cholesky(a: &Block6) -> Option<Block6> {
     Some(l)
 }
 
-fn block6_solve_lower(l: &Block6, v: &Vec6) -> Vec6 {
+pub(crate) fn block6_solve_lower(l: &Block6, v: &Vec6) -> Vec6 {
     let mut out = *v;
     for row in 0..6 {
         for col in 0..row {
@@ -8117,7 +8200,7 @@ fn block6_solve_lower(l: &Block6, v: &Vec6) -> Vec6 {
     out
 }
 
-fn block6_solve_lower_transpose(l: &Block6, v: &Vec6) -> Vec6 {
+pub(crate) fn block6_solve_lower_transpose(l: &Block6, v: &Vec6) -> Vec6 {
     let mut out = *v;
     for row in (0..6).rev() {
         for col in row + 1..6 {
@@ -8142,14 +8225,15 @@ pub(crate) struct CellFactor {
 
 impl CellFactor {
     /// Upper bound on factorisation work this path will accept per build, in
-    /// floating-point multiplications.
-    const MAX_WORK: f64 = 4.0e9;
+    /// floating-point multiplications. A bulk body of 1600 cells costs 3.5e9 and
+    /// then 1.9 s per step; thin bodies such as a limb stay far below this.
+    const MAX_WORK: f64 = 6.0e7;
 
     fn block_at(&self, row: usize, col: usize) -> usize {
         self.offset[row] + col - self.first[row] as usize
     }
 
-    fn build(
+    pub(crate) fn build(
         count: usize,
         diagonal: &[Block6],
         edges: &[(u32, u32, Block6)],
@@ -8267,7 +8351,7 @@ impl CellFactor {
         Some(factor)
     }
 
-    fn matches(&self, edges: &[(u32, u32, Block6)], masks: &[[f64; 6]]) -> bool {
+    pub(crate) fn matches(&self, edges: &[(u32, u32, Block6)], masks: &[[f64; 6]]) -> bool {
         // A stale mask is fine: `solve` is applied between masked vectors, which keeps
         // the preconditioner SPD on the current free subspace.
         let _ = masks;
@@ -8275,7 +8359,7 @@ impl CellFactor {
             && self.graph.iter().zip(edges).all(|(a, b)| a.0 == b.0 && a.1 == b.1)
     }
 
-    fn solve(&self, r: &[Vec6], z: &mut [Vec6], work: &mut Vec<Vec6>) {
+    pub(crate) fn solve(&self, r: &[Vec6], z: &mut [Vec6], work: &mut Vec<Vec6>) {
         let count = r.len();
         work.resize(count, [0.0; 6]);
         for cell in 0..count {
@@ -8308,6 +8392,51 @@ impl CellFactor {
     }
 }
 
+/// The first cell system built after `armed` is set, for preconditioner tests.
+#[cfg(test)]
+pub(crate) struct CapturedCellSystem {
+    pub(crate) diagonal: Vec<Block6>,
+    pub(crate) edges: Vec<(u32, u32, Block6)>,
+    pub(crate) masks: Vec<[f64; 6]>,
+    pub(crate) rhs: Vec<Vec6>,
+    pub(crate) positions: Vec<DVec3>,
+    pub(crate) lattice: Vec<DVec3>,
+    pub(crate) bodies: Vec<u32>,
+}
+
+/// Systems collected while a test has set a capture limit.
+#[cfg(test)]
+pub(crate) struct CellCapture {
+    pub(crate) limit: usize,
+    pub(crate) systems: Vec<CapturedCellSystem>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CAPTURED_CELL_SYSTEM: std::cell::RefCell<Option<CellCapture>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Nanoseconds spent in the phases of the cell solve, and the number of solves:
+/// block assembly, preconditioner build, conjugate gradients, write-back.
+pub static CELL_PROFILE: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn cell_profile_add(phase: usize, started: Instant) {
+    CELL_PROFILE[phase].fetch_add(
+        started.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Solve one cell update: PCG on 6x6 cell blocks, preconditioned by a reused complete
 /// factor when the fill is affordable, otherwise by block IC(0). Blocks of fixed degrees of freedom are eliminated by
 /// zeroing their rows and columns. On a face-connected grid two neighbours share
@@ -8320,6 +8449,8 @@ fn solve_face_cells_sparse(
     predicted: &[DVec3],
     loads: &[Vec3],
 ) -> usize {
+    use crate::contact_constraint::ContactProjection;
+    let phase_started = Instant::now();
     let n = scene.voxels.len();
     let h2 = f64::from(h) * f64::from(h);
     let cell = f64::from(CELL);
@@ -8381,31 +8512,35 @@ fn solve_face_cells_sparse(
             DVec3::new(v.y, -v.x, 0.0),
         )
     };
-    // Off-diagonal blocks H[row][col] with row > col in slot order.
-    let mut edges = Vec::<(u32, u32, Block6)>::new();
-    for c in &scratch.constraints {
+    // Per-bond blocks are independent, so they are computed in parallel and then
+    // added to their cells in bond order, which keeps the sums deterministic.
+    struct BondBlocks {
+        slot_i: u32,
+        slot_j: u32,
+        h_ii: Block6,
+        h_jj: Block6,
+        edge: Option<(u32, u32, Block6)>,
+        rhs_i: Vec6,
+        rhs_j: Vec6,
+    }
+    let scene_ref: &Scene = scene;
+    let bond_blocks = |c: &Constraint| -> Option<BondBlocks> {
         let (i, j) = (c.i, c.j);
         let (slot_i, slot_j) = (cell_of[i], cell_of[j]);
         if slot_i == u32::MAX && slot_j == u32::MAX {
-            continue;
+            return None;
         }
         let r = c.rest;
         let k = c.k.as_dmat3();
         let half = skew(r) * 0.5;
         let k_s = k * half;
         let s_k_s = half.transpose() * k_s;
-        let stiff = face_rotation_stiffness(scene, i, j, r.normalize_or_zero(), c.damage);
+        let stiff = face_rotation_stiffness(scene_ref, i, j, r.normalize_or_zero(), c.damage);
         // G_i = [-I, S], G_j = [I, S]; H = G^T k G plus face rotation stiffness.
         let h_ii = block6_from(k, -k_s, -k_s.transpose(), s_k_s + stiff);
         let h_jj = block6_from(k, k_s, k_s.transpose(), s_k_s + stiff);
         let h_ij = block6_from(-k, -k_s, k_s.transpose(), s_k_s - stiff);
-        if slot_i != u32::MAX {
-            block6_add(&mut diagonal[slot_i as usize], &h_ii);
-        }
-        if slot_j != u32::MAX {
-            block6_add(&mut diagonal[slot_j as usize], &h_jj);
-        }
-        if slot_i != u32::MAX && slot_j != u32::MAX {
+        let edge = if slot_i != u32::MAX && slot_j != u32::MAX {
             if slot_j > slot_i {
                 let mut transposed = [[0.0; 6]; 6];
                 for row in 0..6 {
@@ -8413,34 +8548,50 @@ fn solve_face_cells_sparse(
                         transposed[row][col] = h_ij[col][row];
                     }
                 }
-                edges.push((slot_j, slot_i, transposed));
+                Some((slot_j, slot_i, transposed))
             } else {
-                edges.push((slot_i, slot_j, h_ij));
+                Some((slot_i, slot_j, h_ij))
             }
-        }
+        } else {
+            None
+        };
         // Forces and moments on both cells, all in double precision.
-        let force = k * (scene.positions[j] - scene.positions[i] - r);
-        if slot_i != u32::MAX {
-            for p in 0..3 {
-                rhs[slot_i as usize][p] += force[p];
-            }
-        }
-        if slot_j != u32::MAX {
-            for p in 0..3 {
-                rhs[slot_j as usize][p] -= force[p];
-            }
-        }
+        let force = k * (scene_ref.positions[j] - scene_ref.positions[i] - r);
         let moment = half.transpose() * force;
-        let couple = stiff * face_bend(scene, i, j);
-        if slot_i != u32::MAX {
-            for p in 0..3 {
-                rhs[slot_i as usize][p + 3] += couple[p] - moment[p];
+        let couple = stiff * face_bend(scene_ref, i, j);
+        let mut rhs_i = [0.0; 6];
+        let mut rhs_j = [0.0; 6];
+        for p in 0..3 {
+            rhs_i[p] = force[p];
+            rhs_j[p] = -force[p];
+            rhs_i[p + 3] = couple[p] - moment[p];
+            rhs_j[p + 3] = -(couple[p] + moment[p]);
+        }
+        Some(BondBlocks { slot_i, slot_j, h_ii, h_jj, edge, rhs_i, rhs_j })
+    };
+    let computed: Vec<Option<BondBlocks>> = if scratch.constraints.len() >= 512 {
+        scratch.constraints.par_iter().map(bond_blocks).collect()
+    } else {
+        scratch.constraints.iter().map(bond_blocks).collect()
+    };
+    let mut edges = Vec::<(u32, u32, Block6)>::with_capacity(computed.len());
+    for blocks in computed.into_iter().flatten() {
+        if blocks.slot_i != u32::MAX {
+            let slot = blocks.slot_i as usize;
+            block6_add(&mut diagonal[slot], &blocks.h_ii);
+            for p in 0..6 {
+                rhs[slot][p] += blocks.rhs_i[p];
             }
         }
-        if slot_j != u32::MAX {
-            for p in 0..3 {
-                rhs[slot_j as usize][p + 3] -= couple[p] + moment[p];
+        if blocks.slot_j != u32::MAX {
+            let slot = blocks.slot_j as usize;
+            block6_add(&mut diagonal[slot], &blocks.h_jj);
+            for p in 0..6 {
+                rhs[slot][p] += blocks.rhs_j[p];
             }
+        }
+        if let Some(edge) = blocks.edge {
+            edges.push(edge);
         }
     }
     // Eliminate fixed axes.
@@ -8466,15 +8617,96 @@ fn solve_face_cells_sparse(
         }
     }
     edges.sort_by_key(|edge| (edge.0, edge.1));
+    #[cfg(test)]
+    CAPTURED_CELL_SYSTEM.with(|slot| {
+        if let Some(capture) = slot.borrow_mut().as_mut() {
+            if capture.systems.len() < capture.limit {
+                capture.systems.push(CapturedCellSystem {
+                    diagonal: diagonal.clone(),
+                    edges: edges.clone(),
+                    masks: masks.clone(),
+                    rhs: rhs.clone(),
+                    positions: cells.iter().map(|&i| scene.positions[i]).collect(),
+                    lattice: cells.iter().map(|&i| scene.rest_positions[i]).collect(),
+                    bodies: cells.iter().map(|&i| scene.clusters[i]).collect(),
+                });
+            }
+        }
+    });
     // Reuse a complete factor while the structure holds and it keeps solves short.
     let mut cell_factor = scratch.cell_factor.take();
-    if !cell_factor
+    let force_two_level = std::env::var_os("VOXEL_CELL_TWO_LEVEL").is_some();
+    if force_two_level {
+        cell_factor = None;
+    } else if !cell_factor
         .as_ref()
         .is_some_and(|factor| factor.matches(&edges, &masks) && scratch.cell_factor_iterations <= 40)
     {
         cell_factor = CellFactor::build(count, &diagonal, &edges, &masks);
     }
     let mut cell_factor_work = Vec::new();
+    let system = crate::cell_two_level::CellSystem::new(&diagonal, &edges);
+    cell_profile_add(0, phase_started);
+    let build_started = Instant::now();
+    // Contacts between two free bodies equate normal translations: a projected
+    // solve on the translation part, with a particular solution that closes any
+    // overlap, exactly as for the translation-only system.
+    let mut projection = None;
+    let mut particular = vec![[0.0f64; 6]; count];
+    if scratch.pair_contacts.iter().any(|pair| pair.active) {
+        let mut slot_of = vec![u32::MAX; n];
+        for (slot, &i) in cells.iter().enumerate() {
+            slot_of[i] = slot as u32;
+        }
+        let built = ContactProjection::build(&scratch.pair_contacts, &scratch.free, &slot_of);
+        let targets: Vec<f64> = scratch
+            .pair_contacts
+            .iter()
+            .map(|pair| {
+                if pair.active {
+                    DCELL
+                        - (scene.positions[pair.j][pair.axis] - scene.positions[pair.i][pair.axis])
+                            * pair.sign
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let start = built.particular(&scratch.pair_contacts, &targets, count);
+        for (slot, value) in start.iter().enumerate() {
+            particular[slot][0] = f64::from(value.x);
+            particular[slot][1] = f64::from(value.y);
+            particular[slot][2] = f64::from(value.z);
+        }
+        let mut product = vec![[0.0f64; 6]; count];
+        system.apply(&particular, &mut product);
+        for slot in 0..count {
+            for t in 0..6 {
+                rhs[slot][t] -= product[slot][t];
+            }
+        }
+        built.project_cells(&mut rhs);
+        projection = Some(built);
+    }
+    // A bulk body is too wide for a skyline factor: use the parallel two-level
+    // preconditioner instead of serial IC(0).
+    let mut two_level = scratch.two_level.take();
+    if cell_factor.is_none() {
+        if !two_level.as_ref().is_some_and(|built| {
+            built.matches(count, edges.len(), &masks) && scratch.cell_factor_iterations <= 30
+        }) {
+            let positions: Vec<DVec3> = cells.iter().map(|&i| scene.positions[i]).collect();
+            let lattice: Vec<DVec3> = cells.iter().map(|&i| scene.rest_positions[i]).collect();
+            let bodies: Vec<u32> = cells.iter().map(|&i| scene.clusters[i]).collect();
+            two_level = crate::cell_two_level::TwoLevel::build(
+                &system, &edges, &positions, &lattice, &bodies, &masks, cell,
+                crate::cell_two_level::DEFAULT_DAMPING,
+            );
+        }
+    } else {
+        two_level = None;
+    }
+    let mut two_level_work = std::mem::take(&mut scratch.two_level_work);
     // Block IC(0); falls back to block Jacobi when a pivot breaks down.
     let mut factor = vec![[[0.0; 6]; 6]; count];
     let mut lower = vec![[[0.0; 6]; 6]; edges.len()];
@@ -8486,7 +8718,7 @@ fn solve_face_cells_sparse(
         row_start[row + 1] += row_start[row];
     }
     let mut jacobi = false;
-    'factor: for row in 0..if cell_factor.is_some() { 0 } else { count } {
+    'factor: for row in 0..if cell_factor.is_some() || two_level.is_some() { 0 } else { count } {
         let mut pivot = diagonal[row];
         for e in row_start[row]..row_start[row + 1] {
             let col = edges[e].1 as usize;
@@ -8508,7 +8740,7 @@ fn solve_face_cells_sparse(
             }
         }
     }
-    if jacobi {
+    if jacobi && two_level.is_none() {
         for row in 0..count {
             factor[row] = match block6_cholesky(&diagonal[row]) {
                 Some(value) => value,
@@ -8519,21 +8751,28 @@ fn solve_face_cells_sparse(
             };
         }
     }
+    cell_profile_add(1, build_started);
+    let cg_started = Instant::now();
     let apply = |v: &[Vec6], out: &mut [Vec6]| {
-        for slot in 0..count {
-            out[slot] = block6_mul_vec(&diagonal[slot], &v[slot]);
+        let started = Instant::now();
+        system.apply(v, out);
+        if let Some(projection) = &projection {
+            projection.project_cells(out);
         }
-        for (row, col, block) in &edges {
-            let (row, col) = (*row as usize, *col as usize);
-            let a = block6_mul_vec(block, &v[col]);
-            let b = block6_transpose_mul_vec(block, &v[row]);
-            for p in 0..6 {
-                out[row][p] += a[p];
-                out[col][p] += b[p];
-            }
-        }
+        cell_profile_add(5, started);
     };
-    let mut precondition = |r: &[Vec6], z: &mut [Vec6]| {
+    let mut precondition_unprojected = |r: &[Vec6], z: &mut [Vec6]| {
+        if let Some(two) = &two_level {
+            two.apply(&system, r, z, &mut two_level_work);
+            // The coarse space may predate a contact row that has since fixed
+            // a degree of freedom: project onto the current free subspace.
+            for slot in 0..count {
+                for p in 0..6 {
+                    z[slot][p] *= masks[slot][p];
+                }
+            }
+            return;
+        }
         if let Some(complete) = &cell_factor {
             complete.solve(r, z, &mut cell_factor_work);
             for slot in 0..count {
@@ -8571,12 +8810,15 @@ fn solve_face_cells_sparse(
             }
         }
     };
-    let dot = |a: &[Vec6], b: &[Vec6]| {
-        a.iter()
-            .zip(b)
-            .map(|(x, y)| (0..6).map(|p| x[p] * y[p]).sum::<f64>())
-            .sum::<f64>()
+    let mut precondition = |r: &[Vec6], z: &mut [Vec6]| {
+        let started = Instant::now();
+        precondition_unprojected(r, z);
+        cell_profile_add(6, started);
+        if let Some(projection) = &projection {
+            projection.project_cells(z);
+        }
     };
+    let dot = |a: &[Vec6], b: &[Vec6]| crate::cell_two_level::dot(a, b);
     // The translation and rotation parts have different units. Their inner
     // product is fine for CG, but the stop test uses the force part alone so it
     // keeps the meaning of `solver_relative_tolerance`.
@@ -8615,24 +8857,39 @@ fn solve_face_cells_sparse(
             break;
         }
         let alpha = rz / denominator;
-        for slot in 0..count {
+        let advance = |((x, r), (p, ap)): ((&mut Vec6, &mut Vec6), (&Vec6, &Vec6))| {
             for t in 0..6 {
-                x[slot][t] += alpha * p[slot][t];
-                r[slot][t] -= alpha * ap[slot][t];
+                x[t] += alpha * p[t];
+                r[t] -= alpha * ap[t];
             }
+        };
+        if count >= 1024 {
+            x.par_iter_mut().zip(r.par_iter_mut()).zip(p.par_iter().zip(ap.par_iter())).for_each(advance);
+        } else {
+            x.iter_mut().zip(r.iter_mut()).zip(p.iter().zip(ap.iter())).for_each(advance);
         }
         precondition(&r, &mut z);
         let next = dot(&r, &z);
         let beta = next / rz;
         rz = next;
-        for slot in 0..count {
+        let direction = |(p, z): (&mut Vec6, &Vec6)| {
             for t in 0..6 {
-                p[slot][t] = z[slot][t] + beta * p[slot][t];
+                p[t] = z[t] + beta * p[t];
             }
+        };
+        if count >= 1024 {
+            p.par_iter_mut().zip(z.par_iter()).for_each(direction);
+        } else {
+            p.iter_mut().zip(z.iter()).for_each(direction);
         }
     }
+    cell_profile_add(2, cg_started);
+    CELL_PROFILE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    CELL_PROFILE[3].fetch_add(iterations as u64, std::sync::atomic::Ordering::Relaxed);
     scratch.cell_factor_iterations = iterations;
     scratch.cell_factor = cell_factor;
+    scratch.two_level = two_level;
+    scratch.two_level_work = two_level_work;
     if x.iter().flatten().any(|value| !value.is_finite()) {
         scene.solver_residual = f32::INFINITY;
         return iterations;
@@ -8640,6 +8897,9 @@ fn solve_face_cells_sparse(
     scene.solver_residual = (force_norm(&r) / force0.max(1.0e-12)) as f32;
     scratch.last_force_residual_n = force_norm(&r);
     for (slot, &i) in cells.iter().enumerate() {
+        for t in 0..6 {
+            x[slot][t] += particular[slot][t];
+        }
         scene.positions[i] += DVec3::new(x[slot][0], x[slot][1], x[slot][2]);
         let turn = DVec3::new(x[slot][3], x[slot][4], x[slot][5]);
         if turn != DVec3::ZERO {
@@ -9059,8 +9319,9 @@ fn solve_coupled(
     scratch.mechanical_revs = mechanical_revs;
     scratch.mechanical_slots = mechanical_slots;
     let assembly_time = assembly_start.elapsed();
-    if !coupled_contact && scene.cell_dofs {
+    if scene.cell_dofs {
         let solve_start = Instant::now();
+        build_block_jacobi(&scratch.diagonal, &mut scratch.factor_diagonal);
         let iterations =
             solve_face_cells_sparse(scene, h, scratch, !reuse_preconditioner, predicted, loads);
         return (iterations, [assembly_time, Duration::ZERO, solve_start.elapsed()]);

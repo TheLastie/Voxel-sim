@@ -40,3 +40,10 @@ The current targets, explicitly revised by the user on 2026-11-05, are 60 FPS in
 - Check repository read/write access before editing. Preserve the user's existing work; inspect status before staging and never discard unrelated changes.
 - Commit coherent milestones and push to `origin/main` when the user has asked for pushes. Verify the remote ref actually moved, then give the commit/link. If command-line push lacks credentials, try the available authorized GitHub route; never describe a local commit as pushed. Clearly report a permission/authentication blocker if no write route succeeds.
 - Update [`PROGRESS_2026-10-12.md`](PROGRESS_2026-10-12.md) with measured results, exact settings, known limitations, and the next incomplete requirements. Keep the report factual and distinguish old results from new code.
+
+## Рабочие правила пользователя (5 ноября 2026)
+
+- Работать только внутри `E:\Projects` (см. `E:\Projects\CLAUDE.md`): на диске C ничего не создавать и не менять. Логи, черновики и временные файлы держать в `validation/live-tests/` (там же `scratch/`, не коммитится); вывод фоновых команд перенаправлять в лог на E и читать оттуда.
+- Не простаивать: пока идут сборка, замер или субагент, продолжать независимую работу (код, отчёты, следующая правка) в том же ходе и не заканчивать ход фразой «жду».
+- Тестировать только то, на что правка явно влияет; полный набор — один раз перед коммитом. Время важно.
+- Субагенты разрешены при умеренном расходе токенов; ChatGPT только модель gpt-6-luna на лёгком или среднем размышлении.

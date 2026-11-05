@@ -94,6 +94,32 @@ impl ContactProjection {
         }
     }
 
+    /// The same orthogonal projection for cell vectors in double precision. Only
+    /// the first three components, the translation, carry contact rows; the
+    /// rotation components are untouched.
+    pub fn project_cells(&self, vector: &mut [[f64; 6]]) {
+        for (members, fixed) in &self.groups {
+            let mean = if *fixed {
+                0.0
+            } else {
+                members
+                    .iter()
+                    .map(|&i| {
+                        let (_, axis, slot) = self.nodes[i];
+                        vector[slot.unwrap()][axis]
+                    })
+                    .sum::<f64>()
+                    / members.len() as f64
+            };
+            for &i in members {
+                let (_, axis, slot) = self.nodes[i];
+                if let Some(slot) = slot {
+                    vector[slot][axis] = mean;
+                }
+            }
+        }
+    }
+
     /// A particular solution of C x = target. The tree keeps dependent
     /// manifold rows out of the solve, just as it does for reaction recovery.
     pub fn particular(
