@@ -25,7 +25,7 @@ use std::{
 };
 
 const MAGIC: &[u8; 4] = b"VXED";
-const FORMAT_VERSION: u16 = 6;
+const FORMAT_VERSION: u16 = 7;
 const HEADER_BYTES: usize = 28;
 const MAX_PAYLOAD_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DOCUMENT_ITEMS: u64 = 8_000_000;
@@ -2046,6 +2046,54 @@ pub struct SceneDocument {
     pub scene_object_settings: Vec<SceneObjectSettings>,
     /// Runtime authoring settings; legacy scenes default to disabled welding.
     pub simulation_settings: SceneSimulationSettings,
+    /// Explicit bonds between REVs of the instances above (schema 7). They are
+    /// authored choices; touching faces never create or replace them.
+    pub manual_bonds: Vec<ManualBondDocument>,
+}
+
+/// One REV of one scene instance: `voxel` indexes that instance's `.vxm`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManualBondEndpoint {
+    pub instance: usize,
+    pub voxel: u32,
+}
+
+/// Editable explicit bond between two (possibly distant) REVs.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ManualBondDocument {
+    pub a: ManualBondEndpoint,
+    pub b: ManualBondEndpoint,
+    /// Stress-free centre distance along the bond axis (m). Default 1 cm.
+    pub rest_length_m: f64,
+    /// Axial force carried at creation (N); positive pulls the ends together.
+    pub pretension_n: f64,
+}
+
+impl ManualBondDocument {
+    pub fn new(a: ManualBondEndpoint, b: ManualBondEndpoint) -> Self {
+        Self {
+            a,
+            b,
+            rest_length_m: Scene::DEFAULT_MANUAL_BOND_REST_LENGTH_M,
+            pretension_n: 0.0,
+        }
+    }
+
+    fn validate(&self, instance_count: usize) -> Result<(), String> {
+        if self.a.instance >= instance_count || self.b.instance >= instance_count {
+            return Err("manual bond refers to a missing model instance".into());
+        }
+        if self.a == self.b {
+            return Err("manual bond cannot connect a REV to itself".into());
+        }
+        if !self.rest_length_m.is_finite() || self.rest_length_m <= 0.0 {
+            return Err("manual bond rest length must be finite and positive".into());
+        }
+        if !self.pretension_n.is_finite() {
+            return Err("manual bond pretension must be finite".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -2130,6 +2178,16 @@ struct LegacySceneV5Document {
     scene_object_settings: Vec<SceneObjectSettings>,
 }
 
+/// Version 6 had simulation settings but no manual bonds.
+#[derive(Serialize, Deserialize)]
+struct LegacySceneV6Document {
+    name: String,
+    config: SceneConfig,
+    models: Vec<ModelInstanceDocument>,
+    scene_object_settings: Vec<SceneObjectSettings>,
+    simulation_settings: SceneSimulationSettings,
+}
+
 impl SceneDocument {
     pub fn new(name: impl Into<String>, config: SceneConfig) -> Result<Self, String> {
         config.validate().map_err(str::to_owned)?;
@@ -2139,6 +2197,7 @@ impl SceneDocument {
             models: Vec::new(),
             scene_object_settings: Vec::new(),
             simulation_settings: SceneSimulationSettings::default(),
+            manual_bonds: Vec::new(),
         };
         document.validate()?;
         Ok(document)
@@ -2148,6 +2207,93 @@ impl SceneDocument {
         model.validate()?;
         self.models.push(model);
         Ok(())
+    }
+
+    /// Add an explicit bond between two REVs (default rest length 1 cm, no
+    /// pretension). Returns its index. Endpoint voxel indices are checked when
+    /// the scene is built, because the `.vxm` files are loaded then.
+    pub fn add_manual_bond(&mut self, bond: ManualBondDocument) -> Result<usize, String> {
+        bond.validate(self.models.len())?;
+        self.manual_bonds.push(bond);
+        Ok(self.manual_bonds.len() - 1)
+    }
+
+    /// Edit the rest length and pretension of an existing manual bond.
+    pub fn set_manual_bond_state(
+        &mut self,
+        index: usize,
+        rest_length_m: f64,
+        pretension_n: f64,
+    ) -> Result<(), String> {
+        let instance_count = self.models.len();
+        let bond = self
+            .manual_bonds
+            .get_mut(index)
+            .ok_or_else(|| format!("manual bond index {index} is out of bounds"))?;
+        let mut edited = *bond;
+        edited.rest_length_m = rest_length_m;
+        edited.pretension_n = pretension_n;
+        edited.validate(instance_count)?;
+        *bond = edited;
+        Ok(())
+    }
+
+    pub fn remove_manual_bond(&mut self, index: usize) -> Result<ManualBondDocument, String> {
+        if index >= self.manual_bonds.len() {
+            return Err(format!("manual bond index {index} is out of bounds"));
+        }
+        Ok(self.manual_bonds.remove(index))
+    }
+
+    /// MakeUnique: copy the asset used by instance `index` to `new_asset_path`
+    /// and point only that instance at the copy. Relative paths resolve beside
+    /// `scene_path`. An existing file is never overwritten (the copy is created
+    /// exclusively), and nothing is changed if the copy fails. Never called
+    /// automatically on load. Returns the resolved path of the new file; the
+    /// caller saves the scene document.
+    pub fn make_unique(
+        &mut self,
+        index: usize,
+        scene_path: &Path,
+        new_asset_path: &Path,
+    ) -> Result<PathBuf, String> {
+        if index >= self.models.len() {
+            return Err(format!("model instance index {index} is out of bounds"));
+        }
+        validate_extension(new_asset_path, DocumentKind::Model)?;
+        let directory = scene_path.parent().unwrap_or_else(|| Path::new("."));
+        let resolve = |path: &Path| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                directory.join(path)
+            }
+        };
+        let source = resolve(&self.models[index].asset_path);
+        let target = resolve(new_asset_path);
+        // Validate the source before creating anything.
+        let _: VoxelModelDocument = load_document(&source)
+            .map_err(|error| format!("load model {}: {error}", source.display()))?;
+        let bytes = fs::read(&source)
+            .map_err(|error| format!("read model {}: {error}", source.display()))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    format!("refusing to overwrite existing file {}", target.display())
+                } else {
+                    format!("create {}: {error}", target.display())
+                }
+            })?;
+        if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(&target);
+            return Err(format!("write {}: {error}", target.display()));
+        }
+        self.models[index].asset_path = new_asset_path.to_path_buf();
+        Ok(target)
     }
 
     /// Return saved settings for an instance, or its empty authoring defaults.
@@ -2264,6 +2410,15 @@ impl SceneDocument {
             }
         });
         self.simulation_settings.remove_object(index);
+        self.manual_bonds
+            .retain(|bond| bond.a.instance != index && bond.b.instance != index);
+        for bond in &mut self.manual_bonds {
+            for end in [&mut bond.a, &mut bond.b] {
+                if end.instance > index {
+                    end.instance -= 1;
+                }
+            }
+        }
         Ok(removed)
     }
 
@@ -2396,6 +2551,7 @@ impl SceneDocument {
         let mut object_forces = Vec::with_capacity(self.models.len());
         let mut skeletal_models = Vec::new();
         let mut scene_voxel_count = 0usize;
+        let mut instance_ranges = Vec::with_capacity(self.models.len());
 
         let mut loaded_materials = BTreeMap::<PathBuf, u16>::new();
         for (instance_index, instance) in self.models.iter().enumerate() {
@@ -2421,6 +2577,7 @@ impl SceneDocument {
             scene_voxel_count = scene_voxel_count
                 .checked_add(model.voxels.len())
                 .ok_or_else(|| "scene voxel index range overflow".to_owned())?;
+            instance_ranges.push(range_start..scene_voxel_count);
             if let Some(skeleton) = &model.skeleton {
                 if skeleton.clips.is_empty() {
                     return Err(format!(
@@ -2593,7 +2750,37 @@ impl SceneDocument {
             scene.skeletal_actuators.push(actuator);
         }
         self.apply_simulation_settings(&mut scene)?;
+        self.apply_manual_bonds(&mut scene, &instance_ranges)?;
         Ok(scene)
+    }
+
+    /// Create the authored explicit bonds. Pretension and stretch energy are
+    /// booked as external work by `Scene::connect_manual_bond`.
+    fn apply_manual_bonds(
+        &self,
+        scene: &mut Scene,
+        ranges: &[std::ops::Range<usize>],
+    ) -> Result<(), String> {
+        for (index, bond) in self.manual_bonds.iter().enumerate() {
+            bond.validate(self.models.len())?;
+            let mut ends = [0usize; 2];
+            for (slot, end) in [bond.a, bond.b].into_iter().enumerate() {
+                let range = &ranges[end.instance];
+                if end.voxel as usize >= range.len() {
+                    return Err(format!(
+                        "manual bond {index}: REV {} is out of range for instance {} ({} REVs)",
+                        end.voxel,
+                        end.instance,
+                        range.len()
+                    ));
+                }
+                ends[slot] = range.start + end.voxel as usize;
+            }
+            scene
+                .connect_manual_bond(ends[0], ends[1], bond.rest_length_m, bond.pretension_n)
+                .map_err(|error| format!("manual bond {index}: {error}"))?;
+        }
+        Ok(())
     }
 
     fn apply_simulation_settings(&self, scene: &mut Scene) -> Result<(), String> {
@@ -2700,6 +2887,7 @@ impl EditorDocument for SceneDocument {
         self.models.len()
             + self.scene_object_settings.len()
             + self.simulation_settings.object_initial_temperatures.len()
+            + self.manual_bonds.len()
     }
 
     fn decode_payload(version: u16, payload: &[u8]) -> Result<Self, String> {
@@ -2714,6 +2902,7 @@ impl EditorDocument for SceneDocument {
                     models: old.models,
                     scene_object_settings: Vec::new(),
                     simulation_settings: SceneSimulationSettings::default(),
+                    manual_bonds: Vec::new(),
                 })
             }
             5 => {
@@ -2726,6 +2915,20 @@ impl EditorDocument for SceneDocument {
                     models: old.models,
                     scene_object_settings: old.scene_object_settings,
                     simulation_settings: SceneSimulationSettings::default(),
+                    manual_bonds: Vec::new(),
+                })
+            }
+            6 => {
+                let old: LegacySceneV6Document = codec()
+                    .deserialize(payload)
+                    .map_err(|error| format!("decode version 6 scene: {error}"))?;
+                Ok(Self {
+                    name: old.name,
+                    config: old.config,
+                    models: old.models,
+                    scene_object_settings: old.scene_object_settings,
+                    simulation_settings: old.simulation_settings,
+                    manual_bonds: Vec::new(),
                 })
             }
             FORMAT_VERSION => codec()
@@ -2758,6 +2961,9 @@ impl EditorDocument for SceneDocument {
             settings.validate()?;
         }
         self.simulation_settings.validate(self.models.len())?;
+        for bond in &self.manual_bonds {
+            bond.validate(self.models.len())?;
+        }
         Ok(())
     }
 }
@@ -3977,5 +4183,184 @@ mod tests {
         assert_eq!(frames[1].time_s, 1.0);
         assert_eq!(frames[1].translation_m.z, 0.3);
         assert!(skeleton.add_bone("orphan", None, DVec3::ZERO).is_err());
+    }
+
+    fn linked_fixture(name: &str) -> (PathBuf, SceneDocument, PathBuf) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("validation")
+            .join("tmpfixture")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        save_document(&root.join("part.vxm"), &sample_model()).unwrap();
+        let mut scene = SceneDocument::new(name, SceneConfig::default()).unwrap();
+        for x in [0.0, 0.02] {
+            scene
+                .add_model(ModelInstanceDocument {
+                    asset_path: PathBuf::from("part.vxm"),
+                    translation_m: DVec3::new(x, 0.0, 0.0),
+                    rotation: Quat::IDENTITY,
+                    scale: Vec3::ONE,
+                })
+                .unwrap();
+        }
+        let scene_path = root.join("scene.vxscene");
+        save_document(&scene_path, &scene).unwrap();
+        (root, scene, scene_path)
+    }
+
+    #[test]
+    fn manual_bond_document_builds_stretched_bond_and_books_external_work() {
+        let (root, mut scene, scene_path) = linked_fixture("manual-bond");
+        let end = |instance| ManualBondEndpoint { instance, voxel: 0 };
+        let index = scene
+            .add_manual_bond(ManualBondDocument::new(end(0), end(1)))
+            .unwrap();
+        assert_eq!(scene.manual_bonds[index].rest_length_m, 0.01);
+        let built = scene.build_scene(&scene_path).unwrap();
+        assert_eq!(built.voxels.len(), 2);
+        assert_eq!(built.bonds[0][0].neighbor, 1);
+        // Centres are 2 cm apart and the default rest length is 1 cm.
+        assert!(built.energy.external_work > 0.0);
+        assert!(
+            (built.elastic_bond_energy_j() - built.energy.external_work).abs()
+                < 1e-6 * built.energy.external_work
+        );
+        // Relaxing to the actual 2 cm distance stores (almost) no energy.
+        scene.set_manual_bond_state(index, 0.02, 0.0).unwrap();
+        let relaxed = scene.build_scene(&scene_path).unwrap();
+        assert!(relaxed.energy.external_work < 1e-9 * built.energy.external_work);
+        // Pretension on a relaxed bond is booked too.
+        scene.set_manual_bond_state(index, 0.02, 10.0).unwrap();
+        assert!(scene.build_scene(&scene_path).unwrap().energy.external_work > 0.0);
+
+        // Save/load keeps the bond (schema 7); invalid input is refused.
+        save_document(&scene_path, &scene).unwrap();
+        let loaded: SceneDocument = load_document(&scene_path).unwrap();
+        assert_eq!(loaded.manual_bonds, scene.manual_bonds);
+        assert!(scene.set_manual_bond_state(index, f64::NAN, 0.0).is_err());
+        assert!(scene.set_manual_bond_state(index, -0.01, 0.0).is_err());
+        assert!(scene
+            .set_manual_bond_state(index, 0.01, f64::INFINITY)
+            .is_err());
+        assert!(scene
+            .add_manual_bond(ManualBondDocument::new(end(0), end(0)))
+            .is_err());
+        assert!(scene
+            .add_manual_bond(ManualBondDocument::new(end(0), end(5)))
+            .is_err());
+        let mut out_of_range = ManualBondDocument::new(end(0), end(1));
+        out_of_range.b.voxel = 7;
+        scene.manual_bonds.push(out_of_range);
+        let error = scene.build_scene(&scene_path).err().unwrap();
+        assert!(error.contains("out of range"), "{error}");
+        scene.manual_bonds.pop();
+        // A second bond on the same slot cannot be represented.
+        scene
+            .add_manual_bond(ManualBondDocument::new(end(0), end(1)))
+            .unwrap();
+        let error = scene.build_scene(&scene_path).err().unwrap();
+        assert!(error.contains("one bond per axis"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_six_scene_without_manual_bonds_still_decodes() {
+        let scene = SceneDocument::new("old", SceneConfig::default()).unwrap();
+        let legacy = LegacySceneV6Document {
+            name: scene.name.clone(),
+            config: scene.config.clone(),
+            models: scene.models.clone(),
+            scene_object_settings: Vec::new(),
+            simulation_settings: SceneSimulationSettings::default(),
+        };
+        let payload = codec().serialize(&legacy).unwrap();
+        let migrated = SceneDocument::decode_payload(6, &payload).unwrap();
+        assert!(migrated.manual_bonds.is_empty());
+        assert_eq!(migrated.name, "old");
+    }
+
+    #[test]
+    fn removing_an_instance_drops_and_renumbers_manual_bonds() {
+        let (root, mut scene, _) = linked_fixture("manual-bond-remove");
+        let end = |instance| ManualBondEndpoint { instance, voxel: 0 };
+        let third = scene.models[0].clone();
+        scene.add_model(third).unwrap();
+        scene
+            .add_manual_bond(ManualBondDocument::new(end(1), end(2)))
+            .unwrap();
+        scene
+            .add_manual_bond(ManualBondDocument::new(end(0), end(1)))
+            .unwrap();
+        scene.remove_model(0).unwrap();
+        assert_eq!(scene.manual_bonds.len(), 1);
+        assert_eq!(scene.manual_bonds[0].a.instance, 0);
+        assert_eq!(scene.manual_bonds[0].b.instance, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_vxm_change_reaches_all_linked_instances_and_make_unique_detaches_one() {
+        let (root, mut scene, scene_path) = linked_fixture("linked");
+        let model_path = root.join("part.vxm");
+        let before = scene.build_scene(&scene_path).unwrap();
+        assert_eq!(before.voxels[0].velocity, before.voxels[1].velocity);
+
+        // Edit the shared source; rebuilding the saved scene reflects it in
+        // every linked instance.
+        let mut edited = sample_model();
+        edited.voxels[0].state.velocity = Vec3::new(0.0, 1.5, 0.0);
+        fs::remove_file(&model_path).unwrap();
+        save_document(&model_path, &edited).unwrap();
+        let reloaded: SceneDocument = load_document(&scene_path).unwrap();
+        let after = reloaded.build_scene(&scene_path).unwrap();
+        assert_eq!(after.voxels[0].velocity, Vec3::new(0.0, 1.5, 0.0));
+        assert_eq!(after.voxels[1].velocity, Vec3::new(0.0, 1.5, 0.0));
+        // Reload alone made no new asset (only part.vxm and scene.vxscene).
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+
+        // MakeUnique: only instance 1 points at the copy.
+        let copy = scene
+            .make_unique(1, &scene_path, Path::new("part-unique.vxm"))
+            .unwrap();
+        assert_eq!(copy, root.join("part-unique.vxm"));
+        assert_eq!(scene.models[0].asset_path, PathBuf::from("part.vxm"));
+        assert_eq!(scene.models[1].asset_path, PathBuf::from("part-unique.vxm"));
+        let mut changed_again = edited.clone();
+        changed_again.voxels[0].state.velocity = Vec3::new(0.0, 0.0, 2.0);
+        fs::remove_file(&model_path).unwrap();
+        save_document(&model_path, &changed_again).unwrap();
+        let split = scene.build_scene(&scene_path).unwrap();
+        assert_eq!(split.voxels[0].velocity, Vec3::new(0.0, 0.0, 2.0));
+        assert_eq!(split.voxels[1].velocity, Vec3::new(0.0, 1.5, 0.0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn make_unique_never_overwrites_and_leaves_the_document_unchanged_on_failure() {
+        let (root, mut scene, scene_path) = linked_fixture("unique-guard");
+        let existing = root.join("taken.vxm");
+        let mut other = sample_model();
+        other.name = "do-not-touch".into();
+        save_document(&existing, &other).unwrap();
+        let bytes = fs::read(&existing).unwrap();
+        let error = scene
+            .make_unique(0, &scene_path, Path::new("taken.vxm"))
+            .unwrap_err();
+        assert!(error.contains("refusing to overwrite"), "{error}");
+        assert_eq!(fs::read(&existing).unwrap(), bytes);
+        assert_eq!(scene.models[0].asset_path, PathBuf::from("part.vxm"));
+        // Copying onto the source itself is the same refusal.
+        assert!(scene
+            .make_unique(0, &scene_path, Path::new("part.vxm"))
+            .is_err());
+        assert!(scene
+            .make_unique(0, &scene_path, Path::new("copy.txt"))
+            .is_err());
+        assert!(scene
+            .make_unique(9, &scene_path, Path::new("copy.vxm"))
+            .is_err());
+        assert!(!root.join("copy.vxm").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }

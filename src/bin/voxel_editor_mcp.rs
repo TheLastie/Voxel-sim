@@ -10,7 +10,8 @@ use std::{
 use voxel_physics_lab::{
     documents::{
         generate_auto_bone_weights, load_document, save_document, BoneKeyframeDocument,
-        ConstraintPartDocument, EditorDocument, ModelInstanceDocument, ModelVoxel, SceneDocument,
+        ConstraintPartDocument, EditorDocument, ManualBondDocument, ManualBondEndpoint,
+        ModelInstanceDocument, ModelVoxel, SceneDocument,
         SkeletonDocument, VoxelModelDocument,
     },
     material::Material,
@@ -287,7 +288,7 @@ fn tool_definitions() -> Vec<Value> {
         }), false),
         tool_definition("sample_animation", "Sample interpolated local bone poses and global joints from a clip at a time in seconds.", json!({"type":"object","properties":{"path":{"type":"string"},"clip_index":{"type":"integer","minimum":0},"time_s":{"type":"number","minimum":0}},"required":["path","clip_index","time_s"],"additionalProperties":false}), true),
         tool_definition("edit_voxel_model", "Edit a .vxm on its REV grid: add, move, duplicate or remove one REV; stamp a block, sphere, cylinder or frame; add a built-in material preset or assign a material already stored in the model. Every change writes a validated new file.", json!({"type":"object","properties":{"source_path":{"type":"string"},"output_path":{"type":"string"},"operation":{"type":"string","enum":["add_voxel","remove_voxel","move_voxel","duplicate_voxel","add_material","assign_material","stamp_shape"]},"voxel_index":{"type":"integer","minimum":0},"cell":{"type":"array","items":{"type":"integer"},"minItems":3,"maxItems":3},"min_cell":{"type":"array","items":{"type":"integer"},"minItems":3,"maxItems":3},"max_cell":{"type":"array","items":{"type":"integer"},"minItems":3,"maxItems":3},"shape":{"type":"string","enum":["block","sphere","cylinder","frame"]},"material_name":{"type":"string"}},"required":["source_path","output_path","operation"],"additionalProperties":false}), false),
-        tool_definition("edit_scene", "Add, move, duplicate or remove .vxm instances in a saved .vxscene, preserving project-relative references and returning resulting transforms.", json!({"type":"object","properties":{"source_path":{"type":"string"},"output_path":{"type":"string"},"operation":{"type":"string","enum":["add_instance","move_instance","duplicate_instance","remove_instance"]},"instance_index":{"type":"integer","minimum":0},"asset_path":{"type":"string"},"translation_m":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"rotation_xyzw":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"scale":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"delta_cells":{"type":"array","items":{"type":"integer"},"minItems":3,"maxItems":3}},"required":["source_path","output_path","operation"],"additionalProperties":false}), false),
+        tool_definition("edit_scene", "Add, move, duplicate or remove .vxm instances in a saved .vxscene, preserving project-relative references and returning resulting transforms. Also authors explicit bonds between REVs of two instances (add_manual_bond, set_manual_bond, remove_manual_bond; rest_length_m defaults to 0.01, pretension_n to 0) and make_unique, which copies one instance's .vxm to new_asset_path (never overwriting) and points only that instance at the copy.", json!({"type":"object","properties":{"source_path":{"type":"string"},"output_path":{"type":"string"},"operation":{"type":"string","enum":["add_instance","move_instance","duplicate_instance","remove_instance","add_manual_bond","set_manual_bond","remove_manual_bond","make_unique"]},"instance_index":{"type":"integer","minimum":0},"bond_index":{"type":"integer","minimum":0},"instance_a":{"type":"integer","minimum":0},"voxel_a":{"type":"integer","minimum":0},"instance_b":{"type":"integer","minimum":0},"voxel_b":{"type":"integer","minimum":0},"rest_length_m":{"type":"number","exclusiveMinimum":0},"pretension_n":{"type":"number"},"new_asset_path":{"type":"string"},"asset_path":{"type":"string"},"translation_m":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"rotation_xyzw":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"scale":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"delta_cells":{"type":"array","items":{"type":"integer"},"minItems":3,"maxItems":3}},"required":["source_path","output_path","operation"],"additionalProperties":false}), false),
     ]
 }
 
@@ -1439,6 +1440,7 @@ fn edit_scene(app: &App, args: &Value) -> Result<Value, String> {
     let output_dir = output
         .parent()
         .ok_or("scene output path has no parent directory")?;
+    let mut instance_voxel_counts = Vec::new();
     for instance in &mut scene.models {
         let asset = referenced_path(app, source_dir, &instance.asset_path)?;
         if extension(&asset).as_deref() != Some("vxm") {
@@ -1449,6 +1451,7 @@ fn edit_scene(app: &App, args: &Value) -> Result<Value, String> {
         }
         let model: VoxelModelDocument = load_document(&asset)?;
         model.validate()?;
+        instance_voxel_counts.push(model.voxels.len());
         instance.asset_path = relative_asset_path(output_dir, &asset)?;
     }
     let operation = required_string(args, "operation")?;
@@ -1503,6 +1506,67 @@ fn edit_scene(app: &App, args: &Value) -> Result<Value, String> {
             let index = required_usize(args, "instance_index")?;
             let removed = scene.remove_model(index)?;
             result = json!({"removed_instance_index":index,"asset_path":removed.asset_path});
+        }
+        "add_manual_bond" | "set_manual_bond" => {
+            let rest_length_m = if args.get("rest_length_m").is_some() {
+                required_f64(args, "rest_length_m")?
+            } else {
+                0.01
+            };
+            let pretension_n = if args.get("pretension_n").is_some() {
+                required_f64(args, "pretension_n")?
+            } else {
+                0.0
+            };
+            if operation == "add_manual_bond" {
+                let a = ManualBondEndpoint {
+                    instance: required_usize(args, "instance_a")?,
+                    voxel: u32::try_from(required_usize(args, "voxel_a")?)
+                        .map_err(|_| "voxel_a is too large")?,
+                };
+                let b = ManualBondEndpoint {
+                    instance: required_usize(args, "instance_b")?,
+                    voxel: u32::try_from(required_usize(args, "voxel_b")?)
+                        .map_err(|_| "voxel_b is too large")?,
+                };
+                for end in [a, b] {
+                    let count = instance_voxel_counts
+                        .get(end.instance)
+                        .ok_or("manual bond refers to a missing model instance")?;
+                    if end.voxel as usize >= *count {
+                        return Err(format!(
+                            "REV {} is out of range for instance {} ({count} REVs)",
+                            end.voxel, end.instance
+                        ));
+                    }
+                }
+                let mut bond = ManualBondDocument::new(a, b);
+                bond.rest_length_m = rest_length_m;
+                bond.pretension_n = pretension_n;
+                let index = scene.add_manual_bond(bond)?;
+                result = json!({"bond_index":index,"rest_length_m":rest_length_m,"pretension_n":pretension_n,"note":"representability (one bond per axis per REV) is checked when the scene is built"});
+            } else {
+                let index = required_usize(args, "bond_index")?;
+                scene.set_manual_bond_state(index, rest_length_m, pretension_n)?;
+                result = json!({"bond_index":index,"rest_length_m":rest_length_m,"pretension_n":pretension_n});
+            }
+        }
+        "remove_manual_bond" => {
+            let index = required_usize(args, "bond_index")?;
+            scene.remove_manual_bond(index)?;
+            result = json!({"removed_bond_index":index});
+        }
+        "make_unique" => {
+            let index = required_usize(args, "instance_index")?;
+            let target = output_path(app, required_string(args, "new_asset_path")?)?;
+            if extension(&target).as_deref() != Some("vxm") {
+                return Err("new_asset_path must end in .vxm".into());
+            }
+            let stored = relative_asset_path(output_dir, &target)?;
+            // The scene output is written only after the copy succeeds; the
+            // copy itself is exclusive, so an existing file is never replaced.
+            let created = scene.make_unique(index, &output, &stored)?;
+            result = json!({"instance_index":index,"new_asset_path":relative(&app.root,&created),"note":"only this instance now uses the copy; other instances keep the original"});
         }
         _ => return Err(format!("unsupported scene operation: {operation}")),
     }

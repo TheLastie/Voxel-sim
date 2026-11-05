@@ -1831,6 +1831,121 @@ impl Scene {
         Ok(())
     }
 
+    /// Default stress-free length of a manually authored bond (m).
+    pub const DEFAULT_MANUAL_BOND_REST_LENGTH_M: f64 = DCELL;
+
+    /// Create an explicit bond between two REVs that need not be face
+    /// neighbours. `rest_length_m` is the stress-free centre distance along the
+    /// bond axis (default 1 cm); `pretension_n` is an additional axial force the
+    /// bond carries at creation (positive pulls the ends together). The stress
+    /// is stored through `Bond::formation_offset`, so force and energy follow the
+    /// ordinary constitutive law. Energy stored at creation (stretch plus
+    /// pretension) is recorded as external work in `energy.external_work`.
+    /// The bond axis is the lattice axis best aligned with the separation. The
+    /// graph holds one bond per axis per REV on each side, so a request whose
+    /// slot is occupied is rejected without changing the scene.
+    pub fn connect_manual_bond(
+        &mut self,
+        a: usize,
+        b: usize,
+        rest_length_m: f64,
+        pretension_n: f64,
+    ) -> Result<(), String> {
+        let count = self.voxels.len();
+        if a >= count || b >= count {
+            return Err(format!("manual bond REV index out of range ({a}, {b}; {count} REVs)"));
+        }
+        if a == b {
+            return Err("manual bond cannot connect a REV to itself".into());
+        }
+        if !rest_length_m.is_finite() || rest_length_m <= 0.0 {
+            return Err("manual bond rest length must be finite and positive".into());
+        }
+        if !pretension_n.is_finite() {
+            return Err("manual bond pretension must be finite".into());
+        }
+        let separation = self.positions[b] - self.positions[a];
+        if !separation.is_finite() || separation.length() < 1e-9 {
+            return Err("manual bond endpoints coincide".into());
+        }
+        let frame_rotation = self.rotations[a].slerp(self.rotations[b], 0.5);
+        let axes = [Vec3::X, Vec3::Y, Vec3::Z];
+        let (axis, projection) = (0..3)
+            .map(|axis| (axis, separation.dot((frame_rotation * axes[axis]).as_dvec3())))
+            .max_by(|x, y| x.1.abs().total_cmp(&y.1.abs()))
+            .expect("three axes");
+        let (lower, upper) = if projection >= 0.0 { (a, b) } else { (b, a) };
+        let axis_name = ["x", "y", "z"][axis];
+        if self.bonds[axis][lower].neighbor != EMPTY {
+            return Err(format!(
+                "REV {lower} already has a bond on its +{axis_name} side; the bond graph allows one bond per axis per REV"
+            ));
+        }
+        if self.bonds[axis].iter().any(|bond| bond.neighbor as usize == upper) {
+            return Err(format!(
+                "REV {upper} already has a bond on its -{axis_name} side; the bond graph allows one bond per axis per REV"
+            ));
+        }
+        if self.releases.iter().any(|release| {
+            (release.i == lower && release.j == upper) || (release.i == upper && release.j == lower)
+        }) {
+            return Err("cannot connect a REV pair with a pending fracture release".into());
+        }
+
+        // Install with the stretch-free local offset (a 1 cm rest length equals
+        // the lattice spacing), then add the stress implied by the rest length
+        // and pretension. Axial offset shortens the unstressed bond when the
+        // rest length is below the lattice spacing.
+        let previous = self.bonds[axis][lower];
+        self.bonds[axis][lower] = Bond {
+            neighbor: upper as u32,
+            formation_offset: [rest_length_m - DCELL, 0.0, 0.0],
+            ..Bond::default()
+        };
+        let frame = glam::Mat3::from_cols(
+            frame_rotation * axes[axis],
+            frame_rotation * axes[(axis + 1) % 3],
+            frame_rotation * axes[(axis + 2) % 3],
+        );
+        let stiffness = crate::solver::stiffness_matrix(self, lower, upper, frame);
+        let mut offset = [rest_length_m - DCELL, 0.0, 0.0];
+        if pretension_n != 0.0 {
+            if stiffness == glam::Mat3::ZERO || stiffness.determinant().abs() < 1e-30 {
+                self.bonds[axis][lower] = previous;
+                return Err("manual bond endpoints have no stiffness to carry pretension".into());
+            }
+            let extra = stiffness.inverse() * Vec3::new(pretension_n as f32, 0.0, 0.0);
+            offset[0] -= f64::from(extra.x);
+            offset[1] -= f64::from(extra.y);
+            offset[2] -= f64::from(extra.z);
+        }
+        if offset.iter().any(|value| !value.is_finite()) {
+            self.bonds[axis][lower] = previous;
+            return Err("manual bond formation offset is not finite".into());
+        }
+        self.bonds[axis][lower].formation_offset = offset;
+        self.workspace[axis][lower] = BondWorkspace {
+            rest_neighbor: upper as u32,
+            ..BondWorkspace::default()
+        };
+        self.bonding_contacts
+            .remove(&(lower.min(upper), lower.max(upper)));
+        let cell_coordinate = (self.rest_positions[lower][axis] / DCELL - 0.5).round() as i32;
+        let color = axis * 2 + cell_coordinate.rem_euclid(2) as usize;
+        if !self.colors[color].contains(&lower) {
+            self.colors[color].push(lower);
+        }
+        if !(self.voxels[lower].kinematic && self.voxels[upper].kinematic) {
+            self.energy.external_work +=
+                crate::solver::bond_stored_elastic_energy_j(self, lower, upper, axis);
+        }
+        self.solver_scratch = Default::default();
+        self.thermal_scratch = Default::default();
+        self.collision_scratch = Default::default();
+        crate::solver::rebuild_clusters(self);
+        Ok(())
+    }
+
     /// Fuse two free, face-adjacent REVs into one compressed representative
     /// volume. Mass-weighted composition, linear momentum, and total energy are
     /// conserved; relative kinetic energy becomes internal heat. The fused REV
@@ -4226,5 +4341,108 @@ mod topology_mutation_tests {
         );
         scene.clear_thermal_bonding_rule();
         assert_eq!(scene.thermal_bonding_rule(), None);
+    }
+
+    fn manual_bond_scene(cells: &[[i32; 3]]) -> Scene {
+        let iron = Material::component_id("iron").unwrap();
+        let mut builder = SceneBuilder::standard()
+            .with_gravity(Vec3::ZERO)
+            .with_timestep(0.0005, 2);
+        for cell in cells {
+            builder = builder.add_voxel(VoxelSpawn::at_cell(*cell, iron));
+        }
+        builder.build().unwrap()
+    }
+
+    fn ledger_energy_j(scene: &Scene) -> f64 {
+        let voxels: f64 = scene
+            .voxels
+            .iter()
+            .map(|v| {
+                v.total_internal_energy_j()
+                    + 0.5 * f64::from(v.mass) * f64::from(v.velocity.length_squared())
+            })
+            .sum();
+        voxels + scene.elastic_bond_energy_j() + scene.stored_plastic_bond_energy_j()
+            + scene.energy.pending_release
+    }
+
+    #[test]
+    fn stretched_manual_bond_pulls_free_revs_together_within_external_work() {
+        // Two free iron REVs 2 cm apart (centres) with a 1.98 cm rest length:
+        // a 0.2 mm stretch that stays below the fracture limit. (The 1 cm
+        // default would over-stretch iron here; see the default-rest test.)
+        let mut scene = manual_bond_scene(&[[0, 0, 0], [2, 0, 0]]);
+        let before = ledger_energy_j(&scene);
+        let gap_before = (scene.positions[1] - scene.positions[0]).length();
+        scene.connect_manual_bond(0, 1, 0.0198, 0.0).unwrap();
+        let work = scene.energy.external_work;
+        assert!(work > 0.0, "stretch must be booked as external work");
+        let elastic = scene.elastic_bond_energy_j();
+        assert!((elastic - work).abs() <= 1e-9 * work.max(1.0));
+        for _ in 0..40 {
+            scene.tick();
+        }
+        assert_eq!(scene.broken, 0);
+        assert_ne!(scene.bonds[0][0].neighbor, EMPTY);
+        let gap_after = (scene.positions[1] - scene.positions[0]).length();
+        assert!(gap_after < gap_before, "{gap_after} !< {gap_before}");
+        let momentum = scene.voxels[0].velocity * scene.voxels[0].mass
+            + scene.voxels[1].velocity * scene.voxels[1].mass;
+        assert!(momentum.length() < 1e-4 * scene.voxels[0].mass, "{momentum:?}");
+        let after = ledger_energy_j(&scene);
+        let external = scene.energy.external_work;
+        // f32 voxel state carries ~1e-7 relative error on the ~2 kJ thermal total.
+        let tolerance = 1e-6 * before;
+        assert!(
+            after - before <= external + tolerance,
+            "total {after} - {before} exceeds external work {external}"
+        );
+        assert!(
+            after - before >= external - tolerance,
+            "energy lost beyond ledger"
+        );
+    }
+
+    #[test]
+    fn manual_bond_pretension_is_external_work_and_default_rest_is_one_cm() {
+        assert_eq!(Scene::DEFAULT_MANUAL_BOND_REST_LENGTH_M, 0.01);
+        let mut scene = manual_bond_scene(&[[0, 0, 0], [2, 0, 0]]);
+        scene.connect_manual_bond(0, 1, 0.02, 50.0).unwrap();
+        let k_work = scene.energy.external_work;
+        assert!(k_work > 0.0);
+        assert!((scene.elastic_bond_energy_j() - k_work).abs() < 1e-9 * k_work);
+        // A bond with zero stretch and no pretension stores nothing.
+        let mut relaxed = manual_bond_scene(&[[0, 0, 0], [2, 0, 0]]);
+        relaxed.connect_manual_bond(0, 1, 0.02, 0.0).unwrap();
+        assert_eq!(relaxed.energy.external_work, 0.0);
+    }
+
+    #[test]
+    fn manual_bond_rejects_invalid_requests_without_changing_the_scene() {
+        let mut scene = manual_bond_scene(&[[0, 0, 0], [3, 0, 0], [6, 0, 0], [-3, 0, 0]]);
+        for (a, b, length, pretension) in [
+            (0, 0, 0.01, 0.0),
+            (0, 9, 0.01, 0.0),
+            (0, 1, f64::NAN, 0.0),
+            (0, 1, -0.01, 0.0),
+            (0, 1, 0.0, 0.0),
+            (0, 1, f64::INFINITY, 0.0),
+            (0, 1, 0.01, f64::NAN),
+        ] {
+            assert!(
+                scene.connect_manual_bond(a, b, length, pretension).is_err(),
+                "{a} {b} {length} {pretension}"
+            );
+        }
+        assert_eq!(scene.bonds[0][0].neighbor, EMPTY);
+        assert_eq!(scene.energy.external_work, 0.0);
+        scene.connect_manual_bond(0, 1, 0.03, 0.0).unwrap();
+        // +x slot of REV 0 is taken, and REV 1's -x slot is taken.
+        let slot = scene.connect_manual_bond(0, 2, 0.03, 0.0).unwrap_err();
+        assert!(slot.contains("one bond per axis"), "{slot}");
+        let incoming = scene.connect_manual_bond(3, 1, 0.03, 0.0).unwrap_err();
+        assert!(incoming.contains("one bond per axis"), "{incoming}");
+        assert_eq!(scene.bonds[0][0].neighbor, 1);
     }
 }
