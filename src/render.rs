@@ -994,6 +994,12 @@ pub struct Camera {
     pub free_speed_mps: f32,
     pub look_sensitivity: f32,
 }
+
+const CAMERA_VERTICAL_FOV_RADIANS: f32 = 50.0 * std::f32::consts::PI / 180.0;
+const CAMERA_FIT_MARGIN: f32 = 1.2;
+const CAMERA_MIN_ORBIT_DISTANCE_M: f32 = 0.04;
+const CAMERA_FIT_FALLBACK_DISTANCE_M: f32 = 0.3;
+
 impl Camera {
     pub fn new() -> Self {
         Self {
@@ -1094,6 +1100,32 @@ impl Camera {
     pub fn adjust_free_speed(&mut self, amount: f32) {
         self.free_speed_mps = (self.free_speed_mps * (amount * 0.2).exp()).clamp(0.005, 5000.0);
     }
+
+    /// Return the orbit distance needed to fit a sphere in the current camera
+    /// frustum, using the same vertical field of view as `matrix`.
+    ///
+    /// Invalid radii use a finite fallback distance. Invalid aspects use a
+    /// square viewport, which avoids propagating NaNs into the camera matrix.
+    pub fn fit_orbit_distance_for_sphere(radius_m: f32, viewport_aspect: f32) -> f32 {
+        if !radius_m.is_finite() || radius_m <= 0.0 {
+            return CAMERA_FIT_FALLBACK_DISTANCE_M;
+        }
+
+        let aspect = if viewport_aspect.is_finite() && viewport_aspect > 0.0 {
+            f64::from(viewport_aspect)
+        } else {
+            1.0
+        };
+        let vertical_half_angle = f64::from(CAMERA_VERTICAL_FOV_RADIANS) * 0.5;
+        let horizontal_half_angle = (aspect * vertical_half_angle.tan()).atan();
+        let limiting_half_angle = vertical_half_angle.min(horizontal_half_angle);
+        let distance = f64::from(radius_m) / limiting_half_angle.sin()
+            * f64::from(CAMERA_FIT_MARGIN);
+        distance
+            .max(f64::from(CAMERA_MIN_ORBIT_DISTANCE_M))
+            .min(f64::from(f32::MAX)) as f32
+    }
+
     fn matrix(&self, aspect: f32) -> Mat4 {
         let offset = self.offset_direction() * self.radius;
         // Floating-point reverse Z retains precision on centimetre surfaces
@@ -1104,7 +1136,7 @@ impl Camera {
             None if self.first_person => (self.target, self.target + self.forward()),
             None => (self.target + offset, self.target),
         };
-        Mat4::perspective_infinite_reverse_rh(50f32.to_radians(), aspect, near)
+        Mat4::perspective_infinite_reverse_rh(CAMERA_VERTICAL_FOV_RADIANS, aspect, near)
             * Mat4::look_at_rh(eye, target, Vec3::Z)
     }
 }
@@ -2741,7 +2773,17 @@ mod material_palette_tests {
 #[cfg(test)]
 mod depth_tests {
     use super::Camera;
-    use glam::Vec3;
+    use glam::{Quat, Vec3};
+
+    fn native_editor_scene_viewport(width: u32, height: u32) -> [u32; 4] {
+        let mut ui = crate::ui::Ui::new(1.0, Vec3::ZERO, Vec3::Z);
+        ui.world_active = true;
+        ui.editor_mode = true;
+        ui.set_active_scene_document(Some("framing test".into()), vec!["spider".into()]);
+        ui.selected_scene_model = Some(0);
+        ui.draw(0, 1, 60.0, 0.0, None, None, width as f32, height as f32, None);
+        ui.scene_viewport().expect("native scene viewport")
+    }
 
     #[test]
     fn reverse_depth_preserves_near_and_distant_surfaces_in_every_camera_mode() {
@@ -2764,5 +2806,62 @@ mod depth_tests {
             assert!(close <= 1.0 && close > middle);
             assert!(middle > horizon && horizon > 0.0);
         }
+    }
+
+    #[test]
+    fn orbit_fit_contains_rotated_tall_bounds_in_native_scene_viewports() {
+        // A tall, narrow model turned diagonally produces a wider world-space
+        // AABB than its unrotated local dimensions.
+        let half_extents = Vec3::new(0.012, 0.008, 0.24);
+        let rotation = Quat::from_rotation_y(0.23) * Quat::from_rotation_z(0.71);
+        let (mut minimum, mut maximum) = (
+            Vec3::splat(f32::INFINITY),
+            Vec3::splat(f32::NEG_INFINITY),
+        );
+        for x in [-1.0, 1.0] {
+            for y in [-1.0, 1.0] {
+                for z in [-1.0, 1.0] {
+                    let corner = rotation * (half_extents * Vec3::new(x, y, z));
+                    minimum = minimum.min(corner);
+                    maximum = maximum.max(corner);
+                }
+            }
+        }
+        let half_cell = 0.005;
+        minimum -= Vec3::splat(half_cell);
+        maximum += Vec3::splat(half_cell);
+        let sphere_radius = (maximum - minimum).length() * 0.5;
+        let expected_margin = f64::from(super::CAMERA_FIT_MARGIN);
+
+        for (width, height) in [(1920, 1009), (1280, 720)] {
+            let [_, _, viewport_width, viewport_height] =
+                native_editor_scene_viewport(width, height);
+            let aspect = viewport_width as f32 / viewport_height.max(1) as f32;
+            let distance = Camera::fit_orbit_distance_for_sphere(sphere_radius, aspect);
+            let vertical_half_angle = f64::from(super::CAMERA_VERTICAL_FOV_RADIANS) * 0.5;
+            let horizontal_half_angle = (f64::from(aspect) * vertical_half_angle.tan()).atan();
+            let limiting_half_angle = vertical_half_angle.min(horizontal_half_angle);
+
+            assert!(
+                distance.is_finite()
+                    && f64::from(distance) * limiting_half_angle.sin()
+                        >= f64::from(sphere_radius) * expected_margin - 1.0e-6,
+                "sphere does not fit at {width}x{height}, viewport={viewport_width}x{viewport_height}, distance={distance}, radius={sphere_radius}"
+            );
+        }
+    }
+
+    #[test]
+    fn orbit_fit_invalid_inputs_use_finite_fallbacks() {
+        assert_eq!(
+            Camera::fit_orbit_distance_for_sphere(0.0, 1.0),
+            super::CAMERA_FIT_FALLBACK_DISTANCE_M
+        );
+        assert_eq!(
+            Camera::fit_orbit_distance_for_sphere(f32::NAN, 1.0),
+            super::CAMERA_FIT_FALLBACK_DISTANCE_M
+        );
+        let distance = Camera::fit_orbit_distance_for_sphere(0.1, f32::NAN);
+        assert!(distance.is_finite() && distance >= super::CAMERA_MIN_ORBIT_DISTANCE_M);
     }
 }

@@ -104,8 +104,10 @@ pub struct Ui {
     /// Odd edge length of the sculpt brush, measured in 1 cm REVs.
     pub brush_size_cells: usize,
     pub status_message: Option<String>,
-    /// Simulation seconds per wall-clock second. 1.0 is real time.
+    /// Requested simulation seconds per wall-clock second. 1.0 requests real time.
     pub simulation_time_scale: f32,
+    /// Observed physical clock rate; distinct from the requested speed.
+    pub measured_simulation_rate: Option<f64>,
     /// Latest completed worker cost for 10 ms of simulated physical time.
     pub physics_cost_ms_per_10ms: Option<f64>,
     pub walk_speed_mps: f32,
@@ -439,6 +441,10 @@ pub enum ReticleState {
 }
 
 impl Ui {
+    pub fn set_measured_simulation_rate(&mut self, rate: Option<f64>) {
+        self.measured_simulation_rate = rate.filter(|value| value.is_finite() && *value >= 0.0);
+    }
+
     pub fn set_physics_cost_ms_per_10ms(&mut self, cost: Option<f64>) {
         self.physics_cost_ms_per_10ms = cost.filter(|value| value.is_finite() && *value >= 0.0);
     }
@@ -527,6 +533,7 @@ impl Ui {
             status_message: None,
             simulation_time_scale: 1.0,
             physics_cost_ms_per_10ms: None,
+            measured_simulation_rate: None,
             walk_speed_mps: 4.5,
             look_sensitivity: 0.005,
             paused_before_menu: false,
@@ -2715,10 +2722,11 @@ fn draw_editor(
             out,
             770.0,
             40.0,
-            &format!(
-                "{} · {:.2}×",
-                physics_cost_label(ui.physics_cost_ms_per_10ms),
-                ui.simulation_time_scale
+            &physics_toolbar_label(
+                ui.physics_cost_ms_per_10ms,
+                ui.measured_simulation_rate,
+                ui.simulation_time_scale,
+                ui.canvas_width < 1200.0,
             ),
             0.68,
         );
@@ -3376,6 +3384,26 @@ fn physics_cost_label(cost_ms_per_10ms: Option<f64>) -> String {
             format!("10 ms physics: {cost:.2} ms / 5 ms")
         }
         _ => "10 ms physics: — / 5 ms".to_owned(),
+    }
+}
+
+fn simulation_rate_label(measured: Option<f64>, requested: f32) -> String {
+    let actual = match measured {
+        Some(rate) if rate.is_finite() && rate >= 0.0 => format!("{rate:.2}×"),
+        _ => "—".to_owned(),
+    };
+    format!("Real {actual} / target {requested:.2}×")
+}
+
+fn physics_toolbar_label(cost: Option<f64>, measured: Option<f64>, requested: f32, compact: bool) -> String {
+    if compact {
+        let cost = cost.filter(|value| value.is_finite() && *value >= 0.0)
+            .map_or_else(|| "—".to_owned(), |value| format!("{value:.1}"));
+        let rate = measured.filter(|value| value.is_finite() && *value >= 0.0)
+            .map_or_else(|| "—".to_owned(), |value| format!("{value:.2}×"));
+        format!("{cost} ms · Real {rate}")
+    } else {
+        format!("{} · {}", physics_cost_label(cost), simulation_rate_label(measured, requested))
     }
 }
 
@@ -4725,6 +4753,25 @@ mod scene_inspector_tests {
         assert_eq!(physics_cost_label(Some(0.0)), "10 ms physics: 0.00 ms / 5 ms");
         assert_eq!(physics_cost_label(Some(2.5)), "10 ms physics: 2.50 ms / 5 ms");
         assert_eq!(physics_cost_label(Some(f64::NAN)), "10 ms physics: — / 5 ms");
+    }
+
+    #[test]
+    fn observed_simulation_rate_is_distinct_from_requested_speed() {
+        let mut ui = Ui::new(1.0, Vec3::ZERO, Vec3::Z);
+        assert_eq!(ui.measured_simulation_rate, None);
+        ui.simulation_time_scale = 1.0;
+        ui.set_measured_simulation_rate(Some(0.08));
+        assert_eq!(simulation_rate_label(ui.measured_simulation_rate, ui.simulation_time_scale),
+                   "Real 0.08× / target 1.00×");
+        assert_eq!(physics_toolbar_label(Some(95.0), Some(0.08), 1.0, true),
+                   "95.0 ms · Real 0.08×");
+        assert_eq!(simulation_rate_label(None, 1.0), "Real — / target 1.00×");
+        ui.set_measured_simulation_rate(Some(0.0));
+        assert_eq!(ui.measured_simulation_rate, Some(0.0));
+        for invalid in [f64::NAN, f64::INFINITY, -0.01] {
+            ui.set_measured_simulation_rate(Some(invalid));
+            assert_eq!(ui.measured_simulation_rate, None);
+        }
     }
 
     fn scene_ui(width: f32, height: f32) -> Ui {

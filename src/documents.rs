@@ -7,6 +7,7 @@
 use crate::{
     material::{FractureMode, Material},
     scene::{Scene, SceneConfig},
+    skeletal_actuator::SkeletalActuator,
     scene_welding::SceneSimulationSettings,
     voxel::{Composition, Microstructure, Voxel},
 };
@@ -202,6 +203,12 @@ struct BoneTransform {
 /// on every rendered frame.
 pub struct SkeletonAnimator<'a> {
     model: &'a VoxelModelDocument,
+    prepared: PreparedSkeletonAnimation,
+}
+
+/// Preparation for one immutable model. Kept separately so physical actors can
+/// own their model and reuse the evaluator without a self-referencing borrow.
+pub(crate) struct PreparedSkeletonAnimation {
     rest_bones_global: Vec<BoneTransform>,
     bone_material_limits: Vec<BoneMaterialLimits>,
     weight_offsets: Vec<usize>,
@@ -253,11 +260,17 @@ impl<'a> SkeletonAnimator<'a> {
 
         Ok(Self {
             model,
-            rest_bones_global,
-            bone_material_limits,
-            weight_offsets,
-            voxel_weights,
+            prepared: PreparedSkeletonAnimation {
+                rest_bones_global,
+                bone_material_limits,
+                weight_offsets,
+                voxel_weights,
+            },
         })
+    }
+
+    pub(crate) fn into_prepared(self) -> PreparedSkeletonAnimation {
+        self.prepared
     }
 
     /// Evaluate one clip at local time in seconds. Time is clamped to the clip
@@ -268,10 +281,22 @@ impl<'a> SkeletonAnimator<'a> {
         clip_index: usize,
         time_s: f64,
     ) -> Result<Vec<AnimatedVoxelPose>, String> {
+        self.prepared.evaluate(self.model, clip_index, time_s)
+    }
+}
+
+impl PreparedSkeletonAnimation {
+    /// Only use with the immutable model passed to `SkeletonAnimator::new`.
+    pub(crate) fn evaluate(
+        &self,
+        model: &VoxelModelDocument,
+        clip_index: usize,
+        time_s: f64,
+    ) -> Result<Vec<AnimatedVoxelPose>, String> {
         if !time_s.is_finite() {
             return Err("animation time must be finite".into());
         }
-        let skeleton = self.model.skeleton.as_ref().expect("validated skeleton");
+        let skeleton = model.skeleton.as_ref().expect("validated skeleton");
         let clip = skeleton
             .clips
             .get(clip_index)
@@ -286,8 +311,8 @@ impl<'a> SkeletonAnimator<'a> {
         )?;
         let posed_bones_global = compose_bone_transforms(&skeleton.bones, &local_bones);
 
-        let mut poses = Vec::with_capacity(self.model.voxels.len());
-        for (voxel_index, voxel) in self.model.voxels.iter().enumerate() {
+        let mut poses = Vec::with_capacity(model.voxels.len());
+        for (voxel_index, voxel) in model.voxels.iter().enumerate() {
             let binding_start = self.weight_offsets[voxel_index];
             let binding_end = self.weight_offsets[voxel_index + 1];
             let bindings = &self.voxel_weights[binding_start..binding_end];
@@ -2369,6 +2394,8 @@ impl SceneDocument {
         let mut material_indices = BTreeMap::<Vec<u8>, u16>::new();
         let mut objects = Vec::with_capacity(self.models.len());
         let mut object_forces = Vec::with_capacity(self.models.len());
+        let mut skeletal_models = Vec::new();
+        let mut scene_voxel_count = 0usize;
 
         let mut loaded_materials = BTreeMap::<PathBuf, u16>::new();
         for (instance_index, instance) in self.models.iter().enumerate() {
@@ -2384,13 +2411,27 @@ impl SceneDocument {
             let model: VoxelModelDocument = load_document(&model_path)
                 .map_err(|error| format!("load model {}: {error}", model_path.display()))?;
             model.validate()?;
-            if !model.groups.is_empty()
-                || !model.motion_constraints.is_empty()
-                || model.skeleton.is_some()
-            {
+            if !model.groups.is_empty() || !model.motion_constraints.is_empty() {
                 return Err(format!(
-                    "model {} contains editor groups, constraints, or a skeleton that the physical scene solver does not restore yet",
+                    "model {} contains editor groups or constraints that the physical scene solver does not restore yet",
                     model_path.display()
+                ));
+            }
+            let range_start = scene_voxel_count;
+            scene_voxel_count = scene_voxel_count
+                .checked_add(model.voxels.len())
+                .ok_or_else(|| "scene voxel index range overflow".to_owned())?;
+            if let Some(skeleton) = &model.skeleton {
+                if skeleton.clips.is_empty() {
+                    return Err(format!(
+                        "model {} has a skeleton but no animation clips to drive its physical actuator",
+                        model_path.display()
+                    ));
+                }
+                skeletal_models.push((
+                    model.clone(),
+                    range_start..scene_voxel_count,
+                    rotation_f32,
                 ));
             }
 
@@ -2541,6 +2582,16 @@ impl SceneDocument {
                 scene_voxel_index += 1;
             }
         }
+        let total_scene_voxels = scene.voxels.len();
+        for (model, voxel_range, instance_rotation) in skeletal_models {
+            let actuator = SkeletalActuator::new(
+                model,
+                voxel_range,
+                instance_rotation,
+                total_scene_voxels,
+            )?;
+            scene.skeletal_actuators.push(actuator);
+        }
         self.apply_simulation_settings(&mut scene)?;
         Ok(scene)
     }
@@ -2638,7 +2689,7 @@ fn validate_instance_lattice_transform(
         rotation_f32.y as f64,
         rotation_f32.z as f64,
         rotation_f32.w as f64,
-    );
+    ).normalize();
     Ok((rotation, rotation_f32))
 }
 
@@ -3393,6 +3444,128 @@ mod tests {
             .copied()
             .fold(Vec3::ZERO, |sum, force| sum + force);
         assert!((applied_force - Vec3::new(0.0, 20.0, 0.0)).length() < 1.0e-5);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn scene_build_restores_skeletal_actuators_with_model_order_ranges() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("skeletal-scene-restore-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+
+        let iron = Material::component_id("iron").unwrap();
+        let source = SceneBuilder::standard()
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], iron))
+            .add_voxel(VoxelSpawn::at_cell([1, 0, 0], iron))
+            .build()
+            .unwrap();
+        let mut rigged_model = VoxelModelDocument::from_scene("rigged", &source);
+        let mut skeleton = SkeletonDocument::with_root_bone("root", DVec3::ZERO);
+        let limb = skeleton
+            .add_bone("limb", Some(0), DVec3::new(0.01, 0.0, 0.0))
+            .unwrap();
+        for voxel_index in 0..rigged_model.voxels.len() {
+            skeleton.voxel_weights.push(VoxelBoneWeightDocument {
+                voxel_index: voxel_index as u32,
+                bone_index: limb as u32,
+                weight: 1.0,
+            });
+        }
+        let clip = skeleton.add_animation_clip("bend", 1.0).unwrap();
+        skeleton
+            .set_keyframe(
+                clip,
+                limb,
+                BoneKeyframeDocument {
+                    time_s: 0.0,
+                    translation_m: DVec3::new(0.01, 0.0, 0.0),
+                    rotation: Quat::IDENTITY,
+                },
+            )
+            .unwrap();
+        skeleton
+            .set_keyframe(
+                clip,
+                limb,
+                BoneKeyframeDocument {
+                    time_s: 1.0,
+                    translation_m: DVec3::new(0.01, 0.0, 0.01),
+                    rotation: Quat::IDENTITY,
+                },
+            )
+            .unwrap();
+        rigged_model.skeleton = Some(skeleton);
+        let rigged_path = directory.join("rigged.vxm");
+        save_document(&rigged_path, &rigged_model).unwrap();
+
+        let plain_source = SceneBuilder::standard()
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], iron))
+            .build()
+            .unwrap();
+        let plain_model = VoxelModelDocument::from_scene("plain", &plain_source);
+        let plain_path = directory.join("plain.vxm");
+        save_document(&plain_path, &plain_model).unwrap();
+
+        let mut document = SceneDocument::new("skeletal restore", SceneConfig::default()).unwrap();
+        for (asset_path, x, rotation) in [
+            ("rigged.vxm", 0.0, Quat::IDENTITY),
+            ("plain.vxm", 0.05, Quat::IDENTITY),
+            (
+                "rigged.vxm",
+                0.10,
+                Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            ),
+        ] {
+            document
+                .add_model(ModelInstanceDocument {
+                    asset_path: PathBuf::from(asset_path),
+                    translation_m: DVec3::new(x, 0.0, 0.0),
+                    rotation,
+                    scale: Vec3::ONE,
+                })
+                .unwrap();
+        }
+
+        let scene = document
+            .build_scene(&directory.join("skeletal.vxscene"))
+            .unwrap();
+        assert_eq!(scene.skeletal_actuators.len(), 2);
+        assert_eq!(scene.skeletal_actuators[0].voxel_range(), 0..2);
+        assert_eq!(scene.skeletal_actuators[1].voxel_range(), 3..5);
+        assert_eq!(scene.skeletal_actuators[0].clip_index, 0);
+        assert_eq!(scene.skeletal_actuators[1].clip_index, 0);
+        assert!(scene
+            .skeletal_actuators
+            .iter()
+            .all(|actor| actor.total_scene_voxels() == scene.voxels.len()));
+        assert_eq!(scene.voxels.len(), 5);
+        assert!((scene.positions[2]
+            - (plain_model.voxels[0].position_m + DVec3::new(0.05, 0.0, 0.0)))
+            .length()
+            < 1.0e-12);
+        assert_eq!(scene.voxels[2].mass, plain_model.voxels[0].state.mass);
+        let rotated_instance = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2).normalize();
+        let rotated_instance = glam::DQuat::from_xyzw(
+            f64::from(rotated_instance.x),
+            f64::from(rotated_instance.y),
+            f64::from(rotated_instance.z),
+            f64::from(rotated_instance.w),
+        );
+        let expected_position = rotated_instance.normalize() * rigged_model.voxels[0].position_m
+            + DVec3::new(0.10, 0.0, 0.0);
+        let transform_error_m = scene.positions[3].distance(expected_position);
+        assert!(
+            transform_error_m < 1.0e-12,
+            "second rig instance position mismatch: actual={:?}, expected={expected_position:?}, error={transform_error_m:.3e} m",
+            scene.positions[3]
+        );
+        let restored_model: VoxelModelDocument = load_document(&rigged_path).unwrap();
+        let restored_skeleton = restored_model.skeleton.unwrap();
+        assert_eq!(restored_skeleton.clips.len(), 1);
+        assert_eq!(restored_skeleton.clips[0].name, "bend");
+        assert_eq!(restored_skeleton.clips[0].tracks[0].keyframes.len(), 2);
 
         fs::remove_dir_all(directory).unwrap();
     }

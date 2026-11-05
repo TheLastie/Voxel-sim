@@ -56,6 +56,8 @@ enum PhysicsWorkerRequest {
     ReturnScene,
 }
 
+type PhysicsWorkerMessage = Result<PhysicsFrame, String>;
+
 fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
     match payload.downcast::<String>() {
         Ok(message) => *message,
@@ -137,7 +139,7 @@ pub struct PhysicsFrame {
 /// fixed steps can finish between redraws, without uploading a pose each step.
 pub struct PhysicsWorker {
     requests: Sender<PhysicsWorkerRequest>,
-    frames: Receiver<PhysicsFrame>,
+    frames: Receiver<PhysicsWorkerMessage>,
     worker: Option<JoinHandle<PhysicalSceneSnapshot>>,
     pending_seconds: f64,
     fixed_dt: f64,
@@ -156,47 +158,113 @@ impl PhysicsFrame {
         step_ms: f64,
         generation: u64,
         revision: u64,
-    ) -> Self {
-        Self {
-            cells: scene
-                .positions
-                .iter()
-                .zip(&scene.rotations)
-                .zip(&scene.voxels)
-                .enumerate()
-                .filter(|(_, (_, voxel))| !voxel.kinematic)
-                .map(|(index, ((&position, &rotation), _))| {
-                    let phase = scene
-                        .phase_state(index)
-                        .expect("captured voxel must have a phase state");
-                    PhysicalCellPose {
-                        scene_index: index,
-                        source_cell: scene.source_cells.get(index).copied().flatten(),
-                        world_position_m: position + origin,
-                        rotation,
-                        temperature_kelvin: phase.temperature_kelvin,
-                        liquid_fraction: phase.liquid_fraction,
-                        gas_fraction: phase.gas_fraction,
-                    }
-                })
-                .collect(),
-            fixed_thermal: scene
-                .voxels
-                .iter()
-                .enumerate()
-                .filter(|(_, voxel)| voxel.kinematic)
-                .map(|(scene_index, _)| {
-                    let phase = scene
-                        .phase_state(scene_index)
-                        .expect("captured voxel must have a phase state");
-                    PhysicalCellThermalState {
-                        scene_index,
-                        temperature_kelvin: phase.temperature_kelvin,
-                        liquid_fraction: phase.liquid_fraction,
-                        gas_fraction: phase.gas_fraction,
-                    }
-                })
-                .collect(),
+    ) -> Result<Self, String> {
+        let rev_count = scene.voxels.len();
+        if scene.positions.len() != rev_count || scene.rotations.len() != rev_count {
+            return Err(format!(
+                "pose array length mismatch at revision {revision}: positions={}, rotations={}, REVs={rev_count}",
+                scene.positions.len(),
+                scene.rotations.len()
+            ));
+        }
+        if !scene.solver_residual.is_finite() {
+            return Err(format!(
+                "non-finite solver residual at revision {revision}: {}",
+                scene.solver_residual
+            ));
+        }
+        if let Some(diagnostics) = &scene.last_step_diagnostics {
+            if !diagnostics.relative_solver_residual.is_finite() {
+                return Err(format!(
+                    "non-finite solver status residual at revision {revision}: {}",
+                    diagnostics.relative_solver_residual
+                ));
+            }
+            if diagnostics
+                .contact_pcg_max_true_residual
+                .is_some_and(|residual| !residual.is_finite())
+            {
+                return Err(format!(
+                    "non-finite contact solver status at revision {revision}: {:?}",
+                    diagnostics.contact_pcg_max_true_residual
+                ));
+            }
+        }
+
+        let mut cells = Vec::with_capacity(scene.positions.len());
+        let mut fixed_thermal = Vec::new();
+        for (index, ((&position, &rotation), voxel)) in scene
+            .positions
+            .iter()
+            .zip(&scene.rotations)
+            .zip(&scene.voxels)
+            .enumerate()
+        {
+            if !position.is_finite() {
+                return Err(format!(
+                    "non-finite position at revision {revision}, REV {index}: {position:?}"
+                ));
+            }
+            if !voxel.velocity.is_finite() {
+                return Err(format!(
+                    "non-finite velocity at revision {revision}, REV {index}: {:?}",
+                    voxel.velocity
+                ));
+            }
+            if !voxel.has_finite_thermal_state() {
+                return Err(format!(
+                    "non-finite stored thermal state at revision {revision}, REV {index}"
+                ));
+            }
+            if !rotation.is_finite()
+                || !rotation.length_squared().is_finite()
+                || rotation.length_squared() <= f32::EPSILON
+            {
+                return Err(format!(
+                    "invalid rotation at revision {revision}, REV {index}: {rotation:?}"
+                ));
+            }
+            let world_position_m = position + origin;
+            if !world_position_m.is_finite() {
+                return Err(format!(
+                    "non-finite world position at revision {revision}, REV {index}: {world_position_m:?}"
+                ));
+            }
+
+            let phase = scene.phase_state(index).ok_or_else(|| {
+                format!("missing phase state at revision {revision}, REV {index}")
+            })?;
+            if !phase.temperature_kelvin.is_finite()
+                || !phase.liquid_fraction.is_finite()
+                || !phase.gas_fraction.is_finite()
+            {
+                return Err(format!(
+                    "non-finite thermal status at revision {revision}, REV {index}"
+                ));
+            }
+            if voxel.kinematic {
+                fixed_thermal.push(PhysicalCellThermalState {
+                    scene_index: index,
+                    temperature_kelvin: phase.temperature_kelvin,
+                    liquid_fraction: phase.liquid_fraction,
+                    gas_fraction: phase.gas_fraction,
+                });
+            } else {
+                cells.push(PhysicalCellPose {
+                    scene_index: index,
+                    source_cell: scene.source_cells.get(index).copied().flatten(),
+                    world_position_m,
+                    rotation,
+                    temperature_kelvin: phase.temperature_kelvin,
+                    liquid_fraction: phase.liquid_fraction,
+                    gas_fraction: phase.gas_fraction,
+                });
+            }
+        }
+
+        Ok(Self {
+            cells,
+            fixed_thermal,
             generation,
             revision,
             completed_steps: 0,
@@ -204,7 +272,7 @@ impl PhysicsFrame {
             step_ms,
             full_worker_ms_per_10ms_simulated: None,
             broken: scene.broken,
-        }
+        })
     }
 }
 
@@ -300,9 +368,10 @@ impl PhysicsWorker {
             0.0,
             generation,
             0,
-        );
+        )
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
         let (requests, input) = mpsc::channel();
-        let (output, frames) = mpsc::channel();
+        let (output, frames) = mpsc::channel::<PhysicsWorkerMessage>();
         let grab_target = Arc::new(Mutex::new(None::<GrabTarget>));
         let worker_grab_target = Arc::clone(&grab_target);
         let worker = std::thread::Builder::new()
@@ -364,8 +433,34 @@ impl PhysicsWorker {
                                     }
                                 }
                                 solver::step(&mut scene, &mut tool);
-                                if !scene.solver_residual.is_finite() {
+                                if !scene.solver_residual.is_finite()
+                                    || scene.last_step_diagnostics.as_ref().is_some_and(|status| {
+                                        !status.relative_solver_residual.is_finite()
+                                            || status.contact_pcg_max_true_residual
+                                                .is_some_and(|residual| !residual.is_finite())
+                                    })
+                                {
                                     batch_non_finite_residuals += 1;
+                                    let message = PhysicsFrame::capture(
+                                        &scene,
+                                        origin_world_m,
+                                        time,
+                                        0.0,
+                                        generation,
+                                        revision.wrapping_add(1),
+                                    )
+                                    .err()
+                                    .unwrap_or_else(|| {
+                                        format!("non-finite solver status at step {}", scene.substep_index)
+                                    });
+                                    let _ = output.send(Err(message));
+                                    return PhysicalSceneSnapshot {
+                                        origin_cell,
+                                        origin_world_m,
+                                        simulated_seconds: time,
+                                        pending_seconds: 0.0,
+                                        scene,
+                                    };
                                 }
                                 if let Some(diagnostics) = &scene.last_step_diagnostics {
                                     batch_contacts_peak = batch_contacts_peak.max(diagnostics.contacts_peak);
@@ -382,14 +477,26 @@ impl PhysicsWorker {
                             remaining_batch_steps = requested_steps - completed_steps;
                             let batch_ms = start.elapsed().as_secs_f64()*1000.0;
                             let capture_start = std::time::Instant::now();
-                            let mut frame = PhysicsFrame::capture(
+                            let mut frame = match PhysicsFrame::capture(
                                     &scene,
                                     origin_world_m,
                                     time,
                                     batch_ms / completed_steps.max(1) as f64,
                                     generation,
                                     revision,
-                                );
+                                ) {
+                                Ok(frame) => frame,
+                                Err(message) => {
+                                    let _ = output.send(Err(message));
+                                    return PhysicalSceneSnapshot {
+                                        origin_cell,
+                                        origin_world_m,
+                                        simulated_seconds: time,
+                                        pending_seconds: 0.0,
+                                        scene,
+                                    };
+                                }
+                            };
                             frame.completed_steps = completed_steps;
                             let pose_capture_ms = capture_start.elapsed().as_secs_f64()*1000.0;
                             let new_broken = scene.broken.saturating_sub(broken_before);
@@ -446,7 +553,7 @@ impl PhysicsWorker {
                                     full_worker_wall_ms * 0.01 / completed_simulated_seconds,
                                 );
                             }
-                            if output.send(frame).is_err() {
+                            if output.send(Ok(frame)).is_err() {
                                 break;
                             }
                         }
@@ -538,7 +645,7 @@ impl PhysicsWorker {
             return;
         }
         match self.frames.try_recv() {
-            Ok(frame) => {
+            Ok(Ok(frame)) => {
                 if self.in_flight {
                     let remaining = self.in_flight_steps.saturating_sub(frame.completed_steps);
                     self.pending_seconds += remaining as f64 * self.fixed_dt;
@@ -546,6 +653,10 @@ impl PhysicsWorker {
                 self.frame = frame;
                 self.in_flight = false;
                 self.in_flight_steps = 0;
+            }
+            Ok(Err(message)) => {
+                self.mark_worker_failed(&message);
+                return;
             }
             Err(TryRecvError::Disconnected) => {
                 self.mark_worker_failed("physics worker stopped without publishing a frame");
@@ -579,6 +690,12 @@ impl PhysicsWorker {
     /// Stop this worker after its bounded batch, returning the
     /// authoritative runtime scene for a later reactivation without copying it.
     pub fn into_snapshot(mut self) -> Result<PhysicalSceneSnapshot, std::io::Error> {
+        if let Some(message) = self.failure.take() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            ));
+        }
         self.requests
             .send(PhysicsWorkerRequest::ReturnScene)
             .map_err(|_| {
@@ -592,6 +709,12 @@ impl PhysicsWorker {
             .map_err(|_| {
                 std::io::Error::other("physics worker panicked before returning its scene")
             })?;
+        if let Some(message) = self.frames.try_iter().find_map(Result::err) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            ));
+        }
         // Unfinished requested steps live on the worker until their frame is
         // collected; otherwise they have already returned to pending_seconds.
         snapshot.pending_seconds = self.pending_seconds
@@ -673,7 +796,7 @@ mod tests {
     ) -> (
         PhysicsWorker,
         Receiver<PhysicsWorkerRequest>,
-        Sender<PhysicsFrame>,
+        Sender<PhysicsWorkerMessage>,
     ) {
         let (requests, input) = mpsc::channel();
         let (output, frames) = mpsc::channel();
@@ -713,11 +836,11 @@ mod tests {
         worker.advance(0.016, false);
         input.try_recv().unwrap();
         output
-            .send(PhysicsFrame {
+            .send(Ok(PhysicsFrame {
                 completed_steps: 3,
                 simulated_seconds: 0.003,
                 ..PhysicsFrame::default()
-            })
+            }))
             .unwrap();
         worker.advance(30.0, true);
         assert!(!worker.in_flight);
@@ -726,6 +849,152 @@ mod tests {
         worker.advance(0.0, false);
         assert!(matches!(input.try_recv().unwrap(),PhysicsWorkerRequest::Steps(steps) if steps>1));
         assert!((worker.backlog_seconds() - 0.013).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn failed_physics_message_keeps_last_frame_and_stops_future_steps() {
+        let (mut worker, input, output) = mock_worker_clock(0.001);
+        worker.frame = PhysicsFrame {
+            generation: 8,
+            revision: 12,
+            simulated_seconds: 0.012,
+            ..PhysicsFrame::default()
+        };
+        worker.advance(0.004, false);
+        assert!(matches!(
+            input.try_recv().unwrap(),
+            PhysicsWorkerRequest::Steps(4)
+        ));
+
+        output
+            .send(Err("non-finite position at revision 13, REV 2".to_owned()))
+            .unwrap();
+        worker.advance(0.01, false);
+
+        assert!(worker.has_failure());
+        assert!(worker.failure_message().unwrap().contains("REV 2"));
+        assert_eq!(worker.frame.revision, 12);
+        assert_eq!(worker.frame.simulated_seconds, 0.012);
+        assert_eq!(worker.backlog_seconds(), 0.0);
+        worker.advance(1.0, false);
+        assert!(input.try_recv().is_err());
+    }
+
+    #[test]
+    fn invalid_captured_state_returns_specific_failure() {
+        let mut scene = one_rev_scene();
+        scene.positions[0].x = f64::NAN;
+        let error = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 2, 3)
+            .err()
+            .expect("non-finite position must reject the frame");
+        assert!(error.contains("position"));
+        assert!(error.contains("REV 0"));
+
+        let mut scene = one_rev_scene();
+        scene.voxels[0].velocity.x = f32::NAN;
+        let error = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 2, 3)
+            .err()
+            .expect("non-finite velocity must reject the frame");
+        assert!(error.contains("velocity"));
+        assert!(error.contains("REV 0"));
+
+        let mut scene = one_rev_scene();
+        scene.voxels[0].kinematic = true;
+        scene.positions[0].y = f64::INFINITY;
+        let error = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 2, 3)
+            .err()
+            .expect("fixed REV position must also be checked");
+        assert!(error.contains("position"));
+        assert!(error.contains("REV 0"));
+
+        let mut scene = one_rev_scene();
+        scene.rotations[0] = Quat::from_xyzw(0.0, 0.0, 0.0, 0.0);
+        let error = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 2, 3)
+            .err()
+            .expect("zero rotation must reject the frame");
+        assert!(error.contains("rotation"));
+
+        let mut scene = one_rev_scene();
+        scene.rotations.clear();
+        let error = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 2, 3)
+            .err()
+            .expect("pose array length mismatch must reject the frame");
+        assert!(error.contains("array length mismatch"));
+
+        let mut scene = one_rev_scene();
+        scene.solver_residual = f32::INFINITY;
+        let error = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 2, 3)
+            .err()
+            .expect("non-finite residual must reject the frame");
+        assert!(error.contains("solver residual"));
+    }
+
+    #[test]
+    fn captured_frame_rejects_nonfinite_stored_heat_before_derived_clamping() {
+        for corrupt_field in 0..3 {
+            let mut scene = one_rev_scene();
+            assert!(scene.voxels[0].has_finite_thermal_state());
+            match corrupt_field {
+                0 => scene.voxels[0].internal_energy = f32::NAN,
+                1 => scene.voxels[0].internal_energy_remainder_j = f64::INFINITY,
+                _ => {
+                    let mut cells = Box::new([0.0; crate::voxel::THERMAL_CELL_COUNT]);
+                    cells[13] = f64::NAN;
+                    scene.voxels[0].thermal_cell_energy_j = Some(cells);
+                }
+            }
+            let error = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 2, 3)
+                .err()
+                .expect("stored heat corruption must reject the frame");
+            assert!(error.contains("stored thermal state"));
+            assert!(error.contains("REV 0"));
+        }
+    }
+
+    #[test]
+    fn failed_worker_state_cannot_be_transferred_for_reactivation() {
+        let (mut worker, _input, _output) = mock_worker_clock(0.001);
+        worker.failure = Some("failed state".to_owned());
+        let error = worker
+            .into_snapshot()
+            .err()
+            .expect("failed worker state must not become a resumable snapshot");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("failed state"));
+    }
+
+    #[test]
+    fn queued_worker_failure_is_checked_before_snapshot_transfer() {
+        let (requests, _input) = mpsc::channel();
+        let (output, frames) = mpsc::channel();
+        output.send(Err("queued invalid state".to_owned())).unwrap();
+        drop(output);
+        let worker = std::thread::spawn(|| PhysicalSceneSnapshot {
+            origin_cell: None,
+            origin_world_m: DVec3::ZERO,
+            simulated_seconds: 0.0,
+            pending_seconds: 0.0,
+            scene: one_rev_scene(),
+        });
+        let worker = PhysicsWorker {
+            requests,
+            frames,
+            worker: Some(worker),
+            pending_seconds: 0.0,
+            fixed_dt: 0.001,
+            in_flight: false,
+            in_flight_steps: 0,
+            failure: None,
+            grab_target: Arc::new(Mutex::new(None)),
+            frame: PhysicsFrame::default(),
+        };
+
+        let error = worker
+            .into_snapshot()
+            .err()
+            .expect("queued worker error must prevent snapshot transfer");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("queued invalid state"));
     }
 
     #[test]
@@ -799,7 +1068,7 @@ mod tests {
         let mut scene =
             Scene::from_voxels(config, vec![VoxelSpawn::at_cell([0, 0, 0], iron)]).unwrap();
 
-        let cold = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 1, 1);
+        let cold = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 1, 1).unwrap();
         assert_eq!(cold.cells.len(), 1);
         assert!(cold.cells[0].temperature_kelvin < 9000.0);
         assert_eq!(cold.cells[0].liquid_fraction, 0.0);
@@ -813,7 +1082,7 @@ mod tests {
         let hot_phase = scene.phase_state(0).unwrap();
         assert!((hot_phase.temperature_kelvin - 9000.0).abs() < 0.1);
 
-        let hot = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 1, 2);
+        let hot = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 1, 2).unwrap();
         assert!((hot.cells[0].temperature_kelvin - 9000.0).abs() < 0.1);
         assert_eq!(hot.cells[0].liquid_fraction, hot_phase.liquid_fraction);
         assert_eq!(hot.cells[0].gas_fraction, hot_phase.gas_fraction);
@@ -834,7 +1103,7 @@ mod tests {
         let current_energy = scene.voxels[0].total_internal_energy_j() as f32;
         assert!(scene.add_heat_joules(0, target_energy - current_energy));
 
-        let frame = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 1, 1);
+        let frame = PhysicsFrame::capture(&scene, DVec3::ZERO, 0.0, 0.0, 1, 1).unwrap();
 
         assert!(frame.cells.is_empty());
         assert_eq!(frame.fixed_thermal.len(), 1);

@@ -1647,12 +1647,31 @@ fn advance_step_with_axis_targets_and_loads(
     atmosphere_loads(scene, &mut atmosphere_exposed_faces, &mut ambient_loads);
     let mut applied_loads = std::mem::take(&mut solver_scratch.applied_loads);
     applied_loads.resize(voxel_count, Vec3::ZERO);
+    let has_skeletal_actuators = !scene.skeletal_actuators.is_empty();
+    if has_skeletal_actuators {
+        applied_loads.fill(Vec3::ZERO);
+        for actuator in &mut scene.skeletal_actuators {
+            let _ = actuator.accumulate_forces(
+                &scene.positions,
+                &scene.voxels,
+                &scene.rotations,
+                &scene.properties,
+                f64::from(scene.config.fixed_dt),
+                &mut applied_loads,
+            );
+        }
+    }
     for (i, voxel) in scene.voxels.iter().enumerate() {
         applied_loads[i] = if !voxel.kinematic {
             scene.external_forces[i]
                 + scene.external_accelerations[i] * voxel.mass
                 + loads.get(i).copied().unwrap_or(Vec3::ZERO)
                 + ambient_loads[i]
+                + if has_skeletal_actuators {
+                    applied_loads[i]
+                } else {
+                    Vec3::ZERO
+                }
         } else {
             Vec3::ZERO
         };
@@ -1661,6 +1680,7 @@ fn advance_step_with_axis_targets_and_loads(
     wake_candidates_with_differential_loading(scene, gravity, &applied_loads);
     let may_adapt = scene.adaptive_substeps
         && tool.is_none()
+        && scene.skeletal_actuators.is_empty()
         && loads.is_empty()
         && scene.releases.is_empty()
         && !topology_changed
@@ -1729,6 +1749,9 @@ fn advance_step_with_axis_targets_and_loads(
     let mut new_impact_observations = 0usize;
     let mut stage_time = [Duration::ZERO; 5];
     let mut total_pcg_iterations = 0usize;
+    // A later substep or corotation pass overwrites `solver_residual`, so a
+    // failed solve has to be remembered for the whole fixed step.
+    let mut solve_failed_this_step = false;
     let mut damping_cache_hits = 0usize;
     let mut solve_detail_time = [Duration::ZERO; 3];
     let mut contact_finish_time = Duration::ZERO;
@@ -2098,6 +2121,9 @@ fn advance_step_with_axis_targets_and_loads(
                     reusable_cuda_solution,
                     &mut cuda_enabled_for_step,
                 );
+                #[cfg(test)]
+                inject_test_solve_failure(scene);
+                solve_failed_this_step |= !scene.solver_residual.is_finite();
                 reusable_cuda_solution = cuda_enabled_for_step;
                 total_pcg_iterations += iterations;
                 for index in 0..solve_detail_time.len() {
@@ -2518,6 +2544,26 @@ fn advance_step_with_axis_targets_and_loads(
             let i = constraint.i;
             let j = constraint.j;
             let axis = constraint.axis;
+            let previous_bond = scene.bonds[axis][i];
+            let actor_guarded = scene.skeletal_actuators.iter_mut().any(|actuator| {
+                if !actuator.matches_scene_topology(scene.voxels.len())
+                    || !actuator.protects_bond(i, j)
+                {
+                    return false;
+                }
+                let would_damage = outcome.bond.neighbor == EMPTY
+                    || outcome.bond.damage > previous_bond.damage
+                    || outcome.bond.plastic_strain != previous_bond.plastic_strain;
+                if would_damage {
+                    actuator.stall();
+                }
+                would_damage
+            });
+            if actor_guarded {
+                // Hold this internal REV bond at its last safe state and stop
+                // the actor's pose clock when its material law predicts damage.
+                continue;
+            }
             scene.bonds[axis][i] = outcome.bond;
             scene.workspace[axis][i].last_force = outcome.last_force;
             let dissipation = outcome.dissipation;
@@ -2717,6 +2763,9 @@ fn advance_step_with_axis_targets_and_loads(
     // World exits are a topology event at the fixed-step boundary. This keeps
     // every solver/contact array in one consistent index space for the step.
     let removed_at_boundary = scene.enforce_world_bounds();
+    if solve_failed_this_step {
+        scene.solver_residual = f32::INFINITY;
+    }
     let completed_fixed_steps = scene.substep_index / (scene.config.substeps.max(1) as u64);
     if completed_fixed_steps > 0
         && completed_fixed_steps % AUTO_AGGREGATE_SCAN_INTERVAL_STEPS == 0
@@ -2945,6 +2994,14 @@ pub fn rebuild_clusters(scene: &mut Scene) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonfinite_residual_norm_is_never_reported_as_zero() {
+        assert_eq!(checked_relative_residual(0.0, 0.0), 0.0);
+        assert!(checked_relative_residual(f64::NAN, 0.0).is_infinite());
+        assert!(checked_relative_residual(f64::INFINITY, 1.0).is_infinite());
+        assert!(checked_relative_residual(1.0, f64::NAN).is_infinite());
+    }
 
     fn free_falling_oak_block() -> Scene {
         use crate::material::Material;
@@ -4761,6 +4818,96 @@ pub(crate) struct SolverScratch {
     rotation_counts: Vec<Vec3>,
 }
 #[cfg(test)]
+thread_local! {
+    static TEST_FAILED_SOLVES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn inject_test_solve_failure(scene: &mut Scene) {
+    TEST_FAILED_SOLVES.with(|remaining| {
+        if remaining.get() > 0 {
+            remaining.set(remaining.get() - 1);
+            scene.solver_residual = f32::INFINITY;
+        }
+    });
+}
+
+#[cfg(test)]
+#[test]
+fn failed_solve_in_one_substep_stays_visible_after_later_substeps_succeed() {
+    use crate::material::Material;
+    use crate::scene::{SceneConfig, VoxelSpawn};
+
+    let oak = Material::component_id("oak").unwrap();
+    let mut config = SceneConfig::default();
+    config.substeps = 4;
+    let spawns = vec![
+        VoxelSpawn::at_cell([0, 0, 0], oak),
+        VoxelSpawn::at_cell([1, 0, 0], oak),
+    ];
+    let mut scene = Scene::from_voxels(config, spawns).unwrap();
+    scene.adaptive_substeps = false;
+
+    step(&mut scene, &mut None);
+    assert!(scene.solver_residual.is_finite(), "control step must succeed");
+
+    TEST_FAILED_SOLVES.with(|remaining| remaining.set(1));
+    step(&mut scene, &mut None);
+    TEST_FAILED_SOLVES.with(|remaining| remaining.set(0));
+    assert_eq!(scene.last_mechanical_substeps, 4);
+    assert!(
+        !scene.solver_residual.is_finite(),
+        "failure masked by a later substep: residual={}",
+        scene.solver_residual
+    );
+    let status = scene.last_step_diagnostics.as_ref().unwrap();
+    assert!(!status.relative_solver_residual.is_finite());
+}
+
+#[cfg(test)]
+#[test]
+fn natural_ic0_handles_bonds_whose_owner_index_follows_the_neighbor() {
+    use crate::material::Material;
+    use crate::scene::{SceneConfig, VoxelSpawn};
+
+    let oak = Material::component_id("oak").unwrap();
+    // Deliberately reverse spatial order: the positive-axis bond is owned by
+    // the larger insertion index, which is valid for saved voxel scenes.
+    let mut config = SceneConfig::default();
+    config.substeps = 1;
+    config.gravity = [0.0; 3];
+    config.atmosphere.pressure_pa = 0.0;
+    let run = |spawns| {
+        let mut scene = Scene::from_voxels(config.clone(), spawns).unwrap();
+        for _ in 0..8 {
+            step(&mut scene, &mut None);
+            assert!(scene.positions.iter().all(|value| value.is_finite()));
+            assert!(scene.voxels.iter().all(|value| value.velocity.is_finite()));
+            assert!(scene.solver_residual.is_finite());
+        }
+        scene
+    };
+    let forward = run(vec![
+        VoxelSpawn::at_cell([0, 0, 0], oak),
+        VoxelSpawn::at_cell([1, 0, 0], oak),
+    ]);
+    let reversed = run(vec![
+        VoxelSpawn::at_cell([1, 0, 0], oak),
+        VoxelSpawn::at_cell([0, 0, 0], oak),
+    ]);
+    assert!(reversed.bonds[0].iter().enumerate().any(|(i, bond)|
+        bond.neighbor != EMPTY && (bond.neighbor as usize) < i));
+    for (a, b) in [(forward.positions[0], reversed.positions[1]),
+                   (forward.positions[1], reversed.positions[0])] {
+        assert!(a.distance(b) < 1.0e-5, "voxel permutation changed trajectory: {a:?} vs {b:?}");
+    }
+    for (a, b) in [(forward.voxels[0].velocity, reversed.voxels[1].velocity),
+                   (forward.voxels[1].velocity, reversed.voxels[0].velocity)] {
+        assert!((a - b).length() < 1.0e-5, "voxel permutation changed velocity: {a:?} vs {b:?}");
+    }
+}
+
+#[cfg(test)]
 fn make_constraint(scene: &Scene, i: usize, axis: usize, j: usize) -> Constraint {
     let phases = [i, j].map(|n| {
         scene.properties[n].phase_state(scene.voxels[n].mass, scene.voxels[n].thermal_energy_f32())
@@ -4930,6 +5077,16 @@ fn solve_lower_transpose(l: Mat3, b: Vec3) -> Vec3 {
     Vec3::new(x, y, z)
 }
 
+fn checked_relative_residual(residual_norm: f64, rhs_norm: f64) -> f32 {
+    if !residual_norm.is_finite() || !rhs_norm.is_finite() || residual_norm < 0.0 || rhs_norm < 0.0 {
+        f32::INFINITY
+    } else if rhs_norm == 0.0 {
+        if residual_norm == 0.0 { 0.0 } else { f32::INFINITY }
+    } else {
+        (residual_norm / rhs_norm) as f32
+    }
+}
+
 fn inverse_cholesky_lower(l: Mat3) -> Mat3 {
     Mat3::from_cols(
         solve_lower(l, Vec3::X),
@@ -4972,17 +5129,15 @@ fn build_ic0_links(
         for &edge in &incidence[i][..incidence_len[i] as usize] {
             let edge = edge as usize;
             let constraint = &constraints[edge];
-            if constraint.j == i {
-                let neighbor = active_index[constraint.i];
-                if neighbor != u32::MAX {
+            let other = if constraint.i == i { constraint.j } else { constraint.i };
+            let neighbor = active_index[other];
+            if neighbor != u32::MAX {
+                if neighbor < slot as u32 {
                     let count = &mut lower_link_count[slot];
                     debug_assert!((*count as usize) < lower_links[slot].len());
                     lower_links[slot][*count as usize] = [edge as u32, neighbor];
                     *count += 1;
-                }
-            } else if constraint.i == i {
-                let neighbor = active_index[constraint.j];
-                if neighbor != u32::MAX {
+                } else {
                     let count = &mut upper_link_count[slot];
                     debug_assert!((*count as usize) < upper_links[slot].len());
                     upper_links[slot][*count as usize] = [edge as u32, neighbor];
@@ -5459,7 +5614,7 @@ fn build_ic0(
     factor_matrix: &mut Vec<Mat3>,
     factor_diagonal: &mut Vec<Mat3>,
     factor_edges: &mut Vec<Mat3>,
-) {
+) -> bool {
     let n = scene.voxels.len();
     factor_matrix.resize(n, Mat3::ZERO);
     factor_diagonal.resize(n, Mat3::IDENTITY);
@@ -5478,23 +5633,25 @@ fn build_ic0(
         for &edge in row_edges {
             let edge = edge as usize;
             let c = &constraints[edge];
-            if c.j != row {
+            let col = if c.i == row { c.j } else { c.i };
+            if col >= row {
                 continue;
             }
-            let col = c.i;
             let col_projection = Mat3::from_diagonal(free[col]);
-            let mut value = -row_projection * c.k * col_projection;
-            let col_edges = &incidence[col][..incidence_len[col] as usize];
+            let row_to_col = if c.i == row { c.k } else { c.k.transpose() };
+            let mut value = -row_projection * row_to_col * col_projection;
             for &row_shared in row_edges {
                 let row_shared = row_shared as usize;
                 let r = &constraints[row_shared];
-                if r.j != row || r.i >= col {
+                let shared = if r.i == row { r.j } else { r.i };
+                if shared >= col {
                     continue;
                 }
-                for &col_shared in col_edges {
+                for &col_shared in &incidence[col][..incidence_len[col] as usize] {
                     let col_shared = col_shared as usize;
                     let s = &constraints[col_shared];
-                    if s.j == col && s.i == r.i {
+                    let col_shared_node = if s.i == col { s.j } else { s.i };
+                    if col_shared_node == shared {
                         value -= factor_edges[row_shared] * factor_edges[col_shared].transpose();
                         break;
                     }
@@ -5503,8 +5660,20 @@ fn build_ic0(
             factor_edges[edge] = right_solve_lower_transpose(value, factor_diagonal[col]);
             factor_matrix[row] -= factor_edges[edge] * factor_edges[edge].transpose();
         }
-        factor_diagonal[row] = cholesky_lower(factor_matrix[row]);
+        let Some(factor) = try_cholesky_lower(factor_matrix[row]) else {
+            // IC(0) may break down even when the assembled fine operator is
+            // SPD. A failed block pivot invalidates the entire triangular
+            // factor; never floor it and continue with enormous coefficients.
+            if std::env::var_os("VOXEL_PROFILE_STEP").is_some() {
+                eprintln!("CPU IC(0) breakdown row={row} Schur_block={:?}; using block Jacobi", factor_matrix[row]);
+            }
+            build_block_jacobi(diagonal, factor_diagonal);
+            factor_edges.fill(Mat3::ZERO);
+            return false;
+        };
+        factor_diagonal[row] = factor;
     }
+    true
 }
 
 fn color_active_graph(
@@ -5749,7 +5918,7 @@ fn build_ic0_with_optional_bipartite(
             return true;
         }
     }
-    build_ic0(
+    let built = build_ic0(
         scene,
         free,
         diagonal,
@@ -5760,6 +5929,9 @@ fn build_ic0_with_optional_bipartite(
         factor_diagonal,
         factor_edges,
     );
+    if !built && std::env::var_os("VOXEL_PROFILE_STEP").is_some() {
+        eprintln!("CPU IC(0) natural ordering factor rejected; using block Jacobi");
+    }
     false
 }
 
@@ -7031,7 +7203,7 @@ fn solve_contact_increment_backend(
     projection.project(&mut dx);
     apply(&dx, &mut ap, true);
     for i in 0..n { r[i] = rhs[i] - ap[i]; }
-    let residual = if rhs_norm > 1e-20 { (dot(&r,&r).sqrt()/rhs_norm) as f32 } else { 0.0 };
+    let residual = checked_relative_residual(dot(&r, &r).sqrt(), rhs_norm);
     for (value, offset) in dx.iter_mut().zip(particular) { *value += offset; }
     if input_rhs.iter().all(|value| *value == Vec3::ZERO) {
         // Solve the rigid translation modes analytically. A relative residual
@@ -7195,6 +7367,10 @@ fn solve_projected_contact(scene: &mut Scene, h: f32, scratch: &mut SolverScratc
     }).collect();
     let (dx, iterations, residual) = solve_contact_increment(
         scene, h, scratch, &scratch.pair_contacts, &gap_targets, &rhs);
+    if !residual.is_finite() || dx.iter().any(|value| !value.is_finite()) {
+        scene.solver_residual = f32::INFINITY;
+        return iterations;
+    }
     scene.solver_residual = residual;
     for (slot, &i) in scratch.active.iter().enumerate() { scene.positions[i] += dx[slot].as_dvec3(); }
     if let Some(elastic_before) = elastic_before {
@@ -7900,6 +8076,10 @@ fn solve_coupled(
         scratch.r[slot] = scratch.rhs[i];
     }
     let rhs_norm = dot(&scratch.r, &scratch.r).sqrt();
+    if !rhs_norm.is_finite() {
+        scene.solver_residual = f32::INFINITY;
+        return (0, [assembly_time, factor_time, Duration::ZERO]);
+    }
     if warm_start {
         apply(&scratch.dx, &mut scratch.ap);
         for (residual, &product) in scratch.r.iter_mut().zip(&scratch.ap) {
@@ -7907,6 +8087,10 @@ fn solve_coupled(
         }
     }
     let mut residual_norm = dot(&scratch.r, &scratch.r).sqrt();
+    if !residual_norm.is_finite() {
+        scene.solver_residual = f32::INFINITY;
+        return (0, [assembly_time, factor_time, Duration::ZERO]);
+    }
     if warm_start && residual_norm > rhs_norm {
         scratch.dx.fill(Vec3::ZERO);
         for (slot, &i) in active.iter().enumerate() {
@@ -7914,11 +8098,7 @@ fn solve_coupled(
         }
         residual_norm = rhs_norm;
     }
-    scene.solver_residual = if rhs_norm > 1e-12 {
-        (residual_norm / rhs_norm) as f32
-    } else {
-        0.0
-    };
+    scene.solver_residual = checked_relative_residual(residual_norm, rhs_norm);
     scratch.z.resize(active_count, Vec3::ZERO);
     scratch.p.resize(active_count, Vec3::ZERO);
     scratch.preconditioner_work.resize(active_count, Vec3::ZERO);
@@ -8210,11 +8390,7 @@ fn solve_coupled(
         ) as f32;
     }
     let initial = rhs_norm;
-    scene.solver_residual = if initial > 1e-12 {
-        (dot(&scratch.r, &scratch.r).sqrt() / initial) as f32
-    } else {
-        0.0
-    };
+    scene.solver_residual = checked_relative_residual(dot(&scratch.r, &scratch.r).sqrt(), initial);
     let mut iterations = 0;
     let mut verified_solution = false;
     // These ranges are block diagonal by construction: no active mechanical
@@ -8323,13 +8499,15 @@ fn solve_coupled(
         let z = &mut scratch.z;
         let p = &mut scratch.p;
         let mut rz = dot(r, z);
-        scene.solver_residual = if initial > 1e-12 {
-            (dot(r, r).sqrt() / initial) as f32
-        } else {
-            0.0
-        };
+        let mut numerical_failure = !rz.is_finite()
+            || r.iter().any(|value| !value.is_finite())
+            || z.iter().any(|value| !value.is_finite());
+        scene.solver_residual = checked_relative_residual(dot(r, r).sqrt(), initial);
         let fuse_reductions = fused_pcg_reductions_enabled();
         for _ in 0..scene.config.iterations {
+            if numerical_failure {
+                break;
+            }
             if initial == 0.0 || scene.solver_residual < scene.config.solver_relative_tolerance {
                 verified_solution = true;
                 break;
@@ -8341,10 +8519,15 @@ fn solve_coupled(
                 dot(&p, &ap)
             };
             iterations += 1;
-            if denom <= 1e-30 {
+            if !denom.is_finite() || denom <= 1e-30 || !rz.is_finite() {
+                numerical_failure = !denom.is_finite() || !rz.is_finite();
                 break;
             }
             let alpha = (rz / denom) as f32;
+            if !alpha.is_finite() {
+                numerical_failure = true;
+                break;
+            }
             let residual_squared = if fuse_reductions {
                 update_and_norm(dx, r, p, ap, alpha)
             } else {
@@ -8364,7 +8547,8 @@ fn solve_coupled(
                 }
                 dot(&r, &r)
             };
-            scene.solver_residual = (residual_squared.sqrt() / initial) as f32;
+            scene.solver_residual = checked_relative_residual(residual_squared.sqrt(), initial);
+            numerical_failure |= !scene.solver_residual.is_finite();
             let mut restart = false;
             if scene.solver_residual < scene.config.solver_relative_tolerance {
                 scene.solver_residual = recompute_pcg_residual(
@@ -8420,7 +8604,9 @@ fn solve_coupled(
             }
             rz = next;
         }
-        if !verified_solution {
+        if numerical_failure {
+            scene.solver_residual = f32::INFINITY;
+        } else if !verified_solution {
             scene.solver_residual = recompute_pcg_residual(
                 &scratch.diagonal,
                 &scratch.pcg_rows,
@@ -8434,6 +8620,12 @@ fn solve_coupled(
         }
     }
     let pcg_time = cpu_pcg_start.elapsed();
+    if !scene.solver_residual.is_finite() || scratch.dx.iter().any(|value| !value.is_finite()) {
+        // A failed solve is reported as failed and its nonfinite candidate is
+        // never committed into world positions.
+        scene.solver_residual = f32::INFINITY;
+        return (iterations, [assembly_time, factor_time, pcg_time]);
+    }
     if std::env::var_os("VOXEL_AUDIT_PCG_RESIDUAL").is_some() {
         let audit = audit_pcg_residual(
             &scratch.diagonal,

@@ -29,6 +29,17 @@ pub struct Voxel {
 }
 
 impl Voxel {
+    /// Check stored thermal values before clamping or equation-of-state reads.
+    /// A derived nonnegative total can hide a NaN through `f64::max`.
+    pub fn has_finite_thermal_state(&self) -> bool {
+        self.internal_energy.is_finite()
+            && self.internal_energy_remainder_j.is_finite()
+            && self
+                .thermal_cell_energy_j
+                .as_ref()
+                .map_or(true, |cells| cells.iter().all(|energy| energy.is_finite()))
+    }
+
     /// Exact conserved thermal energy represented by the f32 value and its
     /// compensated residual.
     pub fn total_internal_energy_j(&self) -> f64 {

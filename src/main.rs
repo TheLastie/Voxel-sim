@@ -91,7 +91,7 @@ struct AuthoredInstanceBounds {
     min: Vec3,
     max: Vec3,
     center: Vec3,
-    radius: f32,
+    sphere_radius: f32,
 }
 
 struct CameraSnapshot {
@@ -267,13 +267,20 @@ fn authored_instance_bounds(
     let half_cell = (voxel_physics_lab::coordinates::CELL_M * 0.5) as f32;
     let minimum = minimum - Vec3::splat(half_cell);
     let maximum = maximum + Vec3::splat(half_cell);
-    let center = (minimum + maximum) * 0.5;
-    let radius = ((maximum - minimum).length() * 0.7).max(0.3);
+    let extent = maximum - minimum;
+    if !minimum.is_finite() || !maximum.is_finite() || !extent.is_finite() {
+        return Err("model instance bounds are not finite".into());
+    }
+    let center = minimum + extent * 0.5;
+    let sphere_radius = extent.length() * 0.5;
+    if !center.is_finite() || !sphere_radius.is_finite() || sphere_radius <= 0.0 {
+        return Err("model instance bounds have an invalid radius".into());
+    }
     Ok(AuthoredInstanceBounds {
         min: minimum,
         max: maximum,
         center,
-        radius,
+        sphere_radius,
     })
 }
 
@@ -2692,9 +2699,20 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
         std::env::set_var("VOXEL_CUDA_CONTACT_IC0", "1");
     }
     let creation = impact_scene_creation_args(&args)?;
-    let created_scene_path = creation.as_ref().map(|(path, _)| path.clone());
+    let mut created_scene_path = creation.as_ref().map(|(path, _)| path.clone());
     if let Some((path, options)) = creation.as_ref() {
         voxel_physics_lab::scene_presets::create_impact_scene_with_options(path, options)?;
+    }
+    if let Some(index) = args.iter().position(|arg| arg == "--create-animated-scene") {
+        if creation.is_some() { return Err("choose one scene creation command".into()); }
+        let output = args.get(index+1).filter(|s| !s.starts_with("--"))
+            .ok_or("--create-animated-scene requires an output .vxscene path")?;
+        let model = args.windows(2).find(|pair| pair[0] == "--animated-model")
+            .map(|pair| pair[1].as_str()).ok_or("--animated-model requires a source .vxm path")?;
+        voxel_physics_lab::scene_presets::create_animated_model_scene(
+            Path::new(output), Path::new(model), 96,
+        )?;
+        created_scene_path = Some(std::path::PathBuf::from(output));
     }
     let requested_model_path = args
         .windows(2)
@@ -5155,7 +5173,19 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                                         .unwrap_or_else(|| Path::new("Untitled.vxscene"));
                                     match authored_instance_bounds(document, scene_path, index) {
                                         Ok(bounds) => {
-                                            camera.set_orbit(bounds.center, bounds.radius);
+                                            let aspect = ui
+                                                .scene_viewport()
+                                                .map(|[_, _, width, height]| {
+                                                    width as f32 / height.max(1) as f32
+                                                })
+                                                .unwrap_or(1.0);
+                                            camera.set_orbit(
+                                                bounds.center,
+                                                Camera::fit_orbit_distance_for_sphere(
+                                                    bounds.sphere_radius,
+                                                    aspect,
+                                                ),
+                                            );
                                             camera.yaw = -0.85;
                                             camera.pitch = 0.38;
                                         }
@@ -6529,7 +6559,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                         Err(wgpu::SurfaceError::Timeout) => {}
                     }
                     frames += 1;
-                    if runtime_metrics_server.is_some() && last_runtime_publish.elapsed() >= Duration::from_millis(250) {
+                    if last_runtime_publish.elapsed() >= Duration::from_millis(250) {
                         let physics = authored_physics.as_ref().or(world_physics.as_ref());
                         let simulated = physics.map_or(scene.simulated_seconds, |worker| worker.frame.simulated_seconds);
                         let elapsed_wall = last_runtime_publish.elapsed().as_secs_f64();
@@ -6538,6 +6568,10 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                         let speed = if rate_valid {
                             (simulated-previous_runtime_simulated)/elapsed_wall.max(1.0e-9)
                         } else { 0.0 };
+                        ui.set_measured_simulation_rate(
+                            (physics.is_some() && rate_valid).then_some(speed),
+                        );
+                        if runtime_metrics_server.is_some() {
                         voxel_physics_lab::runtime_metrics::publish("app", serde_json::json!({
                             "scene_name":active_scene_document.as_ref().map(|doc| &doc.name),
                             "scene_path":active_scene_document_path,
@@ -6561,6 +6595,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                                 last_authoring_metrics_key=Some(key);
                             }
                         } else { last_authoring_metrics_key=None; }
+                        }
                         previous_runtime_simulated=simulated;
                         previous_runtime_generation=generation;
                         last_runtime_publish=Instant::now();

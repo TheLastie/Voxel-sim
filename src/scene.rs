@@ -465,6 +465,8 @@ pub struct Scene {
     pub(crate) source_cells: Vec<Option<[i32; 3]>>,
     /// Persistent per-voxel forces in newtons, retained until explicitly reset.
     pub external_forces: Vec<Vec3>,
+    /// Transient skeleton-driven motors, applied through the ordinary solver.
+    pub skeletal_actuators: Vec<crate::skeletal_actuator::SkeletalActuator>,
     /// Persistent per-voxel acceleration inputs in m/s².
     pub external_accelerations: Vec<Vec3>,
     /// Persistent world-coordinate constraints; None leaves an axis free.
@@ -1093,6 +1095,7 @@ impl Scene {
             voxels: Vec::with_capacity(spawns.len()),
             source_cells: vec![None; spawns.len()],
             external_forces: Vec::with_capacity(spawns.len()),
+            skeletal_actuators: Vec::new(),
             external_accelerations: Vec::with_capacity(spawns.len()),
             axis_targets: Vec::with_capacity(spawns.len()),
             positions: Vec::with_capacity(spawns.len()),
@@ -2995,6 +2998,7 @@ impl Scene {
             aggregate_of: vec![None; n],
             source_cells: vec![None; n],
             external_forces: vec![Vec3::ZERO; n],
+            skeletal_actuators: Vec::new(),
             external_accelerations: vec![Vec3::ZERO; n],
             axis_targets: vec![[None; 3]; n],
             previous: positions.clone(),

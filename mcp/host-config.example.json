@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "voxel-editor": {
+      "command": "E:\\path\\to\\voxel-sim\\target\\release\\voxel-editor-mcp.exe",
+      "args": [
+        "--project-root",
+        "E:\\path\\to\\your\\voxel-project"
+      ]
+    }
+  }
+}

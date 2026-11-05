@@ -6,7 +6,7 @@ use glam::{DVec3, Quat, Vec3};
 use crate::{
     coordinates::CELL_M,
     documents::{
-        save_document, EditorDocument, ModelInstanceDocument, SceneDocument, VoxelModelDocument,
+        load_document, save_document, EditorDocument, ModelInstanceDocument, SceneDocument, VoxelModelDocument,
     },
     material::Material,
     scene::{SceneBuilder, SceneConfig, VoxelSpawn},
@@ -192,6 +192,76 @@ pub fn create_impact_scene_with_options(
     Ok(document)
 }
 
+/// Create an ordinary physical scene with an animated saved model above a
+/// fixed, flat centimetre-REV floor. The input model is copied unchanged.
+pub fn create_animated_model_scene(
+    path: &Path,
+    model_path: &Path,
+    floor_cells: usize,
+) -> Result<SceneDocument, String> {
+    if !(8..=512).contains(&floor_cells) {
+        return Err("flat floor size must be between 8 and 512 centimetre cells".into());
+    }
+    if path.exists() {
+        return Err("animated scene output already exists; choose a new path".into());
+    }
+    if path.extension().and_then(|p| p.to_str()) != Some("vxscene") {
+        return Err("animated scene output must end in .vxscene".into());
+    }
+    let model: VoxelModelDocument = load_document(model_path)?;
+    model.validate()?;
+    if model.skeleton.as_ref().is_none_or(|rig| rig.clips.is_empty()) {
+        return Err("animated model needs a valid skeleton and at least one clip".into());
+    }
+    let minimum_z = model.voxels.iter().map(|v| v.rest_position_m.z - CELL_M * 0.5)
+        .fold(f64::INFINITY, f64::min);
+    // Leave a centimetre of clearance, so gravity settles the model onto the
+    // floor through real contacts instead of starting with interpenetration.
+    let translation_z = ((-minimum_z / CELL_M).ceil() + 1.0) * CELL_M;
+    let stone = Material::component_id("stone").ok_or("stone material is unavailable")?;
+    let mut config = SceneConfig::default();
+    config.fixed_dt = 0.01;
+    config.substeps = 4;
+    let mut builder = SceneBuilder::new(config.clone());
+    let half = floor_cells as i32 / 2;
+    for y in 0..floor_cells as i32 {
+        for x in 0..floor_cells as i32 {
+            builder = builder.add_voxel(VoxelSpawn::at_cell([x-half, y-half, -1], stone).fixed());
+        }
+    }
+    let floor_scene = builder.build()?;
+    let floor = VoxelModelDocument::from_scene("Fixed flat ground", &floor_scene);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| format!("create scene folder: {e}"))?;
+    let stem = path.file_stem().and_then(|p| p.to_str()).unwrap_or("animated-model");
+    let mut sequence = 0;
+    let folder = loop {
+        let folder = if sequence == 0 { format!("{stem}-assets") }
+            else { format!("{stem}-assets-{sequence}") };
+        match std::fs::create_dir(parent.join(&folder)) {
+            Ok(()) => break folder,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => sequence += 1,
+            Err(e) => return Err(format!("create animated model asset folder: {e}")),
+        }
+    };
+    let floor_asset = Path::new(&folder).join("flat-ground.vxm");
+    let model_asset = Path::new(&folder).join("animated-model.vxm");
+    save_document(&parent.join(&floor_asset), &floor)?;
+    save_document(&parent.join(&model_asset), &model)?;
+    let mut document = SceneDocument::new("Animated model on flat ground", config)?;
+    for (asset_path, translation_m) in [
+        (floor_asset, DVec3::ZERO),
+        (model_asset, DVec3::new(0.0, 0.0, translation_z)),
+    ] {
+        document.add_model(ModelInstanceDocument {
+            asset_path, translation_m, rotation: Quat::IDENTITY, scale: Vec3::ONE,
+        })?;
+    }
+    document.validate()?;
+    save_document(path, &document)?;
+    Ok(document)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +277,46 @@ mod tests {
             "E:/CodexHome/tmp/voxel-sim-{label}-{}-{timestamp}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn animated_scene_copies_model_and_restores_a_fixed_floor_and_actor() {
+        use crate::documents::{SkeletonDocument, VoxelBoneWeightDocument};
+        let root = unique_test_dir("animated-flat");
+        std::fs::create_dir_all(&root).unwrap();
+        let source_path = root.join("input.vxm");
+        let path = root.join("flat.vxscene");
+        let scene = SceneBuilder::standard()
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], 1))
+            .add_voxel(VoxelSpawn::at_cell([1, 0, 0], 1)).build().unwrap();
+        let mut model = VoxelModelDocument::from_scene("animated fixture", &scene);
+        let mut rig = SkeletonDocument::with_root_bone("body", DVec3::ZERO);
+        rig.add_animation_clip("idle", 1.0).unwrap();
+        rig.voxel_weights = (0..2).map(|voxel_index| VoxelBoneWeightDocument {
+            voxel_index, bone_index: 0, weight: 1.0,
+        }).collect();
+        model.skeleton = Some(rig);
+        save_document(&source_path, &model).unwrap();
+        let source_bytes = std::fs::read(&source_path).unwrap();
+        let authored = create_animated_model_scene(&path, &source_path, 8).unwrap();
+        let physical = authored.build_scene(&path).unwrap();
+        assert_eq!(physical.voxels.len(), 66);
+        assert!(physical.voxels[..64].iter().all(|v| v.kinematic));
+        assert!(physical.voxels[64..].iter().all(|v| !v.kinematic));
+        assert_eq!(physical.skeletal_actuators.len(), 1);
+        assert_eq!(physical.skeletal_actuators[0].voxel_range(), 64..66);
+        assert_eq!(physical.config.gravity, [0.0, 0.0, -9.81]);
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+        let output_bytes = std::fs::read(&path).unwrap();
+        assert!(create_animated_model_scene(&path, &source_path, 8).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), output_bytes);
+
+        model.skeleton.as_mut().unwrap().clips.clear();
+        let no_clips = root.join("no-clips.vxm");
+        save_document(&no_clips, &model).unwrap();
+        assert!(create_animated_model_scene(&root.join("invalid.vxscene"), &no_clips, 8).is_err());
+        assert!(!root.join("invalid.vxscene").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -13,8 +13,9 @@ const MAX_COMPONENT_SUMMARIES: usize = 64;
 const MAX_EXACT_RUNTIME_REVS: usize = 2_048;
 const MAX_RUNTIME_SAMPLE_REVS: usize = 128;
 const PERFORMANCE_WINDOW_CAPACITY: usize = 256;
-const TARGET_ACTIVE_REVS_MIN: usize = 300_000;
-const TARGET_ACTIVE_REVS_MAX: usize = 400_000;
+// User revised the first hardware target on 2026-11-05 to 50k active REVs.
+// A larger measured workload is eligible too; this is not a world-size cap.
+const TARGET_ACTIVE_REVS_MIN: usize = 50_000;
 const TARGET_WALL_MS_PER_10MS: f64 = 5.0;
 
 #[derive(Clone, Copy, Debug)]
@@ -89,8 +90,7 @@ impl PerformanceWindow {
             .map(|s| s.active_dynamic_fine_revs)
             .max();
         let latest = self.samples.back();
-        let eligible = min_revs.is_some_and(|n| n >= TARGET_ACTIVE_REVS_MIN)
-            && max_revs.is_some_and(|n| n <= TARGET_ACTIVE_REVS_MAX);
+        let eligible = min_revs.is_some_and(|n| n >= TARGET_ACTIVE_REVS_MIN);
         let observed_max_worker_cost = worker_costs.iter().copied().reduce(f64::max);
         let budget_pass =
             observed_max_worker_cost.is_some_and(|max_cost| max_cost <= TARGET_WALL_MS_PER_10MS);
@@ -109,7 +109,8 @@ impl PerformanceWindow {
             },
             "target": {
                 "active_dynamic_fine_revs_min": TARGET_ACTIVE_REVS_MIN,
-                "active_dynamic_fine_revs_max": TARGET_ACTIVE_REVS_MAX,
+                "active_dynamic_fine_revs_max": Value::Null,
+                "active_count_semantics": "minimum measured load, not a runtime/world cap",
                 "wall_ms": TARGET_WALL_MS_PER_10MS,
                 "simulated_ms": 10.0,
                 "normalized_to_simulated_ms": 10.0
@@ -358,6 +359,9 @@ where
         } else {
             non_finite_count += 1;
         }
+        if !voxel.has_finite_thermal_state() {
+            non_finite_count += 1;
+        }
         let energy_j = finite_nonnegative(
             voxel.total_internal_energy_j(),
             &mut non_finite_count,
@@ -569,6 +573,20 @@ where
             "accounted_energy_j": if exact { json!(kinetic + internal + elastic.unwrap_or(0.0) + stored_plastic.unwrap_or(0.0)) } else { Value::Null }
         },
         "energy_ledger_j": Value::Object(ledger),
+        "skeletal_actuators": {
+            "count":scene.skeletal_actuators.len(),
+            "limit":16,
+            "items":scene.skeletal_actuators.iter().take(16).enumerate().map(|(index, actor)| json!({
+                "index":index,
+                "voxel_range":[actor.voxel_range().start,actor.voxel_range().end],
+                "clip_index":actor.clip_index,
+                "pose_time_s":actor.elapsed_seconds(),
+                "enabled":actor.enabled,
+                "stalled":actor.stalled,
+                "last_load_l1_norm_n":actor.last_force_norm_n(),
+                "drive":"material_capped_internal_forces; no kinematic pose writes"
+            })).collect::<Vec<_>>()
+        },
         "thermal": exact_total(thermal.clone()),
         "topology": {"intact_bonds": intact_bonds, "broken_cumulative": scene.broken, "component_count": exact_total(json!(component_count)), "cached_dynamic_component_count": scene.cluster_count},
         "components": {"limit": limit, "emitted": summaries.len(), "omitted": exact_total(json!(omitted)), "scope": components_scope, "items": summaries},
@@ -760,25 +778,32 @@ mod tests {
     #[test]
     fn performance_window_normalizes_observed_batches_and_separates_eligibility() {
         let mut window = PerformanceWindow::default();
-        assert!(window.push_batch(350_000, 0.01, 2.0, 8.0));
+        assert!(window.push_batch(50_000, 0.01, 2.0, 8.0));
         let report = window.to_json();
         assert_eq!(report["sample_count"], 1);
         assert_eq!(report["eligibility"]["in_active_rev_range"], true);
         assert_eq!(report["budget_pass"], false);
         assert_eq!(report["full_worker_ms_per_10ms_simulated"]["max"], 8.0);
         assert_eq!(report["solver_ms_per_10ms_simulated"]["p50"], 2.0);
-        assert_eq!(report["target"]["active_dynamic_fine_revs_min"], 300_000);
-        assert_eq!(report["target"]["active_dynamic_fine_revs_max"], 400_000);
+        assert_eq!(report["target"]["active_dynamic_fine_revs_min"], 50_000);
+        assert!(report["target"]["active_dynamic_fine_revs_max"].is_null());
         assert!(report["goal_status"]
             .as_str()
             .unwrap()
             .contains("requires correctness"));
 
         let mut out_of_range = PerformanceWindow::default();
-        assert!(out_of_range.push_batch(200_000, 0.01, 1.0, 4.0));
+        assert!(out_of_range.push_batch(49_999, 0.01, 1.0, 4.0));
         let report = out_of_range.to_json();
         assert_eq!(report["eligibility"]["in_active_rev_range"], false);
         assert_eq!(report["budget_pass"], true);
+
+        let mut above_minimum = PerformanceWindow::default();
+        assert!(above_minimum.push_batch(54_000, 0.01, 1.0, 4.0));
+        assert_eq!(
+            above_minimum.to_json()["eligibility"]["in_active_rev_range"],
+            true
+        );
     }
 
     #[test]
@@ -899,6 +924,17 @@ mod tests {
         let metrics = collect_scene_metrics(&scene, 1);
         assert_eq!(metrics["components"]["emitted"], 1);
         assert!(metrics["out_of_range_state"]["count"].as_u64().unwrap() >= 1);
+        assert!(metrics["non_finite"]["count"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn exact_collector_reports_nan_in_stored_heat_even_if_total_is_clamped() {
+        let mut scene = isolated_iron_scene(1);
+        scene.voxels[0].internal_energy = f32::NAN;
+        assert!(scene.voxels[0].total_internal_energy_j().is_finite());
+        let metrics = collect_scene_metrics(&scene, 1);
+        assert_eq!(metrics["non_finite"]["scope"], "whole scene");
+        assert_eq!(metrics["non_finite"]["warning"], true);
         assert!(metrics["non_finite"]["count"].as_u64().unwrap() >= 1);
     }
 

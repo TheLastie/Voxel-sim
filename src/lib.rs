@@ -15,6 +15,7 @@ pub mod material;
 pub mod material_asset;
 mod multigrid;
 pub mod scene;
+pub mod skeletal_actuator;
 pub mod scene_presets;
 pub mod scene_welding;
 pub mod solver;
