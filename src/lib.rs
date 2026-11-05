@@ -2,6 +2,7 @@ pub mod aggregation;
 mod banded;
 pub mod bond;
 pub mod collision;
+pub mod combustion;
 mod contact_constraint;
 pub mod coordinates;
 mod cuda_solver;

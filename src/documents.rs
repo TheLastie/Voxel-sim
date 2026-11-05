@@ -1468,6 +1468,8 @@ impl From<LegacyMaterialV2> for Material {
             internal_friction_coefficient: 0.0,
             // Older models had no joint material limit; preserve their poses.
             skeletal_joint_limit_rad: std::f32::consts::PI,
+            // Not stored in any document layout; restored by name on scene build.
+            formation_energy_j_per_kg: 0.0,
         }
     }
 }
