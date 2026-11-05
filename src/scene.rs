@@ -1078,10 +1078,11 @@ impl Scene {
 
     fn from_voxels_with_materials_and_groups(
         config: SceneConfig,
-        materials: Vec<Material>,
+        mut materials: Vec<Material>,
         spawns: Vec<VoxelSpawn>,
         bonding_groups: Vec<u32>,
     ) -> Result<Self, String> {
+        Material::restore_builtin_chemistry(&mut materials);
         config.validate().map_err(str::to_owned)?;
         if materials.is_empty() {
             return Err("scene material table must not be empty".into());
@@ -1276,10 +1277,11 @@ impl Scene {
 
     fn from_saved_voxel_states_with_groups(
         config: SceneConfig,
-        materials: Vec<Material>,
+        mut materials: Vec<Material>,
         snapshots: Vec<(DVec3, DVec3, Voxel)>,
         bonding_groups: Vec<u32>,
     ) -> Result<Self, String> {
+        Material::restore_builtin_chemistry(&mut materials);
         if materials.is_empty() {
             return Err("scene material table must not be empty".into());
         }

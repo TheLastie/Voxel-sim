@@ -84,6 +84,19 @@ pub struct Material {
     /// separate from the bulk continuum constitutive law.
     #[serde(default = "default_skeletal_joint_limit_rad")]
     pub skeletal_joint_limit_rad: f32,
+    /// Chemical (formation) energy per kilogram, J/kg, relative to a common
+    /// reference chosen so that every built-in value is nonnegative. A
+    /// reaction releases `-sum(nu_k * h_k)` per unit extent; because the
+    /// recipes conserve total mass, a constant shift of this reference cancels.
+    /// It is part of the equation of state: temperature and phase fractions
+    /// use `internal energy - mass * formation energy`, so heat comes from a
+    /// change of composition at constant internal energy.
+    /// Not serialized, to keep every document layout unchanged: the built-in
+    /// values are restored by component name when a scene is built
+    /// (`Material::restore_builtin_chemistry`). Zero for all pre-existing
+    /// components, which keeps their behaviour bit-identical.
+    #[serde(skip)]
+    pub formation_energy_j_per_kg: f32,
 }
 
 fn default_skeletal_joint_limit_rad() -> f32 {
@@ -96,6 +109,36 @@ impl Material {
             .iter()
             .position(|material| material.name.eq_ignore_ascii_case(name))
             .and_then(|index| u16::try_from(index).ok())
+    }
+
+    /// Built-in formation energy (J/kg) by component name; `None` means zero.
+    /// Reference: liquid water = 0. Vapour sits above liquid by the latent
+    /// heat of vaporization (2.256 MJ/kg); CO2 and O2 follow from standard
+    /// formation enthalpies (-393.5 and 0 kJ/mol against -241.8 kJ/mol for
+    /// water vapour); dry_wood is solved so that burning one kg releases
+    /// 17.0 MJ with the recipe in `crate::combustion` (cellulose C6H10O5
+    /// plus 1% ash, ash at zero). Illustrative, not calibrated species data.
+    pub fn builtin_formation_energy(name: &str) -> Option<f32> {
+        match name {
+            "dry_wood" => Some(10_723_700.0),
+            "oxygen" => Some(15_678_100.0),
+            "carbon_dioxide" => Some(6_736_800.0),
+            "water_vapor" => Some(2_256_000.0),
+            _ => None,
+        }
+    }
+
+    /// Fill in the non-serialized formation energies of built-in components in
+    /// a table that was just deserialized or assembled. Entries that already
+    /// carry a nonzero value are left alone.
+    pub fn restore_builtin_chemistry(table: &mut [Self]) {
+        for material in table {
+            if material.formation_energy_j_per_kg == 0.0 {
+                if let Some(value) = Self::builtin_formation_energy(&material.name) {
+                    material.formation_energy_j_per_kg = value;
+                }
+            }
+        }
     }
 
     pub fn table() -> Vec<Self> {
@@ -610,6 +653,51 @@ impl Material {
         bone.internal_friction_coefficient = 0.15;
         bone.skeletal_joint_limit_rad = 26.0_f32.to_radians();
         table.push(bone);
+
+        // Combustion chemistry (see `crate::combustion`), appended after every
+        // earlier entry so existing composition ids keep their meaning. Dry wood fuel is a
+        // new component rather than a change to `wood`/`oak`, so every existing
+        // scene keeps zero formation energy. Cellulose-like, ~1% mineral ash.
+        let mut dry_wood = table[1].clone();
+        dry_wood.name = "dry_wood".into();
+        dry_wood.moisture_content_dry_basis = 0.0;
+        dry_wood.skeletal_joint_limit_rad = 115.0_f32.to_radians();
+        table.push(dry_wood);
+        // Gases and ash: illustrative room-condition values.
+        for (name, density, cp, conductivity) in [
+            ("oxygen", 1.331_f32, 918.0_f32, 0.0263_f32),
+            ("carbon_dioxide", 1.842, 844.0, 0.0166),
+            ("water_vapor", 0.598, 2010.0, 0.025),
+        ] {
+            table.push(Self::new(
+                name,
+                density,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                cp,
+                conductivity,
+                f32::INFINITY,
+                0.0,
+                0.0,
+                f32::INFINITY,
+                0.0,
+                0.0,
+            ));
+        }
+        // Loose mineral ash: dense solid grains with almost no cohesion.
+        let mut ash = Self::new(
+            "ash", 2400.0, 20e6, 20e6, 8e6, 0.05e6, 0.05e6, 1e6, 0.1e6, 0.1e6, 840.0, 0.3, 1500.0,
+            1.0, 1.0, f32::INFINITY, 300_000.0, 0.0,
+        );
+        ash.surface_friction_coefficient = 0.5;
+        table.push(ash);
+        Self::restore_builtin_chemistry(&mut table);
         table
     }
     #[allow(clippy::too_many_arguments)]
@@ -672,6 +760,7 @@ impl Material {
             solid_kelvin_voigt_time_s: 0.0,
             internal_friction_coefficient: 0.0,
             skeletal_joint_limit_rad: default_skeletal_joint_limit_rad(),
+            formation_energy_j_per_kg: 0.0,
         }
     }
     pub fn mixed(c: &Composition, table: &[Self]) -> Self {
@@ -720,7 +809,8 @@ impl Material {
             moisture_content_dry_basis,
             solid_kelvin_voigt_time_s,
             internal_friction_coefficient,
-            skeletal_joint_limit_rad
+            skeletal_joint_limit_rad,
+            formation_energy_j_per_kg
         );
         // Starter mixture estimate: dynamic viscosity is mass-fraction weighted.
         result.dynamic_viscosity_pa_s = c
@@ -790,7 +880,7 @@ impl Material {
     pub fn energy_at_temperature(&self, mass: f32, temperature_kelvin: f32) -> f32 {
         let mass = mass.max(0.0);
         let temperature = temperature_kelvin.max(0.0);
-        let mut specific = self.heat_capacity * temperature;
+        let mut specific = self.heat_capacity * temperature + self.formation_energy_j_per_kg;
         if temperature > self.melt_temp {
             specific += self.latent_fusion;
         }
@@ -803,7 +893,8 @@ impl Material {
     /// Invert conserved energy into temperature and equilibrium phase fractions.
     pub fn phase_state(&self, mass: f32, energy: f32) -> PhaseState {
         let mass = mass.max(1e-20);
-        let specific = (energy / mass).max(0.0);
+        // The chemical energy of the current composition is not thermal.
+        let specific = (energy / mass - self.formation_energy_j_per_kg).max(0.0);
         let cp = self.heat_capacity.max(1e-12);
         let mut state = PhaseState {
             temperature_kelvin: specific / cp,
@@ -1015,6 +1106,86 @@ mod tests {
         assert_eq!(phase.solid_fraction, 1.0);
         assert_eq!(phase.liquid_fraction, 0.0);
         assert_eq!(phase.gas_fraction, 0.0);
+    }
+
+    #[test]
+    fn zero_formation_energy_leaves_the_equation_of_state_unchanged() {
+        let table = Material::table();
+        // Every component that existed before the chemistry additions keeps
+        // its composition id (saved scenes refer to table positions).
+        assert_eq!(table[10].name, "oak");
+        assert_eq!(table[15].name, "bone");
+        assert_eq!(table[16].name, "dry_wood");
+        assert_eq!(table.len(), 21);
+        for material in table.iter().take(16) {
+            assert_eq!(material.formation_energy_j_per_kg, 0.0, "{}", material.name);
+        }
+        let iron = &table[Material::component_id("iron").unwrap() as usize];
+        for kelvin in [10.0_f32, 293.15, 1811.0, 2000.0, 3134.0, 4000.0] {
+            let energy = iron.energy_at_temperature(0.01, kelvin);
+            let reference = {
+                let mut specific = iron.heat_capacity * kelvin;
+                if kelvin > iron.melt_temp {
+                    specific += iron.latent_fusion;
+                }
+                if kelvin > iron.boil_temp {
+                    specific += iron.latent_vaporization;
+                }
+                0.01_f32 * specific
+            };
+            assert_eq!(energy.to_bits(), reference.to_bits());
+        }
+        let mixture = Material::mixed(
+            &Composition {
+                components: smallvec::smallvec![
+                    (Material::component_id("iron").unwrap(), 0.5),
+                    (Material::component_id("water").unwrap(), 0.5)
+                ],
+            },
+            &table,
+        );
+        assert_eq!(mixture.formation_energy_j_per_kg, 0.0);
+    }
+
+    #[test]
+    fn formation_energy_mixes_by_mass_and_is_removed_from_the_thermal_state() {
+        let table = Material::table();
+        let fuel = Material::component_id("dry_wood").unwrap();
+        let oxygen = Material::component_id("oxygen").unwrap();
+        let composition = Composition {
+            components: smallvec::smallvec![(fuel, 0.25), (oxygen, 0.75)],
+        };
+        let mixture = Material::mixed(&composition, &table);
+        let expected = 0.25 * table[fuel as usize].formation_energy_j_per_kg
+            + 0.75 * table[oxygen as usize].formation_energy_j_per_kg;
+        assert!((mixture.formation_energy_j_per_kg - expected).abs() <= 2.0);
+        let mass = 0.003;
+        let energy = mixture.energy_at_temperature(mass, 650.0);
+        // The stored energy is dominated by the chemical part...
+        assert!(energy > mass * mixture.formation_energy_j_per_kg);
+        // ...but temperature is derived from the thermal remainder only.
+        let phase = mixture.phase_state(mass, energy);
+        assert!((phase.temperature_kelvin - 650.0).abs() < 0.05);
+        assert_eq!(phase.solid_fraction, 1.0);
+        // Less stored energy than the chemical offset is no thermal energy.
+        assert_eq!(
+            mixture.temperature(mass, 0.5 * mass * mixture.formation_energy_j_per_kg),
+            0.0
+        );
+    }
+
+    #[test]
+    fn formation_energy_is_not_serialized_and_is_restored_by_name() {
+        let table = Material::table();
+        let bytes = bincode::serialize(&table).unwrap();
+        let mut loaded: Vec<Material> = bincode::deserialize(&bytes).unwrap();
+        let fuel = Material::component_id("dry_wood").unwrap() as usize;
+        assert_eq!(loaded[fuel].formation_energy_j_per_kg, 0.0);
+        Material::restore_builtin_chemistry(&mut loaded);
+        for (a, b) in table.iter().zip(&loaded) {
+            assert_eq!(a.formation_energy_j_per_kg, b.formation_energy_j_per_kg);
+        }
+        assert!(loaded[fuel].formation_energy_j_per_kg > 0.0);
     }
 
     #[test]
