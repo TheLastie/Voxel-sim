@@ -9,7 +9,7 @@ pub enum FractureMode {
 }
 
 /// Thermodynamic state derived from a voxel's conserved internal energy.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PhaseState {
     pub temperature_kelvin: f32,
     pub solid_fraction: f32,

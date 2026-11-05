@@ -1636,6 +1636,29 @@ impl Scene {
         self.elastic_bond_energy_at_positions_j(&self.positions)
     }
 
+    /// Elastic energy of bonds with at least one non-kinematic end. Bonds between
+    /// two fixed REVs are excluded, so differences within one substep match
+    /// `elastic_bond_energy_j` while the cost follows the moving part of a scene.
+    pub(crate) fn mobile_elastic_bond_energy_j(&self) -> f64 {
+        let mut energy_j = 0.0;
+        for axis in 0..3 {
+            for (i, bond) in self.bonds[axis].iter().enumerate() {
+                if bond.neighbor != EMPTY
+                    && !(self.voxels[i].kinematic && self.voxels[bond.neighbor as usize].kinematic)
+                {
+                    energy_j += crate::solver::bond_stored_elastic_energy_at_positions_j(
+                        self,
+                        &self.positions,
+                        i,
+                        bond.neighbor as usize,
+                        axis,
+                    );
+                }
+            }
+        }
+        energy_j
+    }
+
     /// Elastic strain energy evaluated against an earlier positional snapshot.
     /// Used only when a previously unconstrained solve discovers a new contact.
     pub(crate) fn elastic_bond_energy_at_positions_j(&self, positions: &[DVec3]) -> f64 {

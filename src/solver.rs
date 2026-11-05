@@ -538,7 +538,9 @@ fn capture_nodal_mechanical_energy(
         let axis = edge / voxel_count;
         let i = edge % voxel_count;
         let bond = scene.bonds[axis][i];
-        if bond.neighbor == EMPTY {
+        if bond.neighbor == EMPTY
+            || (scene.voxels[i].kinematic && scene.voxels[bond.neighbor as usize].kinematic)
+        {
             0.0
         } else {
             bond_stored_elastic_energy_j(scene, i, bond.neighbor as usize, axis)
@@ -1074,6 +1076,9 @@ fn fit_rotations(scene: &mut Scene, scratch: &mut SolverScratch) -> f32 {
                 continue;
             }
             let j = j as usize;
+            if scene.voxels[i].kinematic && scene.voxels[j].kinematic {
+                continue;
+            }
             let d = ((scene.positions[j] - scene.positions[i]) / DCELL).as_vec3();
             let mut m = Mat3::ZERO;
             match axis {
@@ -2380,7 +2385,9 @@ fn advance_step_with_axis_targets_and_loads(
                 };
                 applied_work += f64::from(force.dot(displacement));
             }
-            let elastic_after = scene.elastic_bond_energy_j();
+            // Same bond set as `capture_nodal_mechanical_energy`: a bond between
+            // two fixed REVs cannot change within a substep.
+            let elastic_after = scene.mobile_elastic_bond_energy_j();
             kinetic_before + elastic_before + applied_work
                 - kinetic_after - elastic_after
         });
@@ -4794,6 +4801,9 @@ pub(crate) struct SolverScratch {
     rhs: Vec<Vec3>,
     constraints: Vec<Constraint>,
     assembly_phase_strengths: Vec<(f32, f32)>,
+    mechanical_mask: Vec<bool>,
+    mechanical_revs: Vec<usize>,
+    mechanical_slots: Vec<usize>,
     fracture_phase_strengths: Vec<(f32, f32)>,
     fracture_outcomes: Vec<Option<FractureOutcome>>,
     assembly_phases: Vec<crate::material::PhaseState>,
@@ -4862,6 +4872,66 @@ fn failed_solve_in_one_substep_stays_visible_after_later_substeps_succeed() {
     );
     let status = scene.last_step_diagnostics.as_ref().unwrap();
     assert!(!status.relative_solver_residual.is_finite());
+}
+
+#[cfg(test)]
+#[test]
+fn releasing_a_fixed_rev_restores_its_bonds_to_the_next_assembly() {
+    use crate::material::Material;
+    use crate::scene::{SceneConfig, VoxelSpawn};
+
+    let oak = Material::component_id("oak").unwrap();
+    let mut config = SceneConfig::default();
+    config.substeps = 1;
+    let spawns = vec![
+        VoxelSpawn::at_cell([0, 0, 0], oak),
+        VoxelSpawn::at_cell([1, 0, 0], oak),
+        VoxelSpawn::at_cell([2, 0, 0], oak),
+    ];
+    let mut scene = Scene::from_voxels(config, spawns).unwrap();
+    scene.adaptive_substeps = false;
+    scene.fix_voxels(&[0, 1]).unwrap();
+
+    step(&mut scene, &mut None);
+    assert_eq!(scene.solver_scratch.constraints.len(), 1, "fixed pair has no constraint");
+    assert_eq!(scene.solver_scratch.mechanical_revs, vec![1, 2]);
+
+    scene.set_voxel_kinematic(1, false).unwrap();
+    step(&mut scene, &mut None);
+    assert_eq!(scene.solver_scratch.constraints.len(), 2, "released REV regains its bond");
+    assert_eq!(scene.solver_scratch.mechanical_revs, vec![0, 1, 2]);
+    assert!(scene.solver_residual.is_finite());
+}
+
+#[cfg(test)]
+#[test]
+fn mobile_elastic_energy_differs_from_full_energy_only_by_fixed_pairs() {
+    use crate::material::Material;
+    use crate::scene::{SceneConfig, VoxelSpawn};
+
+    let oak = Material::component_id("oak").unwrap();
+    let spawns = vec![
+        VoxelSpawn::at_cell([0, 0, 0], oak),
+        VoxelSpawn::at_cell([1, 0, 0], oak),
+        VoxelSpawn::at_cell([2, 0, 0], oak),
+    ];
+    let mut scene = Scene::from_voxels(SceneConfig::default(), spawns).unwrap();
+    scene.fix_voxels(&[0, 1]).unwrap();
+    let fixed_pair = |scene: &Scene| bond_stored_elastic_energy_j(scene, 0, 1, 0);
+
+    scene.positions[2].x += 1.0e-5;
+    let stretched = scene.mobile_elastic_bond_energy_j();
+    assert!(stretched > 0.0);
+    let expected = scene.elastic_bond_energy_j() - fixed_pair(&scene);
+    assert!((stretched - expected).abs() <= expected.abs() * 1.0e-12);
+
+    let (full_before, mobile_before) =
+        (scene.elastic_bond_energy_j(), scene.mobile_elastic_bond_energy_j());
+    scene.positions[2].x += 1.0e-5;
+    let full_change = scene.elastic_bond_energy_j() - full_before;
+    let mobile_change = scene.mobile_elastic_bond_energy_j() - mobile_before;
+    assert!(full_change > 0.0);
+    assert!((full_change - mobile_change).abs() <= full_change * 1.0e-12);
 }
 
 #[cfg(test)]
@@ -7386,6 +7456,49 @@ fn solve_projected_contact(scene: &mut Scene, h: f32, scratch: &mut SolverScratc
     iterations
 }
 
+/// List the REVs and bond slots that can take part in mechanics. A bond between
+/// two kinematic REVs has no constraint or fracture owner, so a large fixed floor
+/// must not cost per-REV constitutive work on every assembly. Called at the start
+/// of a substep: bonds and kinematic flags do not change before its solves end.
+/// Fixed rows stay at the identity block and a zero right-hand side.
+fn refresh_mechanical_sets(scene: &Scene, scratch: &mut SolverScratch) {
+    let n = scene.voxels.len();
+    scratch.mechanical_mask.clear();
+    scratch
+        .mechanical_mask
+        .extend(scene.voxels.iter().map(|voxel| !voxel.kinematic));
+    scratch.constraint_slots.resize_with(3 * n, || None);
+    scratch.mechanical_slots.clear();
+    for axis in 0..3 {
+        for i in 0..n {
+            let neighbor = scene.bonds[axis][i].neighbor;
+            let slot = axis * n + i;
+            if neighbor == EMPTY {
+                scratch.constraint_slots[slot] = None;
+                continue;
+            }
+            let j = neighbor as usize;
+            if scene.voxels[i].kinematic && scene.voxels[j].kinematic {
+                scratch.constraint_slots[slot] = None;
+                continue;
+            }
+            scratch.mechanical_mask[i] = true;
+            scratch.mechanical_mask[j] = true;
+            scratch.mechanical_slots.push(slot);
+        }
+    }
+    scratch.mechanical_revs.clear();
+    scratch
+        .mechanical_revs
+        .extend((0..n).filter(|&i| scratch.mechanical_mask[i]));
+    scratch.free.resize(n, Vec3::ZERO);
+    scratch.free.fill(Vec3::ZERO);
+    scratch.diagonal.resize(n, Mat3::IDENTITY);
+    scratch.diagonal.fill(Mat3::IDENTITY);
+    scratch.rhs.resize(n, Vec3::ZERO);
+    scratch.rhs.fill(Vec3::ZERO);
+}
+
 fn solve_coupled(
     scene: &mut Scene,
     h: f32,
@@ -7440,25 +7553,28 @@ fn solve_coupled(
             );
         }
     }
-    scratch.free.clear();
-    scratch
-        .free
-        .extend(scene.voxels.iter().enumerate().map(|(i, v)| {
-            Vec3::from_array(std::array::from_fn(|a| {
-                if v.kinematic
-                    || scene.aggregate_of[i].is_some()
-                    || targets.get(i).and_then(|t| t[a]).is_some()
-                {
-                    0.
-                } else {
-                    1.
-                }
-            }))
+    if !reuse_preconditioner || scratch.mechanical_mask.len() != n {
+        refresh_mechanical_sets(scene, scratch);
+    }
+    let mechanical_revs = std::mem::take(&mut scratch.mechanical_revs);
+    let mechanical_slots = std::mem::take(&mut scratch.mechanical_slots);
+    for &i in &mechanical_revs {
+        let v = &scene.voxels[i];
+        scratch.free[i] = Vec3::from_array(std::array::from_fn(|a| {
+            if v.kinematic
+                || scene.aggregate_of[i].is_some()
+                || targets.get(i).and_then(|t| t[a]).is_some()
+            {
+                0.
+            } else {
+                1.
+            }
         }));
+    }
     scratch.active.clear();
     scratch.active_index.resize(n, u32::MAX);
     scratch.active_index.fill(u32::MAX);
-    for i in 0..n {
+    for &i in &mechanical_revs {
         if scratch.free[i] != Vec3::ZERO {
             scratch.active_index[i] =
                 u32::try_from(scratch.active.len()).expect("active REV count exceeds u32");
@@ -7482,19 +7598,12 @@ fn solve_coupled(
     // Per-REV constitutive inputs and row initialization are independent. Keep
     // them parallel only for large active zones; bond compaction and each
     // REV's ordered force gather retain their stable serial accumulation order.
-    let parallel_assembly = parallel_enabled_for(n) || (try_cuda && n >= 4_096);
+    let parallel_assembly =
+        parallel_enabled_for(mechanical_revs.len()) || (try_cuda && mechanical_revs.len() >= 4_096);
     let parallel_precompute = parallel_assembly && parallel_assembly_precompute_enabled();
-    scratch.masses.clear();
-    if parallel_precompute {
-        scene
-            .voxels
-            .par_iter()
-            .map(|v| v.mass / (h * h))
-            .collect_into_vec(&mut scratch.masses);
-    } else {
-        scratch
-            .masses
-            .extend(scene.voxels.iter().map(|v| v.mass / (h * h)));
+    scratch.masses.resize(n, 0.0);
+    for &i in &mechanical_revs {
+        scratch.masses[i] = scene.voxels[i].mass / (h * h);
     }
     // The bond graph is face-connected, so each voxel can touch at most six
     // constraints. Fixed slots avoid millions of tiny heap allocations on a
@@ -7503,8 +7612,7 @@ fn solve_coupled(
     scratch.incidence.fill([u32::MAX; 6]);
     scratch.incidence_len.resize(n, 0);
     scratch.incidence_len.fill(0);
-    scratch.diagonal.resize(n, Mat3::ZERO);
-    scratch.rhs.resize(n, Vec3::ZERO);
+    let mechanical_mask = &scratch.mechanical_mask;
     let initialize_row = |i: usize, diagonal: &mut Mat3, rhs: &mut Vec3| {
         let mass = scratch.masses[i];
         *diagonal = Mat3::from_diagonal(Vec3::splat(mass));
@@ -7517,9 +7625,13 @@ fn solve_coupled(
             .par_iter_mut()
             .zip(scratch.rhs.par_iter_mut())
             .enumerate()
-            .for_each(|(i, (diagonal, rhs))| initialize_row(i, diagonal, rhs));
+            .for_each(|(i, (diagonal, rhs))| {
+                if mechanical_mask[i] {
+                    initialize_row(i, diagonal, rhs);
+                }
+            });
     } else {
-        for i in 0..n {
+        for &i in &mechanical_revs {
             initialize_row(i, &mut scratch.diagonal[i], &mut scratch.rhs[i]);
         }
     }
@@ -7530,40 +7642,39 @@ fn solve_coupled(
     // Read each REV's equation of state once per assembly, shared by all
     // incident bonds and by stiffness/thermal expansion. Rebuilt on every
     // assembly so heat, composition and mass changes cannot leave stale data.
-    scratch.assembly_phases.clear();
-    if parallel_precompute {
-        scene
-            .voxels
-            .par_iter()
-            .zip(scene.properties.par_iter())
-            .map(|(voxel, material)| material.phase_state(voxel.mass, voxel.thermal_energy_f32()))
-            .collect_into_vec(&mut scratch.assembly_phases);
-    } else {
-        for (voxel, material) in scene.voxels.iter().zip(&scene.properties) {
-            scratch
-                .assembly_phases
-                .push(material.phase_state(voxel.mass, voxel.thermal_energy_f32()));
-        }
-    }
-    scratch.assembly_phase_strengths.clear();
+    // Entries outside `mechanical_revs` are never read: every constraint and
+    // fracture outcome names only REVs in that set.
+    scratch.assembly_phases.resize(n, Default::default());
+    scratch.assembly_phase_strengths.resize(n, (1.0, 1.0));
+    let update_phase = |i: usize,
+                        phase: &mut crate::material::PhaseState,
+                        strength: &mut (f32, f32)| {
+        let voxel = &scene.voxels[i];
+        let material = &scene.properties[i];
+        *phase = material.phase_state(voxel.mass, voxel.thermal_energy_f32());
+        *strength = (
+            phase.solid_fraction.clamp(0.0, 1.0),
+            material.thermal_strength_scale(phase.temperature_kelvin),
+        );
+    };
     if parallel_precompute {
         scratch
             .assembly_phases
-            .par_iter()
-            .zip(scene.properties.par_iter())
-            .map(|(phase, material)| {
-                (
-                    phase.solid_fraction.clamp(0.0, 1.0),
-                    material.thermal_strength_scale(phase.temperature_kelvin),
-                )
-            })
-            .collect_into_vec(&mut scratch.assembly_phase_strengths);
+            .par_iter_mut()
+            .zip(scratch.assembly_phase_strengths.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (phase, strength))| {
+                if mechanical_mask[i] {
+                    update_phase(i, phase, strength);
+                }
+            });
     } else {
-        for (phase, material) in scratch.assembly_phases.iter().zip(&scene.properties) {
-            scratch.assembly_phase_strengths.push((
-                phase.solid_fraction.clamp(0.0, 1.0),
-                material.thermal_strength_scale(phase.temperature_kelvin),
-            ));
+        for &i in &mechanical_revs {
+            update_phase(
+                i,
+                &mut scratch.assembly_phases[i],
+                &mut scratch.assembly_phase_strengths[i],
+            );
         }
     }
     let previous_stiffness_len = scratch
@@ -7611,9 +7722,13 @@ fn solve_coupled(
             .par_iter_mut()
             .zip(scratch.stiffness_revisions.par_iter_mut())
             .enumerate()
-            .for_each(|(i, (cached, revision))| update_stiffness(i, cached, revision));
+            .for_each(|(i, (cached, revision))| {
+                if mechanical_mask[i] {
+                    update_stiffness(i, cached, revision);
+                }
+            });
     } else {
-        for i in 0..n {
+        for &i in &mechanical_revs {
             update_stiffness(
                 i,
                 &mut scratch.stiffness_inputs[i],
@@ -7655,12 +7770,13 @@ fn solve_coupled(
             .enumerate()
             .for_each(|(slot, output)| *output = build_constraint(slot, *output));
     } else {
-        for (slot, output) in scratch.constraint_slots.iter_mut().enumerate() {
+        for &slot in &mechanical_slots {
+            let output = &mut scratch.constraint_slots[slot];
             *output = build_constraint(slot, *output);
         }
     }
     scratch.constraints.clear();
-    for constraint in scratch.constraint_slots.iter().filter_map(|slot| *slot) {
+    for constraint in mechanical_slots.iter().filter_map(|&slot| scratch.constraint_slots[slot]) {
         let i = constraint.i;
         let j = constraint.j;
         if scratch.free[i] == Vec3::ZERO && scratch.free[j] == Vec3::ZERO {
@@ -7732,21 +7848,21 @@ fn solve_coupled(
             .par_iter_mut()
             .zip(scratch.diagonal.par_iter_mut())
             .enumerate()
+            .filter(|(i, _)| mechanical_mask[*i])
             .for_each(accumulate_row);
     } else {
-        scratch
-            .rhs
-            .iter_mut()
-            .zip(scratch.diagonal.iter_mut())
-            .enumerate()
-            .for_each(accumulate_row);
+        for &i in &mechanical_revs {
+            accumulate_row((i, (&mut scratch.rhs[i], &mut scratch.diagonal[i])));
+        }
     }
-    for i in 0..n {
+    for &i in &mechanical_revs {
         scratch.rhs[i] *= scratch.free[i];
         let projection = Mat3::from_diagonal(scratch.free[i]);
         scratch.diagonal[i] =
             projection * scratch.diagonal[i] * projection + Mat3::IDENTITY - projection;
     }
+    scratch.mechanical_revs = mechanical_revs;
+    scratch.mechanical_slots = mechanical_slots;
     let assembly_time = assembly_start.elapsed();
     if !coupled_contact && !try_cuda && scene.config.cpu_preconditioner == CpuPreconditioner::IncompleteCholesky0 {
         if let Some((factor_time, solve_time)) = try_banded_solve(scene, h, scratch) {
