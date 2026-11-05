@@ -31,6 +31,8 @@ pub struct SkeletalActuator {
     elapsed_s: f64,
     previous_elapsed_s: f64,
     last_force_norm_n: f64,
+    /// Loads emitted by the latest call, indexed from the start of `voxel_range`.
+    last_forces_n: Vec<Vec3>,
     pub(crate) stalled: bool,
     invalidated: bool,
     editor_bond_protection: bool,
@@ -101,6 +103,12 @@ impl SkeletalActuator {
     pub fn last_force_norm_n(&self) -> f64 {
         self.last_force_norm_n
     }
+    /// Per-REV loads (N) that the latest `accumulate_forces` call added to the
+    /// scene, indexed from `voxel_range().start`; zero for fixed REVs and when
+    /// the call produced no load. Used for resource accounting of motor work.
+    pub fn last_forces_n(&self) -> &[Vec3] {
+        &self.last_forces_n
+    }
 
     /// Enables the editor preview's protection from material bond damage.
     /// Gameplay actors leave this disabled so ordinary world damage applies.
@@ -159,6 +167,7 @@ impl SkeletalActuator {
             elapsed_s: 0.0,
             previous_elapsed_s: 0.0,
             last_force_norm_n: 0.0,
+            last_forces_n: Vec::new(),
             stalled: false,
             invalidated: false,
             editor_bond_protection: false,
@@ -185,6 +194,7 @@ impl SkeletalActuator {
         out: &mut [Vec3],
     ) -> bool {
         self.last_force_norm_n = 0.0;
+        self.last_forces_n.clear();
         let count = positions.len();
         if count != self.total_scene_voxels {
             self.invalidated = true;
@@ -330,10 +340,12 @@ impl SkeletalActuator {
             self.previous_elapsed_s = self.elapsed_s;
             self.elapsed_s = next_time;
         }
+        self.last_forces_n.resize(self.voxel_range.len(), Vec3::ZERO);
         for (slot, &i) in dynamic.iter().enumerate() {
             let f = forces[slot] * scale;
             if f.is_finite() {
                 out[i] += f.as_vec3();
+                self.last_forces_n[i - self.voxel_range.start] = f.as_vec3();
                 self.last_force_norm_n += f.length();
             }
         }
@@ -415,7 +427,7 @@ impl SkeletalActuator {
     }
 }
 
-fn rigid_kinematics(
+pub(crate) fn rigid_kinematics(
     indices: &[usize],
     positions: &[DVec3],
     voxels: &[Voxel],

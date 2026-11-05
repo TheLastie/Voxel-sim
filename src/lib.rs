@@ -6,6 +6,7 @@ pub mod collision;
 pub mod combustion;
 mod contact_constraint;
 pub mod coordinates;
+pub mod creature;
 mod cuda_solver;
 pub mod electrical;
 pub mod fracture;
