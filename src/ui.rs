@@ -14,6 +14,202 @@ const PROJECT_DOCK_HEIGHT: f32 = 200.0;
 const ANIMATION_TIMELINE_COLLAPSED_HEIGHT: f32 = 30.0;
 const ANIMATION_TIMELINE_EXPANDED_HEIGHT: f32 = 128.0;
 
+/// Top-bar Help button: x, y, width, height in logical canvas pixels.
+const HELP_BUTTON: [f32; 4] = [298.0, 0.0, 66.0, 27.0];
+/// Left edge and right margin of the toolbar status text, logical pixels.
+const PHYSICS_STATUS_LEFT: f32 = 770.0;
+const PHYSICS_STATUS_RIGHT_MARGIN: f32 = 12.0;
+/// Conservative advance per character of the 0.68-scale toolbar text.
+const PHYSICS_STATUS_CHAR_WIDTH: f32 = 6.9;
+
+/// Where a shortcut applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelpScope {
+    Always,
+    Scene,
+    Model,
+    SceneAndModel,
+    InspectorField,
+}
+
+impl HelpScope {
+    fn label(self) -> &'static str {
+        match self {
+            HelpScope::Always => "all",
+            HelpScope::Scene => "scene",
+            HelpScope::Model => "model",
+            HelpScope::SceneAndModel => "scene, model",
+            HelpScope::InspectorField => "inspector field",
+        }
+    }
+}
+
+/// How a help row names its key.
+#[derive(Clone, Copy, Debug)]
+pub enum HelpKeys {
+    /// Fixed key(s) handled directly in the event loop. Each `KeyCode` must
+    /// appear in `src/main.rs`; a test enforces that.
+    Fixed {
+        display: &'static str,
+        codes: &'static [KeyCode],
+    },
+    /// A rebindable action; the current key comes from the editor settings.
+    Binding(&'static str),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HelpEntry {
+    pub keys: HelpKeys,
+    pub label: &'static str,
+    pub scope: HelpScope,
+}
+
+const fn fixed_help(
+    display: &'static str,
+    codes: &'static [KeyCode],
+    label: &'static str,
+    scope: HelpScope,
+) -> HelpEntry {
+    HelpEntry { keys: HelpKeys::Fixed { display, codes }, label, scope }
+}
+
+const fn bound_help(action: &'static str, label: &'static str, scope: HelpScope) -> HelpEntry {
+    HelpEntry { keys: HelpKeys::Binding(action), label, scope }
+}
+
+/// Every keyboard shortcut the editor workspace handles. Rows are kept in sync
+/// with `src/main.rs` by `help_shortcuts_are_all_handled_in_the_event_loop`.
+pub const HELP_SHORTCUTS: &[HelpEntry] = &[
+    fixed_help("F1", &[KeyCode::F1], "Show or hide this list", HelpScope::Always),
+    fixed_help("Esc", &[KeyCode::Escape], "Pause menu (Resume, Settings)", HelpScope::Always),
+    fixed_help("F11", &[KeyCode::F11], "Fullscreen on or off", HelpScope::Always),
+    fixed_help(
+        "W A S D",
+        &[KeyCode::KeyW, KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD],
+        "Fly the camera",
+        HelpScope::Always,
+    ),
+    fixed_help(
+        "Shift",
+        &[KeyCode::ShiftLeft, KeyCode::ShiftRight],
+        "Fly faster / add to selection",
+        HelpScope::Always,
+    ),
+    fixed_help("F", &[KeyCode::KeyF], "Free camera on or off", HelpScope::Always),
+    fixed_help(
+        "Arrows",
+        &[KeyCode::ArrowLeft, KeyCode::ArrowRight, KeyCode::ArrowUp, KeyCode::ArrowDown],
+        "Pan the orbit target",
+        HelpScope::Always,
+    ),
+    fixed_help(
+        "Space / P",
+        &[KeyCode::Space, KeyCode::KeyP],
+        "Run or pause physics",
+        HelpScope::Scene,
+    ),
+    fixed_help("B", &[KeyCode::KeyB], "Show or hide bonds", HelpScope::Scene),
+    fixed_help("R", &[KeyCode::KeyR], "Restore the authored state", HelpScope::SceneAndModel),
+    fixed_help(
+        "Enter / Tab / Esc",
+        &[KeyCode::Enter, KeyCode::Tab, KeyCode::Escape],
+        "Apply / next axis / cancel",
+        HelpScope::InspectorField,
+    ),
+    bound_help("move_x_neg", "Move selected X-", HelpScope::SceneAndModel),
+    bound_help("move_x_pos", "Move selected X+", HelpScope::SceneAndModel),
+    bound_help("move_y_pos", "Move selected Y+", HelpScope::SceneAndModel),
+    bound_help("move_y_neg", "Move selected Y-", HelpScope::SceneAndModel),
+    bound_help("move_z_pos", "Move selected Z+", HelpScope::SceneAndModel),
+    bound_help("move_z_neg", "Move selected Z-", HelpScope::SceneAndModel),
+    bound_help("rotate_z_pos", "Rotate selected +90 deg", HelpScope::SceneAndModel),
+    bound_help("rotate_z_neg", "Rotate selected -90 deg", HelpScope::SceneAndModel),
+    bound_help("duplicate", "Duplicate selected", HelpScope::SceneAndModel),
+    bound_help("delete", "Delete selected", HelpScope::SceneAndModel),
+    bound_help("undo", "Undo voxel edit", HelpScope::Model),
+    bound_help("redo", "Redo voxel edit", HelpScope::Model),
+];
+
+/// Current key text for a help row.
+fn help_key_text(entry: &HelpEntry, bindings: &BTreeMap<String, String>) -> String {
+    match entry.keys {
+        HelpKeys::Fixed { display, .. } => display.to_owned(),
+        HelpKeys::Binding(action) => bindings
+            .get(action)
+            .cloned()
+            .unwrap_or_else(|| "-".to_owned()),
+    }
+}
+
+/// Physics state shown in the toolbar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhysicsRunState {
+    Paused,
+    Running,
+    Failed,
+}
+
+impl PhysicsRunState {
+    fn from_flags(paused: bool, failed: bool) -> Self {
+        if failed {
+            PhysicsRunState::Failed
+        } else if paused {
+            PhysicsRunState::Paused
+        } else {
+            PhysicsRunState::Running
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            PhysicsRunState::Paused => "Paused",
+            PhysicsRunState::Running => "Running",
+            PhysicsRunState::Failed => "Failed - R restores",
+        }
+    }
+}
+
+/// Toolbar physics status: state, measured cost, measured rate and backlog,
+/// shortened until it fits `available_width` logical pixels. The values come
+/// from the worker; nothing here is estimated.
+fn physics_status_label(
+    state: PhysicsRunState,
+    cost: Option<f64>,
+    measured: Option<f64>,
+    requested: f32,
+    backlog: Option<f64>,
+    available_width: f32,
+) -> String {
+    let state_text = state.label();
+    let backlog_text = backlog
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| format!(" · backlog {value:.2} s"))
+        .unwrap_or_default();
+    let rate_short = measured
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map_or_else(|| "—".to_owned(), |value| format!("{value:.2}×"));
+    let candidates = [
+        format!(
+            "{state_text} · {}{backlog_text}",
+            physics_toolbar_label(cost, measured, requested, false)
+        ),
+        format!(
+            "{state_text} · {}{backlog_text}",
+            physics_toolbar_label(cost, measured, requested, true)
+        ),
+        format!(
+            "{state_text} · {}",
+            physics_toolbar_label(cost, measured, requested, true)
+        ),
+        format!("{state_text} · Real {rate_short}"),
+        state_text.to_owned(),
+    ];
+    candidates
+        .into_iter()
+        .find(|text| text.chars().count() as f32 * PHYSICS_STATUS_CHAR_WIDTH <= available_width)
+        .unwrap_or_else(|| "…".to_owned())
+}
+
 fn animation_slider_geometry(inspector_left: f32) -> (f32, f32) {
     (18.0, (inspector_left - 36.0).max(1.0))
 }
@@ -110,6 +306,13 @@ pub struct Ui {
     pub measured_simulation_rate: Option<f64>,
     /// Latest completed worker cost for 10 ms of simulated physical time.
     pub physics_cost_ms_per_10ms: Option<f64>,
+    /// Pending plus unacknowledged requested simulated time of the physics
+    /// worker, in seconds. `None` when no worker exists.
+    pub physics_backlog_seconds: Option<f64>,
+    /// True when the physics worker reported a failure and stopped.
+    pub physics_failed: bool,
+    /// Keyboard shortcut reference (F1).
+    pub help_open: bool,
     pub walk_speed_mps: f32,
     pub look_sensitivity: f32,
     paused_before_menu: bool,
@@ -453,6 +656,29 @@ impl Ui {
         self.physics_cost_ms_per_10ms = cost.filter(|value| value.is_finite() && *value >= 0.0);
     }
 
+    /// Records the physics worker's health: `Some((backlog_seconds, failed))`
+    /// while a worker exists, `None` otherwise.
+    pub fn set_physics_worker_status(&mut self, status: Option<(f64, bool)>) {
+        match status {
+            Some((backlog, failed)) => {
+                self.physics_backlog_seconds =
+                    Some(backlog).filter(|value| value.is_finite() && *value >= 0.0);
+                self.physics_failed = failed;
+            }
+            None => {
+                self.physics_backlog_seconds = None;
+                self.physics_failed = false;
+            }
+        }
+    }
+
+    /// Opens or closes the shortcut reference. It exists only in the editor
+    /// workspace, so it never opens over the pause menu or the lab screen.
+    pub fn toggle_help(&mut self) {
+        self.help_open =
+            !self.help_open && self.world_active && self.editor_mode && !self.menu_open;
+    }
+
     pub fn new(speed: f32, start: Vec3, direction: Vec3) -> Self {
         Self {
             standalone_editor_app: false,
@@ -537,6 +763,9 @@ impl Ui {
             status_message: None,
             simulation_time_scale: 1.0,
             physics_cost_ms_per_10ms: None,
+            physics_backlog_seconds: None,
+            physics_failed: false,
+            help_open: false,
             measured_simulation_rate: None,
             walk_speed_mps: 4.5,
             look_sensitivity: 0.005,
@@ -598,6 +827,14 @@ impl Ui {
             return None;
         }
         let dock_top = self.editor_dock_top();
+        if self.help_open {
+            // The shortcut reference owns the pointer: any click closes it and
+            // never reaches the controls underneath.
+            self.help_open = false;
+            if self.world_active && self.editor_mode && !self.menu_open {
+                return None;
+            }
+        }
         if self.world_active && self.editor_mode && !self.menu_open {
             if self.mesh_import_open {
                 let (left, top) = mesh_import_modal_origin(self.canvas_width, self.canvas_height);
@@ -725,6 +962,12 @@ impl Ui {
             if (208.0..=292.0).contains(&x) && (0.0..=28.0).contains(&y) {
                 self.open_settings_from_toolbar();
                 return Some(UiAction::Settings);
+            }
+            if (HELP_BUTTON[0]..=HELP_BUTTON[0] + HELP_BUTTON[2]).contains(&x)
+                && (0.0..=28.0).contains(&y)
+            {
+                self.toggle_help();
+                return None;
             }
             if self.scene_document_available
                 && (370.0..=434.0).contains(&x)
@@ -2206,6 +2449,9 @@ impl Ui {
             if self.mesh_import_open {
                 draw_mesh_import_modal(&mut r, self, self.canvas_width, self.canvas_height);
             }
+            if self.help_open {
+                draw_help_panel(&mut r, self, self.canvas_width);
+            }
         } else if !self.world_active {
             rect(
                 &mut r,
@@ -2624,6 +2870,8 @@ fn draw_editor(
         if ui.settings_open { selected } else { header },
     );
     text(out, 216.0, 7.0, "Settings", 0.9);
+    rect(out, HELP_BUTTON, if ui.help_open { selected } else { header });
+    text(out, HELP_BUTTON[0] + 9.0, 7.0, "Help F1", 0.9);
     if ui.scene_document_available {
         for (x, label, mode) in [
             (370.0, "Object", SceneSelectionMode::Object),
@@ -2730,13 +2978,15 @@ fn draw_editor(
         text(out, 700.0, 40.0, "Bonds", 0.7);
         text(
             out,
-            770.0,
+            PHYSICS_STATUS_LEFT,
             40.0,
-            &physics_toolbar_label(
+            &physics_status_label(
+                PhysicsRunState::from_flags(ui.paused, ui.physics_failed),
                 ui.physics_cost_ms_per_10ms,
                 ui.measured_simulation_rate,
                 ui.simulation_time_scale,
-                ui.canvas_width < 1200.0,
+                ui.physics_backlog_seconds,
+                canvas_width - PHYSICS_STATUS_LEFT - PHYSICS_STATUS_RIGHT_MARGIN,
             ),
             0.68,
         );
@@ -3388,6 +3638,41 @@ fn draw_editor(
     draw_animation_timeline(out, ui, inspector_left, canvas_height);
     clip_and_scroll_scene_inspector(out, ui);
     draw_scene_inspector_scrollbar(out, ui);
+}
+
+const HELP_COLUMN_WIDTH: f32 = 400.0;
+const HELP_ROW_HEIGHT: f32 = 24.0;
+
+/// Panel rectangle (x, y, width, height) for the shortcut reference.
+fn help_panel_bounds(canvas_width: f32, rows: usize) -> [f32; 4] {
+    let width = (HELP_COLUMN_WIDTH * 2.0 + 40.0).min(canvas_width - 40.0);
+    let height = 72.0 + rows as f32 * HELP_ROW_HEIGHT + 20.0;
+    [(canvas_width - width) * 0.5, 110.0, width, height]
+}
+
+fn draw_help_panel(out: &mut Vec<Rect>, ui: &Ui, canvas_width: f32) {
+    let rows = (HELP_SHORTCUTS.len() + 1) / 2;
+    let [left, top, width, height] = help_panel_bounds(canvas_width, rows);
+    rect(out, [left, top, width, height], [0.045, 0.065, 0.08, 0.985]);
+    rect(out, [left, top, width, 4.0], [0.22, 0.68, 0.57, 1.0]);
+    text(out, left + 20.0, top + 14.0, "Keyboard shortcuts", 1.2);
+    text(
+        out,
+        left + 20.0,
+        top + 42.0,
+        "Rebindable keys show their current setting. F1, Esc or a click closes.",
+        0.62,
+    );
+    let column_width = (width - 40.0) * 0.5;
+    for (index, entry) in HELP_SHORTCUTS.iter().enumerate() {
+        let column = index / rows;
+        let row = index % rows;
+        let x = left + 20.0 + column as f32 * column_width;
+        let y = top + 72.0 + row as f32 * HELP_ROW_HEIGHT;
+        text(out, x, y, &help_key_text(entry, &ui.settings_bindings), 0.68);
+        text(out, x + 96.0, y, entry.label, 0.68);
+        text(out, x + 96.0 + 178.0, y, entry.scope.label(), 0.55);
+    }
 }
 
 fn physics_cost_label(cost_ms_per_10ms: Option<f64>) -> String {
@@ -5356,5 +5641,259 @@ mod scene_inspector_tests {
         assert!(actual == expected,
             "another panel is painted over the inspector: actual {} quads, expected {}; first mismatch {:?}",
             actual.len(), expected.len(), actual.iter().zip(&expected).position(|(a, b)| a != b));
+    }
+
+    /// True when `source` contains `needle` not followed by an identifier
+    /// character, so `KeyCode::F1` does not match `KeyCode::F11`.
+    fn contains_token(source: &str, needle: &str) -> bool {
+        source.match_indices(needle).any(|(start, _)| {
+            source[start + needle.len()..]
+                .chars()
+                .next()
+                .map_or(true, |next| !(next.is_ascii_alphanumeric() || next == '_'))
+        })
+    }
+
+    #[test]
+    fn help_shortcuts_are_all_handled_in_the_event_loop() {
+        let main_source = include_str!("main.rs");
+        assert!(!HELP_SHORTCUTS.is_empty());
+        for entry in HELP_SHORTCUTS {
+            match entry.keys {
+                HelpKeys::Fixed { display, codes } => {
+                    assert!(!codes.is_empty(), "{display} lists no key codes");
+                    for code in codes {
+                        let needle = format!("KeyCode::{code:?}");
+                        assert!(
+                            contains_token(main_source, &needle),
+                            "help lists {display} ({needle}) but src/main.rs never handles it"
+                        );
+                    }
+                }
+                HelpKeys::Binding(action) => {
+                    assert!(
+                        crate::app::editor_settings::REBINDABLE_ACTIONS.contains(&action),
+                        "{action} is not a rebindable action"
+                    );
+                    assert!(
+                        crate::app::editor_settings::default_bindings().contains_key(action),
+                        "{action} has no default binding"
+                    );
+                    let needle = format!("binding_pressed(\"{action}\")");
+                    assert!(
+                        main_source.contains(&needle),
+                        "help lists {action} but src/main.rs never tests {needle}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn help_lists_every_rebindable_action_once_and_shows_current_keys() {
+        for action in crate::app::editor_settings::REBINDABLE_ACTIONS {
+            let listed = HELP_SHORTCUTS
+                .iter()
+                .filter(|entry| matches!(entry.keys, HelpKeys::Binding(name) if name == action))
+                .count();
+            assert_eq!(listed, 1, "{action} must appear exactly once in the help list");
+        }
+        let mut bindings = crate::app::editor_settings::default_bindings();
+        bindings.insert("undo".to_owned(), "Ctrl+U".to_owned());
+        let undo = HELP_SHORTCUTS
+            .iter()
+            .find(|entry| matches!(entry.keys, HelpKeys::Binding("undo")))
+            .unwrap();
+        assert_eq!(help_key_text(undo, &bindings), "Ctrl+U");
+        bindings.remove("undo");
+        assert_eq!(help_key_text(undo, &bindings), "-");
+    }
+
+    #[test]
+    fn help_opens_only_in_the_editor_and_any_click_closes_it_without_side_effects() {
+        let mut ui = scene_ui(1280.0, 720.0);
+        ui.toggle_help();
+        assert!(ui.help_open);
+        // A click that would normally pick Voxel mode only closes the panel.
+        assert!(click_canvas(&mut ui, 443.0, 12.0).is_none());
+        assert!(!ui.help_open);
+        assert_eq!(ui.scene_selection_mode, SceneSelectionMode::Object);
+
+        // The top-bar button opens and closes it.
+        assert!(click_canvas(&mut ui, HELP_BUTTON[0] + 10.0, 12.0).is_none());
+        assert!(ui.help_open);
+        assert!(click_canvas(&mut ui, HELP_BUTTON[0] + 10.0, 12.0).is_none());
+        assert!(!ui.help_open);
+
+        ui.menu_open = true;
+        ui.toggle_help();
+        assert!(!ui.help_open, "help must not open over the pause menu");
+        ui.menu_open = false;
+        ui.editor_mode = false;
+        ui.toggle_help();
+        assert!(!ui.help_open, "help must not open outside the editor workspace");
+    }
+
+    #[test]
+    fn help_button_does_not_overlap_neighbouring_top_bar_buttons() {
+        assert!(HELP_BUTTON[0] > 292.0, "overlaps Settings (208..292)");
+        assert!(HELP_BUTTON[0] + HELP_BUTTON[2] < 370.0, "overlaps Object (370..)");
+        let mut ui = scene_ui(1280.0, 720.0);
+        assert!(matches!(
+            click_canvas(&mut ui, 375.0, 12.0),
+            Some(UiAction::SetSceneSelectionMode(SceneSelectionMode::Object))
+        ));
+        assert!(!ui.help_open);
+    }
+
+    #[test]
+    fn help_panel_fits_every_tested_resolution_and_draws_all_rows() {
+        for (width, height) in [
+            (1920.0, 1009.0),
+            (1920.0, 1080.0),
+            (1280.0, 720.0),
+            (960.0, 600.0),
+            (800.0, 600.0),
+            (640.0, 480.0),
+            (1280.0, 400.0),
+        ] {
+            let mut ui = scene_ui(width, height);
+            let closed = ui.draw(0, 0, 60.0, 0.0, None, None, width, height, None);
+            ui.help_open = true;
+            let rects = ui.draw(0, 0, 60.0, 0.0, None, None, width, height, None);
+            assert!(rects.len() > closed.len(), "help draws nothing at {width}x{height}");
+            assert!(
+                rects.iter().all(|item| item.rect[0] >= 0.0
+                    && item.rect[1] >= 0.0
+                    && item.rect[0] + item.rect[2] <= width + 1.0
+                    && item.rect[1] + item.rect[3] <= height + 1.0),
+                "help panel leaves the window at {width}x{height}"
+            );
+            let rows = (HELP_SHORTCUTS.len() + 1) / 2;
+            let [left, top, panel_width, panel_height] = help_panel_bounds(ui.canvas_width, rows);
+            assert!(left >= 0.0 && left + panel_width <= ui.canvas_width);
+            assert!(top + panel_height <= ui.canvas_height, "panel taller than window");
+            // Every row of both columns paints text inside the panel.
+            let column_width = (panel_width - 40.0) * 0.5;
+            for index in 0..HELP_SHORTCUTS.len() {
+                let x = left + 20.0 + (index / rows) as f32 * column_width;
+                let y = top + 72.0 + (index % rows) as f32 * HELP_ROW_HEIGHT;
+                assert!(
+                    has_text_pixel(&ui, &rects, [x, y, column_width - 10.0, HELP_ROW_HEIGHT]),
+                    "help row {index} has no text at {width}x{height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn physics_state_label_distinguishes_paused_running_and_failed_with_measured_values() {
+        let wide = 700.0;
+        assert_eq!(PhysicsRunState::from_flags(true, false), PhysicsRunState::Paused);
+        assert_eq!(PhysicsRunState::from_flags(false, false), PhysicsRunState::Running);
+        // A failed worker is reported as failed even though the UI also pauses.
+        assert_eq!(PhysicsRunState::from_flags(true, true), PhysicsRunState::Failed);
+        assert_eq!(PhysicsRunState::from_flags(false, true), PhysicsRunState::Failed);
+
+        assert_eq!(
+            physics_status_label(PhysicsRunState::Running, Some(2.31), Some(1.0), 1.0, Some(0.25), wide),
+            "Running · 10 ms physics: 2.31 ms / 5 ms · Real 1.00× / target 1.00× · backlog 0.25 s"
+        );
+        assert_eq!(
+            physics_status_label(PhysicsRunState::Paused, None, None, 1.0, None, wide),
+            "Paused · 10 ms physics: — / 5 ms · Real — / target 1.00×"
+        );
+        let failed = physics_status_label(PhysicsRunState::Failed, None, None, 1.0, Some(3.0), wide);
+        assert!(failed.starts_with("Failed"), "{failed}");
+        assert!(failed.contains("backlog 3.00 s"), "{failed}");
+        // Invalid backlog values are not printed as numbers.
+        for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+            let label = physics_status_label(PhysicsRunState::Running, Some(1.0), Some(1.0), 1.0, Some(invalid), wide);
+            assert!(!label.contains("backlog"), "{label}");
+        }
+    }
+
+    #[test]
+    fn physics_state_label_shortens_to_fit_and_never_exceeds_the_available_width() {
+        for available in [700.0, 400.0, 250.0, 190.0, 120.0, 60.0] {
+            let label = physics_status_label(
+                PhysicsRunState::Running,
+                Some(12.5),
+                Some(0.75),
+                1.0,
+                Some(1.5),
+                available,
+            );
+            assert!(
+                label == "…"
+                    || label.chars().count() as f32 * PHYSICS_STATUS_CHAR_WIDTH <= available,
+                "{label:?} does not fit {available}"
+            );
+            assert!(label.starts_with("Running") || label == "…", "{label}");
+        }
+        // The state word survives down to the smallest toolbar the layout allows
+        // (canvas width 960 leaves 178 logical pixels).
+        let narrow = physics_status_label(PhysicsRunState::Paused, Some(4.0), Some(1.0), 1.0, Some(0.0), 178.0);
+        assert!(narrow.starts_with("Paused"), "{narrow}");
+    }
+
+    #[test]
+    fn worker_status_is_sanitised_and_cleared() {
+        let mut ui = Ui::new(1.0, Vec3::ZERO, Vec3::Z);
+        ui.set_physics_worker_status(Some((0.5, true)));
+        assert_eq!(ui.physics_backlog_seconds, Some(0.5));
+        assert!(ui.physics_failed);
+        ui.set_physics_worker_status(Some((f64::NAN, false)));
+        assert_eq!(ui.physics_backlog_seconds, None);
+        assert!(!ui.physics_failed);
+        ui.set_physics_worker_status(Some((2.0, true)));
+        ui.set_physics_worker_status(None);
+        assert_eq!(ui.physics_backlog_seconds, None);
+        assert!(!ui.physics_failed);
+    }
+
+    #[test]
+    fn toolbar_shows_the_physics_state_inside_the_window_at_common_sizes() {
+        for (width, height) in [
+            (1920.0, 1009.0),
+            (1280.0, 720.0),
+            (960.0, 600.0),
+            (800.0, 600.0),
+            (640.0, 480.0),
+        ] {
+            for (paused, failed) in [(true, false), (false, false), (true, true)] {
+                let mut ui = scene_ui(width, height);
+                ui.paused = paused;
+                ui.set_physics_cost_ms_per_10ms(Some(12.34));
+                ui.set_measured_simulation_rate(Some(0.5));
+                ui.set_physics_worker_status(Some((0.12, failed)));
+                let rects = ui.draw(0, 0, 60.0, 0.0, None, None, width, height, None);
+                let scale = ui.canvas_scale;
+                assert!(
+                    has_text_pixel(
+                        &ui,
+                        &rects,
+                        [PHYSICS_STATUS_LEFT, 36.0, ui.canvas_width - PHYSICS_STATUS_LEFT, 24.0]
+                    ),
+                    "no physics status text at {width}x{height}"
+                );
+                let right_edge = rects
+                    .iter()
+                    .filter(|item| {
+                        item.color[0] > 0.8
+                            && item.color[1] > 0.8
+                            && item.color[2] > 0.8
+                            && item.rect[0] >= PHYSICS_STATUS_LEFT * scale
+                            && item.rect[1] >= 36.0 * scale
+                            && item.rect[1] + item.rect[3] <= 60.0 * scale
+                    })
+                    .map(|item| item.rect[0] + item.rect[2])
+                    .fold(0.0_f32, f32::max);
+                assert!(
+                    right_edge <= (ui.canvas_width - 2.0) * scale,
+                    "status text runs past the window at {width}x{height}: {right_edge}"
+                );
+            }
+        }
     }
 }

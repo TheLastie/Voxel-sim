@@ -3407,6 +3407,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                         && ui.editor_mode
                         && !ui.menu_open
                         && !ui.mesh_import_open
+                        && !ui.help_open
                         && !ui.scene_input_active()
                         && active_model_document.is_some()
                         && ui.scene_viewport().is_some_and(|[x, y, width, height]| {
@@ -3420,6 +3421,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                         && ui.editor_mode
                         && !ui.menu_open
                         && !ui.mesh_import_open
+                        && !ui.help_open
                         && !ui.scene_input_active()
                         && active_scene_document.is_some()
                         && ui.scene_viewport().is_some_and(|[x, y, width, height]| {
@@ -4036,7 +4038,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                             }
                             Some(UiAction::OpenScene) => {
                                 if let Some(path) = pick_scene_document_path(false, &mut ui, &mut accumulator, &mut last) {
-                                    ui.set_status_message("Loading scene assets in the background�");
+                                    ui.set_status_message("Loading scene assets in the background…");
                                     let (sender, receiver) = mpsc::channel();
                                     scene_load_job = Some(receiver);
                                     std::thread::spawn(move || {
@@ -4336,7 +4338,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                                         let max_x = scene.positions.iter().map(|position| position.x).max_by(f64::total_cmp);
                                         let (sender, receiver) = mpsc::channel();
                                         scene_load_job = Some(receiver);
-                                        ui.set_status_message("Loading voxel model and rebuilding scene in the background�");
+                                        ui.set_status_message("Loading voxel model and rebuilding scene in the background…");
                                         std::thread::spawn(move || {
                                             let result = (|| {
                                                 let model: VoxelModelDocument = load_document(&path)?;
@@ -5441,6 +5443,14 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                 WindowEvent::KeyboardInput { event, .. }
                     if event.state == ElementState::Pressed
                         && !event.repeat
+                        && ui.help_open
+                        && event.physical_key == PhysicalKey::Code(KeyCode::Escape) =>
+                {
+                    ui.help_open = false;
+                }
+                WindowEvent::KeyboardInput { event, .. }
+                    if event.state == ElementState::Pressed
+                        && !event.repeat
                         && event.physical_key == PhysicalKey::Code(KeyCode::Escape) =>
                 {
                     ui.toggle_pause_menu();
@@ -5685,6 +5695,10 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                         None
                     } else {
                         match event.physical_key {
+                        PhysicalKey::Code(KeyCode::F1) => {
+                            ui.toggle_help();
+                            None
+                        }
                         PhysicalKey::Code(KeyCode::F2) => {
                             grabbed_cell = None;
                             if let Some(physics) = world_physics.as_ref() {
@@ -6261,7 +6275,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                                 ui.set_model_selection(None, None, None);
                                 ui.set_scene_model_selection_bounds(None);
                                 hovered_face = None;
-                                ui.set_status_message("Scene running � Space pauses � R restores the authored state.");
+                                ui.set_status_message("Scene running — Space pauses — R restores the authored state.");
                             }
                             Err(error) => {
                                 ui.paused = true;
@@ -6274,6 +6288,10 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                         ui.set_physics_cost_ms_per_10ms(
                             physics.frame.full_worker_ms_per_10ms_simulated,
                         );
+                        ui.set_physics_worker_status(Some((
+                            physics.backlog_seconds(),
+                            physics.failure_message().is_some(),
+                        )));
                         if let Some(error) = physics.failure_message() {
                             ui.paused = true;
                             if reported_physics_failure != Some(physics.frame.generation) {
@@ -6287,6 +6305,10 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                         if let Some(source) = authored_render_source.as_ref() {
                             renderer.set_authored_physics_frame(source, Some(&physics.frame));
                         }
+                    } else {
+                        // No scene worker: clear any stale failure or backlog. The
+                        // world worker, if present, republishes its own status below.
+                        ui.set_physics_worker_status(None);
                     }
                     if let Some(world) = generated_world.as_mut() {
                         growth_scheduler.advance(world, if ui.paused {
@@ -6334,6 +6356,10 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                         ui.set_physics_cost_ms_per_10ms(
                             physics.frame.full_worker_ms_per_10ms_simulated,
                         );
+                        ui.set_physics_worker_status(Some((
+                            physics.backlog_seconds(),
+                            physics.failure_message().is_some(),
+                        )));
                         if let Some(error) = physics.failure_message() {
                             ui.paused = true;
                             if reported_physics_failure != Some(physics.frame.generation) {
