@@ -1800,6 +1800,11 @@ fn advance_step_with_axis_targets_and_loads(
     let mut contacts = std::mem::take(&mut solver_scratch.contacts);
     let mut impact_energies_j = std::mem::take(&mut solver_scratch.impact_energies_j);
     let mut normal_impulses_ns = std::mem::take(&mut solver_scratch.normal_impulses_ns);
+    let mut implicit_friction_contacts = std::mem::take(&mut solver_scratch.implicit_friction_contacts);
+    let mut support_friction_modes = std::mem::take(&mut solver_scratch.support_friction_modes);
+    let mut support_patch_normal = std::mem::take(&mut solver_scratch.support_patch_normal);
+    let mut solve_loads = std::mem::take(&mut solver_scratch.solve_loads);
+    let mut friction_used_ns = std::mem::take(&mut solver_scratch.friction_used_ns);
     let mut contact_physical_velocities =
         std::mem::take(&mut solver_scratch.contact_physical_velocities);
     let mut contact_targets = targets.to_vec();
@@ -2112,6 +2117,23 @@ fn advance_step_with_axis_targets_and_loads(
                 .sum::<f64>();
             Some((kinetic, substep_elastic_energy_before))
         } else { None };
+        // Continue the previous substep's friction state as the first guess.
+        let mut support_friction_rows = support_rows(scene, &solver_scratch, &contacts);
+        solve_loads.resize(voxel_count, Vec3::ZERO);
+        support_friction_modes.retain(|voxel, _| {
+            support_friction_rows.iter().any(|row| row.voxel == *voxel)
+        });
+        apply_support_friction(
+            scene,
+            &support_friction_rows,
+            &support_friction_modes,
+            &support_patch_normal,
+            targets,
+            &substep_start_positions,
+            &mut contact_targets,
+            &applied_loads,
+            &mut solve_loads,
+        );
         for iteration in 0..scene.config.corotation_iterations {
             let mut contact_pass = 0usize;
             loop {
@@ -2119,7 +2141,7 @@ fn advance_step_with_axis_targets_and_loads(
                     scene,
                     h,
                     &contact_targets,
-                    &applied_loads,
+                    &solve_loads,
                     &predicted,
                     &mut solver_scratch,
                     iteration > 0 || contact_pass > 0,
@@ -2225,20 +2247,7 @@ fn advance_step_with_axis_targets_and_loads(
                 // with a tensile reaction and re-solve the SAME inertial system.
                 // Each pass removes at least one temporary axis constraint, so the
                 // loop terminates without an arbitrary physical force clamp.
-                solver_scratch
-                    .contact_reactions
-                    .resize(voxel_count, DVec3::ZERO);
-                for i in 0..voxel_count {
-                    solver_scratch.contact_reactions[i] = (scene.positions[i] - predicted[i])
-                        * (f64::from(scene.voxels[i].mass) / f64::from(h).powi(2))
-                        - applied_loads[i].as_dvec3();
-                }
-                for c in &solver_scratch.constraints {
-                    let force =
-                        c.k.as_dmat3() * (scene.positions[c.j] - scene.positions[c.i] - c.rest);
-                    solver_scratch.contact_reactions[c.i] -= force;
-                    solver_scratch.contact_reactions[c.j] += force;
-                }
+                compute_contact_reactions(scene, &mut solver_scratch, &predicted, &solve_loads, h);
                 let mut released = false;
                 for i in 0..voxel_count {
                     for axis in 0..3 {
@@ -2348,6 +2357,55 @@ fn advance_step_with_axis_targets_and_loads(
                 && scene.solver_residual <= scene.config.solver_relative_tolerance
             {
                 break;
+            }
+        }
+        // Settle friction on the contacts this solve kept. Each extra solve either
+        // starts or ends a slide, so two are enough to reach a consistent state.
+        support_friction_rows = support_rows(scene, &solver_scratch, &contacts);
+        for _ in 0..2 {
+            if support_friction_rows.is_empty() {
+                support_friction_modes.clear();
+                break;
+            }
+            compute_contact_reactions(scene, &mut solver_scratch, &predicted, &solve_loads, h);
+            let changed = update_support_friction(
+                scene,
+                &support_friction_rows,
+                &solver_scratch,
+                &mut support_friction_modes,
+                &mut support_patch_normal,
+                &substep_start_positions,
+                h,
+            );
+            if !changed {
+                break;
+            }
+            apply_support_friction(
+                scene,
+                &support_friction_rows,
+                &support_friction_modes,
+                &support_patch_normal,
+                targets,
+                &substep_start_positions,
+                &mut contact_targets,
+                &applied_loads,
+                &mut solve_loads,
+            );
+            let (iterations, detail_time) = solve_coupled(
+                scene,
+                h,
+                &contact_targets,
+                &solve_loads,
+                &predicted,
+                &mut solver_scratch,
+                true,
+                reusable_cuda_solution,
+                &mut cuda_enabled_for_step,
+            );
+            solve_failed_this_step |= !scene.solver_residual.is_finite();
+            total_pcg_iterations += iterations;
+            for index in 0..solve_detail_time.len() {
+                solve_detail_time[index] += detail_time[index];
             }
         }
         stage_time[1] += phase_start.elapsed();
@@ -2670,16 +2728,33 @@ fn advance_step_with_axis_targets_and_loads(
                     - pre_contact_velocities[contact.i]).dot(contact.normal);
                 if closing < -1.0e-10 { receivers.extend([contact.i, contact.j]); }
             }
+            // A slide on a fixed support dissipates into the sliding contact.
+            receivers.extend(support_friction_modes.iter().filter_map(|(voxel, mode)| {
+                matches!(mode, SupportFriction::Slip(_)).then_some(*voxel)
+            }));
             receivers.retain(|&i| !scene.voxels[i].kinematic);
             receivers.sort_unstable();
             receivers.dedup();
             if !receivers.is_empty() {
                 let heat_per_voxel = heat / receivers.len() as f64;
                 for i in receivers { scene.voxels[i].add_internal_energy_j(heat_per_voxel); }
-                scene.energy.implicit_solver_heat += implicit_contact_heat;
+                // A sliding support dissipates through kinetic friction in the same
+                // implicit budget; a simultaneous impact in this substep shares the label.
+                if support_friction_modes.values().any(|mode| matches!(mode, SupportFriction::Slip(_))) {
+                    scene.energy.contact_friction_heat += implicit_contact_heat;
+                } else {
+                    scene.energy.implicit_solver_heat += implicit_contact_heat;
+                }
                 scene.energy.contact_restitution_heat += restitution_heat;
             }
         }
+        // Contacts settled by the implicit friction above skip the velocity pass.
+        implicit_friction_contacts.clear();
+        implicit_friction_contacts.extend(contacts.iter().map(|contact| {
+            let voxel = if scene.voxels[contact.i].kinematic { contact.j } else { contact.i };
+            support_friction_modes.contains_key(&voxel)
+                && (scene.voxels[contact.i].kinematic || scene.voxels[contact.j].kinematic)
+        }));
         collision::resolve_velocities_with_precontact_into(
             scene,
             &contacts,
@@ -2687,6 +2762,8 @@ fn advance_step_with_axis_targets_and_loads(
             &pre_contact_velocities,
             &mut normal_impulses_ns,
             &mut contact_physical_velocities,
+            &implicit_friction_contacts,
+            &mut friction_used_ns,
         );
         collision::resolve_liquid_viscosity(scene, &contacts, targets, h);
         let contact_finish_start = profile_step.then(Instant::now);
@@ -2790,6 +2867,11 @@ fn advance_step_with_axis_targets_and_loads(
     solver_scratch.applied_loads = applied_loads;
     solver_scratch.substep_start_positions = substep_start_positions;
     solver_scratch.substep_start_velocities = substep_start_velocities;
+    solver_scratch.implicit_friction_contacts = implicit_friction_contacts;
+    solver_scratch.support_friction_modes = support_friction_modes;
+    solver_scratch.support_patch_normal = support_patch_normal;
+    solver_scratch.solve_loads = solve_loads;
+    solver_scratch.friction_used_ns = friction_used_ns;
     solver_scratch.substep_mechanical_energy = substep_mechanical_energy;
     solver_scratch.energy_edge_values = energy_edge_values;
     solver_scratch.free_implicit_budgets = free_implicit_budgets;
@@ -4801,6 +4883,11 @@ pub(crate) struct SolverScratch {
     rhs: Vec<Vec3>,
     constraints: Vec<Constraint>,
     assembly_phase_strengths: Vec<(f32, f32)>,
+    implicit_friction_contacts: Vec<bool>,
+    support_friction_modes: rustc_hash::FxHashMap<usize, SupportFriction>,
+    support_patch_normal: rustc_hash::FxHashMap<usize, f64>,
+    solve_loads: Vec<Vec3>,
+    friction_used_ns: Vec<f32>,
     mechanical_mask: Vec<bool>,
     mechanical_revs: Vec<usize>,
     mechanical_slots: Vec<usize>,
@@ -7454,6 +7541,299 @@ fn solve_projected_contact(scene: &mut Scene, h: f32, scratch: &mut SolverScratc
         scene.workspace[c.axis][c.i].lambda = -c.frame.transpose() * force * (h*h);
     }
     iterations
+}
+
+/// How one contact patch on a fixed support behaved in the previous pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SupportFriction {
+    /// No tangential motion: the patch keeps its substep-start tangent position.
+    Stick,
+    /// Kinetic friction opposing motion along this unit tangential direction.
+    Slip(Vec3),
+}
+
+/// One REV pressed against a fixed support on `axis`.
+struct SupportRow {
+    voxel: usize,
+    axis: usize,
+    normal: f32,
+    friction: f32,
+    patch: usize,
+}
+
+/// REVs on fixed supports, grouped into patches joined by intact bonds. A foot is
+/// one patch; two feet of a body are two, and can slip independently.
+fn support_rows(scene: &Scene, scratch: &SolverScratch, contacts: &[collision::Contact]) -> Vec<SupportRow> {
+    let mut rows = Vec::<SupportRow>::new();
+    let mut index = rustc_hash::FxHashMap::<usize, usize>::default();
+    for contact in contacts {
+        let abs_normal = contact.normal.abs();
+        let axis = if abs_normal.x > 0.5 { 0 } else if abs_normal.y > 0.5 { 1 } else { 2 };
+        let voxel = if scene.voxels[contact.i].kinematic {
+            contact.j
+        } else if scene.voxels[contact.j].kinematic {
+            contact.i
+        } else {
+            continue;
+        };
+        let Some(normal) = scratch.contact_axis_normals.get(voxel).map(|axes| axes[axis]) else {
+            continue;
+        };
+        if normal == 0.0 || scene.voxels[voxel].kinematic || index.contains_key(&voxel) {
+            continue;
+        }
+        index.insert(voxel, rows.len());
+        rows.push(SupportRow {
+            voxel,
+            axis,
+            normal,
+            friction: scene.config.fracture.friction
+                * (scene.properties[contact.i].surface_friction_coefficient
+                    + scene.properties[contact.j].surface_friction_coefficient),
+            patch: rows.len(),
+        });
+    }
+    fn root(rows: &mut [SupportRow], mut i: usize) -> usize {
+        while rows[i].patch != i {
+            let next = rows[i].patch;
+            rows[i].patch = rows[next].patch;
+            i = next;
+        }
+        i
+    }
+    for row in 0..rows.len() {
+        let voxel = rows[row].voxel;
+        for axis in 0..3 {
+            let neighbor = scene.bonds[axis][voxel].neighbor;
+            if neighbor == EMPTY {
+                continue;
+            }
+            if let Some(&other) = index.get(&(neighbor as usize)) {
+                let (a, b) = (root(&mut rows, row), root(&mut rows, other));
+                rows[b].patch = a;
+            }
+        }
+    }
+    for row in 0..rows.len() {
+        rows[row].patch = root(&mut rows, row);
+    }
+    rows
+}
+
+/// Reaction a solved row needs from its constraints:
+/// `R = m (x - x_pred) / h^2 - load - bond forces`.
+fn compute_contact_reactions(
+    scene: &Scene,
+    scratch: &mut SolverScratch,
+    predicted: &[DVec3],
+    loads: &[Vec3],
+    h: f32,
+) {
+    let scale = 1.0 / f64::from(h).powi(2);
+    scratch.contact_reactions.resize(scene.voxels.len(), DVec3::ZERO);
+    for i in 0..scene.voxels.len() {
+        scratch.contact_reactions[i] = (scene.positions[i] - predicted[i])
+            * (f64::from(scene.voxels[i].mass) * scale)
+            - loads[i].as_dvec3();
+    }
+    for c in &scratch.constraints {
+        let force = c.k.as_dmat3() * (scene.positions[c.j] - scene.positions[c.i] - c.rest);
+        scratch.contact_reactions[c.i] -= force;
+        scratch.contact_reactions[c.j] += force;
+    }
+}
+
+/// Constrain or load the tangent axes of every support row for the next solve.
+fn apply_support_friction(
+    scene: &mut Scene,
+    rows: &[SupportRow],
+    modes: &rustc_hash::FxHashMap<usize, SupportFriction>,
+    patch_normal: &rustc_hash::FxHashMap<usize, f64>,
+    base_targets: &[[Option<f64>; 3]],
+    substep_start: &[DVec3],
+    contact_targets: &mut [[Option<f64>; 3]],
+    applied_loads: &[Vec3],
+    solve_loads: &mut [Vec3],
+) {
+    solve_loads.copy_from_slice(applied_loads);
+    let mut patch_rows = rustc_hash::FxHashMap::<usize, usize>::default();
+    for row in rows {
+        *patch_rows.entry(row.patch).or_default() += 1;
+    }
+    for row in rows {
+        for axis in 0..3 {
+            if axis != row.axis {
+                contact_targets[row.voxel][axis] = base_targets[row.voxel][axis];
+            }
+        }
+        match modes.get(&row.voxel) {
+            Some(SupportFriction::Stick) => {
+                for axis in 0..3 {
+                    if axis != row.axis && base_targets[row.voxel][axis].is_none() {
+                        let start = substep_start[row.voxel][axis];
+                        contact_targets[row.voxel][axis] = Some(start);
+                        scene.positions[row.voxel][axis] = start;
+                    }
+                }
+            }
+            Some(SupportFriction::Slip(direction)) => {
+                let normal = patch_normal.get(&row.patch).copied().unwrap_or(0.0);
+                let share = normal / patch_rows[&row.patch] as f64;
+                solve_loads[row.voxel] -= *direction * (f64::from(row.friction) * share) as f32;
+            }
+            None => {}
+        }
+    }
+}
+
+/// Coulomb friction for contacts on fixed supports, solved in the implicit system
+/// so stiff bonds and the weight above a contact are respected and the mechanical
+/// energy it removes reaches the contact heat budget.
+///
+/// A patch sticks while its tangential reaction stays within `mu N`. Otherwise it
+/// slides under kinetic friction until the motion reverses, then sticks. N and T
+/// are per patch: single rows carry solver noise from stiff bonds that can exceed
+/// a REV's weight, while bond forces cancel over a body. A body with one patch
+/// therefore uses the exact body totals, and several patches are bounded by them.
+/// Returns true when the mode set changed and another solve is required.
+fn update_support_friction(
+    scene: &Scene,
+    rows: &[SupportRow],
+    scratch: &SolverScratch,
+    modes: &mut rustc_hash::FxHashMap<usize, SupportFriction>,
+    patch_normal: &mut rustc_hash::FxHashMap<usize, f64>,
+    substep_start: &[DVec3],
+    h: f32,
+) -> bool {
+    use rustc_hash::FxHashMap;
+    let reactions = &scratch.contact_reactions;
+    let mut body_total = FxHashMap::<u32, DVec3>::default();
+    for row in rows {
+        body_total.entry(scene.clusters[row.voxel]).or_default();
+    }
+    for (i, voxel) in scene.voxels.iter().enumerate() {
+        if voxel.kinematic {
+            continue;
+        }
+        if let Some(total) = body_total.get_mut(&scene.clusters[i]) {
+            *total += reactions[i];
+        }
+    }
+    struct Patch {
+        normal: f64,
+        tangential: DVec3,
+        motion: DVec3,
+        mass: f64,
+        count: usize,
+        cluster: u32,
+        axis: usize,
+        direction: f64,
+        friction: f64,
+    }
+    let mut patches = FxHashMap::<usize, Patch>::default();
+    let mut body_patches = FxHashMap::<u32, std::collections::BTreeSet<usize>>::default();
+    for row in rows {
+        let voxel = row.voxel;
+        let cluster = scene.clusters[voxel];
+        body_patches.entry(cluster).or_default().insert(row.patch);
+        let patch = patches.entry(row.patch).or_insert(Patch {
+            normal: 0.0,
+            tangential: DVec3::ZERO,
+            motion: DVec3::ZERO,
+            mass: 0.0,
+            count: 0,
+            cluster,
+            axis: row.axis,
+            direction: f64::from(row.normal),
+            friction: f64::from(row.friction),
+        });
+        let mut tangent = reactions[voxel];
+        tangent[row.axis] = 0.0;
+        let mut motion = scene.positions[voxel] - substep_start[voxel];
+        motion[row.axis] = 0.0;
+        patch.normal += (reactions[voxel][row.axis] * f64::from(row.normal)).max(0.0);
+        patch.tangential += tangent;
+        patch.motion += motion;
+        patch.count += 1;
+    }
+    // Bound the noisy row sums by the exact body totals.
+    for (cluster, members) in &body_patches {
+        let total = body_total[cluster];
+        let sum: f64 = members.iter().map(|id| patches[id].normal).sum();
+        let first = &patches[members.iter().next().unwrap()];
+        let body_normal = (total[first.axis] * first.direction).max(0.0);
+        for id in members {
+            let single = members.len() == 1;
+            let patch = patches.get_mut(id).unwrap();
+            if sum > body_normal && sum > 0.0 {
+                patch.normal *= body_normal / sum;
+            }
+            if single {
+                let mut tangent = total;
+                tangent[patch.axis] = 0.0;
+                patch.tangential = tangent;
+            }
+        }
+    }
+    let mut body_mass = FxHashMap::<u32, f64>::default();
+    for (i, voxel) in scene.voxels.iter().enumerate() {
+        if !voxel.kinematic && body_total.contains_key(&scene.clusters[i]) {
+            *body_mass.entry(scene.clusters[i]).or_default() += f64::from(voxel.mass);
+        }
+    }
+    for patch in patches.values_mut() {
+        patch.mass = body_mass.get(&patch.cluster).copied().unwrap_or(0.0);
+    }
+    let h = f64::from(h);
+    let mut changed = false;
+    let mut next_modes = FxHashMap::<usize, SupportFriction>::default();
+    for row in rows {
+        let patch = &patches[&row.patch];
+        let limit = patch.friction * patch.normal;
+        let motion = patch.motion / patch.count.max(1) as f64;
+        let speed = motion.length() / h;
+        // Speed kinetic friction can remove from this body within one substep.
+        let stoppable = if patch.mass > 0.0 { limit / patch.mass * h } else { 0.0 };
+        let current = modes.get(&row.voxel).copied();
+        let next = match current {
+            Some(SupportFriction::Stick) => {
+                if patch.tangential.length() <= limit * (1.0 + 1.0e-6) + 1.0e-12 {
+                    SupportFriction::Stick
+                } else {
+                    // Slides against the reaction that could not be sustained.
+                    SupportFriction::Slip((-patch.tangential.normalize()).as_vec3())
+                }
+            }
+            Some(SupportFriction::Slip(direction)) => {
+                if motion.dot(direction.as_dvec3()) <= 0.0 || speed <= stoppable {
+                    SupportFriction::Stick
+                } else {
+                    SupportFriction::Slip((motion / motion.length()).as_vec3())
+                }
+            }
+            None => {
+                if speed > stoppable.max(1.0e-9) && motion.length() > 0.0 {
+                    SupportFriction::Slip((motion / motion.length()).as_vec3())
+                } else {
+                    SupportFriction::Stick
+                }
+            }
+        };
+        // Direction changes within a slide are applied on the next substep.
+        let material_change = !matches!(
+            (current, next),
+            (Some(SupportFriction::Stick), SupportFriction::Stick)
+                | (Some(SupportFriction::Slip(_)), SupportFriction::Slip(_))
+        );
+        changed |= material_change;
+        next_modes.insert(row.voxel, next);
+    }
+    patch_normal.clear();
+    for (id, patch) in &patches {
+        patch_normal.insert(*id, patch.normal);
+    }
+    *modes = next_modes;
+    changed
 }
 
 /// List the REVs and bond slots that can take part in mechanics. A bond between

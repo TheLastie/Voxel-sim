@@ -550,6 +550,7 @@ pub(crate) fn resolve_velocities_with_precontact(
 ) -> Vec<f32> {
     let mut normal_impulses = Vec::with_capacity(contacts.len());
     let mut physical_velocities = Vec::with_capacity(pre_contact_velocities.len());
+    let mut friction_used = Vec::new();
     resolve_velocities_with_precontact_into(
         scene,
         contacts,
@@ -557,6 +558,8 @@ pub(crate) fn resolve_velocities_with_precontact(
         pre_contact_velocities,
         &mut normal_impulses,
         &mut physical_velocities,
+        &[],
+        &mut friction_used,
     );
     normal_impulses
 }
@@ -568,8 +571,28 @@ pub(crate) fn resolve_velocities_with_precontact_into(
     pre_contact_velocities: &[Vec3],
     normal_impulses: &mut Vec<f32>,
     physical_velocities: &mut Vec<Vec3>,
+    implicit_friction: &[bool],
+    friction_used: &mut Vec<f32>,
 ) {
     normal_impulses.resize(contacts.len(), 0.0);
+    // One Coulomb budget per contact for the whole substep: the passes below
+    // redistribute it between contacts, they must not grant it again.
+    friction_used.clear();
+    friction_used.resize(contacts.len(), 0.0);
+    // Without a solved reaction the support load is estimated from a REV's own
+    // closing speed; several contacts of that REV share the same load.
+    let mut contacts_per_voxel_axis = FxHashMap::<(usize, usize), u32>::default();
+    for (index, contact) in contacts.iter().enumerate() {
+        if implicit_friction.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        let axis = normal_axis(contact.normal);
+        for voxel in [contact.i, contact.j] {
+            if !scene.voxels[voxel].kinematic {
+                *contacts_per_voxel_axis.entry((voxel, axis)).or_default() += 1;
+            }
+        }
+    }
     physical_velocities.resize(pre_contact_velocities.len(), Vec3::ZERO);
     physical_velocities.copy_from_slice(pre_contact_velocities);
     for iteration in 0..4 {
@@ -647,8 +670,10 @@ pub(crate) fn resolve_velocities_with_precontact_into(
             let pair_friction = scene.config.fracture.friction
                 * (scene.properties[c.i].surface_friction_coefficient
                     + scene.properties[c.j].surface_friction_coefficient);
-            let mut friction_normal_impulse = normal_impulse;
-            if friction_normal_impulse <= 0.0 && physical_closing < -1e-6 {
+            // A fixed support's friction was already solved in the implicit system.
+            let friction_is_implicit = implicit_friction.get(contact_index).copied().unwrap_or(false);
+            let mut friction_normal_impulse = if friction_is_implicit { 0.0 } else { normal_impulse };
+            if !friction_is_implicit && friction_normal_impulse <= 0.0 && physical_closing < -1e-6 {
                 // A resting floor contact is position constrained by the
                 // mechanical solve. That removes its normal velocity before
                 // this impulse pass, but gravity still creates a real support
@@ -665,7 +690,14 @@ pub(crate) fn resolve_velocities_with_precontact_into(
                 let support_denom =
                     unconstrained_inverse_mass(c.i) + unconstrained_inverse_mass(c.j);
                 if support_denom > 0.0 {
-                    friction_normal_impulse = -physical_closing / support_denom;
+                    let sharing = [c.i, c.j]
+                        .iter()
+                        .filter_map(|&voxel| contacts_per_voxel_axis.get(&(voxel, axis)))
+                        .copied()
+                        .max()
+                        .unwrap_or(1)
+                        .max(1);
+                    friction_normal_impulse = -physical_closing / support_denom / sharing as f32;
                 }
             }
             if friction_normal_impulse > 0.0 && pair_friction > 0.0 {
@@ -700,9 +732,13 @@ pub(crate) fn resolve_velocities_with_precontact_into(
                     let tangent_weight = (0..3)
                         .map(|axis| direction[axis].powi(2) * tangent_response[axis])
                         .sum::<f32>();
-                    if tangent_weight > 0.0 {
-                        let impulse_magnitude = (tangent_speed / tangent_weight)
-                            .min(pair_friction * friction_normal_impulse);
+                    let friction_budget = (pair_friction * friction_normal_impulse
+                        - friction_used[contact_index])
+                        .max(0.0);
+                    if tangent_weight > 0.0 && friction_budget > 0.0 {
+                        let impulse_magnitude =
+                            (tangent_speed / tangent_weight).min(friction_budget);
+                        friction_used[contact_index] += impulse_magnitude;
                         // The relative tangential velocity is v_j - v_i, so
                         // the contact impulse on j points opposite that motion.
                         let impulse = -direction * impulse_magnitude;
@@ -2087,7 +2123,8 @@ mod tests {
         assert!(
             (scene.voxels[0].total_internal_energy_j()
                 - initial_internal
-                - scene.energy.contact_friction_heat)
+                - scene.energy.contact_friction_heat
+                - scene.energy.implicit_solver_heat)
                 .abs()
                 < 1e-12
         );
