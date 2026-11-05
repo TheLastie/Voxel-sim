@@ -4083,6 +4083,34 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                                     }
                                 }
                             }
+                            Some(action @ (UiAction::SavePhysicalState | UiAction::LoadPhysicalState)) => {
+                                let saving = matches!(action, UiAction::SavePhysicalState);
+                                let state_path = active_scene_document_path
+                                    .as_deref()
+                                    .map(|path| path.with_extension("vxstate"));
+                                let result: Result<String, String> = match state_path {
+                                    None => Err("Save the scene first; its state is stored beside it.".into()),
+                                    Some(_) if authored_physics.is_some() || !ui.paused => {
+                                        Err("Pause the simulation first; Stop keeps the full state.".into())
+                                    }
+                                    Some(path) if saving => scene
+                                        .save_checkpoint(&path)
+                                        .map(|()| format!("Saved physical state at {:.3} s", scene.simulated_seconds)),
+                                    Some(path) => Scene::load_checkpoint(&path).map(|loaded| {
+                                        let seconds = loaded.simulated_seconds;
+                                        scene = loaded;
+                                        model_revision = model_revision.wrapping_add(1);
+                                        format!("Loaded physical state at {seconds:.3} s; Run continues it, R resets.")
+                                    }),
+                                };
+                                match result {
+                                    Ok(message) => ui.set_status_message(message),
+                                    Err(error) => {
+                                        eprintln!("physical state: {error}");
+                                        ui.set_status_message(format!("Error: {error}"));
+                                    }
+                                }
+                            }
                             Some(UiAction::NewModel) => {
                                 scene_load_job = None;
                                 let result = (|| {

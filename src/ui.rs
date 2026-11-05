@@ -144,6 +144,10 @@ pub enum UiAction {
     NewScene,
     OpenScene,
     SaveScene,
+    /// Write the paused physical state beside the scene as `<name>.vxstate`.
+    SavePhysicalState,
+    /// Continue from the `<name>.vxstate` saved beside the scene.
+    LoadPhysicalState,
     NewModel,
     OpenModel,
     SaveModel,
@@ -699,6 +703,12 @@ impl Ui {
                         }
                         11 if (349.0..=377.0).contains(&y) && self.scene_document_available => {
                             Some(UiAction::CreateImpactScene { side: 74 })
+                        }
+                        12 if (378.0..=406.0).contains(&y) && self.scene_document_available => {
+                            Some(UiAction::SavePhysicalState)
+                        }
+                        13 if (407.0..=435.0).contains(&y) && self.scene_document_available => {
+                            Some(UiAction::LoadPhysicalState)
                         }
                         _ => None,
                     };
@@ -3289,6 +3299,8 @@ fn draw_editor(
             ("Export Model as OBJ...", ui.model_document_available),
             ("Create Impact Scene (16³)", ui.scene_document_available),
             ("Create Impact Scene (74³)", ui.scene_document_available),
+            ("Save Physical State (paused)", ui.scene_document_available),
+            ("Load Physical State", ui.scene_document_available),
         ];
         rect(
             out,
@@ -4772,6 +4784,29 @@ mod scene_inspector_tests {
             ui.set_measured_simulation_rate(Some(invalid));
             assert_eq!(ui.measured_simulation_rate, None);
         }
+    }
+
+    #[test]
+    fn physical_state_menu_rows_need_an_open_scene() {
+        let mut ui = Ui::new(1.0, Vec3::ZERO, Vec3::Z);
+        ui.world_active = true;
+        ui.editor_mode = true;
+        ui.file_menu_open = true;
+        assert!(ui.click(130.0, 392.0).is_none());
+        ui.file_menu_open = true;
+        assert!(ui.click(130.0, 421.0).is_none());
+
+        ui.set_scene_document_available(true);
+        ui.file_menu_open = true;
+        assert!(matches!(ui.click(130.0, 392.0), Some(UiAction::SavePhysicalState)));
+        ui.file_menu_open = true;
+        assert!(matches!(ui.click(130.0, 421.0), Some(UiAction::LoadPhysicalState)));
+        // The row above is still the 74-cube impact scene, not a state action.
+        ui.file_menu_open = true;
+        assert!(matches!(
+            ui.click(130.0, 363.0),
+            Some(UiAction::CreateImpactScene { side: 74 })
+        ));
     }
 
     fn scene_ui(width: f32, height: f32) -> Ui {
