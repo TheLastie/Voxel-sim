@@ -22,6 +22,11 @@ path = "src/bin/gpu_info.rs"
 required-features = ["desktop"]
 
 [[bin]]
+name = "gpu_cell_probe"
+path = "src/bin/gpu_cell_probe.rs"
+required-features = ["desktop"]
+
+[[bin]]
 name = "voxel-editor-mcp"
 path = "src/bin/voxel_editor_mcp.rs"
 
