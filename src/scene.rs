@@ -484,6 +484,8 @@ pub struct Scene {
     pub materials: Vec<Material>,
     pub properties: Vec<Material>,
     pub rotations: Vec<Quat>,
+    /// Whether this step solves cell rotations; decided at the start of each step.
+    pub(crate) cell_dofs: bool,
     /// Double-precision cell rotations; `rotations` holds the same values as f32.
     pub(crate) precise_rotations: Vec<glam::DQuat>,
     /// Angular velocity of each cell about its own centre, rad/s, world axes.
@@ -1114,6 +1116,7 @@ impl Scene {
             materials,
             properties: Vec::with_capacity(spawns.len()),
             rotations: Vec::with_capacity(spawns.len()),
+            cell_dofs: false,
             precise_rotations: Vec::with_capacity(spawns.len()),
             angular_velocities: Vec::with_capacity(spawns.len()),
             clusters: Vec::with_capacity(spawns.len()),
@@ -3172,6 +3175,7 @@ impl Scene {
             materials,
             properties,
             rotations: vec![Quat::IDENTITY; n],
+            cell_dofs: false,
             precise_rotations: vec![glam::DQuat::IDENTITY; n],
             angular_velocities: vec![glam::DVec3::ZERO; n],
             clusters: vec![0; n],

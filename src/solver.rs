@@ -513,7 +513,7 @@ pub(crate) fn bond_stored_elastic_energy_at_positions_j(
     let bond = scene.bonds[axis][i];
     let frame = basis(axis, scene.rotations[i].slerp(scene.rotations[j], 0.5));
     let stiffness = stiffness_matrix(scene, i, j, frame);
-    let precise = face_cell_dofs_enabled() && scene.precise_rotations.len() == scene.rotations.len();
+    let precise = scene.cell_dofs && scene.precise_rotations.len() == scene.rotations.len();
     let displacement = if precise {
         let temperatures = [i, j].map(|n| {
             scene.properties[n]
@@ -1080,14 +1080,18 @@ pub fn release_voxel(scene: &mut Scene, voxel: usize) -> Result<(), &'static str
 /// Local polar fits make the vector constraints invariant to rigid rotation.
 /// Returns the largest quaternion angle changed by this fit.
 /// Cells solve their rotations directly. Pair contacts still use the translation-only
-/// solve, which needs fitted frames. Reports a change so frames refresh once.
+/// solve, which needs fitted frames; it then returns the change of that fit.
 fn update_frames(scene: &mut Scene, scratch: &mut SolverScratch) -> f32 {
-    if face_cell_dofs_enabled() && !scratch.pair_contacts.iter().any(|pair| pair.active) {
+    if scene.cell_dofs && !scratch.pair_contacts.iter().any(|pair| pair.active) {
+        // Rotations are solved; report a change so the second pass still runs.
+        // Skipping it when theta^2 is small gave 172/230 ms (actor on/off) against
+        // 233/95 ms, and the cause of the slower resting case is not understood.
         return 1.0;
     }
     fit_rotations(scene, scratch)
 }
 
+/// Returns the largest quaternion angle changed by this fit.
 fn fit_rotations(scene: &mut Scene, scratch: &mut SolverScratch) -> f32 {
     let n = scene.voxels.len();
     if !scene
@@ -1646,6 +1650,7 @@ fn advance_step_with_axis_targets_and_loads(
     assert!(loads.is_empty() || loads.len() == scene.voxels.len());
     scene.solver_residual_audit = None;
     scene.last_step_diagnostics = None;
+    scene.cell_dofs = decide_cell_dofs(scene);
     scene.solver_max_audited_residual = None;
     // Keep the large per-step and per-substep work arrays alive across calls.
     let mut solver_scratch = std::mem::take(&mut scene.solver_scratch);
@@ -2232,7 +2237,7 @@ fn advance_step_with_axis_targets_and_loads(
                 }
                 // Near-zero reactions within the solve tolerance can flip a row back and
                 // forth. Keep the last feasible state instead of looping forever.
-                if face_cell_dofs_enabled() && contact_pass > 16 {
+                if scene.cell_dofs && contact_pass > 16 {
                     break;
                 }
                 if let Some((i, axis, plane, normal)) = blocking {
@@ -3255,11 +3260,6 @@ mod tests {
 
     #[test]
     fn bond_rest_cache_reuses_only_exact_inputs_and_damage_still_updates_stiffness() {
-        // Cells derive the rest vector from double-precision rotations on every
-        // assembly; this cache only serves the translation-only solve.
-        if face_cell_dofs_enabled() {
-            return;
-        }
         let scene = rest_cache_test_scene();
         let initial = cached_test_constraint(&scene, 0, 0, 1, None);
 
@@ -5192,7 +5192,7 @@ fn make_constraint_at_phases(
         formation_offset: bond.formation_offset,
         plastic_strain: bond.plastic_strain,
     };
-    let rest = if face_cell_dofs_enabled() && scene.precise_rotations.len() == scene.rotations.len() {
+    let rest = if scene.cell_dofs && scene.precise_rotations.len() == scene.rotations.len() {
         face_rest(
             scene,
             i,
@@ -7935,11 +7935,40 @@ fn update_support_friction(
 
 /// Rigid cells with face springs: each REV has a translation and a rotation. A bond
 /// measures the gap at the shared face, so a rigid rotation produces no strain; the
-/// face also carries bending `E L^3 / 12` and torsion. `VOXEL_BOND_ONLY` selects the
-/// older translation-only solve, whose shear resists torque-driven rotation.
-fn face_cell_dofs_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("VOXEL_BOND_ONLY").is_none())
+/// face also carries bending `E L^3 / 12` and torsion. The older translation-only
+/// solve resists torque-driven rotation with its shear, so it stays locked.
+///
+/// The cell solver is serial CPU code: a skyline factorisation for small and thin
+/// bodies, block IC(0) otherwise. Above `CELL_DOF_MAX_REVS` mechanical REVs it takes
+/// seconds per step (16k REVs: 1984 ms against 179 ms), so larger scenes keep the
+/// translation-only solve, and the choice is announced once. A parallel or GPU cell
+/// solver removes this limit. `VOXEL_FACE_CELLS=1` forces cells, `VOXEL_BOND_ONLY=1`
+/// forbids them.
+const CELL_DOF_MAX_REVS: usize = 4096;
+
+fn decide_cell_dofs(scene: &Scene) -> bool {
+    if std::env::var_os("VOXEL_BOND_ONLY").is_some() {
+        return false;
+    }
+    if std::env::var_os("VOXEL_FACE_CELLS").is_some() {
+        return true;
+    }
+    let mechanical = scene
+        .voxels
+        .iter()
+        .enumerate()
+        .filter(|(i, voxel)| !voxel.kinematic && scene.aggregate_of[*i].is_none())
+        .count();
+    let allowed = mechanical <= CELL_DOF_MAX_REVS;
+    if !allowed {
+        static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "note: {mechanical} mechanical REVs exceed {CELL_DOF_MAX_REVS}; this scene uses the                  translation-only solver, so torque-driven rotation of large bodies stays locked"
+            );
+        }
+    }
+    allowed
 }
 
 /// Matrix of a bond's local axes for `axis`, in double precision.
@@ -8755,7 +8784,7 @@ fn solve_coupled(
         .filter(|&value| value > 0)
         .unwrap_or(scene.config.cuda_iterations);
     let coupled_contact = scratch.pair_contacts.iter().any(|p| p.active);
-    let try_cuda = !face_cell_dofs_enabled() && !coupled_contact && *cuda_enabled_for_step
+    let try_cuda = !scene.cell_dofs && !coupled_contact && *cuda_enabled_for_step
         && match backend.as_str() {
             "cpu" => false,
             "cuda" => true,
@@ -9030,7 +9059,7 @@ fn solve_coupled(
     scratch.mechanical_revs = mechanical_revs;
     scratch.mechanical_slots = mechanical_slots;
     let assembly_time = assembly_start.elapsed();
-    if !coupled_contact && face_cell_dofs_enabled() {
+    if !coupled_contact && scene.cell_dofs {
         let solve_start = Instant::now();
         let iterations =
             solve_face_cells_sparse(scene, h, scratch, !reuse_preconditioner, predicted, loads);
