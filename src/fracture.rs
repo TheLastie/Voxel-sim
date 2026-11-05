@@ -158,14 +158,14 @@ impl Dissipation {
             + self.released
     }
 }
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct Release {
     pub i: usize,
     pub j: usize,
     pub energy: f64,
     pub due: u64,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 pub struct EnergyLedger {
     pub plastic_heat: f64,
     pub stored_plastic: f64,

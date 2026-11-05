@@ -40,7 +40,55 @@ pub struct SkeletalActuator {
     pub enabled: bool,
 }
 
+/// Changing part of an actuator, stored in a checkpoint.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
+pub struct ActuatorRuntime {
+    elapsed_s: f64,
+    previous_elapsed_s: f64,
+    stalled: bool,
+    invalidated: bool,
+    editor_bond_protection: bool,
+    clip_index: usize,
+    playback_speed: f64,
+    strength_scale: f32,
+    enabled: bool,
+}
+
 impl SkeletalActuator {
+    pub(crate) fn model(&self) -> &VoxelModelDocument {
+        &self.model
+    }
+
+    pub(crate) fn instance_rotation_f32(&self) -> Quat {
+        self.instance_rotation.as_quat()
+    }
+
+    pub(crate) fn runtime(&self) -> ActuatorRuntime {
+        ActuatorRuntime {
+            elapsed_s: self.elapsed_s,
+            previous_elapsed_s: self.previous_elapsed_s,
+            stalled: self.stalled,
+            invalidated: self.invalidated,
+            editor_bond_protection: self.editor_bond_protection,
+            clip_index: self.clip_index,
+            playback_speed: self.playback_speed,
+            strength_scale: self.strength_scale,
+            enabled: self.enabled,
+        }
+    }
+
+    pub(crate) fn restore_runtime(&mut self, runtime: ActuatorRuntime) {
+        self.elapsed_s = runtime.elapsed_s;
+        self.previous_elapsed_s = runtime.previous_elapsed_s;
+        self.stalled = runtime.stalled;
+        self.invalidated = runtime.invalidated;
+        self.editor_bond_protection = runtime.editor_bond_protection;
+        self.clip_index = runtime.clip_index;
+        self.playback_speed = runtime.playback_speed;
+        self.strength_scale = runtime.strength_scale;
+        self.enabled = runtime.enabled;
+    }
+
     pub fn voxel_range(&self) -> Range<usize> {
         self.voxel_range.clone()
     }

@@ -70,14 +70,14 @@ pub enum CpuPreconditioner {
 }
 
 /// Inclusive world-space bounds for REV centres (metres).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct WorldBounds {
     pub min: DVec3,
     pub max: DVec3,
 }
 
 /// Temperature, impact, pressure, and dwell thresholds for automatic bonding.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct ThermalBondingRule {
     pub component: u16,
     pub minimum_mass_fraction: f32,
@@ -90,14 +90,14 @@ pub struct ThermalBondingRule {
 }
 
 /// Automatic fusion criterion evaluated from real contact impulses and dwell.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct ThermalFusionRule {
     pub minimum_temperature_kelvin: f32,
     pub minimum_contact_pressure_pa: f32,
     pub minimum_dwell_seconds: f32,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default)]
 struct BondingContactState {
     dwell_seconds: f32,
     impact_qualified: bool,
@@ -147,7 +147,7 @@ struct ThermalScratch {
 }
 
 /// Cumulative material and energy removed by world-boundary deletion.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq)]
 pub struct BoundaryRemovalLedger {
     pub voxel_count: u64,
     pub mass_kg: f64,
@@ -440,6 +440,8 @@ pub struct StepDiagnostics {
     pub timings_ms: std::collections::BTreeMap<&'static str, f64>,
 }
 
+mod checkpoint;
+
 /// Positions are separate arrays; material identity exists only in composition.
 pub struct Scene {
     /// Physical time advanced by the fixed-step solver; never wall-clock time.
@@ -482,6 +484,10 @@ pub struct Scene {
     pub materials: Vec<Material>,
     pub properties: Vec<Material>,
     pub rotations: Vec<Quat>,
+    /// Double-precision cell rotations; `rotations` holds the same values as f32.
+    pub(crate) precise_rotations: Vec<glam::DQuat>,
+    /// Angular velocity of each cell about its own centre, rad/s, world axes.
+    pub angular_velocities: Vec<glam::DVec3>,
     /// Derived connectivity labels; rebuilt only when topology changes.
     pub clusters: Vec<u32>,
     pub broken: usize,
@@ -1108,6 +1114,8 @@ impl Scene {
             materials,
             properties: Vec::with_capacity(spawns.len()),
             rotations: Vec::with_capacity(spawns.len()),
+            precise_rotations: Vec::with_capacity(spawns.len()),
+            angular_velocities: Vec::with_capacity(spawns.len()),
             clusters: Vec::with_capacity(spawns.len()),
             broken: 0,
             cluster_count: 0,
@@ -1193,6 +1201,8 @@ impl Scene {
             scene.axis_targets.push([None; 3]);
             scene.properties.push(material);
             scene.rotations.push(Quat::IDENTITY);
+            scene.precise_rotations.push(glam::DQuat::IDENTITY);
+            scene.angular_velocities.push(glam::DVec3::ZERO);
             scene.clusters.push(0);
             keys.push(key);
         }
@@ -2231,6 +2241,18 @@ impl Scene {
             keep
         });
         old_index = 0;
+        self.precise_rotations.retain(|_| {
+            let keep = keep[old_index];
+            old_index += 1;
+            keep
+        });
+        old_index = 0;
+        self.angular_velocities.retain(|_| {
+            let keep = keep[old_index];
+            old_index += 1;
+            keep
+        });
+        old_index = 0;
         self.clusters.retain(|_| {
             let keep = keep[old_index];
             old_index += 1;
@@ -3035,6 +3057,8 @@ impl Scene {
             materials,
             properties,
             rotations: vec![Quat::IDENTITY; n],
+            precise_rotations: vec![glam::DQuat::IDENTITY; n],
+            angular_velocities: vec![glam::DVec3::ZERO; n],
             clusters: vec![0; n],
             broken: 0,
             cluster_count: 1,

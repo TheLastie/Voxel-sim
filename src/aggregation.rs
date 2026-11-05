@@ -104,7 +104,7 @@ impl fmt::Display for AggregationError {
 
 impl Error for AggregationError {}
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 struct AggregateMember {
     index: usize,
     mass_kg: f64,
@@ -145,7 +145,7 @@ pub(crate) struct RigidMemberTranslationPose {
 /// A spatially coarse mechanical body with the original REV states retained
 /// as body-frame residuals for conservative refinement. The 1 cm REVs and
 /// their material/bond data are not replaced by invented material states.
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct RigidAggregate {
     mass_kg: f64,
     center_of_mass_m: DVec3,

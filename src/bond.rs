@@ -1,6 +1,6 @@
 use glam::Vec3;
 pub const EMPTY: u32 = u32::MAX;
-#[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
 pub struct Bond {
     pub neighbor: u32,
     /// Local-frame stress-free offset established when an adhesive bond forms (m).

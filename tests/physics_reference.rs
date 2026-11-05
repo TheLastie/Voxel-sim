@@ -87,7 +87,6 @@ fn axial_bar_static_elongation_matches_hooke() {
 
 /// Euler-Bernoulli plus Timoshenko shear: F L^3 / (3 E I) + F L / (k G A).
 #[test]
-#[ignore = "open defect: bond shear locks rotation, measured 27% too stiff; see VALIDATION_2026-11-05.md"]
 fn cantilever_tip_deflection_matches_beam_theory() {
     let (iron, props) = material("iron");
     let (nx, ny, nz) = (31, 3, 3);
@@ -237,7 +236,6 @@ fn mean_velocity(scene: &Scene, from: usize) -> Vec3 {
 
 /// Coulomb friction does not depend on how many layers press on the contact.
 #[test]
-#[ignore = "open defect: friction heat of 1 mK tips this iron block and mechanical energy rises; see VALIDATION_2026-11-05.md"]
 fn thick_block_stops_at_the_same_coulomb_distance() {
     let config = config(0.01, 4, [0.0, 0.0, -9.81]);
     let mu = iron_on_stone_mu(f64::from(config.fracture.friction));
@@ -293,7 +291,6 @@ fn tilted_gravity_holds_below_and_accelerates_above_friction_angle() {
 /// A block with its centre of mass past the pivot edge tips about that edge.
 /// Rigid pivot: angular acceleration = torque / inertia about the edge.
 #[test]
-#[ignore = "open defect: torque-driven rotation is locked, iron reaches 1e-5 of this; see VALIDATION_2026-11-05.md"]
 fn block_past_its_tipping_angle_pivots_over_the_edge() {
     let (iron, _) = material("iron");
     let (stone, _) = material("stone");
@@ -323,11 +320,53 @@ fn block_past_its_tipping_angle_pivots_over_the_edge() {
     let height = |scene: &Scene| scene.positions[floor..].iter().map(|p| p.z).sum::<f64>() / count;
     let start = height(&scene);
     run(&mut scene, 10);
-    let (width, tall) = (3.0 * CELL, 5.0 * CELL);
-    let torque = gx * tall * 0.5 - G * width * 0.5;
-    let inertia = (width * width + tall * tall) / 12.0 + (width * width + tall * tall) * 0.25;
-    let angle = 0.5 * (torque / inertia) * 0.1 * 0.1;
-    check("pivot_com_rise", width * 0.5 * angle, height(&scene) - start);
+    // Rigid pendulum about the front row, integrated exactly: the angle is large.
+    let (half_w, half_h) = (1.5 * CELL, 2.5 * CELL);
+    // Mass fills the 4 x 6 cell outline, whose inertia the lattice reproduces.
+    let (side, tall) = (4.0 * CELL, 6.0 * CELL);
+    let inertia = (side * side + tall * tall) / 12.0 + half_w * half_w + half_h * half_h;
+    let (mut angle, mut rate) = (0.0f64, 0.0f64);
+    let dt = 1.0e-5;
+    for _ in 0..(0.1 / dt) as usize {
+        let x = -half_w * angle.cos() + half_h * angle.sin();
+        let z = half_w * angle.sin() + half_h * angle.cos();
+        rate += (gx * z + G * x) / inertia * dt;
+        angle += rate * dt;
+    }
+    let rise = half_w * angle.sin() + half_h * angle.cos() - half_h;
+    check("pivot_com_rise", rise, height(&scene) - start);
+}
+
+/// A resting free body must not gain energy from solver noise.
+#[test]
+fn free_iron_block_at_rest_stays_at_rest() {
+    let (iron, _) = material("iron");
+    let mut cells = Vec::new();
+    for x in 0..5 {
+        for y in 0..5 {
+            for z in 0..5 {
+                cells.push(([x, y, z], iron));
+            }
+        }
+    }
+    let mut scene = build(config(0.01, 4, [0.0; 3]), cells.into_iter());
+    let start = scene.positions.clone();
+    run(&mut scene, 500);
+    let mass: f64 = scene.voxels.iter().map(|v| f64::from(v.mass)).sum();
+    let kinetic: f64 = scene
+        .voxels
+        .iter()
+        .map(|v| 0.5 * f64::from(v.mass) * f64::from(v.velocity.length_squared()))
+        .sum();
+    let moved = scene
+        .positions
+        .iter()
+        .zip(&start)
+        .map(|(a, b)| (*a - *b).length())
+        .fold(0.0, f64::max);
+    eprintln!("REF rest_noise: kinetic={:.3e} J/kg moved={moved:.3e} m", kinetic / mass);
+    assert!(kinetic / mass < 1.0e-10, "resting block gained {} J/kg", kinetic / mass);
+    assert!(moved < 1.0e-6, "resting block moved {moved} m");
 }
 
 /// Infinite-rod step solution: T(x) = Tm - dT/2 erf(x / (2 sqrt(alpha t))).
