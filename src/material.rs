@@ -697,6 +697,85 @@ impl Material {
         );
         ash.surface_friction_coefficient = 0.5;
         table.push(ash);
+
+        // Organic processing (see `crate::recipes`: tanning and decay),
+        // appended after `ash` so every earlier composition id keeps its
+        // meaning. ILLUSTRATIVE engineering values in the right order of
+        // magnitude for wet raw skin, vegetable tannin extract, vegetable-
+        // tanned leather and humus; NOT calibrated material data. `water`
+        // already exists (id 4). Animal tissue (`flesh`, `muscle`) is used as
+        // is. Like those, all four have formation energy zero (the same
+        // reference), so tanning is thermally neutral and the heat of rot
+        // comes from oxygen and carbon dioxide (`builtin_formation_energy`
+        // therefore needs no new entries). The water that drives the recipes
+        // is the `water` component of the REV composition; the
+        // `moisture_content_dry_basis` field is descriptive, as for flesh.
+        // Raw hide: ~64% water by mass (1.8 kg/kg dry), weak, high rate of rot.
+        let mut hide = Self::new(
+            "hide", 1_080.0, 8.0e6, 4.0e6, 2.5e6, 12.0e6, 8.0e6, 3.0e6, 4.0e6, 6.0e6, 3_200.0,
+            0.4, f32::INFINITY, 15_000.0, 10_000.0, f32::INFINITY, 0.0, 0.0,
+        );
+        hide.poisson = 0.45;
+        hide.fracture_mode = FractureMode::Ductile;
+        hide.hardening_modulus = 1.0e6;
+        hide.failure_plastic_strain = 0.4;
+        hide.hardness = 3.0e6;
+        hide.surface_friction_coefficient = 0.5;
+        hide.electrical_conductivity = 0.3;
+        hide.relative_permittivity = 80.0;
+        hide.thermal_expansion_parallel = 60.0e-6;
+        hide.thermal_expansion_perpendicular = 60.0e-6;
+        hide.moisture_content_dry_basis = 1.8;
+        hide.solid_kelvin_voigt_time_s = 0.03;
+        hide.internal_friction_coefficient = 0.3;
+        hide.skeletal_joint_limit_rad = 140.0_f32.to_radians();
+        table.push(hide);
+        // Vegetable tannin (polyphenol extract powder): loose, weak grains.
+        let mut tannin = Self::new(
+            "tannin", 1_300.0, 5.0e6, 5.0e6, 2.0e6, 0.02e6, 0.02e6, 1.0e6, 0.1e6, 0.1e6, 1_500.0,
+            0.15, f32::INFINITY, 1.0, 1.0, f32::INFINITY, 0.0, 0.0,
+        );
+        tannin.surface_friction_coefficient = 0.5;
+        tannin.relative_permittivity = 5.0;
+        tannin.moisture_content_dry_basis = 0.1;
+        table.push(tannin);
+        // Vegetable-tanned leather: stronger and stiffer than wet hide, little
+        // water (0.15 kg/kg dry), resists rot (see the decay recipes). Its heat
+        // capacity is the mass-weighted mean of the tanning reactants (1 kg hide
+        // at 3200 + 0.35 kg tannin at 1500 per 1.35 kg), so tanning, whose
+        // formation-energy heat is zero, leaves the derived temperature alone at
+        // constant internal energy: enthalpy here is `cp*T + h_f` from 0 K, so a
+        // cp mismatch across a reaction would show up as spurious heating.
+        let mut leather = Self::new(
+            "leather", 1_000.0, 150.0e6, 100.0e6, 50.0e6, 25.0e6, 18.0e6, 8.0e6, 12.0e6, 15.0e6,
+            2_759.26, 0.15, f32::INFINITY, 30_000.0, 25_000.0, f32::INFINITY, 0.0, 0.0,
+        );
+        leather.poisson = 0.4;
+        leather.fracture_mode = FractureMode::Ductile;
+        leather.hardening_modulus = 20.0e6;
+        leather.failure_plastic_strain = 0.3;
+        leather.hardness = 10.0e6;
+        leather.surface_friction_coefficient = 0.6;
+        leather.electrical_conductivity = 1.0e-8;
+        leather.relative_permittivity = 4.0;
+        leather.thermal_expansion_parallel = 80.0e-6;
+        leather.thermal_expansion_perpendicular = 80.0e-6;
+        leather.moisture_content_dry_basis = 0.15;
+        leather.solid_kelvin_voigt_time_s = 0.01;
+        leather.internal_friction_coefficient = 0.3;
+        leather.skeletal_joint_limit_rad = 150.0_f32.to_radians();
+        table.push(leather);
+        // Humus: the rot product (organic waste), crumbly with almost no cohesion.
+        let mut humus = Self::new(
+            "humus", 1_200.0, 5.0e6, 5.0e6, 2.0e6, 0.02e6, 0.02e6, 0.5e6, 0.05e6, 0.05e6, 1_900.0,
+            0.25, f32::INFINITY, 1.0, 1.0, f32::INFINITY, 0.0, 0.0,
+        );
+        humus.surface_friction_coefficient = 0.6;
+        humus.electrical_conductivity = 1.0e-3;
+        humus.relative_permittivity = 15.0;
+        humus.moisture_content_dry_basis = 0.3;
+        humus.internal_friction_coefficient = 0.5;
+        table.push(humus);
         Self::restore_builtin_chemistry(&mut table);
         table
     }
@@ -1116,7 +1195,13 @@ mod tests {
         assert_eq!(table[10].name, "oak");
         assert_eq!(table[15].name, "bone");
         assert_eq!(table[16].name, "dry_wood");
-        assert_eq!(table.len(), 21);
+        assert_eq!(table[20].name, "ash");
+        // Organic-processing components are appended after `ash`.
+        assert_eq!(
+            table[21..].iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            ["hide", "tannin", "leather", "humus"]
+        );
+        assert_eq!(table.len(), 25);
         for material in table.iter().take(16) {
             assert_eq!(material.formation_energy_j_per_kg, 0.0, "{}", material.name);
         }
@@ -1186,6 +1271,34 @@ mod tests {
             assert_eq!(a.formation_energy_j_per_kg, b.formation_energy_j_per_kg);
         }
         assert!(loaded[fuel].formation_energy_j_per_kg > 0.0);
+    }
+
+    #[test]
+    fn organic_processing_components_are_complete_and_leather_beats_hide() {
+        let table = Material::table();
+        let get = |name: &str| &table[Material::component_id(name).unwrap() as usize];
+        for name in ["hide", "tannin", "leather", "humus"] {
+            let m = get(name);
+            assert!(m.density > 0.0 && m.heat_capacity > 0.0 && m.thermal_cond > 0.0, "{name}");
+            assert!(m.young > 0.0 && m.shear > 0.0 && m.tensile_strength > 0.0, "{name}");
+            assert!(m.fracture_energy > 0.0 && m.relative_permittivity > 0.0, "{name}");
+            assert!((0.0..=std::f32::consts::PI).contains(&m.skeletal_joint_limit_rad));
+            // No tabulated formation energy: same reference as flesh and muscle.
+            assert_eq!(m.formation_energy_j_per_kg, 0.0, "{name}");
+        }
+        let (hide, leather) = (get("hide"), get("leather"));
+        assert!(leather.tensile_strength > 1.5 * hide.tensile_strength);
+        assert!(leather.young > 5.0 * hide.young);
+        assert!(leather.moisture_content_dry_basis < 0.2 * hide.moisture_content_dry_basis);
+        assert!(get("humus").tensile_strength < 0.01 * hide.tensile_strength);
+        // Restored by name after a round trip, like the other chemistry.
+        let bytes = bincode::serialize(&table).unwrap();
+        let mut loaded: Vec<Material> = bincode::deserialize(&bytes).unwrap();
+        Material::restore_builtin_chemistry(&mut loaded);
+        for (a, b) in table.iter().zip(&loaded) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.formation_energy_j_per_kg, b.formation_energy_j_per_kg);
+        }
     }
 
     #[test]

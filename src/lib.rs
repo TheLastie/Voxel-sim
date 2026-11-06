@@ -4,6 +4,8 @@ mod cell_two_level;
 pub mod bond;
 pub mod collision;
 pub mod combustion;
+pub mod recipe_data;
+pub mod recipes;
 mod contact_constraint;
 pub mod coordinates;
 mod cuda_solver;
