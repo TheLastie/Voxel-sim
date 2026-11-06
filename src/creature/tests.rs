@@ -27,8 +27,14 @@ fn creature_cells() -> Vec<[i32; 3]> {
 }
 
 fn creature_model() -> VoxelModelDocument {
+    creature_model_of(&creature_cells())
+}
+
+/// Same skeleton for any 8 cells: the first four REVs belong to the root bone,
+/// the last four to the limb bone.
+fn creature_model_of(cells: &[[i32; 3]]) -> VoxelModelDocument {
     let mut builder = SceneBuilder::standard();
-    for cell in creature_cells() {
+    for &cell in cells {
         builder = builder.add_voxel(VoxelSpawn::at_cell(cell, 1));
     }
     let scene = builder.build().unwrap();
@@ -65,14 +71,19 @@ fn creature_model() -> VoxelModelDocument {
 
 /// Fixed ground under the creature (REVs 0..8), creature REVs 8..16.
 fn world() -> Scene {
+    world_raised(0)
+}
+
+/// As `world`, with the creature `cells` REV heights above the ground.
+fn world_raised(cells: i32) -> Scene {
     let mut builder = SceneBuilder::standard();
     for x in 0..4 {
         for y in 0..2 {
             builder = builder.add_voxel(VoxelSpawn::at_cell([x, y, -1], 1).fixed());
         }
     }
-    for cell in creature_cells() {
-        builder = builder.add_voxel(VoxelSpawn::at_cell(cell, 1));
+    for [x, y, z] in creature_cells() {
+        builder = builder.add_voxel(VoxelSpawn::at_cell([x, y, z + cells], 1));
     }
     let mut scene = builder.build().unwrap();
     assert_eq!(scene.voxels.len(), 16);
@@ -100,6 +111,12 @@ fn organs() -> OrganParams {
 fn zero_basal(mut o: OrganParams) -> OrganParams {
     o.basal_power_w = 0.0;
     o
+}
+
+fn bound_layout(scene: &Scene, feet: Vec<usize>) -> SensorLayout {
+    let mut layout = SensorLayout::new(&scene.skeletal_actuators[0], feet).unwrap();
+    layout.bind(scene).unwrap();
+    layout
 }
 
 // ----- 1. resource ledger --------------------------------------------------
@@ -253,9 +270,9 @@ fn horn_fit_recovers_a_known_rotation() {
 fn sensors_read_feet_orientation_joints_and_internal_state_from_the_scene() {
     let mut scene = world();
     let ledger = ResourceLedger::new(organs()).unwrap();
-    let layout = SensorLayout::new(&scene.skeletal_actuators[0], vec![0, 4]).unwrap();
+    let layout = bound_layout(&scene, vec![0, 4]);
     assert_eq!(layout.joint_count(), 1);
-    assert_eq!(layout.input_count(), 2 + 3 + 3 + 1 + 2);
+    assert_eq!(layout.input_count(), 2 * 2 + 3 + 3 + 1 + 4);
 
     let r = SensorReading::read(&scene, &layout, &ledger).unwrap();
     assert_eq!(r.foot_contact, vec![true, true], "feet rest on the ground");
@@ -306,7 +323,7 @@ fn sensors_read_feet_orientation_joints_and_internal_state_from_the_scene() {
 fn sensor_layout_rejects_stale_topology() {
     let mut scene = world();
     let ledger = ResourceLedger::new(organs()).unwrap();
-    let layout = SensorLayout::new(&scene.skeletal_actuators[0], vec![0]).unwrap();
+    let layout = bound_layout(&scene, vec![0]);
     scene.positions.pop();
     assert!(SensorReading::read(&scene, &layout, &ledger).is_err());
     let scene = world();
@@ -591,13 +608,8 @@ fn learning_does_not_touch_the_genome_and_offspring_start_from_scratch() {
 fn reading(contacts: &[bool]) -> SensorReading {
     SensorReading {
         foot_contact: contacts.to_vec(),
-        body_orientation: None,
-        up_in_body: None,
-        angular_velocity_rad_s: Vec3::ZERO,
-        com_velocity_m_s: Vec3::ZERO,
-        joints: Vec::new(),
         stored_energy_fraction: 1.0,
-        hunger: 0.0,
+        ..SensorReading::empty(contacts.len())
     }
 }
 
@@ -739,4 +751,406 @@ fn a_draining_store_weakens_the_creature_without_overdraft() {
     if let Some(first_zero) = applied.iter().position(|&a| a == 0.0) {
         assert!(debits[first_zero..].iter().all(|&d| d == 0.0));
     }
+}
+
+// ----- 6. sensors from real scene state ---------------------------------------
+
+const COLUMN: usize = 4;
+
+/// A 2 x 2 x 2 block (bottom layer = root bone, top layer = limb bone) resting
+/// on fixed ground, `raised` REV heights up. Creature REVs are 4..12.
+fn column_world(raised: i32) -> Scene {
+    let cells: Vec<[i32; 3]> = [0, 1]
+        .iter()
+        .flat_map(|&z| [[0, 0], [1, 0], [0, 1], [1, 1]].map(|[x, y]| [x, y, z]))
+        .collect();
+    let mut builder = SceneBuilder::standard();
+    for x in 0..2 {
+        for y in 0..2 {
+            builder = builder.add_voxel(VoxelSpawn::at_cell([x, y, -1], 1).fixed());
+        }
+    }
+    for [x, y, z] in &cells {
+        builder = builder.add_voxel(VoxelSpawn::at_cell([*x, *y, z + raised], 1));
+    }
+    let mut scene = builder.build().unwrap();
+    let actuator =
+        SkeletalActuator::new(creature_model_of(&cells), COLUMN..COLUMN + 8, Quat::IDENTITY, 12).unwrap();
+    scene.skeletal_actuators.push(actuator);
+    scene.config.fixed_dt = 0.01;
+    scene
+}
+
+fn creature_on(scene: &Scene, feet: Vec<usize>) -> Creature {
+    let mut o = organs();
+    o.store_capacity_j = 1.0e6;
+    let layout = SensorLayout::new(&scene.skeletal_actuators[0], feet).unwrap();
+    let genome = genome_for_body("sensor-fixture", &layout, o, 5, 8, 1).unwrap();
+    Creature::new(genome, None, scene, 0).unwrap()
+}
+
+#[test]
+fn every_sensor_has_a_stable_id_a_unit_and_a_cost_and_reads_are_noise_free() {
+    let scene = world();
+    let ledger = ResourceLedger::new(organs()).unwrap();
+    let layout = bound_layout(&scene, vec![0, 4]);
+    let catalog = layout.catalog();
+    let a = SensorReading::read(&scene, &layout, &ledger).unwrap();
+    let b = SensorReading::read(&scene, &layout, &ledger).unwrap();
+    assert_eq!(a, b, "no noise and no hidden state");
+    assert_eq!(a.values().len(), catalog.len());
+    let labels: Vec<String> = catalog.iter().map(|d| d.id.label()).collect();
+    let unique: std::collections::HashSet<_> = labels.iter().collect();
+    assert_eq!(unique.len(), labels.len(), "ids are unique: {labels:?}");
+    assert!(labels.contains(&"foot_normal_load/rev=4".to_string()));
+    assert!(labels.contains(&"support_load".to_string()));
+    assert!(labels.contains(&"joint_angle/bone=1".to_string()));
+    assert!(labels.contains(&"muscle_load/bone=0".to_string()));
+    let unit_of = |label: &str| catalog.iter().find(|d| d.id.label() == label).unwrap().unit;
+    assert_eq!(unit_of("foot_normal_load/rev=0"), "N");
+    assert_eq!(unit_of("com_height"), "m");
+    assert_eq!(unit_of("body_tilt"), "rad");
+    assert_eq!(unit_of("tissue_stress/bone=1"), "Pa");
+    assert_eq!(unit_of("angular_velocity/x"), "rad/s");
+
+    // The id of a foot is its creature-local REV index, not a scene index.
+    let mut builder = SceneBuilder::standard();
+    for x in 0..4 {
+        for y in 0..3 {
+            builder = builder.add_voxel(VoxelSpawn::at_cell([x, y, -1], 1).fixed());
+        }
+    }
+    for cell in creature_cells() {
+        builder = builder.add_voxel(VoxelSpawn::at_cell(cell, 1));
+    }
+    let mut shifted = builder.build().unwrap();
+    let total = shifted.voxels.len();
+    shifted.skeletal_actuators.push(
+        SkeletalActuator::new(creature_model(), total - 8..total, Quat::IDENTITY, total).unwrap(),
+    );
+    assert_ne!(shifted.skeletal_actuators[0].voxel_range().start, GROUND);
+    let moved_labels: Vec<String> = bound_layout(&shifted, vec![0, 4])
+        .catalog()
+        .iter()
+        .map(|d| d.id.label())
+        .collect();
+    assert_eq!(moved_labels, labels, "ids follow the model's REVs, not the scene block");
+
+    assert!(a.is_finite());
+    assert_eq!(a.cost.reads, 1);
+    assert_eq!(a.cost.values, catalog.len() as u64);
+    assert!(a.cost.rev_reads > 0 && a.cost.bond_reads > 0 && a.cost.pair_tests > 0);
+    assert_eq!(a.cost.operations(), a.cost.rev_reads + a.cost.bond_reads + a.cost.pair_tests);
+    let mut unbound = SensorLayout::new(&scene.skeletal_actuators[0], vec![0]).unwrap();
+    assert!(SensorReading::read(&scene, &unbound, &ledger).is_err(), "unbound layouts are refused");
+    unbound.bind(&scene).unwrap();
+    assert!(unbound.is_bound());
+}
+
+#[test]
+fn foot_load_shares_the_support_measured_by_momentum_balance() {
+    let mut passive = PassiveController;
+    let mut step = |s: &mut Scene| solver::step(s, &mut None);
+
+    // One layer on the ground: each of the 8 foot REVs carries its own weight.
+    let mut scene = world_raised(3);
+    scene.config.fixed_dt = 0.01;
+    let mut creature = creature_on(&scene, (0..8).collect());
+    let m_g = f64::from(scene.voxels[GROUND].mass) * 9.81;
+    let mut readings = Vec::new();
+    for _ in 0..20 {
+        creature.drive_step(&mut scene, &mut passive, &mut step).unwrap();
+        readings.push(creature.sense(&scene).unwrap());
+    }
+    let falling = &readings[2];
+    assert!(falling.foot_contact.iter().all(|&c| !c));
+    assert!(
+        falling.support_load_n == 0.0 && falling.foot_normal_load_n.iter().all(|&l| l == 0.0),
+        "free fall carries no load: {:?}",
+        falling.foot_normal_load_n
+    );
+    let landing = readings.iter().map(|r| r.foot_normal_load_n[0]).fold(0.0f32, f32::max);
+    assert!(f64::from(landing) > 3.0 * m_g, "landing impact load {landing} vs {m_g}");
+    let rest = readings.last().unwrap();
+    assert!(rest.foot_contact.iter().all(|&c| c));
+    for load in &rest.foot_normal_load_n {
+        assert!((f64::from(*load) / m_g - 1.0).abs() < 0.02, "foot load {load} vs m g {m_g}");
+    }
+    assert!((rest.support_load_n / rest.body_weight_n - 1.0).abs() < 0.02, "support carries the weight");
+    assert!(rest.inertia_included);
+    // The same body read without a measured acceleration (static assumption):
+    // resting loads agree, a hanging body has no feet on anything and no load.
+    let plain = SensorReading::read(&scene, creature.sensor_layout(), creature.ledger()).unwrap();
+    assert!(!plain.inertia_included);
+    assert!((plain.support_load_n / plain.body_weight_n - 1.0).abs() < 0.02);
+    let hanging = world_raised(3);
+    let plain = SensorReading::read(&hanging, creature.sensor_layout(), creature.ledger()).unwrap();
+    assert_eq!(plain.support_load_n, 0.0, "nothing touches, nothing supports");
+
+    // A two-layer block: the load of the top layer reaches the feet through bonds.
+    let mut scene = column_world(0);
+    let mut creature = creature_on(&scene, vec![0, 1, 2, 3]);
+    let m_g = f64::from(scene.voxels[COLUMN].mass) * 9.81;
+    for _ in 0..40 {
+        creature.drive_step(&mut scene, &mut passive, &mut step).unwrap();
+    }
+    let r = creature.sense(&scene).unwrap();
+    eprintln!(
+        "column foot loads / (m g) = {:?}",
+        r.foot_normal_load_n.iter().map(|l| f64::from(*l) / m_g).collect::<Vec<_>>()
+    );
+    for load in &r.foot_normal_load_n {
+        assert!((f64::from(*load) / m_g - 2.0).abs() < 0.1, "column foot load {load} vs 2 m g {m_g}");
+    }
+    let total: f32 = r.foot_normal_load_n.iter().sum();
+    assert!((total / r.body_weight_n - 1.0).abs() < 0.05, "feet carry the weight: {total} vs {}", r.body_weight_n);
+}
+
+#[test]
+fn height_tilt_and_pose_error_follow_the_scene() {
+    let mut scene = column_world(2);
+    let ledger = ResourceLedger::new(organs()).unwrap();
+    let layout = bound_layout(&scene, vec![0]);
+    let r = SensorReading::read(&scene, &layout, &ledger).unwrap();
+    // Layers at cells 2 and 3: centres 2.5 and 3.5 REVs up, so the block centre is at 3 REVs.
+    assert!((r.com_height_m.unwrap() - 0.03).abs() < 1e-6, "{:?}", r.com_height_m);
+    assert!((r.body_height_m.unwrap() - 0.005).abs() < 1e-6, "centre half a REV above the lowest REV");
+    assert!(r.tilt_rad.unwrap() < 1e-6);
+    assert!(r.pose_error_rms_m.unwrap() < 1e-9, "the rest pose is the commanded pose at t = 0");
+
+    // Turn the block 0.2 rad about the horizontal y axis through its centre.
+    let centre = (COLUMN..COLUMN + 8).map(|i| scene.positions[i]).sum::<DVec3>() / 8.0;
+    let turn = DQuat::from_rotation_y(0.2);
+    for i in COLUMN..COLUMN + 8 {
+        scene.positions[i] = centre + turn * (scene.positions[i] - centre);
+    }
+    let r = SensorReading::read(&scene, &layout, &ledger).unwrap();
+    assert!((r.tilt_rad.unwrap() - 0.2).abs() < 1e-4, "{:?}", r.tilt_rad);
+
+    // Push one limb REV 3 mm out of the commanded pose: the pose error is the
+    // distance to the commanded position in the comoving frame.
+    let mut scene = column_world(0);
+    scene.positions[COLUMN + 5].x += 0.003;
+    let errors = scene.skeletal_actuators[0]
+        .pose_error_m(&scene.positions, &scene.voxels, &scene.rotations)
+        .unwrap();
+    assert!((f64::from(errors[5]) - 0.003 * 7.0 / 8.0).abs() < 1e-6, "{}", errors[5]);
+    assert!((f64::from(errors[0]) - 0.003 / 8.0).abs() < 1e-6);
+    let r = SensorReading::read(&scene, &bound_layout(&scene, vec![0]), &ledger).unwrap();
+    let limb = r.muscles.iter().find(|m| m.bone_index == 1).unwrap();
+    let root = r.muscles.iter().find(|m| m.bone_index == 0).unwrap();
+    assert!(limb.pose_error_rms_m.unwrap() > 0.001);
+    assert!(limb.pose_error_rms_m.unwrap() > 2.0 * root.pose_error_rms_m.unwrap());
+}
+
+#[test]
+fn muscle_load_and_tissue_stress_come_from_the_actuator_and_the_bonds() {
+    let mut scene = world();
+    scene.config.fixed_dt = 0.01;
+    let mut creature = small_creature(&scene, 1.0e6, 0.5);
+    let mut step = |s: &mut Scene| solver::step(s, &mut None);
+    let mut controller = RecordedAnimationController;
+    for _ in 0..6 {
+        creature.drive_step(&mut scene, &mut controller, &mut step).unwrap();
+    }
+    let r = creature.sense(&scene).unwrap();
+    let actuator = &scene.skeletal_actuators[0];
+    let l1: f32 = actuator.last_forces_n().iter().map(|f| f.length()).sum();
+    let reported: f32 = r.muscles.iter().map(|m| m.actuator_load_n).sum();
+    assert!(l1 > 0.0 && (reported - l1).abs() <= 1e-4 * l1, "muscle load {reported} vs actuator {l1}");
+
+    // Independent largest bond stress over the bonds that touch the creature.
+    let range = actuator.voxel_range();
+    let mut expected = 0.0f32;
+    for axis in 0..3 {
+        for owner in 0..scene.voxels.len() {
+            let j = scene.workspace[axis][owner].rest_neighbor;
+            if j == crate::bond::EMPTY || scene.bonds[axis][owner].neighbor == crate::bond::EMPTY {
+                continue;
+            }
+            if range.contains(&owner) || range.contains(&(j as usize)) {
+                let force = scene.workspace[axis][owner].last_force.length();
+                expected = expected.max(force / (CELL_M * CELL_M) as f32);
+            }
+        }
+    }
+    let peak = r.muscles.iter().map(|m| m.peak_tissue_stress_pa).fold(0.0f32, f32::max);
+    assert!(expected > 0.0, "driving loads the bonds");
+    assert!((peak - expected).abs() <= 1e-4 * expected, "stress {peak} vs {expected}");
+    let strain = r.muscles.iter().map(|m| m.peak_tissue_strain).fold(0.0f32, f32::max);
+    assert!(strain > 0.0 && strain < 0.1, "strain {strain}");
+
+    // A relaxed body has no actuator load.
+    let mut relaxed = world();
+    relaxed.config.fixed_dt = 0.01;
+    let mut c2 = small_creature(&relaxed, 1.0e6, 0.5);
+    c2.drive_step(&mut relaxed, &mut PassiveController, &mut step).unwrap();
+    let r2 = c2.sense(&relaxed).unwrap();
+    assert!(r2.muscles.iter().all(|m| m.actuator_load_n == 0.0));
+}
+
+#[test]
+fn a_driven_step_reports_the_cost_and_time_of_sensing_control_and_accounting() {
+    let mut scene = world();
+    scene.config.fixed_dt = 0.01;
+    let mut creature = small_creature(&scene, 1.0e6, 0.5);
+    let mut controller = creature.spiking_controller().unwrap();
+    let mut step = |s: &mut Scene| solver::step(s, &mut None);
+    let mut spent = SensorCost::default();
+    for _ in 0..3 {
+        let r = creature.drive_step(&mut scene, &mut controller, &mut step).unwrap();
+        spent.accumulate(r.sensor_cost);
+        assert!(r.timing.solver_s > 0.0);
+    }
+    assert_eq!(spent, creature.sensor_cost_total());
+    assert_eq!(creature.sensor_cost_total().reads, 3);
+    assert_eq!(controller.network().cost().steps, 30, "the network runs at its own 1 ms step");
+}
+
+// ----- 7. learning a simple task from real sensor frames ------------------------
+
+/// Sensor frames of a real physical episode: the creature is dropped from
+/// `cells` REV heights with relaxed muscles and lands. One frame per fixed step.
+fn drop_frames(cells: i32, steps: usize) -> Vec<SensorReading> {
+    let mut scene = world_raised(cells);
+    scene.config.fixed_dt = 0.01;
+    let mut creature = small_creature(&scene, 1.0e6, 0.5);
+    let mut passive = PassiveController;
+    let mut step = |s: &mut Scene| solver::step(s, &mut None);
+    let mut frames = Vec::new();
+    for _ in 0..steps {
+        creature.drive_step(&mut scene, &mut passive, &mut step).unwrap();
+        frames.push(creature.sense(&scene).unwrap());
+    }
+    frames
+}
+
+fn learner(seed: u64) -> Creature {
+    let scene = world();
+    let mut o = organs();
+    o.store_capacity_j = 1.0e6;
+    let layout = SensorLayout::new(&scene.skeletal_actuators[0], vec![0, 4]).unwrap();
+    // Two muscle channels; the task trains channel 1 only.
+    let mut genome = genome_for_body("learner", &layout, o, seed, 12, 2).unwrap();
+    // Start with most neurons tonically active: a silent network has a flat
+    // reward landscape (no spikes, nothing to improve on).
+    genome.network.init_bias_fraction = 0.8;
+    Creature::new(genome, None, &scene, 0).unwrap()
+}
+
+fn loaded_task(frames: &[SensorReading]) -> ActivationTask {
+    let weight_per_rev = frames[0].body_weight_n / 8.0;
+    ActivationTask::new(
+        1,
+        SensorCondition::FootLoadAtLeast {
+            foot: 0,
+            newtons: 0.5 * weight_per_rev,
+        },
+    )
+}
+
+#[test]
+fn a_chosen_muscle_learns_to_follow_a_sensor_condition_and_the_genome_is_unchanged() {
+    let train = drop_frames(6, 40);
+    let held_out = drop_frames(4, 40);
+    let task = loaded_task(&train);
+    let airborne = train.iter().filter(|f| !task.condition.holds(f)).count();
+    eprintln!("train frames: {airborne} unloaded, {} loaded", train.len() - airborne);
+    assert!(airborne > task.settle_frames + 3 && train.len() - airborne > 10, "both classes occur in the physics");
+    assert!(task.condition.holds(train.last().unwrap()) && !task.condition.holds(&train[2]));
+
+    let mut creature = learner(31);
+    let genome_before = serde_json::to_string(creature.genome()).unwrap();
+    let learned_before = creature.learned().clone();
+    let layout = creature.genome().network.clone();
+    let dt = 0.01;
+    let held_before = task.reward(&layout, &learned_before, &held_out, dt).unwrap();
+
+    let report = creature.learn_activation_task(&task, &train, dt, 7, 300).unwrap();
+    let held_after = task.reward(&layout, creature.learned(), &held_out, dt).unwrap();
+    eprintln!(
+        "task reward {:.4} -> {:.4} (accepted {}/{}); held-out episode {:.4} -> {:.4}; a constant output scores -0.5",
+        report.reward_before, report.reward_after, report.accepted, report.trials, held_before, held_after
+    );
+    assert_eq!(report.trials, 300);
+    assert!(report.accepted > 0 && report.accepted <= 300);
+    assert!(report.reward_after > report.reward_before, "learning improves the reward");
+    assert!(report.reward_after > -0.35, "better than any constant activation (-0.5)");
+    assert!(held_after > held_before, "the improvement carries to a new drop");
+    assert!(held_after > -0.45, "held-out reward beats a constant activation");
+
+    // Learning moved the learned state and nothing else.
+    assert_ne!(creature.learned().weights, learned_before.weights);
+    assert_eq!(creature.learned().accepted_updates as usize, report.accepted);
+    assert_eq!(creature.learned().trials, 300);
+    creature.learned().validate_against(&layout).unwrap();
+    assert_eq!(serde_json::to_string(creature.genome()).unwrap(), genome_before);
+    assert_eq!(creature.genome().network.init_seed, learned_before_seed(&creature));
+
+    // Deterministic for a fixed seed; another seed takes another path.
+    let mut again = learner(31);
+    let report2 = again.learn_activation_task(&task, &train, dt, 7, 300).unwrap();
+    assert_eq!(report2, report);
+    assert_eq!(again.learned(), creature.learned());
+    let mut other = learner(31);
+    other.learn_activation_task(&task, &train, dt, 8, 300).unwrap();
+    assert_ne!(other.learned().weights, creature.learned().weights);
+
+    // A child inherits the genome, not what the parent learned.
+    let child = Creature::new(creature.genome().offspring(5).unwrap(), None, &world(), 0).unwrap();
+    assert_eq!(child.learned().accepted_updates, 0);
+    assert_ne!(child.learned().weights, creature.learned().weights);
+}
+
+fn learned_before_seed(creature: &Creature) -> u64 {
+    creature.genome().network.init_seed
+}
+
+#[test]
+fn a_task_without_both_classes_or_with_a_bad_channel_is_refused() {
+    let frames = drop_frames(6, 40);
+    let creature = learner(3);
+    let layout = creature.genome().network.clone();
+    let learned = creature.learned().clone();
+    let never = ActivationTask::new(1, SensorCondition::FootLoadAtLeast { foot: 0, newtons: 1.0e6 });
+    assert!(never.reward(&layout, &learned, &frames, 0.01).is_err());
+    let bad_channel = ActivationTask::new(5, SensorCondition::TiltAtLeast { rad: 0.1 });
+    assert!(bad_channel.reward(&layout, &learned, &frames, 0.01).is_err());
+    let missing_foot = ActivationTask::new(0, SensorCondition::FootLoadAtLeast { foot: 9, newtons: 0.0 });
+    assert!(!missing_foot.condition.holds(&frames[0]));
+}
+
+// ----- 8. energy path through the scene -----------------------------------------
+
+#[test]
+fn muscle_losses_reach_the_muscle_revs_as_internal_energy_and_the_books_balance() {
+    let mut scene = world();
+    scene.config.fixed_dt = 0.01;
+    start_sliding(&mut scene, 0.3);
+    let mut creature = small_creature(&scene, 1.0e6, 0.5);
+    let mut controller = creature.spiking_controller().unwrap();
+    let internal = |s: &Scene| -> f64 {
+        (GROUND..GROUND + 8).map(|i| s.voxels[i].total_internal_energy_j()).sum()
+    };
+    let stored0 = creature.ledger().stored_j();
+    let (mut debited, mut net, mut heat, mut deposited) = (0.0, 0.0, 0.0, 0.0);
+    for _ in 0..12 {
+        // The closure notes the internal energy the moment the solver is done.
+        let mut after_solver = 0.0;
+        let mut step = |s: &mut Scene| {
+            solver::step(s, &mut None);
+            after_solver = internal(s);
+        };
+        let r = creature.drive_step(&mut scene, &mut controller, &mut step).unwrap();
+        deposited += internal(&scene) - after_solver;
+        debited += r.outcome.debited_j;
+        net += r.outcome.net_mechanical_work_j;
+        heat += r.outcome.heat_per_rev_j.iter().sum::<f64>();
+        assert_eq!(r.outcome.unfunded_work_j, 0.0);
+    }
+    assert!(heat > 0.0 && net.abs() < heat, "mostly losses: net {net:e} J, heat {heat:e} J");
+    assert!((deposited - heat).abs() <= 1e-9 * heat, "heat in the REVs {deposited:e} vs ledger {heat:e}");
+    assert!((stored0 - creature.ledger().stored_j() - debited).abs() <= 1e-12 * stored0);
+    assert!((debited - (net + heat)).abs() <= 1e-9 * debited, "store drop = work + heat");
+    assert!((creature.ledger().heat_total_j() - heat).abs() <= 1e-9 * heat);
 }
