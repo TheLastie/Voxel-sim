@@ -505,7 +505,9 @@ impl TwoLevel {
         let data = &self.levels[level];
         let Some(transfer) = &data.transfer else {
             let (work, _) = works.split_first_mut().expect("bottom work");
+            let started = std::time::Instant::now();
             self.bottom.solve(r, z, &mut work.coarse_work);
+            crate::solver::CELL_PROFILE[7].fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             for (value, mask) in z.iter_mut().zip(&data.masks) {
                 for p in 0..6 {
                     value[p] *= mask[p];

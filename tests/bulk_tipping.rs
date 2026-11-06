@@ -53,8 +53,8 @@ fn tip(width: i32, height: i32, steps: usize) -> (f64, f64, f64) {
     let p = &solver::CELL_PROFILE;
     let ms = |k: usize| p[k].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1.0e6 / steps as f64;
     eprintln!(
-        "  PHASES per step: assemble={:.0} build={:.0} cg={:.0} (matrix={:.0} precondition={:.0}) ms",
-        ms(0), ms(1), ms(2), ms(5), ms(6)
+        "  PHASES per step: assemble={:.0} build={:.0} cg={:.0} (matrix={:.0} precondition={:.0} of which bottom={:.0}) ms",
+        ms(0), ms(1), ms(2), ms(5), ms(6), ms(7)
     );
     // Rigid block pivoting about its front bottom edge, integrated exactly.
     let (w, h) = (f64::from(width) * 0.01, f64::from(height) * 0.01);
