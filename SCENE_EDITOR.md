@@ -87,3 +87,33 @@ Pause (Space) останавливает время и оставляет пол
 совпадает с непрерывным в пределах допуска решателя (в тесте — до 1e-6 м за 20 шагов),
 а не побитово. Из GUI проверены только тест меню и тест файла; запуск в окне редактора
 не выполнялся.
+
+## Chemistry, run panel and creature inspector
+
+These controls call the same engine API as the MCP tools of the same name
+(`mcp/README.md`).
+
+- **Inspector > Chemistry** (scene open; collapsed by default): *Reactions on/off*,
+  *Interval (s)* (simulated seconds between reaction updates, `0` = every step),
+  *Load recipe…* (pick a recipe JSON such as `recipes/wood_rot.json`; it replaces
+  the built-in recipes for this scene) and *Built-in* (back to the built-in
+  recipes). Settings are saved at once in `<scene>.chemistry.json` beside the
+  scene (an unsaved scene keeps them in memory until it is saved) and handed to
+  the scene when the simulation starts. Changes need the authored scene, so press
+  R first if the simulation has run. Errors, such as a recipe that does not parse
+  or names a missing material, appear in the status bar and change nothing.
+- **Project dock > Run** shows state (Run, Pause, Failed), measured world speed,
+  backlog, the worker cost per 10 ms of physics as latest, p50, p95 and max over
+  the last 128 batches, the active mechanical REV count and the solver mode (cell
+  rotations or translation only, from `solver::uses_cell_rotations`).
+- **Project dock > Creature** exists only when `<scene>.creatures.json` lists a
+  creature that fits the scene. It is read-only: resource ledger, sensor channels
+  with units (paged), sensor and network cost counters. The editor does not drive
+  creatures, so the ledger shows the birth state and the network is not running;
+  values are read while the scene is not owned by the physics worker and marked
+  `(stale)` otherwise.
+- **F1** lists every key the event loop handles; a test fails if a key is added
+  to `src/main.rs` without a help row (or an explained exception).
+
+Layout of all of these is tested at 1920×1009 and 1280×720. The real window was
+not opened or looked at for this work.

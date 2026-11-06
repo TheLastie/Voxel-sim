@@ -8030,6 +8030,25 @@ thread_local! {
     pub(crate) static FORCE_CELL_DOFS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Read-only: REVs the solver counts as mechanical (not fixed, not in a rigid
+/// aggregate). This is the number `decide_cell_dofs` compares with its limit.
+pub fn mechanical_rev_count(scene: &Scene) -> usize {
+    scene
+        .voxels
+        .iter()
+        .enumerate()
+        .filter(|(i, voxel)| !voxel.kinematic && scene.aggregate_of[*i].is_none())
+        .count()
+}
+
+/// Read-only: whether the solver uses cell rotations (true) or the
+/// translation-only solve (false) for this scene, as decided by
+/// `decide_cell_dofs` (including the `VOXEL_FACE_CELLS` / `VOXEL_BOND_ONLY`
+/// overrides). Does not step or change the scene.
+pub fn uses_cell_rotations(scene: &Scene) -> bool {
+    decide_cell_dofs(scene)
+}
+
 fn decide_cell_dofs(scene: &Scene) -> bool {
     #[cfg(test)]
     if let Some(forced) = FORCE_CELL_DOFS.with(std::cell::Cell::get) {

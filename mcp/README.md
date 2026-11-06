@@ -63,6 +63,31 @@ existing directory beneath that root. Parent directories are never created.
   Batching does not add controls for changing the live editor or physics state;
   it only combines the saved-file tools and read-only telemetry queries listed
   here.
+- `get_run_panel` — read-only. The values of the editor's **Run** tab: state
+  (`Run`, `Pause`, `Failed`), measured world speed, backlog, worker cost per
+  10 ms of physics (latest, p50, p95, max over the last 128 published batches;
+  full worker cost, not the solver alone), active mechanical REV count and
+  solver mode (`cell_rotations` or `translation_only`). The editor publishes
+  the panel four times a second; the reply includes `age_ms`. It errors when no
+  editor runs or nothing has been published, and never invents values.
+- `get_scene_chemistry`, `set_scene_chemistry` — the editor's **Chemistry**
+  section. Settings (reactions on or off, interval in simulated seconds, recipe
+  file) live in `<scene>.chemistry.json` beside the `.vxscene`; a scene without
+  the file has reactions off and the built-in recipes. `set_scene_chemistry`
+  takes any of `enabled`, `interval_s`, `recipe_path` (a recipe JSON such as
+  `recipes/wood_rot.json`, which replaces the built-in recipes) or
+  `use_builtin_recipes`; it parses the recipe against the scene's materials and
+  applies the result to a scratch scene before writing, and updates the
+  settings file in place and atomically (it is a settings file, not an authored
+  asset). It never edits the `.vxscene`. A running editor reads the file when
+  it opens the scene.
+- `inspect_creatures` — read-only creature inspector for the scene's creatures,
+  listed in `<scene>.creatures.json` (name, skeletal actuator index, genome,
+  optional learned state). Reports the resource ledger (stored energy, work,
+  heat), every sensor channel with unit and value, sensor read counters and the
+  network size and counters. No file means no creature and an empty list.
+  Inspecting counts as no creature read. The editor does not drive creatures, so
+  a ledger shows the birth state and the network counters are `null`.
 - `author_animation` — create a root, ordered child-bone hierarchy, named clip,
   quaternion keyframes, and automatic REV weights in one call. The source model
   stays unchanged and the result is written as a new validated `.vxm`.

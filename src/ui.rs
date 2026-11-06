@@ -2,6 +2,9 @@ use crate::scene::SceneConfig;
 use crate::tool::Shape;
 use glam::Vec3;
 use std::collections::BTreeMap;
+use voxel_physics_lab::creature_inspector::CreatureInspection;
+use voxel_physics_lab::run_panel::RunPanelSnapshot;
+use voxel_physics_lab::scene_chemistry::{interval_text, recipe_name, ChemistrySettings};
 use voxel_physics_lab::scene_welding::ThermalBondingSettings;
 use winit::keyboard::KeyCode;
 const MAX_PUSH_FORCE_N: f32 = 15_000.0;
@@ -30,6 +33,10 @@ pub enum HelpScope {
     Model,
     SceneAndModel,
     InspectorField,
+    /// Generated world with a character (F2, F6).
+    World,
+    /// Physics-lab tool shapes.
+    Lab,
 }
 
 impl HelpScope {
@@ -40,6 +47,8 @@ impl HelpScope {
             HelpScope::Model => "model",
             HelpScope::SceneAndModel => "scene, model",
             HelpScope::InspectorField => "inspector field",
+            HelpScope::World => "world",
+            HelpScope::Lab => "lab",
         }
     }
 }
@@ -96,6 +105,20 @@ pub const HELP_SHORTCUTS: &[HelpEntry] = &[
         HelpScope::Always,
     ),
     fixed_help("F", &[KeyCode::KeyF], "Free camera on or off", HelpScope::Always),
+    fixed_help(
+        "Ctrl",
+        &[KeyCode::ControlLeft, KeyCode::ControlRight],
+        "Fly down / crouch in a world",
+        HelpScope::Always,
+    ),
+    fixed_help("F2", &[KeyCode::F2], "Switch editor and play workspace", HelpScope::Always),
+    fixed_help("F6", &[KeyCode::F6], "Start world physics", HelpScope::World),
+    fixed_help(
+        "1 2 3 4",
+        &[KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4],
+        "Choose the tool shape",
+        HelpScope::Lab,
+    ),
     fixed_help(
         "Arrows",
         &[KeyCode::ArrowLeft, KeyCode::ArrowRight, KeyCode::ArrowUp, KeyCode::ArrowDown],
@@ -256,7 +279,7 @@ pub struct Ui {
     scene_inspector_scroll: f32,
     inspector_scroll_dragging: bool,
     scene_physics: ScenePhysicsValues,
-    scene_inspector_collapsed: [bool; 5],
+    scene_inspector_collapsed: [bool; 6],
     view_right: Vec3,
     view_up: Vec3,
     pub selected_scene_model: Option<usize>,
@@ -313,6 +336,16 @@ pub struct Ui {
     pub physics_failed: bool,
     /// Keyboard shortcut reference (F1).
     pub help_open: bool,
+    /// Latest run-panel readings (Run tab of the project dock); `None` until published.
+    pub run_panel: Option<RunPanelSnapshot>,
+    /// Chemistry settings of the open scene, shown in the Chemistry section.
+    pub scene_chemistry: ChemistrySettings,
+    /// Creatures of the open scene. Empty means the Creature tab does not exist.
+    creature_inspections: Vec<CreatureInspection>,
+    selected_creature: usize,
+    creature_sensor_page: usize,
+    /// The scene is owned by the physics worker, so the creature values are from before it started.
+    creature_stale: bool,
     pub walk_speed_mps: f32,
     pub look_sensitivity: f32,
     paused_before_menu: bool,
@@ -450,6 +483,16 @@ pub enum UiAction {
     LoadSceneMaterial,
     SaveSceneMaterial,
     CreateSceneMaterial,
+    /// Turn the scene's reactions on or off (Chemistry section).
+    SetChemistryEnabled(bool),
+    /// Simulated seconds between reaction updates; 0 reacts at every step.
+    SetChemistryInterval {
+        seconds: f64,
+    },
+    /// Pick a recipe JSON with a file dialog and load it for the scene.
+    ChooseChemistryRecipe,
+    /// Go back to the built-in recipes.
+    UseBuiltinChemistryRecipes,
     CreateImpactScene {
         side: usize,
     },
@@ -489,6 +532,7 @@ enum SceneInputTarget {
     Velocity,
     Force,
     InitialTemperature,
+    ChemistryInterval,
 }
 
 #[derive(Clone, Debug)]
@@ -530,6 +574,7 @@ enum SceneInspectorSection {
     Dynamics,
     Material,
     Welding,
+    Chemistry,
     Simulation,
 }
 
@@ -547,6 +592,10 @@ enum SceneInspectorItem {
     MaterialActions,
     WeldingToggle,
     WeldingConfigure,
+    ChemistryToggle,
+    ChemistryInterval,
+    ChemistryRecipe,
+    ChemistryStatus,
     PhysicsField(usize),
     PhysicsApply,
     Hint,
@@ -679,6 +728,67 @@ impl Ui {
             !self.help_open && self.world_active && self.editor_mode && !self.menu_open;
     }
 
+    /// Latest run-panel readings for the Run tab.
+    pub fn set_run_panel(&mut self, snapshot: Option<RunPanelSnapshot>) {
+        self.run_panel = snapshot;
+    }
+
+    /// Creatures of the open scene. An empty list removes the Creature tab;
+    /// the selection and page stay inside the new list.
+    pub fn set_creature_inspections(&mut self, creatures: Vec<CreatureInspection>) {
+        self.creature_inspections = creatures;
+        if self.creature_inspections.is_empty() {
+            if self.project_category == DOCK_TAB_CREATURE {
+                self.project_category = 0;
+            }
+            self.selected_creature = 0;
+            self.creature_sensor_page = 0;
+            return;
+        }
+        self.selected_creature = self.selected_creature.min(self.creature_inspections.len() - 1);
+        let pages = creature_sensor_pages(&self.creature_inspections[self.selected_creature]);
+        self.creature_sensor_page = self.creature_sensor_page.min(pages - 1);
+    }
+
+    /// True while the physics worker owns the scene: the values shown are the last ones read.
+    pub fn set_creature_stale(&mut self, stale: bool) {
+        self.creature_stale = stale;
+    }
+
+    pub fn creature_count(&self) -> usize {
+        self.creature_inspections.len()
+    }
+
+    /// Previous/next creature and sensor page buttons of the Creature tab.
+    /// Returns whether the click hit one of them.
+    fn click_creature_tab(&mut self, x: f32, y: f32) -> bool {
+        let count = self.creature_inspections.len();
+        let Some(view) = self.creature_inspections.get(self.selected_creature) else {
+            return false;
+        };
+        let layout = creature_tab_layout(self);
+        let pages = creature_sensor_pages(view);
+        if count > 1 && point_in(layout.previous_creature, x, y) {
+            self.selected_creature = (self.selected_creature + count - 1) % count;
+            self.creature_sensor_page = 0;
+            return true;
+        }
+        if count > 1 && point_in(layout.next_creature, x, y) {
+            self.selected_creature = (self.selected_creature + 1) % count;
+            self.creature_sensor_page = 0;
+            return true;
+        }
+        if pages > 1 && point_in(layout.previous_page, x, y) {
+            self.creature_sensor_page = (self.creature_sensor_page + pages - 1) % pages;
+            return true;
+        }
+        if pages > 1 && point_in(layout.next_page, x, y) {
+            self.creature_sensor_page = (self.creature_sensor_page + 1) % pages;
+            return true;
+        }
+        false
+    }
+
     pub fn new(speed: f32, start: Vec3, direction: Vec3) -> Self {
         Self {
             standalone_editor_app: false,
@@ -720,7 +830,7 @@ impl Ui {
             scene_inspector_scroll: 0.0,
             inspector_scroll_dragging: false,
             scene_physics: ScenePhysicsValues::default(),
-            scene_inspector_collapsed: [false, false, false, true, true],
+            scene_inspector_collapsed: [false, false, false, true, true, true],
             view_right: Vec3::X,
             view_up: Vec3::Z,
             selected_scene_model: None,
@@ -766,6 +876,12 @@ impl Ui {
             physics_backlog_seconds: None,
             physics_failed: false,
             help_open: false,
+            run_panel: None,
+            scene_chemistry: ChemistrySettings::default(),
+            creature_inspections: Vec::new(),
+            selected_creature: 0,
+            creature_sensor_page: 0,
+            creature_stale: false,
             measured_simulation_rate: None,
             walk_speed_mps: 4.5,
             look_sensitivity: 0.005,
@@ -1328,13 +1444,17 @@ impl Ui {
             if self.scene_document_available && x >= self.canvas_width - 250.0 && y >= 144.0 {
                 return self.click_scene_inspector(x, y);
             }
-            if (8.0..=112.0).contains(&x) && (dock_top + 36.0..=dock_top + 62.0).contains(&y) {
-                self.project_category = 0;
+            if (dock_top + 36.0..=dock_top + 62.0).contains(&y) {
+                if let Some((index, _)) = dock_tabs(self).into_iter().find(|(index, _)| {
+                    let left = dock_tab_left(*index);
+                    (left..=left + DOCK_TAB_WIDTH).contains(&x)
+                }) {
+                    self.project_category = index;
+                }
                 return None;
             }
-            if (116.0..=220.0).contains(&x) && (dock_top + 36.0..=dock_top + 62.0).contains(&y) {
-                self.project_category = 1;
-                return None;
+            if self.project_category == DOCK_TAB_CREATURE {
+                self.click_creature_tab(x, y);
             }
             return None;
         }
@@ -2021,6 +2141,17 @@ impl Ui {
                         }
                         UiAction::SetSceneForce { value }
                     }
+                    SceneInputTarget::ChemistryInterval => {
+                        if !(0.0..=voxel_physics_lab::scene_chemistry::MAX_CHEMISTRY_INTERVAL_S)
+                            .contains(&x)
+                        {
+                            self.status_message = Some(
+                                "Chemistry interval must be between 0 and 31557600 s.".into(),
+                            );
+                            return None;
+                        }
+                        UiAction::SetChemistryInterval { seconds: x }
+                    }
                     SceneInputTarget::InitialTemperature => {
                         if x <= 0.0 || x > f64::from(f32::MAX) {
                             self.status_message =
@@ -2151,7 +2282,9 @@ impl Ui {
                         instance.velocity_m_s.map(|value| format!("{value:.3}"))
                     }
                     SceneInputTarget::Force => instance.force_n.map(|value| format!("{value:.2}")),
-                    SceneInputTarget::InitialTemperature => unreachable!(),
+                    SceneInputTarget::InitialTemperature | SceneInputTarget::ChemistryInterval => {
+                        unreachable!()
+                    }
                 };
                 self.scene_input = Some(SceneInputState {
                     target,
@@ -2198,6 +2331,35 @@ impl Ui {
                     self.welding_input = Some(welding_input_from_settings(settings));
                 }
             }
+            SceneInspectorItem::ChemistryToggle => {
+                return Some(UiAction::SetChemistryEnabled(!self.scene_chemistry.enabled));
+            }
+            SceneInspectorItem::ChemistryInterval => {
+                let pending_action = self.commit_inline_editor_before_focus_change()?;
+                if self.scene_input_active() {
+                    return pending_action;
+                }
+                self.scene_input = Some(SceneInputState {
+                    target: SceneInputTarget::ChemistryInterval,
+                    values: [
+                        format!("{}", self.scene_chemistry.interval_s),
+                        "0".into(),
+                        "0".into(),
+                    ],
+                    axis: 0,
+                    editing: false,
+                });
+                return pending_action;
+            }
+            SceneInspectorItem::ChemistryRecipe => {
+                let column = ((x - (inspector_left + 10.0)) / 115.0).floor() as usize;
+                return match column {
+                    0 => Some(UiAction::ChooseChemistryRecipe),
+                    1 => Some(UiAction::UseBuiltinChemistryRecipes),
+                    _ => None,
+                };
+            }
+            SceneInspectorItem::ChemistryStatus => {}
             SceneInspectorItem::PhysicsField(field) => {
                 if let Some(input) = self.scene_physics_input.as_mut() {
                     input.field = field;
@@ -3575,8 +3737,8 @@ fn draw_editor(
     rect(out, [0.0, dock_top, inspector_left, 200.0], panel);
     rect(out, [0.0, dock_top, inspector_left, 32.0], header);
     text(out, 18.0, dock_top + 8.0, "Project", 0.8);
-    for (index, label) in ["Scenes", "Voxel Models"].iter().enumerate() {
-        let x = 8.0 + index as f32 * 108.0;
+    for (index, label) in dock_tabs(ui) {
+        let x = dock_tab_left(index);
         rect(
             out,
             [x, dock_top + 36.0, 104.0, 26.0],
@@ -3593,7 +3755,9 @@ fn draw_editor(
         [8.0, dock_top + 67.0, inspector_left - 16.0, 122.0],
         [0.065, 0.075, 0.085, 1.0],
     );
-    let mut lines = if ui.project_category == 0 {
+    let mut lines = if ui.project_category >= 2 {
+        Vec::new()
+    } else if ui.project_category == 0 {
         if ui.scene_document_available {
             vec![
                 format!(
@@ -3634,6 +3798,11 @@ fn draw_editor(
     for (index, line) in lines.iter().enumerate() {
         text(out, 20.0, dock_top + 81.0 + index as f32 * 22.0, line, 0.72);
     }
+    match ui.project_category {
+        2 => draw_run_tab(out, ui, dock_top),
+        3 => draw_creature_tab(out, ui, dock_top, inspector_left, header),
+        _ => {}
+    }
     draw_coordinate_grid(out, ui);
     draw_animation_timeline(out, ui, inspector_left, canvas_height);
     clip_and_scroll_scene_inspector(out, ui);
@@ -3673,6 +3842,159 @@ fn draw_help_panel(out: &mut Vec<Rect>, ui: &Ui, canvas_width: f32) {
         text(out, x + 96.0, y, entry.label, 0.68);
         text(out, x + 96.0 + 178.0, y, entry.scope.label(), 0.55);
     }
+}
+
+/// `label` cut with an ellipsis until it is at most `max_width` logical pixels
+/// wide at `scale`.
+fn fit_text(label: &str, scale: f32, max_width: f32) -> String {
+    let width = |candidate: &str| {
+        let mut scratch = Vec::new();
+        text(&mut scratch, 0.0, 0.0, candidate, scale);
+        scratch.iter().map(|item| item.rect[0] + item.rect[2]).fold(0.0_f32, f32::max)
+    };
+    if width(label) <= max_width {
+        return label.to_owned();
+    }
+    let mut kept: Vec<char> = label.chars().collect();
+    while !kept.is_empty() {
+        kept.pop();
+        let candidate = format!("{}…", kept.iter().collect::<String>());
+        if width(&candidate) <= max_width {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
+const DOCK_TAB_RUN: usize = 2;
+const DOCK_TAB_CREATURE: usize = 3;
+const DOCK_TAB_STEP: f32 = 108.0;
+const DOCK_TAB_WIDTH: f32 = 104.0;
+const CREATURE_ROW_HEIGHT: f32 = 14.0;
+const CREATURE_SENSORS_PER_PAGE: usize = 7;
+const CREATURE_TEXT_SCALE: f32 = 0.62;
+
+/// Tabs of the project dock. The Creature tab exists only when the open scene
+/// has a creature.
+fn dock_tabs(ui: &Ui) -> Vec<(usize, &'static str)> {
+    let mut tabs = vec![(0, "Scenes"), (1, "Voxel Models"), (DOCK_TAB_RUN, "Run")];
+    if !ui.creature_inspections.is_empty() {
+        tabs.push((DOCK_TAB_CREATURE, "Creature"));
+    }
+    tabs
+}
+
+fn dock_tab_left(index: usize) -> f32 {
+    8.0 + index as f32 * DOCK_TAB_STEP
+}
+
+fn draw_run_tab(out: &mut Vec<Rect>, ui: &Ui, dock_top: f32) {
+    let lines = ui
+        .run_panel
+        .as_ref()
+        .map_or_else(|| vec!["No run readings yet.".to_owned()], RunPanelSnapshot::lines);
+    for (index, line) in lines.iter().enumerate() {
+        text(out, 20.0, dock_top + 81.0 + index as f32 * 22.0, line, 0.72);
+    }
+}
+
+/// Controls of the Creature tab, in logical canvas pixels.
+#[derive(Clone, Copy, Debug)]
+struct CreatureTabLayout {
+    area: [f32; 4],
+    first_row_y: f32,
+    left_x: f32,
+    sensor_x: f32,
+    previous_creature: [f32; 4],
+    next_creature: [f32; 4],
+    previous_page: [f32; 4],
+    next_page: [f32; 4],
+}
+
+fn creature_tab_layout(ui: &Ui) -> CreatureTabLayout {
+    let dock_top = ui.editor_dock_top();
+    let inspector_left = ui.canvas_width - 250.0;
+    let area = [8.0, dock_top + 67.0, inspector_left - 16.0, 122.0];
+    let first_row_y = area[1] + 5.0;
+    let button = |x: f32| [x, first_row_y - 2.0, 22.0, CREATURE_ROW_HEIGHT];
+    let right = area[0] + area[2];
+    CreatureTabLayout {
+        area,
+        first_row_y,
+        left_x: 20.0,
+        sensor_x: 380.0,
+        previous_creature: button(300.0),
+        next_creature: button(326.0),
+        previous_page: button(right - 56.0),
+        next_page: button(right - 28.0),
+    }
+}
+
+fn point_in(rect: [f32; 4], x: f32, y: f32) -> bool {
+    x >= rect[0] && x <= rect[0] + rect[2] && y >= rect[1] && y <= rect[1] + rect[3]
+}
+
+fn draw_creature_tab(
+    out: &mut Vec<Rect>,
+    ui: &Ui,
+    dock_top: f32,
+    inspector_left: f32,
+    header: [f32; 4],
+) {
+    debug_assert!((dock_top - ui.editor_dock_top()).abs() < 0.01);
+    debug_assert!((inspector_left - (ui.canvas_width - 250.0)).abs() < 0.01);
+    let Some(view) = ui.creature_inspections.get(ui.selected_creature) else {
+        return;
+    };
+    let layout = creature_tab_layout(ui);
+    let row_y = |row: usize| layout.first_row_y + row as f32 * CREATURE_ROW_HEIGHT;
+    let count = ui.creature_inspections.len();
+    let title = format!(
+        "Creature {}/{}: {}",
+        ui.selected_creature + 1,
+        count,
+        format!(
+            "{}{}",
+            view.name.chars().take(14).collect::<String>(),
+            if ui.creature_stale { " (stale)" } else { "" }
+        )
+    );
+    text(out, layout.left_x, row_y(0), &title, CREATURE_TEXT_SCALE);
+    if count > 1 {
+        for (rect_, label) in [(layout.previous_creature, "<"), (layout.next_creature, ">")] {
+            rect(out, rect_, header);
+            text(out, rect_[0] + 8.0, rect_[1] + 3.0, label, CREATURE_TEXT_SCALE);
+        }
+    }
+    for (index, line) in view.summary_lines().iter().enumerate() {
+        text(out, layout.left_x, row_y(index + 1), line, CREATURE_TEXT_SCALE);
+    }
+    let pages = creature_sensor_pages(view);
+    let page = ui.creature_sensor_page.min(pages - 1);
+    text(
+        out,
+        layout.sensor_x,
+        row_y(0),
+        &format!("Sensors {}/{} ({} channels)", page + 1, pages, view.sensors.len()),
+        CREATURE_TEXT_SCALE,
+    );
+    if pages > 1 {
+        for (rect_, label) in [(layout.previous_page, "<"), (layout.next_page, ">")] {
+            rect(out, rect_, header);
+            text(out, rect_[0] + 8.0, rect_[1] + 3.0, label, CREATURE_TEXT_SCALE);
+        }
+    }
+    for row in 0..CREATURE_SENSORS_PER_PAGE {
+        let Some(line) = view.sensor_line(page * CREATURE_SENSORS_PER_PAGE + row) else {
+            break;
+        };
+        let line = fit_text(&line, CREATURE_TEXT_SCALE, layout.previous_page[0] - layout.sensor_x - 4.0);
+        text(out, layout.sensor_x, row_y(row + 1), &line, CREATURE_TEXT_SCALE);
+    }
+}
+
+fn creature_sensor_pages(view: &CreatureInspection) -> usize {
+    view.sensors.len().div_ceil(CREATURE_SENSORS_PER_PAGE).max(1)
 }
 
 fn physics_cost_label(cost_ms_per_10ms: Option<f64>) -> String {
@@ -4197,6 +4519,7 @@ fn draw_scene_inspector_contents(
                     SceneInspectorSection::Dynamics => "Dynamics",
                     SceneInspectorSection::Material => "Material",
                     SceneInspectorSection::Welding => "Thermal welding",
+                    SceneInspectorSection::Chemistry => "Chemistry",
                     SceneInspectorSection::Simulation => "Simulation / physics",
                 };
                 let marker = if ui.scene_inspector_collapsed[index] {
@@ -4397,6 +4720,78 @@ fn draw_scene_inspector_contents(
                 rect(out, [left + 10.0, y + 1.0, 230.0, row.height - 2.0], header);
                 text(out, left + 18.0, y + 8.0, "Edit welding thresholds…", 0.56);
             }
+            SceneInspectorItem::ChemistryToggle => {
+                let enabled = ui.scene_chemistry.enabled;
+                rect(
+                    out,
+                    [left + 10.0, y + 1.0, 230.0, row.height - 2.0],
+                    if enabled { selected } else { header },
+                );
+                text(
+                    out,
+                    left + 18.0,
+                    y + 8.0,
+                    if enabled {
+                        "Reactions on · click to turn off"
+                    } else {
+                        "Reactions off · click to turn on"
+                    },
+                    0.56,
+                );
+            }
+            SceneInspectorItem::ChemistryInterval => {
+                text(out, left + 14.0, y + 9.0, "Interval (s)", 0.55);
+                let active = ui
+                    .scene_input
+                    .as_ref()
+                    .filter(|input| input.target == SceneInputTarget::ChemistryInterval);
+                let value = active.map_or_else(
+                    || interval_text(ui.scene_chemistry.interval_s),
+                    |input| input.values[0].clone(),
+                );
+                let focused = active.is_some();
+                rect(
+                    out,
+                    [left + 154.0, y + 3.0, 81.0, row.height - 6.0],
+                    if focused {
+                        [0.12, 0.32, 0.31, 1.0]
+                    } else {
+                        [0.035, 0.05, 0.06, 1.0]
+                    },
+                );
+                text(
+                    out,
+                    left + 158.0,
+                    y + 9.0,
+                    &format!(
+                        "{}{}",
+                        value.chars().take(11).collect::<String>(),
+                        if focused { "|" } else { "" }
+                    ),
+                    0.49,
+                );
+            }
+            SceneInspectorItem::ChemistryRecipe => {
+                for (column, label) in ["Load recipe…", "Built-in"].into_iter().enumerate() {
+                    let x = left + 10.0 + column as f32 * 115.0;
+                    rect(out, [x, y + 1.0, 111.0, row.height - 2.0], header);
+                    text(out, x + 9.0, y + 8.0, label, 0.56);
+                }
+            }
+            SceneInspectorItem::ChemistryStatus => {
+                let recipes = ui
+                    .scene_chemistry
+                    .recipe_file
+                    .as_deref()
+                    .map_or_else(|| "built-in".to_owned(), recipe_name);
+                text(
+                    out,
+                    left + 14.0,
+                    y + 6.0,
+                    &fit_text(&format!("Recipes: {recipes}"), 0.5, 222.0),
+                    0.5,
+                );
+            }
             SceneInspectorItem::PhysicsField(field) => {
                 let labels = [
                     "Time step (s)",
@@ -4482,6 +4877,7 @@ fn scene_section_index(section: SceneInspectorSection) -> usize {
         SceneInspectorSection::Material => 2,
         SceneInspectorSection::Welding => 3,
         SceneInspectorSection::Simulation => 4,
+        SceneInspectorSection::Chemistry => 5,
     }
 }
 
@@ -4516,6 +4912,7 @@ fn scene_inspector_rows(ui: &Ui) -> Vec<SceneInspectorRow> {
         SceneInspectorSection::Dynamics,
         SceneInspectorSection::Material,
         SceneInspectorSection::Welding,
+        SceneInspectorSection::Chemistry,
         SceneInspectorSection::Simulation,
     ];
     if !selected {
@@ -4578,6 +4975,12 @@ fn scene_inspector_rows(ui: &Ui) -> Vec<SceneInspectorRow> {
                         28.0,
                     );
                 }
+            }
+            SceneInspectorSection::Chemistry => {
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::ChemistryToggle, 28.0);
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::ChemistryInterval, 28.0);
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::ChemistryRecipe, 28.0);
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::ChemistryStatus, 22.0);
             }
             SceneInspectorSection::Simulation => {
                 for field in 0..9 {
@@ -5376,7 +5779,7 @@ mod scene_inspector_tests {
         let mut ui = scene_ui(640.0, 480.0);
         let scale = ui.canvas_scale;
         let inspector_left = ui.canvas_width - 250.0;
-        ui.scene_inspector_collapsed = [false; 5];
+        ui.scene_inspector_collapsed = [false; 6];
         let start = ui.scene_inspector_scroll;
         assert!(ui.scroll_scene_hierarchy(-1.0, (inspector_left + 120.0) * scale, 220.0 * scale));
         assert!(ui.scene_inspector_scroll > start);
@@ -5894,6 +6297,562 @@ mod scene_inspector_tests {
                     "status text runs past the window at {width}x{height}: {right_edge}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod editor_controls_tests {
+    use super::*;
+    use voxel_physics_lab::{
+        creature::SensorCost,
+        creature_inspector::{LedgerView, NetworkView, SensorRow},
+        run_panel::{RunPanel, RunPanelInput, RunState, SolverMode},
+    };
+
+    const SIZES: [(f32, f32); 2] = [(1920.0, 1009.0), (1280.0, 720.0)];
+
+    fn scene_ui(width: f32, height: f32) -> Ui {
+        let mut ui = Ui::new(1.0, Vec3::ZERO, Vec3::Z);
+        ui.world_active = true;
+        ui.editor_mode = true;
+        ui.set_active_scene_document(Some("Scene".to_owned()), vec!["Impact object".to_owned()]);
+        ui.selected_scene_model = Some(0);
+        ui.set_selected_scene_model_info(Some(SceneModelInspectorInfo {
+            name: "Impact object".to_owned(),
+            translation_m: [0.01, 0.02, 0.03],
+            rotation_deg: [0.0, 90.0, 0.0],
+            scale: [1.0; 3],
+            velocity_m_s: [0.0; 3],
+            force_n: [0.0; 3],
+            material_name: "Steel".to_owned(),
+        }));
+        ui.draw(0, 0, 60.0, 0.0, None, None, width, height, None);
+        ui
+    }
+
+    fn redraw(ui: &mut Ui, width: f32, height: f32) -> Vec<Rect> {
+        ui.draw(0, 0, 60.0, 0.0, None, None, width, height, None)
+    }
+
+    fn click_canvas(ui: &mut Ui, x: f32, y: f32) -> Option<UiAction> {
+        ui.click(x * ui.canvas_scale, y * ui.canvas_scale)
+    }
+
+    /// Width in logical pixels of `label` drawn at `scale`.
+    fn text_width(label: &str, scale: f32) -> f32 {
+        let mut scratch = Vec::new();
+        text(&mut scratch, 0.0, 0.0, label, scale);
+        scratch.iter().map(|item| item.rect[0] + item.rect[2]).fold(0.0, f32::max)
+    }
+
+    fn has_text_pixel(ui: &Ui, rects: &[Rect], logical_area: [f32; 4]) -> bool {
+        let s = ui.canvas_scale;
+        rects.iter().any(|item| {
+            item.color[0] > 0.8
+                && item.color[1] > 0.8
+                && item.color[2] > 0.8
+                && item.rect[0] < (logical_area[0] + logical_area[2]) * s
+                && item.rect[0] + item.rect[2] > logical_area[0] * s
+                && item.rect[1] < (logical_area[1] + logical_area[3]) * s
+                && item.rect[1] + item.rect[3] > logical_area[1] * s
+        })
+    }
+
+    fn click_row(ui: &mut Ui, item: SceneInspectorItem, x_offset: f32) -> Option<UiAction> {
+        let row = scene_inspector_rows(ui).into_iter().find(|row| row.item == item).unwrap();
+        let left = ui.canvas_width - 250.0;
+        click_canvas(ui, left + x_offset, row.top - ui.scene_inspector_scroll + row.height * 0.5)
+    }
+
+    fn expand_chemistry(ui: &mut Ui) {
+        ui.scene_inspector_collapsed[5] = false;
+    }
+
+    // ----- chemistry -------------------------------------------------------
+
+    #[test]
+    fn chemistry_section_is_collapsed_by_default_and_has_four_rows_when_open() {
+        let mut ui = scene_ui(1280.0, 720.0);
+        let items = |ui: &Ui| scene_inspector_rows(ui).into_iter().map(|row| row.item).collect::<Vec<_>>();
+        assert!(items(&ui).contains(&SceneInspectorItem::Section(SceneInspectorSection::Chemistry)));
+        assert!(!items(&ui).contains(&SceneInspectorItem::ChemistryToggle));
+        expand_chemistry(&mut ui);
+        for item in [
+            SceneInspectorItem::ChemistryToggle,
+            SceneInspectorItem::ChemistryInterval,
+            SceneInspectorItem::ChemistryRecipe,
+            SceneInspectorItem::ChemistryStatus,
+        ] {
+            assert!(items(&ui).contains(&item), "{item:?}");
+        }
+    }
+
+    #[test]
+    fn chemistry_controls_emit_their_actions() {
+        let mut ui = scene_ui(1920.0, 1009.0);
+        expand_chemistry(&mut ui);
+        // The section header folds and unfolds like the others.
+        assert!(click_row(&mut ui, SceneInspectorItem::Section(SceneInspectorSection::Chemistry), 40.0).is_none());
+        assert!(ui.scene_inspector_collapsed[5]);
+        assert!(click_row(&mut ui, SceneInspectorItem::Section(SceneInspectorSection::Chemistry), 40.0).is_none());
+        assert!(!ui.scene_inspector_collapsed[5]);
+
+        assert!(matches!(
+            click_row(&mut ui, SceneInspectorItem::ChemistryToggle, 100.0),
+            Some(UiAction::SetChemistryEnabled(true))
+        ));
+        ui.scene_chemistry.enabled = true;
+        assert!(matches!(
+            click_row(&mut ui, SceneInspectorItem::ChemistryToggle, 100.0),
+            Some(UiAction::SetChemistryEnabled(false))
+        ));
+
+        assert!(matches!(
+            click_row(&mut ui, SceneInspectorItem::ChemistryRecipe, 50.0),
+            Some(UiAction::ChooseChemistryRecipe)
+        ));
+        assert!(matches!(
+            click_row(&mut ui, SceneInspectorItem::ChemistryRecipe, 170.0),
+            Some(UiAction::UseBuiltinChemistryRecipes)
+        ));
+        // Status line is text only.
+        assert!(click_row(&mut ui, SceneInspectorItem::ChemistryStatus, 50.0).is_none());
+    }
+
+    fn type_interval(ui: &mut Ui, value: &str) -> Option<UiAction> {
+        assert!(click_row(ui, SceneInspectorItem::ChemistryInterval, 190.0).is_none());
+        assert!(ui.scene_input_active());
+        for character in value.chars() {
+            ui.scene_input_char(character);
+        }
+        ui.scene_input_key(KeyCode::Enter)
+    }
+
+    #[test]
+    fn chemistry_interval_field_accepts_seconds_and_rejects_bad_values_with_a_message() {
+        let mut ui = scene_ui(1920.0, 1009.0);
+        expand_chemistry(&mut ui);
+        match type_interval(&mut ui, "3600") {
+            Some(UiAction::SetChemistryInterval { seconds }) => assert_eq!(seconds, 3600.0),
+            other => panic!("unexpected {:?}", other.is_some()),
+        }
+        assert!(!ui.scene_input_active(), "an applied value closes the editor");
+        match type_interval(&mut ui, "0.25") {
+            Some(UiAction::SetChemistryInterval { seconds }) => assert_eq!(seconds, 0.25),
+            _ => panic!("0.25 s must be accepted"),
+        }
+        // Zero means every step and is allowed.
+        assert!(matches!(
+            type_interval(&mut ui, "0"),
+            Some(UiAction::SetChemistryInterval { seconds }) if seconds == 0.0
+        ));
+        for bad in ["-5", "99999999999", "."] {
+            ui.status_message = None;
+            assert!(type_interval(&mut ui, bad).is_none(), "{bad}");
+            assert!(ui.status_message.is_some(), "{bad} gives no message");
+            assert!(ui.scene_input_active(), "the bad value stays editable");
+            ui.scene_input_key(KeyCode::Escape);
+        }
+        // The field starts from the current setting.
+        ui.scene_chemistry.interval_s = 120.0;
+        click_row(&mut ui, SceneInspectorItem::ChemistryInterval, 190.0);
+        assert_eq!(ui.scene_input.as_ref().unwrap().values[0], "120");
+    }
+
+    #[test]
+    fn chemistry_rows_fit_inside_the_inspector_at_both_resolutions() {
+        for (width, height) in SIZES {
+            let mut ui = scene_ui(width, height);
+            expand_chemistry(&mut ui);
+            ui.scene_chemistry.enabled = true;
+            ui.scene_chemistry.interval_s = 31_557_600.0;
+            ui.scene_chemistry.recipe_file =
+                Some("../a/very/long/directory/name/with_a_remarkably_long_recipe_file_name.json".into());
+            redraw(&mut ui, width, height);
+            let rows = scene_inspector_rows(&ui);
+            let chem: Vec<_> = rows
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row.item,
+                        SceneInspectorItem::Section(SceneInspectorSection::Chemistry)
+                            | SceneInspectorItem::ChemistryToggle
+                            | SceneInspectorItem::ChemistryInterval
+                            | SceneInspectorItem::ChemistryRecipe
+                            | SceneInspectorItem::ChemistryStatus
+                    )
+                })
+                .collect();
+            assert_eq!(chem.len(), 5);
+            // Rows are stacked without overlap.
+            for pair in rows.windows(2) {
+                assert!(pair[0].top + pair[0].height <= pair[1].top + 0.01, "{:?} overlaps {:?}", pair[0], pair[1]);
+            }
+            // Scrolled so the section starts near the top, every row is inside the window.
+            let chem_top = chem[0].top;
+            ui.scene_inspector_scroll = chem_top - 150.0;
+            redraw(&mut ui, width, height);
+            for row in &chem {
+                let top = row.top - ui.scene_inspector_scroll;
+                assert!(top >= 140.0, "{:?} above the inspector at {width}x{height}", row.item);
+                assert!(top + row.height <= ui.canvas_height + 0.01, "{:?} off screen at {width}x{height}", row.item);
+            }
+            // Text fits its control.
+            assert!(text_width("Reactions off · click to turn on", 0.56) + 8.0 <= 222.0);
+            assert!(text_width("Reactions on · click to turn off", 0.56) + 8.0 <= 222.0);
+            assert!(text_width("Interval (s)", 0.55) + 14.0 <= 154.0 - 4.0);
+            assert!(text_width("every step|", 0.49) + 4.0 <= 81.0);
+            assert!(text_width("3.156e7 s|", 0.49) + 4.0 <= 81.0);
+            assert!(text_width("0.123456789|", 0.49) + 4.0 <= 81.0);
+            assert!(text_width("Load recipe…", 0.56) + 9.0 <= 111.0);
+            assert!(text_width("Built-in", 0.56) + 9.0 <= 111.0);
+            let longest = format!("Recipes: {}", "W".repeat(24));
+            assert!(text_width(&fit_text(&longest, 0.5, 222.0), 0.5) <= 222.0, "status line too wide");
+            assert_eq!(fit_text("Recipes: built-in", 0.5, 222.0), "Recipes: built-in");
+        }
+    }
+
+    // ----- run tab ---------------------------------------------------------
+
+    fn run_snapshot(state: RunState) -> RunPanelSnapshot {
+        let mut panel = RunPanel::new();
+        for (revision, cost) in [(1, 1.5), (2, 2.5), (3, 123.45)] {
+            panel.record(1, revision, Some(cost));
+        }
+        panel.snapshot(RunPanelInput {
+            state,
+            requested_speed: 31_557_600.0,
+            measured_speed: Some(1234.5),
+            backlog_s: Some(12345.67),
+            active_mechanical_revs: Some(123_456_789),
+            solver_mode: Some(SolverMode::TranslationOnly),
+        })
+    }
+
+    #[test]
+    fn run_tab_is_reachable_and_shows_all_panel_rows_inside_the_dock() {
+        for (width, height) in SIZES {
+            let mut ui = scene_ui(width, height);
+            let dock_top = ui.editor_dock_top();
+            assert_eq!(ui.project_category, 0);
+            let tab = dock_tab_left(DOCK_TAB_RUN) + 10.0;
+            assert!(click_canvas(&mut ui, tab, dock_top + 48.0).is_none());
+            assert_eq!(ui.project_category, DOCK_TAB_RUN);
+
+            // Before the first reading it says so.
+            let rects = redraw(&mut ui, width, height);
+            assert!(has_text_pixel(&ui, &rects, [20.0, dock_top + 78.0, 300.0, 18.0]));
+
+            ui.set_run_panel(Some(run_snapshot(RunState::Run)));
+            let rects = redraw(&mut ui, width, height);
+            let lines = ui.run_panel.as_ref().unwrap().lines();
+            assert_eq!(lines.len(), 4);
+            let box_right = ui.canvas_width - 250.0 - 8.0;
+            for (index, line) in lines.iter().enumerate() {
+                let y = dock_top + 81.0 + index as f32 * 22.0;
+                assert!(has_text_pixel(&ui, &rects, [20.0, y - 2.0, 200.0, 18.0]), "row {index} not drawn at {width}x{height}");
+                assert!(20.0 + text_width(line, 0.72) <= box_right, "row {index} too wide: {line}");
+                assert!(y + 12.0 <= dock_top + 67.0 + 122.0, "row {index} below the dock box");
+            }
+            assert!(dock_top + 81.0 + 3.0 * 22.0 + 12.0 <= ui.canvas_height - ui.animation_timeline_height() + 0.01);
+        }
+    }
+
+    #[test]
+    fn run_tab_text_fits_for_every_state_and_extreme_values() {
+        for state in [RunState::Run, RunState::Pause, RunState::Failed] {
+            let snapshot = run_snapshot(state);
+            let box_width = 960.0 - 250.0 - 8.0; // narrowest canvas
+            for line in snapshot.lines() {
+                assert!(20.0 + text_width(&line, 0.72) <= box_width, "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn dock_tabs_do_not_overlap_and_stay_inside_the_dock() {
+        for (width, height) in SIZES.into_iter().chain([(960.0, 600.0)]) {
+            let mut ui = scene_ui(width, height);
+            ui.set_creature_inspections(vec![creature("A", 3)]);
+            redraw(&mut ui, width, height);
+            let tabs = dock_tabs(&ui);
+            assert_eq!(tabs.len(), 4);
+            for pair in tabs.windows(2) {
+                assert!(dock_tab_left(pair[0].0) + DOCK_TAB_WIDTH < dock_tab_left(pair[1].0));
+            }
+            let last = tabs.last().unwrap().0;
+            assert!(dock_tab_left(last) + DOCK_TAB_WIDTH <= ui.canvas_width - 250.0);
+            for (index, label) in tabs {
+                assert!(text_width(label, 0.7) + 9.0 <= DOCK_TAB_WIDTH, "{label}");
+                let x = dock_tab_left(index) + 5.0;
+                let tab_y = ui.editor_dock_top() + 48.0;
+                click_canvas(&mut ui, x, tab_y);
+                assert_eq!(ui.project_category, index);
+            }
+        }
+    }
+
+    // ----- creature tab ----------------------------------------------------
+
+    fn creature(name: &str, sensors: usize) -> CreatureInspection {
+        CreatureInspection {
+            name: name.to_owned(),
+            ledger: LedgerView {
+                stored_j: 12345.678,
+                capacity_j: 1.0e6,
+                stomach_j: 0.0,
+                hunger: 0.5,
+                work_j: -1.25e-3,
+                heat_j: 3.5e-4,
+                debited_j: 4.0e-3,
+                unfunded_work_j: 0.0,
+                conservation_residual_j: 0.0,
+            },
+            sensors: (0..sensors)
+                .map(|index| SensorRow {
+                    label: format!("foot_normal_load/rev={index}"),
+                    unit: "N",
+                    value: if index % 5 == 4 { None } else { Some(index as f64 * 1.5) },
+                })
+                .collect(),
+            read_cost: SensorCost { reads: 1, values: sensors as u64, rev_reads: 10, bond_reads: 4, pair_tests: 2 },
+            creature_sensor_cost: SensorCost::default(),
+            network: NetworkView { neurons: 14, synapses: 60, inputs: 20, cost: None },
+        }
+    }
+
+    #[test]
+    fn creature_tab_does_not_exist_without_a_creature() {
+        for (width, height) in SIZES {
+            let mut ui = scene_ui(width, height);
+            assert_eq!(ui.creature_count(), 0);
+            assert!(dock_tabs(&ui).iter().all(|(index, _)| *index != DOCK_TAB_CREATURE));
+            // A click where the tab would be selects nothing.
+            let x = dock_tab_left(DOCK_TAB_CREATURE) + 10.0;
+            let tab_y = ui.editor_dock_top() + 48.0;
+                click_canvas(&mut ui, x, tab_y);
+            assert_eq!(ui.project_category, 0);
+            // Nothing creature-related is drawn on any tab.
+            let rects = redraw(&mut ui, width, height);
+            ui.project_category = DOCK_TAB_CREATURE;
+            let forced = redraw(&mut ui, width, height);
+            assert!(forced.len() <= rects.len(), "a forced creature tab draws creature rows");
+        }
+    }
+
+    #[test]
+    fn creature_tab_appears_with_a_creature_and_goes_away_with_it() {
+        let mut ui = scene_ui(1280.0, 720.0);
+        ui.set_creature_inspections(vec![creature("Walker", 10)]);
+        assert_eq!(dock_tabs(&ui).last().unwrap().1, "Creature");
+        let tab_y = ui.editor_dock_top() + 48.0;
+        click_canvas(&mut ui, dock_tab_left(DOCK_TAB_CREATURE) + 10.0, tab_y);
+        assert_eq!(ui.project_category, DOCK_TAB_CREATURE);
+        ui.set_creature_inspections(Vec::new());
+        assert_eq!(ui.project_category, 0, "the open tab falls back when the creature is gone");
+        assert_eq!(ui.creature_count(), 0);
+    }
+
+    #[test]
+    fn creature_tab_layout_fits_and_every_row_is_drawn_at_both_resolutions() {
+        for (width, height) in SIZES.into_iter().chain([(960.0, 600.0)]) {
+            let mut ui = scene_ui(width, height);
+            ui.set_creature_inspections(vec![creature("A creature with a long name", 30), creature("Second", 3)]);
+            ui.project_category = DOCK_TAB_CREATURE;
+            let rects = redraw(&mut ui, width, height);
+            let layout = creature_tab_layout(&ui);
+            let area = layout.area;
+            let area_right = area[0] + area[2];
+            let area_bottom = area[1] + area[3];
+            assert!(area_bottom <= ui.canvas_height - ui.animation_timeline_height() + 0.01);
+            assert!(area_right <= ui.canvas_width - 250.0);
+
+            // Buttons: inside the box, apart from each other and from the text columns.
+            let buttons = [layout.previous_creature, layout.next_creature, layout.previous_page, layout.next_page];
+            for (index, a) in buttons.iter().enumerate() {
+                assert!(a[0] >= area[0] && a[0] + a[2] <= area_right, "button {index} leaves the box");
+                assert!(a[1] >= area[1] && a[1] + a[3] <= area_bottom, "button {index} leaves the box");
+                for b in &buttons[index + 1..] {
+                    let apart = a[0] + a[2] <= b[0] || b[0] + b[2] <= a[0];
+                    assert!(apart, "buttons overlap: {a:?} {b:?}");
+                }
+            }
+            assert!(layout.next_creature[0] + layout.next_creature[2] <= layout.sensor_x);
+
+            let view = &ui.creature_inspections[0];
+            let title_width = text_width("Creature 1/2: A creature with (stale)", CREATURE_TEXT_SCALE);
+            assert!(layout.left_x + title_width <= layout.previous_creature[0], "title runs into the selector");
+            let mut last_row = 0.0_f32;
+            for (index, line) in view.summary_lines().iter().enumerate() {
+                assert!(layout.left_x + text_width(line, CREATURE_TEXT_SCALE) <= layout.previous_creature[0], "{line}");
+                let y = layout.first_row_y + (index + 1) as f32 * CREATURE_ROW_HEIGHT;
+                assert!(has_text_pixel(&ui, &rects, [layout.left_x, y - 1.0, 120.0, CREATURE_ROW_HEIGHT]), "summary row {index}");
+                last_row = last_row.max(y + CREATURE_ROW_HEIGHT);
+            }
+            let pages = creature_sensor_pages(view);
+            assert_eq!(pages, 5);
+            for page in 0..pages {
+                for row in 0..CREATURE_SENSORS_PER_PAGE {
+                    if let Some(line) = view.sensor_line(page * CREATURE_SENSORS_PER_PAGE + row) {
+                        let line = fit_text(&line, CREATURE_TEXT_SCALE, layout.previous_page[0] - layout.sensor_x - 4.0);
+                        assert!(
+                            layout.sensor_x + text_width(&line, CREATURE_TEXT_SCALE) <= layout.previous_page[0],
+                            "sensor line too wide: {line}"
+                        );
+                    }
+                }
+            }
+            for row in 0..CREATURE_SENSORS_PER_PAGE {
+                let y = layout.first_row_y + (row + 1) as f32 * CREATURE_ROW_HEIGHT;
+                assert!(has_text_pixel(&ui, &rects, [layout.sensor_x, y - 1.0, 120.0, CREATURE_ROW_HEIGHT]), "sensor row {row}");
+            }
+            let header = format!("Sensors {}/{} ({} channels)", pages, pages, 30);
+            assert!(layout.sensor_x + text_width(&header, CREATURE_TEXT_SCALE) <= layout.previous_page[0]);
+            assert!(last_row <= area_bottom, "summary rows run out of the box");
+        }
+    }
+
+    #[test]
+    fn creature_selector_and_pager_buttons_work_and_hide_when_useless() {
+        let mut ui = scene_ui(1280.0, 720.0);
+        ui.set_creature_inspections(vec![creature("A", 20), creature("B", 3)]);
+        ui.project_category = DOCK_TAB_CREATURE;
+        redraw(&mut ui, 1280.0, 720.0);
+        let layout = creature_tab_layout(&ui);
+        let centre = |r: [f32; 4]| (r[0] + r[2] * 0.5, r[1] + r[3] * 0.5);
+
+        let (x, y) = centre(layout.next_page);
+        assert!(click_canvas(&mut ui, x, y).is_none());
+        assert_eq!(ui.creature_sensor_page, 1);
+        let (x, y) = centre(layout.previous_page);
+        click_canvas(&mut ui, x, y);
+        click_canvas(&mut ui, x, y);
+        assert_eq!(ui.creature_sensor_page, 2, "wraps to the last of three pages");
+
+        let (x, y) = centre(layout.next_creature);
+        click_canvas(&mut ui, x, y);
+        assert_eq!((ui.selected_creature, ui.creature_sensor_page), (1, 0), "a new creature starts at page 1");
+        // Creature B has a single page: its pager is hidden and inert.
+        let (x, y) = centre(layout.next_page);
+        click_canvas(&mut ui, x, y);
+        assert_eq!(ui.creature_sensor_page, 0);
+        let (x, y) = centre(layout.previous_creature);
+        click_canvas(&mut ui, x, y);
+        assert_eq!(ui.selected_creature, 0);
+
+        // With one creature the selector is inert and not drawn.
+        ui.set_creature_inspections(vec![creature("Only", 3)]);
+        let with_one = redraw(&mut ui, 1280.0, 720.0);
+        let (x, y) = centre(layout.next_creature);
+        click_canvas(&mut ui, x, y);
+        assert_eq!(ui.selected_creature, 0);
+        ui.set_creature_inspections(vec![creature("Only", 3), creature("Two", 3)]);
+        let with_two = redraw(&mut ui, 1280.0, 720.0);
+        assert!(with_two.len() > with_one.len(), "the selector is drawn only for several creatures");
+
+        // Shrinking the list keeps the selection and page valid.
+        ui.selected_creature = 1;
+        ui.creature_sensor_page = 4;
+        ui.set_creature_inspections(vec![creature("Only", 3)]);
+        assert_eq!((ui.selected_creature, ui.creature_sensor_page), (0, 0));
+    }
+
+    #[test]
+    fn stale_creature_values_are_labelled() {
+        let mut ui = scene_ui(1280.0, 720.0);
+        ui.set_creature_inspections(vec![creature("A", 3)]);
+        ui.project_category = DOCK_TAB_CREATURE;
+        let fresh = redraw(&mut ui, 1280.0, 720.0).len();
+        ui.set_creature_stale(true);
+        let stale = redraw(&mut ui, 1280.0, 720.0).len();
+        assert!(stale > fresh);
+    }
+
+    // ----- help ------------------------------------------------------------
+
+    fn contains_token(source: &str, needle: &str) -> bool {
+        source.match_indices(needle).any(|(start, _)| {
+            source[start + needle.len()..]
+                .chars()
+                .next()
+                .map_or(true, |next| !(next.is_ascii_alphanumeric() || next == '_'))
+        })
+    }
+
+    /// Keys main.rs reads that are deliberately not shortcuts of their own.
+    const UNLISTED_KEYS: [(&str, &str); 2] = [
+        ("Backspace", "erases a character while typing in a text field"),
+        ("NumpadEnter", "the numpad twin of Enter, listed as Enter"),
+    ];
+
+    #[test]
+    fn every_key_the_event_loop_handles_is_in_the_help_or_explained() {
+        let source = include_str!("main.rs");
+        let listed: Vec<String> = HELP_SHORTCUTS
+            .iter()
+            .filter_map(|entry| match entry.keys {
+                HelpKeys::Fixed { codes, .. } => Some(codes.iter().map(|code| format!("{code:?}")).collect::<Vec<_>>()),
+                HelpKeys::Binding(_) => None,
+            })
+            .flatten()
+            .collect();
+        let mut handled = std::collections::BTreeSet::new();
+        for (start, _) in source.match_indices("KeyCode::") {
+            let name: String = source[start + 9..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            handled.insert(name);
+        }
+        assert!(handled.contains("F1") && handled.contains("F11"), "scan found no keys");
+        for key in handled {
+            let allowed = UNLISTED_KEYS.iter().any(|(name, _)| *name == key);
+            assert!(
+                listed.contains(&key) || allowed,
+                "main.rs handles KeyCode::{key} but F1 help does not list it"
+            );
+        }
+        for (name, _) in UNLISTED_KEYS {
+            assert!(contains_token(source, &format!("KeyCode::{name}")), "{name} is no longer used; drop it from UNLISTED_KEYS");
+        }
+    }
+
+    #[test]
+    fn every_rebindable_help_entry_has_a_default_key_that_the_event_loop_resolves_uniquely() {
+        let defaults = crate::app::editor_settings::default_bindings();
+        let settings = crate::app::editor_settings::EditorSettings::default();
+        let mut seen = std::collections::BTreeMap::new();
+        for entry in HELP_SHORTCUTS {
+            let HelpKeys::Binding(action) = entry.keys else { continue };
+            let binding = defaults.get(action).unwrap_or_else(|| panic!("{action} has no default key"));
+            // The key text as the event loop sees it: `Ctrl+X` is Ctrl held and `KeyX`.
+            let (control, key) = match binding.strip_prefix("Ctrl+") {
+                Some(rest) => (true, rest),
+                None => (false, binding.as_str()),
+            };
+            let key_debug = if key.len() == 1 { format!("Key{key}") } else { key.to_owned() };
+            assert!(
+                crate::app::editor_settings::is_pressed(&settings, action, &key_debug, control),
+                "{action}: default key {binding} is not recognised by is_pressed"
+            );
+            if let Some(other) = seen.insert(binding.to_ascii_lowercase(), action) {
+                panic!("{action} and {other} share the default key {binding}");
+            }
+            // And the help row shows exactly that key.
+            assert_eq!(help_key_text(entry, &defaults), *binding);
+        }
+        assert_eq!(seen.len(), crate::app::editor_settings::REBINDABLE_ACTIONS.len());
+    }
+
+    #[test]
+    fn help_rows_added_for_f2_f6_ctrl_and_tool_shapes_are_listed_once() {
+        for key in ["F2", "F6", "Ctrl", "1 2 3 4"] {
+            let count = HELP_SHORTCUTS
+                .iter()
+                .filter(|entry| matches!(entry.keys, HelpKeys::Fixed { display, .. } if display == key))
+                .count();
+            assert_eq!(count, 1, "{key}");
         }
     }
 }

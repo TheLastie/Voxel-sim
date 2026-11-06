@@ -132,6 +132,12 @@ pub struct PhysicsFrame {
     /// Includes pose capture and any metrics publish performed by that batch.
     pub full_worker_ms_per_10ms_simulated: Option<f64>,
     pub broken: usize,
+    /// Non-fixed, non-aggregated REVs the solver treats as mechanical when
+    /// this frame was captured (the count that decides the solver mode).
+    pub mechanical_revs: usize,
+    /// Solver mode for this scene: true for cell rotations, false for the
+    /// translation-only solve. Read from `solver::uses_cell_rotations`.
+    pub cell_rotations: bool,
 }
 
 /// Ordered clock increments are retained even when the solver runs slower
@@ -151,7 +157,7 @@ pub struct PhysicsWorker {
 }
 
 impl PhysicsFrame {
-    fn capture(
+    pub(crate) fn capture(
         scene: &Scene,
         origin: DVec3,
         simulated_seconds: f64,
@@ -272,6 +278,8 @@ impl PhysicsFrame {
             step_ms,
             full_worker_ms_per_10ms_simulated: None,
             broken: scene.broken,
+            mechanical_revs: crate::solver::mechanical_rev_count(scene),
+            cell_rotations: crate::solver::uses_cell_rotations(scene),
         })
     }
 }

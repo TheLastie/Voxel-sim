@@ -391,6 +391,29 @@ fn serve(req: &Value, d: &Discovery) -> Value {
             .unwrap_or(Value::Null);
         return json!({"ok":true,"pid":d.pid,"session_id":d.session_id,"root":d.root,"objects":object});
     }
+    if command == "latest" {
+        // The newest sample of one topic, for panels that publish a complete
+        // state each time (for example `run_panel`).
+        let Some(topic) = req.get("topic").and_then(Value::as_str) else {
+            return error_response(d, "topic_required");
+        };
+        let (lock, _) = ring();
+        let Ok(state) = lock.lock() else {
+            return error_response(d, "busy");
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let sample = state.samples.iter().rev().find(|s| s.topic == topic);
+        return json!({
+            "ok":true,"pid":d.pid,"session_id":d.session_id,"root":d.root,
+            "topic":topic,
+            "sequence":sample.map(|s| s.sequence),
+            "age_ms":sample.map(|s| now.saturating_sub(s.timestamp_ms).min(u128::from(u64::MAX)) as u64),
+            "data":sample.map_or(Value::Null, |s| s.data.clone()),
+        });
+    }
     if command != "read" && command != "metrics" {
         return error_response(d, "unknown_command");
     }
