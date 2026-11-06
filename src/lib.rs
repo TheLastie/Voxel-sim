@@ -35,6 +35,7 @@ pub mod world;
 pub mod world_physics;
 pub mod physics_metrics;
 pub mod plant;
+pub mod plant_world;
 
 pub mod documents;
 pub mod experiments;
