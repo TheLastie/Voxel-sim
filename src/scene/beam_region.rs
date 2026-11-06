@@ -15,6 +15,10 @@
 use super::*;
 use crate::beam::{reduce_lattice_along_x, Beam, BeamMaterial};
 
+/// A region whose peak stress reaches this fraction of the material limit is expanded
+/// into cells at the end of the step.
+const BEAM_VALIDITY_LIMIT: f64 = 0.95;
+
 pub(crate) struct BeamRegion {
     beam: Beam,
     /// Scene index of each member REV.
@@ -232,7 +236,13 @@ impl Scene {
                     }
                 }
             }
+            let valid = region.beam.validity() < BEAM_VALIDITY_LIMIT;
             self.beam_regions[id] = Some(region);
+            if !valid {
+                // The reduced model no longer holds (stress near the material limit):
+                // give the region back to the cell solver, which can fracture.
+                let _ = self.expand_beam(id);
+            }
         }
         self.mark_render_changed();
     }

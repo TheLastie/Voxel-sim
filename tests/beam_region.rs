@@ -118,6 +118,23 @@ fn an_expanded_region_continues_in_the_cell_solver() {
 }
 
 #[test]
+fn an_overstressed_region_is_expanded_into_cells_automatically() {
+    let (mut scene, _root, _tip) = cantilever(31, 3);
+    scene.config.gravity = [0.0, 0.0, 2.0e4]; // ten times the valid load, upward
+    let cells: Vec<usize> = (0..scene.positions.len()).collect();
+    let id = scene.reduce_to_beam(&cells, 40).expect("reduce");
+    for _ in 0..10 {
+        solver::step(&mut scene, &mut None);
+        if scene.beam_region_energy_j(id).is_none() {
+            break;
+        }
+    }
+    assert!(scene.beam_region_energy_j(id).is_none(), "the region should have been expanded");
+    assert!(scene.voxels.iter().enumerate().all(|(i, v)| v.kinematic == (i < 9)));
+    assert!(scene.positions.iter().all(|p| p.is_finite()));
+}
+
+#[test]
 fn a_region_with_a_free_first_slice_is_refused() {
     let (mut scene, root, _tip) = cantilever(8, 3);
     scene.release_voxels(&root).unwrap();
