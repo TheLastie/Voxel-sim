@@ -103,6 +103,35 @@ impl TierCensus {
 }
 
 impl Scene {
+    /// The tier each REV runs at: 0 sleeping, 1 fixed, 2 rigid, 3 beam, 4 cells. Same rules
+    /// as `tier_census`; for displays and recordings.
+    pub fn rev_tiers(&self) -> Vec<u8> {
+        let asleep = self.sleeping_flags();
+        let mut in_beam = vec![false; self.voxels.len()];
+        for region in self.beam_regions.iter().flatten() {
+            for (local, &i) in region.members().iter().enumerate() {
+                if !region.saved_kinematic(local) {
+                    in_beam[i] = true;
+                }
+            }
+        }
+        (0..self.voxels.len())
+            .map(|i| {
+                if asleep[i] {
+                    0
+                } else if in_beam[i] {
+                    3
+                } else if self.aggregate_of.get(i).copied().flatten().is_some() {
+                    2
+                } else if self.voxels[i].kinematic {
+                    1
+                } else {
+                    4
+                }
+            })
+            .collect()
+    }
+
     /// Count the scene's REVs by physics tier. Every REV is counted once.
     pub fn tier_census(&self) -> TierCensus {
         let mut census = TierCensus::default();
