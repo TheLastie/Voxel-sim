@@ -109,3 +109,20 @@ fn disabling_the_governor_returns_every_region() {
     assert_eq!(scene.governed_beam_count(), 0);
     assert!(scene.voxels.iter().enumerate().all(|(i, v)| v.kinematic == (i < 9 || i == 279)));
 }
+
+#[test]
+fn the_census_counts_every_rev_once_in_the_tier_it_runs_at() {
+    let (mut scene, _, _) = scene_with_cantilever();
+    let before = scene.tier_census();
+    assert_eq!(before.total(), scene.voxels.len());
+    assert_eq!((before.fixed, before.cells, before.beam), (10, 270, 0));
+    scene
+        .enable_tier_governor(TierGovernorConfig { budget_ms: 1.0, ..Default::default() })
+        .unwrap();
+    for _ in 0..3 {
+        solver::step(&mut scene, &mut None);
+    }
+    let after = scene.tier_census();
+    assert_eq!(after.total(), scene.voxels.len());
+    assert_eq!((after.fixed, after.cells, after.beam), (10, 0, 270));
+}

@@ -443,7 +443,7 @@ pub struct StepDiagnostics {
 mod checkpoint;
 mod beam_region;
 mod tier_governor;
-pub use tier_governor::TierGovernorConfig;
+pub use tier_governor::{TierCensus, TierGovernorConfig};
 
 /// Positions are separate arrays; material identity exists only in composition.
 pub struct Scene {

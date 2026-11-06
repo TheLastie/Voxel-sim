@@ -79,7 +79,53 @@ pub(crate) struct TierGovernor {
     plan: Option<Plan>,
 }
 
+/// How many REVs the scene currently simulates at each physics tier. The rigid tier is
+/// the solver's own automatic aggregation (bodies at rest, woken by load, contact or
+/// topology change); the beam tier is `reduce_to_beam`; everything else is fine cells.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TierCensus {
+    /// Fixed (kinematic) REVs that are not cells of the solver.
+    pub fixed: usize,
+    /// Members of rigid aggregates.
+    pub rigid: usize,
+    /// Free members of beam regions.
+    pub beam: usize,
+    /// Mechanical REVs solved as cells.
+    pub cells: usize,
+}
+
+impl TierCensus {
+    pub fn total(&self) -> usize {
+        self.fixed + self.rigid + self.beam + self.cells
+    }
+}
+
 impl Scene {
+    /// Count the scene's REVs by physics tier. Every REV is counted once.
+    pub fn tier_census(&self) -> TierCensus {
+        let mut census = TierCensus::default();
+        let mut in_beam = vec![false; self.voxels.len()];
+        for region in self.beam_regions.iter().flatten() {
+            for (local, &i) in region.members().iter().enumerate() {
+                if !region.saved_kinematic(local) {
+                    in_beam[i] = true;
+                }
+            }
+        }
+        for i in 0..self.voxels.len() {
+            if in_beam[i] {
+                census.beam += 1;
+            } else if self.aggregate_of.get(i).copied().flatten().is_some() {
+                census.rigid += 1;
+            } else if self.voxels[i].kinematic {
+                census.fixed += 1;
+            } else {
+                census.cells += 1;
+            }
+        }
+        census
+    }
+
     /// Let the budget governor put clamped slender parts of the scene on the beam tier
     /// when the fine solver would exceed `config.budget_ms`, or when the beam is within the
     /// tolerance and cheaper. Off by default.
