@@ -3,6 +3,7 @@ use crate::tool::Shape;
 use glam::Vec3;
 use std::collections::BTreeMap;
 use voxel_physics_lab::creature_inspector::CreatureInspection;
+use voxel_physics_lab::physics_tiers::{GovernorReading, TierField, TierPatch, TierSettings};
 use voxel_physics_lab::run_panel::RunPanelSnapshot;
 use voxel_physics_lab::scene_chemistry::{interval_text, recipe_name, ChemistrySettings};
 use voxel_physics_lab::scene_welding::ThermalBondingSettings;
@@ -279,7 +280,7 @@ pub struct Ui {
     scene_inspector_scroll: f32,
     inspector_scroll_dragging: bool,
     scene_physics: ScenePhysicsValues,
-    scene_inspector_collapsed: [bool; 6],
+    scene_inspector_collapsed: [bool; 7],
     view_right: Vec3,
     view_up: Vec3,
     pub selected_scene_model: Option<usize>,
@@ -340,6 +341,8 @@ pub struct Ui {
     pub run_panel: Option<RunPanelSnapshot>,
     /// Chemistry settings of the open scene, shown in the Chemistry section.
     pub scene_chemistry: ChemistrySettings,
+    /// Physics tier governor settings of the open scene, shown in the "Physics tiers" section.
+    pub scene_tiers: TierSettings,
     /// Creatures of the open scene. Empty means the Creature tab does not exist.
     creature_inspections: Vec<CreatureInspection>,
     selected_creature: usize,
@@ -493,6 +496,13 @@ pub enum UiAction {
     ChooseChemistryRecipe,
     /// Go back to the built-in recipes.
     UseBuiltinChemistryRecipes,
+    /// Turn the automatic physics tier governor on or off (Physics tiers section).
+    SetPhysicsTiersEnabled(bool),
+    /// Set one numeric governor setting.
+    SetPhysicsTiersValue {
+        field: TierField,
+        value: f64,
+    },
     CreateImpactScene {
         side: usize,
     },
@@ -533,6 +543,7 @@ enum SceneInputTarget {
     Force,
     InitialTemperature,
     ChemistryInterval,
+    TierField(TierField),
 }
 
 #[derive(Clone, Debug)]
@@ -575,6 +586,7 @@ enum SceneInspectorSection {
     Material,
     Welding,
     Chemistry,
+    PhysicsTiers,
     Simulation,
 }
 
@@ -596,6 +608,9 @@ enum SceneInspectorItem {
     ChemistryInterval,
     ChemistryRecipe,
     ChemistryStatus,
+    TiersToggle,
+    TiersField(TierField),
+    TiersStatus,
     PhysicsField(usize),
     PhysicsApply,
     Hint,
@@ -830,7 +845,7 @@ impl Ui {
             scene_inspector_scroll: 0.0,
             inspector_scroll_dragging: false,
             scene_physics: ScenePhysicsValues::default(),
-            scene_inspector_collapsed: [false, false, false, true, true, true],
+            scene_inspector_collapsed: [false, false, false, true, true, true, true],
             view_right: Vec3::X,
             view_up: Vec3::Z,
             selected_scene_model: None,
@@ -878,6 +893,7 @@ impl Ui {
             help_open: false,
             run_panel: None,
             scene_chemistry: ChemistrySettings::default(),
+            scene_tiers: TierSettings::default(),
             creature_inspections: Vec::new(),
             selected_creature: 0,
             creature_sensor_page: 0,
@@ -2141,6 +2157,16 @@ impl Ui {
                         }
                         UiAction::SetSceneForce { value }
                     }
+                    SceneInputTarget::TierField(field) => {
+                        // Check the value now so a bad number keeps the field open with a message.
+                        let checked = TierPatch::field(field, x)
+                            .and_then(|patch| self.scene_tiers.updated(patch));
+                        if let Err(message) = checked {
+                            self.status_message = Some(message);
+                            return None;
+                        }
+                        UiAction::SetPhysicsTiersValue { field, value: x }
+                    }
                     SceneInputTarget::ChemistryInterval => {
                         if !(0.0..=voxel_physics_lab::scene_chemistry::MAX_CHEMISTRY_INTERVAL_S)
                             .contains(&x)
@@ -2282,7 +2308,9 @@ impl Ui {
                         instance.velocity_m_s.map(|value| format!("{value:.3}"))
                     }
                     SceneInputTarget::Force => instance.force_n.map(|value| format!("{value:.2}")),
-                    SceneInputTarget::InitialTemperature | SceneInputTarget::ChemistryInterval => {
+                    SceneInputTarget::InitialTemperature
+                    | SceneInputTarget::ChemistryInterval
+                    | SceneInputTarget::TierField(_) => {
                         unreachable!()
                     }
                 };
@@ -2360,6 +2388,27 @@ impl Ui {
                 };
             }
             SceneInspectorItem::ChemistryStatus => {}
+            SceneInspectorItem::TiersToggle => {
+                return Some(UiAction::SetPhysicsTiersEnabled(!self.scene_tiers.enabled));
+            }
+            SceneInspectorItem::TiersField(field) => {
+                let pending_action = self.commit_inline_editor_before_focus_change()?;
+                if self.scene_input_active() {
+                    return pending_action;
+                }
+                self.scene_input = Some(SceneInputState {
+                    target: SceneInputTarget::TierField(field),
+                    values: [
+                        format!("{}", self.scene_tiers.field_value(field)),
+                        "0".into(),
+                        "0".into(),
+                    ],
+                    axis: 0,
+                    editing: false,
+                });
+                return pending_action;
+            }
+            SceneInspectorItem::TiersStatus => {}
             SceneInspectorItem::PhysicsField(field) => {
                 if let Some(input) = self.scene_physics_input.as_mut() {
                     input.field = field;
@@ -3866,6 +3915,24 @@ fn fit_text(label: &str, scale: f32, max_width: f32) -> String {
     String::new()
 }
 
+/// Short governor status for the inspector: `None` before any run panel reading.
+fn tier_status_short(reading: Option<Option<&GovernorReading>>) -> String {
+    match reading {
+        None => "Now: —".to_owned(),
+        Some(None) => "Now: governor off in the scene".to_owned(),
+        Some(Some(reading)) => match reading.plan {
+            None => format!("Now: {} beams, no plan yet", reading.governed_beams),
+            Some(plan) => format!(
+                "Now: {} beams · plan {:.2}/{:.2} ms{}",
+                reading.governed_beams,
+                plan.total_cost_ms,
+                plan.budget_ms,
+                if plan.overloaded { " · overloaded" } else { "" }
+            ),
+        },
+    }
+}
+
 const DOCK_TAB_RUN: usize = 2;
 const DOCK_TAB_CREATURE: usize = 3;
 const DOCK_TAB_STEP: f32 = 108.0;
@@ -4520,6 +4587,7 @@ fn draw_scene_inspector_contents(
                     SceneInspectorSection::Material => "Material",
                     SceneInspectorSection::Welding => "Thermal welding",
                     SceneInspectorSection::Chemistry => "Chemistry",
+                    SceneInspectorSection::PhysicsTiers => "Physics tiers",
                     SceneInspectorSection::Simulation => "Simulation / physics",
                 };
                 let marker = if ui.scene_inspector_collapsed[index] {
@@ -4792,6 +4860,59 @@ fn draw_scene_inspector_contents(
                     0.5,
                 );
             }
+            SceneInspectorItem::TiersToggle => {
+                let enabled = ui.scene_tiers.enabled;
+                rect(
+                    out,
+                    [left + 10.0, y + 1.0, 230.0, row.height - 2.0],
+                    if enabled { selected } else { header },
+                );
+                text(
+                    out,
+                    left + 18.0,
+                    y + 8.0,
+                    if enabled {
+                        "Governor on · click to turn off"
+                    } else {
+                        "Governor off · click to turn on"
+                    },
+                    0.56,
+                );
+            }
+            SceneInspectorItem::TiersField(field) => {
+                let active = ui.scene_input.as_ref().filter(|input| input.target == SceneInputTarget::TierField(field));
+                let value = active.map_or_else(
+                    || format!("{}", ui.scene_tiers.field_value(field)),
+                    |input| input.values[0].clone(),
+                );
+                let focused = active.is_some();
+                text(out, left + 14.0, y + 7.0, field.label(), 0.52);
+                rect(
+                    out,
+                    [left + 147.0, y + 2.0, 88.0, row.height - 4.0],
+                    if focused {
+                        [0.12, 0.32, 0.31, 1.0]
+                    } else {
+                        [0.035, 0.05, 0.06, 1.0]
+                    },
+                );
+                clipped_inspector_text(
+                    out,
+                    [left + 152.0, y + 6.0, 79.0, 15.0],
+                    &format!("{value}{}", if focused { "|" } else { "" }),
+                    0.48,
+                    focused,
+                );
+            }
+            SceneInspectorItem::TiersStatus => {
+                text(
+                    out,
+                    left + 14.0,
+                    y + 6.0,
+                    &fit_text(&tier_status_short(ui.run_panel.as_ref().map(|panel| panel.tier_governor.as_ref())), 0.5, 222.0),
+                    0.5,
+                );
+            }
             SceneInspectorItem::PhysicsField(field) => {
                 let labels = [
                     "Time step (s)",
@@ -4878,6 +4999,7 @@ fn scene_section_index(section: SceneInspectorSection) -> usize {
         SceneInspectorSection::Welding => 3,
         SceneInspectorSection::Simulation => 4,
         SceneInspectorSection::Chemistry => 5,
+        SceneInspectorSection::PhysicsTiers => 6,
     }
 }
 
@@ -4913,6 +5035,7 @@ fn scene_inspector_rows(ui: &Ui) -> Vec<SceneInspectorRow> {
         SceneInspectorSection::Material,
         SceneInspectorSection::Welding,
         SceneInspectorSection::Chemistry,
+        SceneInspectorSection::PhysicsTiers,
         SceneInspectorSection::Simulation,
     ];
     if !selected {
@@ -4981,6 +5104,13 @@ fn scene_inspector_rows(ui: &Ui) -> Vec<SceneInspectorRow> {
                 push_scene_row(&mut rows, &mut y, SceneInspectorItem::ChemistryInterval, 28.0);
                 push_scene_row(&mut rows, &mut y, SceneInspectorItem::ChemistryRecipe, 28.0);
                 push_scene_row(&mut rows, &mut y, SceneInspectorItem::ChemistryStatus, 22.0);
+            }
+            SceneInspectorSection::PhysicsTiers => {
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::TiersToggle, 28.0);
+                for field in TierField::ALL {
+                    push_scene_row(&mut rows, &mut y, SceneInspectorItem::TiersField(field), 23.0);
+                }
+                push_scene_row(&mut rows, &mut y, SceneInspectorItem::TiersStatus, 22.0);
             }
             SceneInspectorSection::Simulation => {
                 for field in 0..9 {
@@ -5779,7 +5909,7 @@ mod scene_inspector_tests {
         let mut ui = scene_ui(640.0, 480.0);
         let scale = ui.canvas_scale;
         let inspector_left = ui.canvas_width - 250.0;
-        ui.scene_inspector_collapsed = [false; 6];
+        ui.scene_inspector_collapsed = [false; 7];
         let start = ui.scene_inspector_scroll;
         assert!(ui.scroll_scene_hierarchy(-1.0, (inspector_left + 120.0) * scale, 220.0 * scale));
         assert!(ui.scene_inspector_scroll > start);
@@ -6307,6 +6437,7 @@ mod editor_controls_tests {
     use voxel_physics_lab::{
         creature::SensorCost,
         creature_inspector::{LedgerView, NetworkView, SensorRow},
+        physics_tiers::{GovernorReading, PlanReading},
         run_panel::{RunPanel, RunPanelInput, RunState, SolverMode},
     };
 
@@ -6527,6 +6658,15 @@ mod editor_controls_tests {
             backlog_s: Some(12345.67),
             active_mechanical_revs: Some(123_456_789),
             solver_mode: Some(SolverMode::TranslationOnly),
+            tier_governor: Some(GovernorReading {
+                governed_beams: 123_456,
+                plan: Some(PlanReading {
+                    total_cost_ms: 12345.67,
+                    budget_ms: 1000.0,
+                    overloaded: true,
+                    over_tolerance_regions: 12_345,
+                }),
+            }),
         })
     }
 
@@ -6547,7 +6687,7 @@ mod editor_controls_tests {
             ui.set_run_panel(Some(run_snapshot(RunState::Run)));
             let rects = redraw(&mut ui, width, height);
             let lines = ui.run_panel.as_ref().unwrap().lines();
-            assert_eq!(lines.len(), 4);
+            assert_eq!(lines.len(), 5);
             let box_right = ui.canvas_width - 250.0 - 8.0;
             for (index, line) in lines.iter().enumerate() {
                 let y = dock_top + 81.0 + index as f32 * 22.0;
@@ -6555,7 +6695,7 @@ mod editor_controls_tests {
                 assert!(20.0 + text_width(line, 0.72) <= box_right, "row {index} too wide: {line}");
                 assert!(y + 12.0 <= dock_top + 67.0 + 122.0, "row {index} below the dock box");
             }
-            assert!(dock_top + 81.0 + 3.0 * 22.0 + 12.0 <= ui.canvas_height - ui.animation_timeline_height() + 0.01);
+            assert!(dock_top + 81.0 + 4.0 * 22.0 + 12.0 <= ui.canvas_height - ui.animation_timeline_height() + 0.01);
         }
     }
 
@@ -6854,5 +6994,262 @@ mod editor_controls_tests {
                 .count();
             assert_eq!(count, 1, "{key}");
         }
+    }
+}
+
+#[cfg(test)]
+mod physics_tier_controls_tests {
+    use super::*;
+    use voxel_physics_lab::{
+        physics_tiers::PlanReading,
+        run_panel::{RunPanel, RunPanelInput, RunState, SolverMode},
+    };
+
+    const SIZES: [(f32, f32); 3] = [(1920.0, 1009.0), (1280.0, 720.0), (960.0, 600.0)];
+
+    fn scene_ui(width: f32, height: f32) -> Ui {
+        let mut ui = Ui::new(1.0, Vec3::ZERO, Vec3::Z);
+        ui.world_active = true;
+        ui.editor_mode = true;
+        ui.set_active_scene_document(Some("Scene".to_owned()), vec!["Bar".to_owned()]);
+        ui.selected_scene_model = Some(0);
+        ui.set_selected_scene_model_info(Some(SceneModelInspectorInfo {
+            name: "Bar".to_owned(),
+            translation_m: [0.0; 3],
+            rotation_deg: [0.0; 3],
+            scale: [1.0; 3],
+            velocity_m_s: [0.0; 3],
+            force_n: [0.0; 3],
+            material_name: "Steel".to_owned(),
+        }));
+        ui.draw(0, 0, 60.0, 0.0, None, None, width, height, None);
+        ui
+    }
+
+    fn redraw(ui: &mut Ui, width: f32, height: f32) -> Vec<Rect> {
+        ui.draw(0, 0, 60.0, 0.0, None, None, width, height, None)
+    }
+
+    fn click_canvas(ui: &mut Ui, x: f32, y: f32) -> Option<UiAction> {
+        ui.click(x * ui.canvas_scale, y * ui.canvas_scale)
+    }
+
+    fn click_row(ui: &mut Ui, item: SceneInspectorItem, x_offset: f32) -> Option<UiAction> {
+        let row = scene_inspector_rows(ui).into_iter().find(|row| row.item == item).unwrap();
+        let left = ui.canvas_width - 250.0;
+        click_canvas(ui, left + x_offset, row.top - ui.scene_inspector_scroll + row.height * 0.5)
+    }
+
+    fn text_width(label: &str, scale: f32) -> f32 {
+        let mut scratch = Vec::new();
+        text(&mut scratch, 0.0, 0.0, label, scale);
+        scratch.iter().map(|item| item.rect[0] + item.rect[2]).fold(0.0, f32::max)
+    }
+
+    fn type_value(ui: &mut Ui, field: TierField, value: &str) -> Option<UiAction> {
+        assert!(click_row(ui, SceneInspectorItem::TiersField(field), 190.0).is_none());
+        assert!(ui.scene_input_active());
+        for character in value.chars() {
+            ui.scene_input_char(character);
+        }
+        ui.scene_input_key(KeyCode::Enter)
+    }
+
+    #[test]
+    fn physics_tiers_section_is_collapsed_by_default_and_lists_every_setting_when_open() {
+        let mut ui = scene_ui(1280.0, 720.0);
+        let items = |ui: &Ui| scene_inspector_rows(ui).into_iter().map(|row| row.item).collect::<Vec<_>>();
+        assert!(items(&ui).contains(&SceneInspectorItem::Section(SceneInspectorSection::PhysicsTiers)));
+        assert!(!items(&ui).contains(&SceneInspectorItem::TiersToggle));
+        ui.scene_inspector_collapsed[6] = false;
+        let open = items(&ui);
+        assert!(open.contains(&SceneInspectorItem::TiersToggle) && open.contains(&SceneInspectorItem::TiersStatus));
+        for field in TierField::ALL {
+            assert!(open.contains(&SceneInspectorItem::TiersField(field)), "{field:?}");
+        }
+        // The header folds like the others.
+        assert!(click_row(&mut ui, SceneInspectorItem::Section(SceneInspectorSection::PhysicsTiers), 40.0).is_none());
+        assert!(ui.scene_inspector_collapsed[6]);
+    }
+
+    #[test]
+    fn physics_tier_controls_emit_their_actions() {
+        let mut ui = scene_ui(1920.0, 1009.0);
+        ui.scene_inspector_collapsed[6] = false;
+        assert!(matches!(
+            click_row(&mut ui, SceneInspectorItem::TiersToggle, 100.0),
+            Some(UiAction::SetPhysicsTiersEnabled(true))
+        ));
+        ui.scene_tiers.enabled = true;
+        assert!(matches!(
+            click_row(&mut ui, SceneInspectorItem::TiersToggle, 100.0),
+            Some(UiAction::SetPhysicsTiersEnabled(false))
+        ));
+        assert!(click_row(&mut ui, SceneInspectorItem::TiersStatus, 50.0).is_none());
+
+        let cases = [
+            (TierField::BudgetMs, "2.5", 2.5),
+            (TierField::CellMsPerRev, "0.2", 0.2),
+            (TierField::Tolerance, "0.05", 0.05),
+            (TierField::IntervalSteps, "20", 20.0),
+            (TierField::BeamSubsteps, "80", 80.0),
+        ];
+        for (field, typed, expected) in cases {
+            match type_value(&mut ui, field, typed) {
+                Some(UiAction::SetPhysicsTiersValue { field: got, value }) => {
+                    assert_eq!((got, value), (field, expected));
+                }
+                _ => panic!("{field:?} gave no action"),
+            }
+            assert!(!ui.scene_input_active());
+        }
+    }
+
+    #[test]
+    fn physics_tier_fields_start_from_the_current_value_and_reject_bad_numbers_with_a_message() {
+        let mut ui = scene_ui(1920.0, 1009.0);
+        ui.scene_inspector_collapsed[6] = false;
+        ui.scene_tiers.budget_ms = 1.5;
+        click_row(&mut ui, SceneInspectorItem::TiersField(TierField::BudgetMs), 190.0);
+        assert_eq!(ui.scene_input.as_ref().unwrap().values[0], "1.5");
+        ui.scene_input_key(KeyCode::Escape);
+        for (field, bad) in [
+            (TierField::BudgetMs, "0"),
+            (TierField::BudgetMs, "-3"),
+            (TierField::CellMsPerRev, "0"),
+            (TierField::Tolerance, "2"),
+            (TierField::IntervalSteps, "0"),
+            (TierField::IntervalSteps, "2.5"),
+            (TierField::BeamSubsteps, "0"),
+            (TierField::BeamSubsteps, "99999"),
+            (TierField::BudgetMs, "."),
+        ] {
+            ui.status_message = None;
+            assert!(type_value(&mut ui, field, bad).is_none(), "{field:?} {bad}");
+            assert!(ui.status_message.is_some(), "{field:?} {bad} gives no message");
+            assert!(ui.scene_input_active(), "{field:?} {bad} should stay editable");
+            ui.scene_input_key(KeyCode::Escape);
+        }
+    }
+
+    #[test]
+    fn physics_tier_rows_fit_and_stay_on_screen_at_three_resolutions() {
+        for (width, height) in SIZES {
+            let mut ui = scene_ui(width, height);
+            ui.scene_inspector_collapsed[6] = false;
+            ui.scene_inspector_collapsed[5] = false;
+            ui.scene_tiers.enabled = true;
+            ui.scene_tiers.budget_ms = 123.456789012;
+            ui.set_run_panel(Some(RunPanel::new().snapshot(RunPanelInput {
+                state: RunState::Run,
+                requested_speed: 1.0,
+                measured_speed: Some(1.0),
+                backlog_s: Some(0.0),
+                active_mechanical_revs: Some(1),
+                solver_mode: Some(SolverMode::CellRotations),
+                tier_governor: Some(GovernorReading {
+                    governed_beams: 123_456,
+                    plan: Some(PlanReading {
+                        total_cost_ms: 12345.67,
+                        budget_ms: 5.0,
+                        overloaded: true,
+                        over_tolerance_regions: 3,
+                    }),
+                }),
+            })));
+            redraw(&mut ui, width, height);
+            let rows = scene_inspector_rows(&ui);
+            for pair in rows.windows(2) {
+                assert!(pair[0].top + pair[0].height <= pair[1].top + 0.01, "{:?} overlaps {:?}", pair[0], pair[1]);
+            }
+            let tier_rows: Vec<_> = rows
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row.item,
+                        SceneInspectorItem::Section(SceneInspectorSection::PhysicsTiers)
+                            | SceneInspectorItem::TiersToggle
+                            | SceneInspectorItem::TiersField(_)
+                            | SceneInspectorItem::TiersStatus
+                    )
+                })
+                .collect();
+            assert_eq!(tier_rows.len(), 8);
+            ui.scene_inspector_scroll = tier_rows[0].top - 150.0;
+            redraw(&mut ui, width, height);
+            for row in &tier_rows {
+                let top = row.top - ui.scene_inspector_scroll;
+                assert!(top >= 140.0, "{:?} above the inspector at {width}x{height}", row.item);
+                assert!(top + row.height <= ui.canvas_height + 0.01, "{:?} off screen at {width}x{height}", row.item);
+            }
+            for field in TierField::ALL {
+                assert!(text_width(field.label(), 0.52) + 14.0 <= 147.0 - 4.0, "{field:?} label too wide");
+            }
+            for label in ["Governor on · click to turn off", "Governor off · click to turn on"] {
+                assert!(text_width(label, 0.56) + 8.0 <= 222.0, "{label}");
+            }
+            // The value is clipped to its field, however long: no glyph passes the field edge.
+            let budget = tier_rows.iter().find(|row| row.item == SceneInspectorItem::TiersField(TierField::BudgetMs)).unwrap();
+            let (scale, left) = (ui.canvas_scale, ui.canvas_width - 250.0);
+            let field_top = (budget.top - ui.scene_inspector_scroll) * scale;
+            let drawn = redraw(&mut ui, width, height);
+            let right_edge = drawn.iter()
+                .filter(|item| item.color[0] > 0.8 && item.rect[1] >= field_top && item.rect[1] < field_top + budget.height * scale && item.rect[0] >= (left + 147.0) * scale)
+                .map(|item| item.rect[0] + item.rect[2])
+                .fold(0.0_f32, f32::max);
+            assert!(right_edge > (left + 150.0) * scale, "the long value is not drawn at {width}x{height}");
+            assert!(right_edge <= (left + 235.0) * scale + 0.5, "the value passes its field at {width}x{height}: {right_edge}");
+            let status = tier_status_short(ui.run_panel.as_ref().map(|panel| panel.tier_governor.as_ref()));
+            assert!(status.contains("123456 beams") && status.contains("overloaded"), "{status}");
+            assert!(text_width(&fit_text(&status, 0.5, 222.0), 0.5) <= 222.0);
+
+            // The Run tab shows the governor row inside the dock box.
+            ui.project_category = DOCK_TAB_RUN;
+            let rects = redraw(&mut ui, width, height);
+            let dock_top = ui.editor_dock_top();
+            let lines = ui.run_panel.as_ref().unwrap().lines();
+            assert_eq!(lines.len(), 5);
+            assert!(lines[4].starts_with("Tier governor: 123456 governed beams"), "{}", lines[4]);
+            assert!(20.0 + text_width(&lines[4], 0.72) <= ui.canvas_width - 250.0 - 8.0, "governor row too wide");
+            let y = dock_top + 81.0 + 4.0 * 22.0;
+            assert!(y + 12.0 <= dock_top + 67.0 + 122.0, "governor row below the dock box");
+            let scale = ui.canvas_scale;
+            assert!(
+                rects.iter().any(|item| item.color[0] > 0.8
+                    && item.rect[1] >= (y - 2.0) * scale
+                    && item.rect[1] <= (y + 16.0) * scale
+                    && item.rect[0] >= 20.0 * scale
+                    && item.rect[0] <= 300.0 * scale),
+                "governor row not drawn at {width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_status_distinguishes_unknown_off_and_planned() {
+        assert_eq!(tier_status_short(None), "Now: —");
+        assert_eq!(tier_status_short(Some(None)), "Now: governor off in the scene");
+        let waiting = GovernorReading { governed_beams: 0, plan: None };
+        assert_eq!(tier_status_short(Some(Some(&waiting))), "Now: 0 beams, no plan yet");
+        let planned = GovernorReading {
+            governed_beams: 2,
+            plan: Some(PlanReading { total_cost_ms: 3.0, budget_ms: 5.0, overloaded: false, over_tolerance_regions: 0 }),
+        };
+        assert_eq!(tier_status_short(Some(Some(&planned))), "Now: 2 beams · plan 3.00/5.00 ms");
+    }
+
+    #[test]
+    fn chemistry_and_tier_fields_do_not_share_editor_state() {
+        let mut ui = scene_ui(1280.0, 720.0);
+        ui.scene_inspector_collapsed[5] = false;
+        ui.scene_inspector_collapsed[6] = false;
+        click_row(&mut ui, SceneInspectorItem::ChemistryInterval, 190.0);
+        assert!(matches!(ui.scene_input.as_ref().unwrap().target, SceneInputTarget::ChemistryInterval));
+        ui.scene_input_key(KeyCode::Escape);
+        click_row(&mut ui, SceneInspectorItem::TiersField(TierField::BudgetMs), 190.0);
+        assert!(matches!(
+            ui.scene_input.as_ref().unwrap().target,
+            SceneInputTarget::TierField(TierField::BudgetMs)
+        ));
     }
 }
