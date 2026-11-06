@@ -5,10 +5,11 @@
 //! What this module is not: it does not make a creature walk. The only
 //! learned behaviour is [`ActivationTask`]: raising one muscle channel while a
 //! sensor condition holds. Digestion, transport and the brain live in this
-//! module's plain data, not yet in dedicated organ REVs.
+//! module's plain data; the organ graph in [`organs`] maps organs and their
+//! channels onto existing REVs by stable id and lets damage limit them.
 //!
 //! Sensing ([`SensorLayout`], [`SensorReading`]) reads the real scene: contact,
-//! the support force and its share per foot (momentum balance of the body), the
+//! the exact support reaction per foot (`Scene::support_load_n`, with a documented momentum-balance fallback when the scene has none), the
 //! height of the centre of mass, tilt, joint angles, pose error against the
 //! actuator's commanded pose, actuator load and bond stress per bone. Every
 //! channel has a stable id ([`SensorId`]), one unit and a cost counter
@@ -193,6 +194,14 @@ pub struct ResourceLedger {
     heat_j: f64,
     mechanical_net_j: f64,
     unfunded_work_j: f64,
+    /// Share of the nominal digestion rate that works, `0..=1`; set from the
+    /// organ graph (a damaged stomach or a cut transport path lowers it).
+    #[serde(default = "full_throughput")]
+    digestion_throughput: f64,
+}
+
+fn full_throughput() -> f64 {
+    1.0
 }
 
 impl ResourceLedger {
@@ -210,7 +219,17 @@ impl ResourceLedger {
             heat_j: 0.0,
             mechanical_net_j: 0.0,
             unfunded_work_j: 0.0,
+            digestion_throughput: 1.0,
         })
+    }
+
+    /// Limit digestion to `share` (`0..=1`) of its nominal power. A non-finite
+    /// value counts as zero.
+    pub fn set_digestion_throughput(&mut self, share: f64) {
+        self.digestion_throughput = if share.is_finite() { share.clamp(0.0, 1.0) } else { 0.0 };
+    }
+    pub fn digestion_throughput(&self) -> f64 {
+        self.digestion_throughput
     }
 
     pub fn params(&self) -> &OrganParams {
@@ -271,7 +290,7 @@ impl ResourceLedger {
         }
         let digested = self
             .stomach_j
-            .min(self.params.digestion_power_w * dt_s);
+            .min(self.params.digestion_power_w * self.digestion_throughput * dt_s);
         let absorbed = digested * self.params.absorption_efficiency;
         let room = (self.params.store_capacity_j - self.stored_j).max(0.0);
         let kept = absorbed.min(room);
@@ -586,33 +605,48 @@ pub struct MuscleReading {
     pub pose_error_rms_m: Option<f32>,
 }
 
+/// Origin of the foot and support loads in a [`SensorReading`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoadSource {
+    /// `Scene::support_load_n`: normal reaction of fixed supports per REV.
+    SolverReaction,
+    /// Equal-share estimate from the momentum balance of the whole body.
+    MomentumEstimate,
+}
+
 /// What a creature can sense of the real engine state in one instant.
 ///
 /// Every number is computed from scene state at read time; nothing is noisy or
 /// remembered. Not available without changing the solver, and therefore
-/// absent: the solver's own contact impulses (support is measured on the whole
-/// body by momentum balance and shared among the touching feet), friction
-/// state, light, and exteroception beyond touch.
+/// absent: contact impulses against movable objects (only fixed supports are
+/// reported by the solver), friction state, light, and exteroception beyond
+/// touch.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SensorReading {
     /// For each foot REV: is another REV outside the creature touching it?
     pub foot_contact: Vec<bool>,
-    /// For each foot REV: its share of `support_load_n` (N); zero for a foot
-    /// that does not touch anything. The solver does not export contact
-    /// impulses, and bond forces are too noisy on a stiff body to attribute the
-    /// support to single REVs, so the support is divided equally among the
-    /// touching feet. List every REV that can bear weight as a foot (for
-    /// example with [`SensorLayout::lowest_revs`]) or the shares are too large.
+    /// For each foot REV: the compressive load it carries (N). With
+    /// [`LoadSource::SolverReaction`] this is the exact normal reaction the
+    /// solver reported for that REV against a fixed support in the last
+    /// substep (`Scene::support_load_n`); a foot that touches nothing fixed
+    /// reads zero. With [`LoadSource::MomentumEstimate`] (fallback, only when
+    /// the scene has no reaction vector, for example before its first step or
+    /// right after a topology change) it is the body-wide momentum balance
+    /// shared equally among the touching feet, so list every REV that can bear
+    /// weight as a foot (for example with [`SensorLayout::lowest_revs`]).
     pub foot_normal_load_n: Vec<f32>,
-    /// Net force the environment (contacts and bonds to outside REVs) exerts on
-    /// the whole creature along world up (N): `M a - M g - F_external -
-    /// F_actuator` projected on up, clamped at zero, and zero when no foot
-    /// touches. Internal bond forces cancel, so it is exact up to the accuracy
-    /// of the velocities. It includes the inertial term only when accelerations
-    /// were supplied (see `inertia_included`); otherwise the body is assumed
-    /// not to accelerate.
+    /// Total compressive load the environment puts on the creature (N), along
+    /// the support normals. Solver reaction: the sum of the per-REV reactions
+    /// over the creature's REVs (inertia is already inside it). Fallback: net
+    /// force of contacts and outside bonds along world up, `M a - M g -
+    /// F_external - F_actuator`, clamped at zero, zero when no foot touches.
+    /// Limit of the exact source: weight carried by a movable object (a crate,
+    /// another body) is not a fixed-support reaction and reads zero.
     pub support_load_n: f32,
-    /// True when the foot loads include the measured acceleration.
+    /// Where `foot_normal_load_n` and `support_load_n` came from.
+    pub load_source: LoadSource,
+    /// True when the loads include the inertial term (always for the solver
+    /// reaction; for the fallback only when accelerations were supplied).
     pub inertia_included: bool,
     /// Creature weight `M |g|` (N), for scaling the loads.
     pub body_weight_n: f32,
@@ -847,6 +881,7 @@ impl SensorReading {
             foot_contact: vec![false; foot_count],
             foot_normal_load_n: vec![0.0; foot_count],
             support_load_n: 0.0,
+            load_source: LoadSource::MomentumEstimate,
             inertia_included: false,
             body_weight_n: 0.0,
             com_height_m: None,
@@ -866,7 +901,7 @@ impl SensorReading {
     }
 
     /// Read the real engine state of one creature. Does not mutate the scene.
-    /// Foot loads assume the feet are not accelerating; use
+    /// Without a solver reaction vector the fallback foot loads assume the feet are not accelerating; use
     /// [`read_with_motion`](Self::read_with_motion) when accelerations are known.
     pub fn read(
         scene: &Scene,
@@ -911,7 +946,7 @@ impl SensorReading {
         });
 
         // Contact: any REV outside the creature within one cell (plus tolerance).
-        let mut foot_contact = Vec::with_capacity(layout.foot_local.len());
+        let mut foot_contact: Vec<bool> = Vec::with_capacity(layout.foot_local.len());
         for &f in &layout.foot_local {
             let p = pos[range.start + f];
             cost.rev_reads += 1;
@@ -946,36 +981,56 @@ impl SensorReading {
         } else {
             (None, DVec3::ZERO, DVec3::ZERO)
         };
-        // Support: what the environment must supply so that gravity, external
-        // and actuator loads produce the measured acceleration of the whole body.
-        // Internal bond forces cancel in the sum, so they are not read here.
+        // Support. Exact path: the solver's own reaction of fixed supports per
+        // REV. Fallback (documented on `SensorReading`): the momentum balance of
+        // the whole body, shared equally among the touching feet.
+        let exact = !scene.support_load_n.is_empty() && scene.support_load_n.len() == scene.voxels.len();
         let touching = foot_contact.iter().filter(|&&c| c).count();
-        let support_load = match up {
-            Some(up) if touching > 0 && total_mass > 0.0 => {
-                let mut needed = DVec3::ZERO;
-                for &i in &dynamic {
-                    let l = i - range.start;
-                    let m = f64::from(scene.voxels[i].mass);
-                    let actuator_force = actuator
-                        .and_then(|a| a.last_forces_n().get(l).copied())
-                        .unwrap_or(Vec3::ZERO)
-                        .as_dvec3();
-                    let inertial = acceleration_m_s2.map_or(DVec3::ZERO, |a| a[l].as_dvec3() * m);
-                    needed += inertial
-                        - gravity * m
-                        - scene.external_forces[i].as_dvec3()
-                        - scene.external_accelerations[i].as_dvec3() * m
-                        - actuator_force;
-                }
-                let load = needed.dot(up).max(0.0);
-                if load.is_finite() { load } else { 0.0 }
+        let (support_load, foot_normal_load_n) = if exact {
+            let reaction = &scene.support_load_n;
+            cost.rev_reads += range.len() as u64;
+            let total: f64 = range.clone().map(|i| f64::from(reaction[i])).sum();
+            let feet: Vec<f32> = layout
+                .foot_local
+                .iter()
+                .map(|&f| reaction[range.start + f])
+                .collect();
+            for (c, &load) in foot_contact.iter_mut().zip(&feet) {
+                *c |= load > 0.0;
             }
-            _ => 0.0,
+            (if total.is_finite() { total } else { 0.0 }, feet)
+        } else {
+            // What the environment must supply so that gravity, external and
+            // actuator loads produce the measured acceleration of the body.
+            // Internal bond forces cancel in the sum, so they are not read here.
+            let support_load = match up {
+                Some(up) if touching > 0 && total_mass > 0.0 => {
+                    let mut needed = DVec3::ZERO;
+                    for &i in &dynamic {
+                        let l = i - range.start;
+                        let m = f64::from(scene.voxels[i].mass);
+                        let actuator_force = actuator
+                            .and_then(|a| a.last_forces_n().get(l).copied())
+                            .unwrap_or(Vec3::ZERO)
+                            .as_dvec3();
+                        let inertial = acceleration_m_s2.map_or(DVec3::ZERO, |a| a[l].as_dvec3() * m);
+                        needed += inertial
+                            - gravity * m
+                            - scene.external_forces[i].as_dvec3()
+                            - scene.external_accelerations[i].as_dvec3() * m
+                            - actuator_force;
+                    }
+                    let load = needed.dot(up).max(0.0);
+                    if load.is_finite() { load } else { 0.0 }
+                }
+                _ => 0.0,
+            };
+            let feet = foot_contact
+                .iter()
+                .map(|&c| if c { (support_load / touching as f64) as f32 } else { 0.0 })
+                .collect();
+            (support_load, feet)
         };
-        let foot_normal_load_n: Vec<f32> = foot_contact
-            .iter()
-            .map(|&c| if c { (support_load / touching as f64) as f32 } else { 0.0 })
-            .collect();
 
         let com_height_m = com.zip(up).map(|(c, u)| c.dot(u) as f32);
         let body_height_m = com.zip(up).and_then(|(c, u)| {
@@ -1089,7 +1144,8 @@ impl SensorReading {
             foot_contact,
             foot_normal_load_n,
             support_load_n: support_load as f32,
-            inertia_included: acceleration_m_s2.is_some(),
+            load_source: if exact { LoadSource::SolverReaction } else { LoadSource::MomentumEstimate },
+            inertia_included: exact || acceleration_m_s2.is_some(),
             body_weight_n: (total_mass * gravity.length()) as f32,
             com_height_m,
             body_height_m,
@@ -2109,16 +2165,32 @@ impl Controller for SpikingController {
 /// forced into `0..=1`; a non-finite command counts as zero. A zero scale also
 /// disables the actuator so an exhausted creature does not move.
 pub fn apply_command(command: &ControlCommand, limit: f32, actuators: &mut [SkeletalActuator]) -> Result<(), String> {
-    if command.actuator_strength.len() != actuators.len() {
-        return Err("command length differs from the actuator count".into());
+    apply_command_limits(command, &vec![limit; actuators.len()], actuators)
+}
+
+/// As [`apply_command`] with one limit per actuator, so that each can be
+/// weakened separately (a damaged muscle, a cut supply line).
+pub fn apply_command_limits(
+    command: &ControlCommand,
+    limits: &[f32],
+    actuators: &mut [SkeletalActuator],
+) -> Result<(), String> {
+    if command.actuator_strength.len() != actuators.len() || limits.len() != actuators.len() {
+        return Err("command and limit lengths differ from the actuator count".into());
     }
-    let limit = if limit.is_finite() { limit.clamp(0.0, 1.0) } else { 0.0 };
-    for (a, &c) in actuators.iter_mut().zip(&command.actuator_strength) {
-        let c = if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 };
-        a.strength_scale = c.min(limit);
-        a.enabled = a.strength_scale > 0.0;
+    for ((a, &c), &limit) in actuators.iter_mut().zip(&command.actuator_strength).zip(limits) {
+        set_strength(a, c, limit);
     }
     Ok(())
+}
+
+/// The one place a strength factor reaches an actuator; returns the applied value.
+fn set_strength(actuator: &mut SkeletalActuator, command: f32, limit: f32) -> f32 {
+    let limit = if limit.is_finite() { limit.clamp(0.0, 1.0) } else { 0.0 };
+    let c = if command.is_finite() { command.clamp(0.0, 1.0) } else { 0.0 };
+    actuator.strength_scale = c.min(limit);
+    actuator.enabled = actuator.strength_scale > 0.0;
+    actuator.strength_scale
 }
 
 // ---------------------------------------------------------------------------
@@ -2138,12 +2210,25 @@ pub struct StepTiming {
 /// What one driven step did.
 #[derive(Clone, Debug)]
 pub struct StepReport {
+    /// Mean commanded strength over the actuators (the command itself when
+    /// there is one).
     pub commanded: f32,
+    /// Mean applied strength over the actuators.
     pub applied: f32,
+    /// Strength the controller asked for, per actuator, after the brain and
+    /// its signal paths scaled it.
+    pub commanded_each: Vec<f32>,
+    /// Strength applied to each actuator after the energy and organ limits.
+    pub applied_each: Vec<f32>,
+    /// Net mechanical work of each actuator's loads this step (J).
+    pub work_each_j: Vec<f64>,
     pub outcome: MuscleStepOutcome,
     /// Cost of the sensor read that fed the controller.
     pub sensor_cost: SensorCost,
     pub timing: StepTiming,
+    /// True when the scene lost REVs, so sensors and actuators of this
+    /// creature are no longer bound (see [`Creature::drive_step`]).
+    pub topology_changed: bool,
 }
 
 pub struct Creature {
@@ -2151,28 +2236,60 @@ pub struct Creature {
     learned: LearnedState,
     ledger: ResourceLedger,
     sensors: SensorLayout,
-    actuator_index: usize,
+    /// Scene indices of the skeletal actuators this creature drives, in the
+    /// order of the controller's outputs. Their REV ranges are disjoint.
+    actuator_indices: Vec<usize>,
+    /// Stable ids of every REV of all actuator ranges, ascending.
+    body_ids: Vec<u64>,
+    organs: Option<OrganGraph>,
+    organ_refresh_interval_s: f64,
+    organ_age_s: f64,
+    /// Heat that had no REV left to receive it (J); zero unless the whole body is gone.
+    undeposited_heat_j: f64,
     /// Acceleration of each creature REV over the last driven step (m/s^2),
-    /// from the velocities at its start and end; feeds the foot-load sensors.
+    /// from the velocities at its start and end; feeds the fallback foot-load
+    /// estimate. Indexed over the sensor range (the first actuator).
     last_acceleration: Option<Vec<Vec3>>,
     sensor_cost: SensorCost,
 }
 
 impl Creature {
-    /// Build from a genome. With `initial_gait == None` the creature starts
-    /// from scratch (weights regenerated from the genome); with a gait it starts
-    /// from that learned state and keeps learning from it.
+    /// Build from a genome with one skeletal actuator. See
+    /// [`new_multi`](Self::new_multi).
     pub fn new(
         genome: Genome,
         initial_gait: Option<LearnedState>,
         scene: &Scene,
         actuator_index: usize,
     ) -> Result<Self, String> {
+        Self::new_multi(genome, initial_gait, scene, &[actuator_index])
+    }
+
+    /// Build a creature that drives several skeletal actuators, each with its
+    /// own strength factor (controller output `k` drives `actuator_indices[k]`).
+    /// The first actuator is the body: sensors read its REV range and bones.
+    /// Other actuators (limbs, tails) add muscle tissue, work accounting and
+    /// organ nodes, but their REVs are not part of the sensor fits. Actuator
+    /// REV ranges must be disjoint. With `initial_gait == None` the creature
+    /// starts from scratch; with a gait it starts from that learned state.
+    pub fn new_multi(
+        genome: Genome,
+        initial_gait: Option<LearnedState>,
+        scene: &Scene,
+        actuator_indices: &[usize],
+    ) -> Result<Self, String> {
         genome.validate()?;
-        let actuator = scene
-            .skeletal_actuators
-            .get(actuator_index)
-            .ok_or("scene has no such actuator")?;
+        let first = *actuator_indices.first().ok_or("a creature needs at least one actuator")?;
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        for &k in actuator_indices {
+            let a = scene.skeletal_actuators.get(k).ok_or("scene has no such actuator")?;
+            let r = a.voxel_range();
+            if ranges.iter().any(|o| o.start < r.end && r.start < o.end) {
+                return Err("actuator REV ranges of one creature must be disjoint".into());
+            }
+            ranges.push(r);
+        }
+        let actuator = &scene.skeletal_actuators[first];
         let feet = genome.structure.foot_voxels.iter().map(|&f| f as usize).collect();
         let mut sensors = SensorLayout::new(actuator, feet)?;
         sensors.bind(scene)?;
@@ -2190,12 +2307,23 @@ impl Creature {
             }
             None => LearnedState::from_scratch(&genome.network),
         };
+        let mut body_ids: Vec<u64> = ranges
+            .iter()
+            .flat_map(|r| r.clone())
+            .filter_map(|i| scene.rev_id(i))
+            .collect();
+        body_ids.sort_unstable();
         Ok(Self {
             ledger: ResourceLedger::new(genome.organs.clone())?,
             genome,
             learned,
             sensors,
-            actuator_index,
+            actuator_indices: actuator_indices.to_vec(),
+            body_ids,
+            organs: None,
+            organ_refresh_interval_s: 0.1,
+            organ_age_s: 0.0,
+            undeposited_heat_j: 0.0,
             last_acceleration: None,
             sensor_cost: SensorCost::default(),
         })
@@ -2219,6 +2347,81 @@ impl Creature {
     pub fn sensor_layout(&self) -> &SensorLayout {
         &self.sensors
     }
+    pub fn actuator_count(&self) -> usize {
+        self.actuator_indices.len()
+    }
+    pub fn actuator_indices(&self) -> &[usize] {
+        &self.actuator_indices
+    }
+    /// Stable ids of all REVs of this creature's actuators.
+    pub fn body_ids(&self) -> &[u64] {
+        &self.body_ids
+    }
+    pub fn organs(&self) -> Option<&OrganGraph> {
+        self.organs.as_ref()
+    }
+    pub fn organs_mut(&mut self) -> Option<&mut OrganGraph> {
+        self.organs.as_mut()
+    }
+    /// Heat the ledger booked that no REV could receive (J).
+    pub fn undeposited_heat_j(&self) -> f64 {
+        self.undeposited_heat_j
+    }
+    /// Attach an organ graph; from then on every driven step reads damage
+    /// through it. The graph is refreshed at least every
+    /// `refresh_interval_s` of simulated time and whenever the REV count changes.
+    pub fn set_organs(&mut self, graph: OrganGraph, refresh_interval_s: f64) -> Result<(), String> {
+        if !(refresh_interval_s.is_finite() && refresh_interval_s >= 0.0) {
+            return Err("organ refresh interval must be finite and nonnegative".into());
+        }
+        self.organs = Some(graph);
+        self.organ_refresh_interval_s = refresh_interval_s;
+        self.organ_age_s = f64::INFINITY;
+        Ok(())
+    }
+
+    /// Build the standard anatomy of [`OrganGraph::standard`] for this creature:
+    /// one muscle node per actuator over its dynamic REVs.
+    pub fn build_standard_organs(
+        &mut self,
+        scene: &Scene,
+        plan: &OrganPlan,
+        refresh_interval_s: f64,
+    ) -> Result<(), String> {
+        let mut muscle_revs = Vec::new();
+        let mut body = Vec::new();
+        for &k in &self.actuator_indices {
+            let range = scene
+                .skeletal_actuators
+                .get(k)
+                .ok_or("creature actuator is missing")?
+                .voxel_range();
+            body.extend(range.clone());
+            muscle_revs.push(
+                range
+                    .filter(|&i| !scene.voxels[i].kinematic && scene.voxels[i].mass > 0.0)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let weight = muscle_revs
+            .iter()
+            .flatten()
+            .map(|&i| f64::from(scene.voxels[i].mass))
+            .sum::<f64>()
+            * f64::from(Vec3::from_array(scene.config.gravity).length());
+        let p = &self.genome.organs;
+        let nutrient_w = p.peak_mechanical_power_w / p.muscle_efficiency + p.basal_power_w + p.digestion_power_w;
+        let graph = OrganGraph::standard(
+            scene,
+            body,
+            plan,
+            &muscle_revs,
+            nutrient_w.max(1e-9),
+            (10.0 * weight).max(1e-9),
+        )?;
+        self.set_organs(graph, refresh_interval_s)
+    }
+
     /// Cumulative cost of every sensor read made through this creature.
     pub fn sensor_cost_total(&self) -> SensorCost {
         self.sensor_cost
@@ -2226,13 +2429,20 @@ impl Creature {
 
     /// Read the creature's sensors now, with the acceleration of the last
     /// driven step when there is one. Counts towards `sensor_cost_total`.
+    /// Fails with an error once the scene's topology changed under the
+    /// sensor layout (see [`drive_step`](Self::drive_step) for how a driven
+    /// step handles that). Sense-organ damage is applied when an organ graph
+    /// is attached.
     pub fn sense(&mut self, scene: &Scene) -> Result<SensorReading, String> {
-        let reading = SensorReading::read_with_motion(
+        let mut reading = SensorReading::read_with_motion(
             scene,
             &self.sensors,
             &self.ledger,
             self.last_acceleration.as_deref(),
         )?;
+        if let Some(graph) = &self.organs {
+            graph.degrade_sensors(&mut reading);
+        }
         self.sensor_cost.accumulate(reading.cost);
         Ok(reading)
     }
@@ -2246,14 +2456,53 @@ impl Creature {
         )?))
     }
 
+    fn refresh_organs(&mut self, scene: &Scene, dt: f64) {
+        if let Some(graph) = &mut self.organs {
+            self.organ_age_s += dt;
+            if graph.needs_refresh(scene) || self.organ_age_s >= self.organ_refresh_interval_s {
+                graph.refresh(scene);
+                self.organ_age_s = 0.0;
+            }
+        }
+    }
+
+    /// Put `heat_j` into the surviving REVs of the body, by mass. Whatever has
+    /// no receiver is kept in `undeposited_heat_j` so the loss stays visible.
+    fn deposit_heat(&mut self, scene: &mut Scene, heat_j: f64) {
+        if heat_j <= 0.0 {
+            return;
+        }
+        let alive: Vec<usize> = self.body_ids.iter().filter_map(|&id| scene.rev_index(id)).collect();
+        let mass: f64 = alive.iter().map(|&i| f64::from(scene.voxels[i].mass)).sum();
+        if mass > 0.0 {
+            for &i in &alive {
+                let share = f64::from(scene.voxels[i].mass) / mass;
+                scene.voxels[i].add_internal_energy_j(heat_j * share);
+            }
+        } else {
+            self.undeposited_heat_j += heat_j;
+        }
+    }
+
     /// One physical step with sensing, control, actuation, accounting and
     /// heat. `advance` must perform exactly one fixed solver step on the scene
     /// (for example `|s| solver::step(s, &mut None)`).
     ///
-    /// The controller's strength factor is held for the whole fixed step: the
-    /// solver evaluates the actuator's loads once per step, so a command cannot
-    /// change inside it without a change to the solver. A spiking controller
-    /// still integrates its own state at the network step (1 ms by default).
+    /// The controller answers with one strength factor per actuator. Each is
+    /// scaled by what reaches that muscle through the organ graph (brain
+    /// integrity and the signal path), then limited by the energy store and by
+    /// the muscle's own integrity and nutrient supply. The factors are held for
+    /// the whole fixed step: the solver evaluates actuator loads once per step,
+    /// so a command cannot change inside it without a change to the solver. A
+    /// spiking controller still integrates its own state at the network step
+    /// (1 ms by default).
+    ///
+    /// If the scene lost REVs (outside the world bounds, fusion) the sensor
+    /// layout and the actuators are stale and the engine pauses actuation. The
+    /// creature does not fail: it stops sensing and controlling (zero
+    /// strength, `topology_changed` in the report), still pays basal
+    /// metabolism, and puts the heat into the surviving tissue by stable id.
+    /// Rebinding sensors after such a change is not implemented.
     pub fn drive_step(
         &mut self,
         scene: &mut Scene,
@@ -2262,68 +2511,120 @@ impl Creature {
     ) -> Result<StepReport, String> {
         use std::time::Instant;
         let dt = f64::from(scene.config.fixed_dt);
+        let n_act = self.actuator_indices.len();
+        if self.actuator_indices.iter().any(|&k| k >= scene.skeletal_actuators.len()) {
+            return Err("creature actuator is missing".into());
+        }
+        self.refresh_organs(scene, dt);
+        let bound = scene.voxels.len() == self.sensors.total_scene_voxels;
+
         let started = Instant::now();
-        let reading = self.sense(scene)?;
+        let reading = if bound { Some(self.sense(scene)?) } else { None };
         let sensing_s = started.elapsed().as_secs_f64();
 
         let started = Instant::now();
-        let command = controller.control(dt, &reading, 1)?;
+        let mut command = match &reading {
+            Some(r) => controller.control(dt, r, n_act)?,
+            None => ControlCommand { actuator_strength: vec![0.0; n_act] },
+        };
+        if command.actuator_strength.len() != n_act {
+            return Err("command length differs from the actuator count".into());
+        }
+        if let Some(graph) = &self.organs {
+            graph.gate_command(&mut command);
+        }
         let control_s = started.elapsed().as_secs_f64();
 
-        let limit = self.ledger.strength_limit(dt);
-        let idx = self.actuator_index;
-        let actuators = scene
-            .skeletal_actuators
-            .get_mut(idx..=idx)
-            .ok_or("creature actuator is missing")?;
-        apply_command(&command, limit, actuators)?;
-        let applied = scene.skeletal_actuators[idx].strength_scale;
-        let range = scene.skeletal_actuators[idx].voxel_range();
+        let energy_limit = if bound { self.ledger.strength_limit(dt) } else { 0.0 };
+        let mut applied_each = Vec::with_capacity(n_act);
+        for (slot, &k) in self.actuator_indices.iter().enumerate() {
+            let cap = self.organs.as_ref().map_or(1.0, |g| g.strength_cap(slot)) as f32;
+            applied_each.push(set_strength(
+                &mut scene.skeletal_actuators[k],
+                command.actuator_strength[slot],
+                energy_limit.min(cap),
+            ));
+        }
+        if let Some(graph) = &self.organs {
+            self.ledger.set_digestion_throughput(graph.digestion_throughput());
+        }
 
-        let muscle: Vec<usize> = range
-            .clone()
-            .filter(|&i| !scene.voxels[i].kinematic && scene.voxels[i].mass > 0.0)
-            .collect();
-        let v0_all: Vec<Vec3> = range.clone().map(|i| scene.voxels[i].velocity).collect();
+        // Muscle REVs of every actuator: (slot, actuator-local index, stable id).
+        let mut muscle: Vec<(usize, usize, u64)> = Vec::new();
+        let mut v0: Vec<Vec3> = Vec::new();
+        let mut sense_v0: Vec<Vec3> = Vec::new();
+        let sense_range = self.sensors.range();
+        if bound {
+            for (slot, &k) in self.actuator_indices.iter().enumerate() {
+                let range = scene.skeletal_actuators[k].voxel_range();
+                for i in range.clone() {
+                    if !scene.voxels[i].kinematic && scene.voxels[i].mass > 0.0 {
+                        muscle.push((slot, i - range.start, scene.rev_ids[i]));
+                        v0.push(scene.voxels[i].velocity);
+                    }
+                }
+            }
+            sense_v0 = sense_range.clone().map(|i| scene.voxels[i].velocity).collect();
+        }
         let started = Instant::now();
         advance(scene);
         let solver_s = started.elapsed().as_secs_f64();
-        if scene.voxels.len() != self.sensors.total_scene_voxels {
-            return Err("scene topology changed during the step".into());
-        }
+        let topology_changed = scene.voxels.len() != self.sensors.total_scene_voxels;
 
         let started = Instant::now();
-        let loads = scene.skeletal_actuators[idx].last_forces_n();
-        let forces: Vec<Vec3> = muscle
-            .iter()
-            .map(|&i| loads.get(i - range.start).copied().unwrap_or(Vec3::ZERO))
-            .collect();
-        let v0: Vec<Vec3> = muscle.iter().map(|&i| v0_all[i - range.start]).collect();
-        let v1: Vec<Vec3> = muscle.iter().map(|&i| scene.voxels[i].velocity).collect();
-        let outcome = self.ledger.settle_muscle_step(dt, &forces, &v0, &v1)?;
-        for (&i, &heat) in muscle.iter().zip(&outcome.heat_per_rev_j) {
-            scene.voxels[i].add_internal_energy_j(heat);
+        // Muscle REVs are found again by stable id. One that left the world keeps
+        // its start velocity as its end velocity: its energy went to the boundary ledger.
+        let mut forces = Vec::with_capacity(muscle.len());
+        let mut v1 = Vec::with_capacity(muscle.len());
+        let mut work_each_j = vec![0.0; n_act];
+        for (m, &(slot, local, id)) in muscle.iter().enumerate() {
+            let load = scene.skeletal_actuators[self.actuator_indices[slot]]
+                .last_forces_n()
+                .get(local)
+                .copied()
+                .unwrap_or(Vec3::ZERO);
+            let end = scene.rev_index(id).map_or(v0[m], |i| scene.voxels[i].velocity);
+            forces.push(load);
+            v1.push(end);
+            work_each_j[slot] += load.as_dvec3().dot((v0[m].as_dvec3() + end.as_dvec3()) * 0.5) * dt;
         }
-        self.last_acceleration = Some(
-            range
-                .clone()
-                .zip(&v0_all)
-                .map(|(i, v0)| (scene.voxels[i].velocity - *v0) / dt as f32)
-                .collect(),
-        );
+        let outcome = self.ledger.settle_muscle_step(dt, &forces, &v0, &v1)?;
+        let mut orphan_heat = outcome.unlocalised_heat_j;
+        for (&(_, _, id), &heat) in muscle.iter().zip(&outcome.heat_per_rev_j) {
+            match scene.rev_index(id) {
+                Some(i) => scene.voxels[i].add_internal_energy_j(heat),
+                None => orphan_heat += heat,
+            }
+        }
+        self.deposit_heat(scene, orphan_heat);
+        self.last_acceleration = if topology_changed || !bound {
+            None
+        } else {
+            Some(
+                sense_range
+                    .zip(&sense_v0)
+                    .map(|(i, v0)| (scene.voxels[i].velocity - *v0) / dt as f32)
+                    .collect(),
+            )
+        };
         self.learned.lifetime_s += dt;
         let accounting_s = started.elapsed().as_secs_f64();
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
         Ok(StepReport {
-            commanded: command.actuator_strength.first().copied().unwrap_or(0.0),
-            applied,
+            commanded: mean(&command.actuator_strength),
+            applied: mean(&applied_each),
+            commanded_each: command.actuator_strength,
+            applied_each,
+            work_each_j,
             outcome,
-            sensor_cost: reading.cost,
+            sensor_cost: reading.map(|r| r.cost).unwrap_or_default(),
             timing: StepTiming {
                 sensing_s,
                 control_s,
                 solver_s,
                 accounting_s,
             },
+            topology_changed,
         })
     }
 
@@ -2371,7 +2672,12 @@ pub fn genome_for_body(
     Ok(genome)
 }
 
+pub mod organs;
 pub mod task;
+pub use organs::{
+    Channel, ChannelId, ChannelKind, NodeSpec, OrganCost, OrganGraph, OrganId, OrganNode, OrganPlan, OrganRole,
+    SenseScope,
+};
 pub use task::{ActivationTask, SensorCondition, TaskReport};
 
 #[cfg(test)]

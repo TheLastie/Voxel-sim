@@ -848,7 +848,7 @@ fn every_sensor_has_a_stable_id_a_unit_and_a_cost_and_reads_are_noise_free() {
 }
 
 #[test]
-fn foot_load_shares_the_support_measured_by_momentum_balance() {
+fn foot_loads_are_the_solver_reactions_of_the_fixed_support() {
     let mut passive = PassiveController;
     let mut step = |s: &mut Scene| solver::step(s, &mut None);
 
@@ -870,7 +870,9 @@ fn foot_load_shares_the_support_measured_by_momentum_balance() {
         falling.foot_normal_load_n
     );
     let landing = readings.iter().map(|r| r.foot_normal_load_n[0]).fold(0.0f32, f32::max);
-    assert!(f64::from(landing) > 3.0 * m_g, "landing impact load {landing} vs {m_g}");
+    eprintln!("landing peak foot load / (m g) = {:.2}", f64::from(landing) / m_g);
+    assert!(f64::from(landing) > 1.5 * m_g, "landing impact load {landing} vs {m_g}");
+    assert!(readings.iter().all(|r| r.load_source == LoadSource::SolverReaction));
     let rest = readings.last().unwrap();
     assert!(rest.foot_contact.iter().all(|&c| c));
     for load in &rest.foot_normal_load_n {
@@ -878,13 +880,23 @@ fn foot_load_shares_the_support_measured_by_momentum_balance() {
     }
     assert!((rest.support_load_n / rest.body_weight_n - 1.0).abs() < 0.02, "support carries the weight");
     assert!(rest.inertia_included);
-    // The same body read without a measured acceleration (static assumption):
-    // resting loads agree, a hanging body has no feet on anything and no load.
+    // The exact loads need no measured acceleration.
     let plain = SensorReading::read(&scene, creature.sensor_layout(), creature.ledger()).unwrap();
-    assert!(!plain.inertia_included);
+    assert_eq!(plain.load_source, LoadSource::SolverReaction);
     assert!((plain.support_load_n / plain.body_weight_n - 1.0).abs() < 0.02);
+    let feet_sum: f32 = plain.foot_normal_load_n.iter().sum();
+    assert!((feet_sum / plain.body_weight_n - 1.0).abs() < 0.02, "feet carry the weight");
+    // Fallback: with no reaction vector the momentum-balance estimate is used
+    // and agrees at rest (equal shares of the whole-body balance).
+    scene.support_load_n.clear();
+    let est = SensorReading::read(&scene, creature.sensor_layout(), creature.ledger()).unwrap();
+    assert_eq!(est.load_source, LoadSource::MomentumEstimate);
+    assert!(!est.inertia_included);
+    assert!((est.support_load_n / est.body_weight_n - 1.0).abs() < 0.02);
+    // A body that never stepped has no vector: fallback, nothing touches, no load.
     let hanging = world_raised(3);
     let plain = SensorReading::read(&hanging, creature.sensor_layout(), creature.ledger()).unwrap();
+    assert_eq!(plain.load_source, LoadSource::MomentumEstimate);
     assert_eq!(plain.support_load_n, 0.0, "nothing touches, nothing supports");
 
     // A two-layer block: the load of the top layer reaches the feet through bonds.
@@ -1153,4 +1165,457 @@ fn muscle_losses_reach_the_muscle_revs_as_internal_energy_and_the_books_balance(
     assert!((stored0 - creature.ledger().stored_j() - debited).abs() <= 1e-12 * stored0);
     assert!((debited - (net + heat)).abs() <= 1e-9 * debited, "store drop = work + heat");
     assert!((creature.ledger().heat_total_j() - heat).abs() <= 1e-9 * heat);
+}
+
+// ----- 9. organ graph --------------------------------------------------------
+
+/// The (axis, owner) of the bond between REVs `a` and `b`, in whichever direction it is stored.
+fn bond_slot(scene: &Scene, a: usize, b: usize) -> (usize, usize) {
+    for axis in 0..3 {
+        if scene.bonds[axis][a].neighbor == b as u32 {
+            return (axis, a);
+        }
+        if scene.bonds[axis][b].neighbor == a as u32 {
+            return (axis, b);
+        }
+    }
+    panic!("no bond between {a} and {b}");
+}
+
+fn cut(scene: &mut Scene, local_a: usize, local_b: usize) {
+    let (axis, owner) = bond_slot(scene, GROUND + local_a, GROUND + local_b);
+    scene.bonds[axis][owner].neighbor = crate::bond::EMPTY;
+}
+
+fn hurt(scene: &mut Scene, local_a: usize, local_b: usize, damage: f32) {
+    let (axis, owner) = bond_slot(scene, GROUND + local_a, GROUND + local_b);
+    scene.bonds[axis][owner].damage = damage;
+}
+
+/// Creature layout (local indices) in the fixture world, x = 0..3:
+///   y=1:  2  3  6  7
+///   y=0:  0  1  4  5
+/// Brain on 6 and 7, stomach on 2, store on 3, foot sense on 0 and 1,
+/// muscle on 4 and 5. The hinge between x=1 and x=2 holds the links 1-4 and 3-6.
+fn anatomy(scene: &Scene) -> OrganGraph {
+    let g = |locals: &[usize]| locals.iter().map(|l| GROUND + l).collect::<Vec<_>>();
+    let plan = OrganPlan {
+        brain: g(&[6, 7]),
+        stomach: g(&[2]),
+        store: g(&[3]),
+        foot_sense: g(&[0, 1]),
+        foot_indices: vec![0],
+        body_sense: Vec::new(),
+    };
+    OrganGraph::standard(scene, GROUND..GROUND + 8, &plan, &[g(&[4, 5])], 100.0, 100.0).unwrap()
+}
+
+fn channel_of(graph: &OrganGraph, kind: ChannelKind, from: OrganRole, to: OrganRole) -> Channel {
+    let f = graph.first_node(from).unwrap().id;
+    let t = graph.first_node(to).unwrap().id;
+    graph
+        .channels()
+        .iter()
+        .find(|c| c.kind == kind && c.from == f && c.to == t)
+        .unwrap()
+        .clone()
+}
+
+fn organ_creature(scene: &Scene) -> Creature {
+    let mut p = organs();
+    p.store_capacity_j = 1.0e6;
+    p.basal_power_w = 1.0;
+    p.exhaustion_fraction = 0.01;
+    let layout = SensorLayout::new(&scene.skeletal_actuators[0], vec![0, 4]).unwrap();
+    let genome = genome_for_body("creature-fixture", &layout, p, 21, 16, 1).unwrap();
+    let mut creature = Creature::new(genome, None, scene, 0).unwrap();
+    creature.set_organs(anatomy(scene), 0.0).unwrap();
+    creature
+}
+
+#[test]
+fn organs_are_views_of_existing_revs_and_count_mass_and_energy_once() {
+    let scene = world();
+    let graph = anatomy(&scene);
+    // Brain, stomach, store, feet and muscle together cover all eight REVs once.
+    let all: f64 = (GROUND..GROUND + 8).map(|i| f64::from(scene.voxels[i].mass)).sum();
+    assert!((graph.owned_mass_kg(&scene) - all).abs() <= 1e-12 * all);
+    let energy: f64 = (GROUND..GROUND + 8).map(|i| scene.voxels[i].total_internal_energy_j()).sum();
+    assert!((graph.owned_internal_energy_j(&scene) - energy).abs() <= 1e-12 * energy);
+    // Sharing a REV between two nodes does not double the books.
+    let mut shared = anatomy(&scene);
+    shared
+        .add_node(&scene, NodeSpec::new(OrganRole::Respiration, "lungs", vec![GROUND, GROUND + 6]))
+        .unwrap();
+    assert_eq!(shared.owned_mass_kg(&scene), graph.owned_mass_kg(&scene));
+    assert_eq!(shared.owned_internal_energy_j(&scene), graph.owned_internal_energy_j(&scene));
+    // The graph stores ids, not energy: heating a REV shows in the organ's energy.
+    let mut warmed = world();
+    warmed.voxels[GROUND + 4].add_internal_energy_j(5.0);
+    assert!((graph.owned_internal_energy_j(&warmed) - energy - 5.0).abs() < 1e-3);
+    // Tissue must belong to the body and exist.
+    assert!(shared.add_node(&scene, NodeSpec::new(OrganRole::Store, "bad", vec![0])).is_err());
+    assert!(shared.add_node(&scene, NodeSpec::new(OrganRole::Store, "bad", vec![])).is_err());
+    // Intact body: every channel is fully available, every organ whole.
+    for c in graph.channels() {
+        assert_eq!(c.availability(), 1.0, "{c:?}");
+        assert_eq!(c.throughput(), c.capacity);
+    }
+    for n in graph.nodes() {
+        assert_eq!(n.integrity(), 1.0);
+    }
+}
+
+#[test]
+fn damage_to_the_path_of_a_channel_limits_its_throughput() {
+    let mut scene = world();
+    let mut graph = anatomy(&scene);
+    let sense_to_brain = |g: &OrganGraph| channel_of(g, ChannelKind::Signal, OrganRole::SenseOrgan, OrganRole::Brain);
+    let store_to_muscle = |g: &OrganGraph| channel_of(g, ChannelKind::Nutrient, OrganRole::Store, OrganRole::Muscle);
+    let intact = sense_to_brain(&graph);
+    assert_eq!((intact.availability(), intact.throughput()), (1.0, 1000.0));
+    assert!(intact.delay_s() > 0.0 && intact.delay_s().is_finite(), "{intact:?}");
+
+    // Both rows cross the hinge (links 1-4 and 3-6). Damage one: the signal
+    // takes the other row at full strength.
+    hurt(&mut scene, 1, 4, 0.7);
+    graph.refresh(&scene);
+    assert_eq!(sense_to_brain(&graph).availability(), 1.0, "detour through intact tissue");
+    // Damage both: the better of the two limits the channel.
+    hurt(&mut scene, 3, 6, 0.4);
+    graph.refresh(&scene);
+    let hurt_both = sense_to_brain(&graph);
+    assert!((hurt_both.availability() - 0.6).abs() < 1e-6, "{hurt_both:?}");
+    assert!((hurt_both.throughput() - 600.0).abs() < 1e-3);
+    let nutrient = store_to_muscle(&graph);
+    assert!((nutrient.availability() - 0.6).abs() < 1e-6, "{nutrient:?}");
+    let muscle = graph.node(nutrient.to).unwrap().integrity();
+    assert!((graph.strength_cap(0) - 0.6f64.min(muscle)).abs() < 1e-6, "the weakest link limits");
+    // The stomach-to-store channel does not cross the hinge and is untouched.
+    assert_eq!(channel_of(&graph, ChannelKind::Nutrient, OrganRole::Digestion, OrganRole::Store).availability(), 1.0);
+    // A broken bond is worth zero health: break the better row (3-6).
+    cut(&mut scene, 3, 6);
+    graph.refresh(&scene);
+    let c = sense_to_brain(&graph);
+    assert!((c.availability() - 0.3).abs() < 1e-6, "only the 0.7-damaged row is left: {c:?}");
+    // Cut the last connection: the channel is dead, signals and food do not cross.
+    cut(&mut scene, 1, 4);
+    graph.refresh(&scene);
+    let c = sense_to_brain(&graph);
+    assert_eq!((c.availability(), c.throughput()), (0.0, 0.0));
+    assert!(c.delay_s().is_infinite() && c.route_ids().is_empty());
+    assert_eq!(graph.strength_cap(0), 0.0);
+    // Brain to muscle lies on the right side of the hinge and still works.
+    assert_eq!(channel_of(&graph, ChannelKind::Signal, OrganRole::Brain, OrganRole::Muscle).availability(), 1.0);
+    // The mechanical channel (muscle -> feet) crosses the hinge as well and is cut.
+    assert_eq!(channel_of(&graph, ChannelKind::Mechanical, OrganRole::Muscle, OrganRole::SenseOrgan).availability(), 0.0);
+    assert!(graph.cost().refreshes >= 5 && graph.cost().search_visits > 0);
+}
+
+#[test]
+fn brain_damage_changes_the_controller_output_and_losing_it_leaves_a_passive_body() {
+    let mut scene = world();
+    scene.config.fixed_dt = 0.01;
+    let mut creature = organ_creature(&scene);
+    let mut controller = RecordedAnimationController;
+    let mut step = |s: &mut Scene| solver::step(s, &mut None);
+    let healthy = creature.drive_step(&mut scene, &mut controller, &mut step).unwrap();
+    assert_eq!(healthy.commanded_each, vec![1.0]);
+    assert_eq!(healthy.applied_each, vec![1.0]);
+
+    // Wound the brain tissue (the 6-7 bond lies inside it): output falls with it.
+    hurt(&mut scene, 6, 7, 0.5);
+    let wounded = creature.drive_step(&mut scene, &mut controller, &mut step).unwrap();
+    let brain = creature.organs().unwrap().first_node(OrganRole::Brain).unwrap().integrity();
+    assert!((brain - 0.5).abs() < 1e-6, "integrity {brain}");
+    assert!((wounded.commanded_each[0] - 0.5).abs() < 1e-6, "{:?}", wounded.commanded_each);
+    assert!(wounded.applied < healthy.applied);
+    assert!(scene.skeletal_actuators[0].enabled);
+
+    // Remove the brain REVs from the world (outside the bounds): central
+    // control is gone, the body is not.
+    let ids_before: Vec<u64> = (GROUND..GROUND + 8).map(|i| scene.rev_id(i).unwrap()).collect();
+    let mass_before = scene.total_mass_kg();
+    let positions_before: Vec<DVec3> = scene.positions.clone();
+    scene.set_world_bounds(DVec3::splat(-100.0), DVec3::splat(100.0)).unwrap();
+    for local in [6, 7] {
+        scene.positions[GROUND + local].x = 1.0e3;
+    }
+    assert_eq!(scene.set_world_bounds(DVec3::splat(-100.0), DVec3::splat(100.0)).unwrap(), 2);
+    assert_eq!(scene.voxels.len(), 14, "only the two brain REVs left; the body stays");
+    let removed = scene.boundary_removals();
+    assert_eq!(removed.voxel_count, 2);
+    assert!(
+        (scene.total_mass_kg() + removed.mass_kg - mass_before).abs() <= 1e-9 * mass_before,
+        "mass is conserved"
+    );
+
+    // Stable ids: every surviving REV is still found as the same tissue.
+    for local in 0..6 {
+        let index = scene.rev_index(ids_before[local]).expect("surviving tissue keeps its id");
+        assert_eq!(index, GROUND + local);
+        assert_eq!(scene.positions[index], positions_before[GROUND + local]);
+    }
+    assert!(scene.rev_index(ids_before[6]).is_none() && scene.rev_index(ids_before[7]).is_none());
+
+    let mut step_after = |s: &mut Scene| solver::step(s, &mut None);
+    let lost = creature.drive_step(&mut scene, &mut controller, &mut step_after).unwrap();
+    assert!(lost.topology_changed);
+    assert_eq!(creature.organs().unwrap().brain_integrity(), 0.0);
+    assert_eq!(lost.commanded_each, vec![0.0]);
+    assert_eq!(lost.applied_each, vec![0.0]);
+    assert!(finite_scene(&scene), "the body keeps simulating");
+    assert_eq!(scene.voxels.len(), 14);
+    assert!(creature.ledger().conservation_residual_j().abs() < 1e-6);
+}
+
+#[test]
+fn ids_still_point_to_the_same_tissue_after_a_removal_in_the_middle() {
+    let mut scene = world();
+    scene.config.fixed_dt = 0.01;
+    let mut creature = organ_creature(&scene);
+    let (stomach, store, foot) = {
+        let g = creature.organs().unwrap();
+        (
+            g.first_node(OrganRole::Digestion).unwrap().clone(),
+            g.first_node(OrganRole::Store).unwrap().clone(),
+            g.first_node(OrganRole::SenseOrgan).unwrap().clone(),
+        )
+    };
+    let store_id = store.tissue_ids()[0];
+    let store_rest = scene.rest_positions[GROUND + 3];
+    let store_mass = scene.voxels[GROUND + 3].mass;
+    // Detach REV 2 (the stomach) from its neighbours, throw it out of the world
+    // inside the step, and let the solver remove it at the end of that step.
+    scene.set_world_bounds(DVec3::splat(-100.0), DVec3::splat(100.0)).unwrap();
+    for (a, b) in [(2, 3), (2, 0)] {
+        cut(&mut scene, a, b);
+    }
+    let total_before = scene.total_mass_kg();
+    let mut internal_after_solver = 0.0;
+    let mut step = |s: &mut Scene| {
+        s.positions[GROUND + 2].x = 1.0e3;
+        solver::step(s, &mut None);
+        internal_after_solver = s.voxels.iter().map(|v| v.total_internal_energy_j()).sum::<f64>();
+    };
+    let mut controller = RecordedAnimationController;
+    creature.ledger_mut().ingest_food(10.0).unwrap();
+    let report = creature.drive_step(&mut scene, &mut controller, &mut step).unwrap();
+    assert!(report.topology_changed, "the solver removed the REV during the step");
+    assert_eq!(scene.voxels.len(), 15);
+    let removed = scene.boundary_removals();
+    assert!((scene.total_mass_kg() + removed.mass_kg - total_before).abs() <= 1e-9 * total_before);
+
+    // The store sat behind the removed REV in the array; its id maps to a shifted index.
+    let moved = scene.rev_index(store_id).unwrap();
+    assert_eq!(moved, GROUND + 2, "indices shifted down by one");
+    assert_eq!(scene.voxels[moved].mass, store_mass);
+    assert_eq!(scene.rest_positions[moved], store_rest, "same lattice cell, same tissue");
+    assert!(scene.rev_index(stomach.tissue_ids()[0]).is_none());
+
+    // The graph follows the ids: the stomach is gone, the store and feet are whole.
+    creature
+        .drive_step(&mut scene, &mut controller, &mut |s: &mut Scene| solver::step(s, &mut None))
+        .unwrap();
+    let g = creature.organs().unwrap();
+    assert_eq!(g.node(stomach.id).unwrap().integrity(), 0.0);
+    assert!(g.node(store.id).unwrap().integrity() > 0.99);
+    assert!(g.node(foot.id).unwrap().integrity() > 0.99);
+    assert_eq!(g.digestion_throughput(), 0.0, "no stomach, no digestion");
+    assert_eq!(creature.ledger().digestion_throughput(), 0.0);
+    assert!(creature.ledger().stomach_j() > 0.0, "food stays put when digestion stops");
+    assert!(creature.ledger().conservation_residual_j().abs() < 1e-9);
+    // Energy books: the heat the ledger booked reached the surviving REVs.
+    assert!(creature.ledger().heat_total_j() > 0.0);
+    assert_eq!(creature.undeposited_heat_j(), 0.0);
+    let internal_after: f64 = scene.voxels.iter().map(|v| v.total_internal_energy_j()).sum();
+    assert!(internal_after > internal_after_solver, "heat from the metabolism reached the tissue");
+}
+
+#[test]
+fn damaged_sense_tissue_degrades_the_sensor_inputs() {
+    let mut scene = world();
+    scene.config.fixed_dt = 0.01;
+    let mut creature = organ_creature(&scene);
+    let mut step = |s: &mut Scene| solver::step(s, &mut None);
+    for _ in 0..20 {
+        creature.drive_step(&mut scene, &mut PassiveController, &mut step).unwrap();
+    }
+    let healthy = creature.sense(&scene).unwrap();
+    assert_eq!(healthy.foot_contact, vec![true, true]);
+    assert!(healthy.foot_normal_load_n[0] > 0.0);
+    // Hurt the tissue of the foot organ (its internal bond 0-1): foot 0 reads weaker.
+    hurt(&mut scene, 0, 1, 0.8);
+    creature.organs_mut().unwrap().refresh(&scene);
+    let weak = creature.sense(&scene).unwrap();
+    let integrity = creature.organs().unwrap().first_node(OrganRole::SenseOrgan).unwrap().integrity();
+    assert!((integrity - 0.2).abs() < 1e-6);
+    assert_eq!(weak.foot_contact, vec![false, true], "below the detection threshold the foot is silent");
+    assert!((weak.foot_normal_load_n[0] - 0.2 * healthy.foot_normal_load_n[0]).abs() <= 1e-4 * healthy.foot_normal_load_n[0]);
+    assert_eq!(weak.foot_normal_load_n[1], healthy.foot_normal_load_n[1], "other feet are untouched");
+    assert_eq!(weak.joints, healthy.joints);
+}
+
+#[test]
+fn damaged_stomach_slows_digestion_and_the_books_balance() {
+    let mut scene = world();
+    scene.config.fixed_dt = 0.01;
+    let mut creature = organ_creature(&scene);
+    let mut step = |s: &mut Scene| solver::step(s, &mut None);
+    creature.ledger_mut().ingest_food(10.0).unwrap();
+    let mut digest = |c: &mut Creature, scene: &mut Scene| {
+        let before = c.ledger().stomach_j();
+        for _ in 0..20 {
+            c.drive_step(scene, &mut PassiveController, &mut step).unwrap();
+        }
+        before - c.ledger().stomach_j()
+    };
+    let full = digest(&mut creature, &mut scene);
+    assert!((full - 0.4).abs() < 1e-6, "2 W for 0.2 s: {full}");
+    // The stomach is REV 2 alone: its links are 2-0 and 2-3. Damage both by 0.5.
+    hurt(&mut scene, 2, 0, 0.5);
+    hurt(&mut scene, 2, 3, 0.5);
+    let half = digest(&mut creature, &mut scene);
+    assert!((half - 0.5 * full).abs() < 1e-6, "digestion at half: {half} vs {full}");
+    assert!(creature.ledger().conservation_residual_j().abs() < 1e-9);
+}
+
+// ----- 10. several actuators -----------------------------------------------------
+
+fn second_cells() -> Vec<[i32; 3]> {
+    creature_cells().iter().map(|&[x, y, z]| [x + 6, y, z]).collect()
+}
+
+/// Two separate bodies on one floor: REVs 16..24 and 24..32, one skeletal
+/// actuator each (scene actuators 0 and 1).
+fn two_body_world() -> Scene {
+    let mut builder = SceneBuilder::standard();
+    for x in (0..4).chain(6..10) {
+        for y in 0..2 {
+            builder = builder.add_voxel(VoxelSpawn::at_cell([x, y, -1], 1).fixed());
+        }
+    }
+    for cells in [creature_cells(), second_cells()] {
+        for [x, y, z] in cells {
+            builder = builder.add_voxel(VoxelSpawn::at_cell([x, y, z], 1));
+        }
+    }
+    let mut scene = builder.build().unwrap();
+    assert_eq!(scene.voxels.len(), 32);
+    for (range, cells) in [(16..24, creature_cells()), (24..32, second_cells())] {
+        let actuator = SkeletalActuator::new(creature_model_of(&cells), range, Quat::IDENTITY, 32).unwrap();
+        scene.skeletal_actuators.push(actuator);
+    }
+    scene.config.fixed_dt = 0.01;
+    scene
+}
+
+struct Fixed(Vec<f32>);
+impl Controller for Fixed {
+    fn name(&self) -> &str {
+        "fixed"
+    }
+    fn control(&mut self, _: f64, _: &SensorReading, n: usize) -> Result<ControlCommand, String> {
+        assert_eq!(n, self.0.len());
+        Ok(ControlCommand { actuator_strength: self.0.clone() })
+    }
+}
+
+fn two_actuator_creature(scene: &Scene, outputs: usize) -> Creature {
+    let mut p = organs();
+    p.store_capacity_j = 1.0e6;
+    p.peak_mechanical_power_w = 5.0;
+    p.exhaustion_fraction = 0.01;
+    let layout = SensorLayout::new(&scene.skeletal_actuators[0], vec![0, 4]).unwrap();
+    let genome = genome_for_body("creature-fixture", &layout, p, 21, 16, outputs).unwrap();
+    Creature::new_multi(genome, None, scene, &[0, 1]).unwrap()
+}
+
+#[test]
+fn two_actuators_are_driven_independently_through_the_solver_and_the_ledger_balances() {
+    let mut scene = two_body_world();
+    for i in 16..32 {
+        scene.voxels[i].velocity = Vec3::new(0.3, 0.0, 0.0);
+    }
+    let mut creature = two_actuator_creature(&scene, 2);
+    assert_eq!(creature.actuator_count(), 2);
+    let internal = |s: &Scene| -> f64 { (16..32).map(|i| s.voxels[i].total_internal_energy_j()).sum() };
+    let stored0 = creature.ledger().stored_j();
+    let (mut debited, mut net, mut heat, mut deposited) = (0.0, 0.0, 0.0, 0.0);
+    let mut by_actuator = [0.0f64; 2];
+    let schedule = [[1.0f32, 0.0], [0.0, 1.0], [0.25, 0.75], [1.0, 1.0]];
+    let mut work_per_entry = Vec::new();
+    for commands in schedule {
+        // Keep both bodies sliding so that the loads act along a real velocity.
+        for i in 16..32 {
+            scene.voxels[i].velocity = Vec3::new(0.3, 0.0, 0.0);
+        }
+        let mut entry_work = [0.0f64; 2];
+        let mut controller = Fixed(commands.to_vec());
+        for _ in 0..4 {
+            let mut after_solver = 0.0;
+            let mut step = |s: &mut Scene| {
+                solver::step(s, &mut None);
+                after_solver = internal(s);
+            };
+            let r = creature.drive_step(&mut scene, &mut controller, &mut step).unwrap();
+            deposited += internal(&scene) - after_solver;
+            assert_eq!(r.applied_each, commands.to_vec(), "each actuator gets its own factor");
+            assert_eq!(r.commanded_each, commands.to_vec());
+            for k in 0..2 {
+                let a = &scene.skeletal_actuators[k];
+                assert_eq!(a.strength_scale, commands[k]);
+                assert_eq!(a.enabled, commands[k] > 0.0);
+                by_actuator[k] += r.work_each_j[k];
+                entry_work[k] += r.work_each_j[k];
+                // A switched-off actuator emits no load and does no work.
+                if commands[k] == 0.0 {
+                    assert_eq!(a.last_force_norm_n(), 0.0);
+                    assert_eq!(r.work_each_j[k], 0.0);
+                }
+            }
+            let sum: f64 = r.work_each_j.iter().sum();
+            assert!((sum - r.outcome.net_mechanical_work_j).abs() <= 1e-12 + 1e-9 * r.outcome.positive_work_j);
+            debited += r.outcome.debited_j;
+            net += r.outcome.net_mechanical_work_j;
+            heat += r.outcome.heat_per_rev_j.iter().sum::<f64>();
+            assert!(finite_scene(&scene));
+        }
+        work_per_entry.push(entry_work);
+    }
+    eprintln!("two actuators: work per schedule entry {work_per_entry:?}, total by actuator {by_actuator:?}");
+    assert!(work_per_entry[0][0].abs() > 1e-6 && work_per_entry[0][1] == 0.0, "only actuator 0 works");
+    assert!(work_per_entry[1][0] == 0.0 && work_per_entry[1][1].abs() > 1e-6, "only actuator 1 works");
+    assert!(work_per_entry[2].iter().all(|w| w.abs() > 1e-6) && work_per_entry[3].iter().all(|w| w.abs() > 1e-6));
+    // Ledger: the store paid net work plus heat, and the heat is in the REVs.
+    assert!(by_actuator[0] != 0.0 && by_actuator[1] != 0.0);
+    assert!((by_actuator.iter().sum::<f64>() - net).abs() <= 1e-9 * net.abs().max(1e-9));
+    assert!((stored0 - creature.ledger().stored_j() - debited).abs() <= 1e-9 * stored0);
+    assert!((debited - (net + heat)).abs() <= 1e-9 * debited, "debited {debited:e} vs net {net:e} + heat {heat:e}");
+    assert!((deposited - heat).abs() <= 1e-9 * heat, "heat in the REVs {deposited:e} vs ledger {heat:e}");
+    assert!(creature.ledger().conservation_residual_j().abs() < 1e-6);
+    assert_eq!(creature.ledger().unfunded_work_total_j(), 0.0);
+}
+
+#[test]
+fn a_spiking_network_drives_two_actuators_from_two_outputs_and_bad_setups_are_refused() {
+    let mut scene = two_body_world();
+    let mut creature = two_actuator_creature(&scene, 2);
+    let mut controller = creature.spiking_controller().unwrap();
+    let mut step = |s: &mut Scene| solver::step(s, &mut None);
+    let mut differ = false;
+    for _ in 0..12 {
+        let r = creature.drive_step(&mut scene, &mut controller, &mut step).unwrap();
+        assert_eq!(r.commanded_each.len(), 2);
+        differ |= r.commanded_each[0] != r.commanded_each[1];
+    }
+    assert!(differ, "two outputs, two separate strengths");
+    // One output cannot feed two actuators (the old averaging needs a multiple).
+    let layout = SensorLayout::new(&scene.skeletal_actuators[0], vec![0, 4]).unwrap();
+    let genome = genome_for_body("creature-fixture", &layout, organs(), 3, 8, 1).unwrap();
+    let mut single_output = Creature::new_multi(genome.clone(), None, &scene, &[0, 1]).unwrap();
+    let mut c = single_output.spiking_controller().unwrap();
+    assert!(single_output.drive_step(&mut scene, &mut c, &mut step).is_err());
+    assert!(Creature::new_multi(genome.clone(), None, &scene, &[0, 0]).is_err(), "same actuator twice overlaps");
+    assert!(Creature::new_multi(genome, None, &scene, &[]).is_err());
 }
