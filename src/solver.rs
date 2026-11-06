@@ -2906,6 +2906,11 @@ fn advance_step_with_axis_targets_and_loads(
     if solve_failed_this_step {
         scene.solver_residual = f32::INFINITY;
     }
+    // Reactions change composition at constant internal energy, so they run once per
+    // fixed step after mechanics and heat, never inside the implicit solve.
+    if scene.chemistry_enabled {
+        let _ = scene.react(scene.config.fixed_dt);
+    }
     let completed_fixed_steps = scene.substep_index / (scene.config.substeps.max(1) as u64);
     if completed_fixed_steps > 0
         && completed_fixed_steps % AUTO_AGGREGATE_SCAN_INTERVAL_STEPS == 0

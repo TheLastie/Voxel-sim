@@ -41,6 +41,12 @@ The current targets, explicitly revised by the user on 2026-11-05, are 60 FPS in
 - Commit coherent milestones and push to `origin/main` when the user has asked for pushes. Verify the remote ref actually moved, then give the commit/link. If command-line push lacks credentials, try the available authorized GitHub route; never describe a local commit as pushed. Clearly report a permission/authentication blocker if no write route succeeds.
 - Update [`PROGRESS_2026-10-12.md`](PROGRESS_2026-10-12.md) with measured results, exact settings, known limitations, and the next incomplete requirements. Keep the report factual and distinguish old results from new code.
 
+## Бюджет физики (решение пользователя 6 ноября 2026)
+
+Ближайший этап проектируется под 1–2 мс физики на 10 мс симуляции в обычной игровой сцене;
+5 мс остаётся верхним пределом приёмки. Достигается уровнями физики (`INTEGRATION_PLAN_2026-11-05.md` §7),
+а не ослаблением законов: сокращённые модели сохраняют состояние каждого REV и раскрываются обратно.
+
 ## Рабочие правила пользователя (5 ноября 2026)
 
 - Работать только внутри `E:\Projects` (см. `E:\Projects\CLAUDE.md`): на диске C ничего не создавать и не менять. Логи, черновики и временные файлы держать в `validation/live-tests/` (там же `scratch/`, не коммитится); вывод фоновых команд перенаправлять в лог на E и читать оттуда.

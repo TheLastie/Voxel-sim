@@ -1,5 +1,6 @@
 pub mod aggregation;
 mod banded;
+pub mod budget;
 mod cell_two_level;
 pub mod bond;
 pub mod collision;
@@ -8,6 +9,7 @@ pub mod recipe_data;
 pub mod recipes;
 mod contact_constraint;
 pub mod coordinates;
+pub mod creature;
 mod cuda_solver;
 pub mod electrical;
 pub mod fracture;
