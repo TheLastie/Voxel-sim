@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use rayon::prelude::*;
 
 use crate::{
+    plant::YEAR_DAYS as PLANT_YEAR_DAYS,
+    plant_world::{PlantGeometry, PlantPopulation, PopulationConfig, SiteInput},
     scene::{Scene, SceneConfig, VoxelSpawn},
     voxel::{Composition, Microstructure},
 };
@@ -317,6 +319,21 @@ pub struct TerrainVoxel {
     pub fiber_direction: Option<Vec3>,
 }
 
+/// How the world's vegetation develops.
+///
+/// `Legacy` derives every tree's size from its age with the original closed-form
+/// approximation (`compute_plant_growth`); it is the default so existing worlds,
+/// saves and tests are unchanged. `ResourceBased` keeps one `plant::Plant` per
+/// individual in a [`PlantPopulation`]: growth is event-driven, limited by finite soil
+/// water and minerals and by light, and the generator takes its dimensions from the
+/// plants' state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GrowthModel {
+    #[default]
+    Legacy,
+    ResourceBased,
+}
+
 #[derive(Clone, Debug)]
 pub struct GeneratedWorld {
     /// Optional visible/accessible experiment footprint; the seeded field is unchanged.
@@ -338,6 +355,13 @@ pub struct GeneratedWorld {
     generated_growth_quarter: u32,
     generated_calendar_quarter: u64,
     geometry_revision: u64,
+    growth_model: GrowthModel,
+    /// Resource-based plants, index-aligned with `plants` (`ResourceBased` only).
+    plant_population: Option<PlantPopulation>,
+    /// Population revision each plant's cached geometry was built from.
+    geometry_stamps: Vec<u64>,
+    /// Plants within this (x, y, radius) get geometry; `None` loads all of them.
+    loaded_region: Option<(f32, f32, f32)>,
 }
 
 /// Schedule biological growth without running vegetation rebuilds in the
@@ -637,6 +661,86 @@ struct PlantGrowth {
     trunk_height_m: f32,
     trunk_radius_m: f32,
     crown_spread_m: f32,
+    /// Present when the dimensions above come from a plant's resource state.
+    state: Option<StateGrowth>,
+}
+
+/// Extra dimensions that only a resource-based plant provides.
+#[derive(Clone, Copy, Debug, Default)]
+struct StateGrowth {
+    /// Volume of branch wood from the branch pool and the wood density (m3).
+    branch_volume_m3: f32,
+    leaf_area_m2: f32,
+    /// Radius of one foliage cluster; 0 when the plant carries no leaves.
+    leaf_radius_m: f32,
+}
+
+/// Foliage area per unit crown volume of a leafy crown (m2/m3), provisional.
+const FOLIAGE_AREA_DENSITY_M2_M3: f32 = 8.0;
+
+impl PlantGrowth {
+    /// Dimensions from a plant state. Trunk, crown and leaf sizes are the plant's
+    /// own; only the stage label (used for root scale and side shoots) is classified.
+    fn from_state(geometry: &PlantGeometry) -> Self {
+        if !geometry.germinated || geometry.height_m <= 0.0 {
+            return Self::default();
+        }
+        let stage = if geometry.senescent {
+            GrowthStage::Senescent
+        } else if geometry.relative_size < 0.03 {
+            GrowthStage::Seedling
+        } else if geometry.relative_size < 0.2 {
+            GrowthStage::Sapling
+        } else if geometry.relative_size < 0.5 {
+            GrowthStage::Pole
+        } else {
+            GrowthStage::Mature
+        };
+        Self {
+            stage,
+            light: geometry.light,
+            structural_light: geometry.structural_light,
+            water: geometry.water,
+            nutrients: geometry.nutrients,
+            development_age_years: geometry.age_years.max(f32::MIN_POSITIVE),
+            vigor: geometry.vigor,
+            height_m: geometry.height_m,
+            trunk_height_m: geometry.trunk_height_m,
+            trunk_radius_m: geometry.trunk_radius_m,
+            crown_spread_m: geometry.crown_radius_m,
+            state: Some(StateGrowth {
+                branch_volume_m3: geometry.branch_volume_m3,
+                leaf_area_m2: geometry.leaf_area_m2,
+                leaf_radius_m: 0.0,
+            }),
+        }
+    }
+
+    /// Radius of one foliage cluster, or `None` when this plant shows no leaves.
+    /// Legacy plants follow the calendar and their crown spread; resource-based
+    /// plants have leaves exactly when their leaf pool says so.
+    fn foliage_radius(&self, leaf_retention: f32, season_phase: f32) -> Option<f32> {
+        match self.state {
+            Some(state) => (state.leaf_radius_m > 0.0).then_some(state.leaf_radius_m),
+            None => ((0.20..0.84).contains(&season_phase) || leaf_retention >= 0.85)
+                .then(|| (0.20 + self.crown_spread_m * 0.055).clamp(0.22, LEAF_CLUSTER_RADIUS_M)),
+        }
+    }
+
+    /// Fix the cluster radius once the branch layout is known: the foliage volume
+    /// implied by the leaf area, shared by two clusters per branch segment.
+    fn set_leaf_radius(&mut self, branches: &[BranchSegment]) {
+        let Some(state) = self.state.as_mut() else { return };
+        let clusters = 2 * branches.iter().filter(|branch| !branch.is_root).count();
+        state.leaf_radius_m = if clusters == 0 || state.leaf_area_m2 < 0.05 {
+            0.0
+        } else {
+            let volume = state.leaf_area_m2 / FOLIAGE_AREA_DENSITY_M2_M3;
+            (3.0 * volume / (4.0 * std::f32::consts::PI * clusters as f32))
+                .cbrt()
+                .clamp(0.08, LEAF_CLUSTER_RADIUS_M)
+        };
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -825,6 +929,13 @@ impl GeneratedWorld {
     /// Build a deterministic 10 km² seeded map. Centimeter cells are generated
     /// implicitly; these 100×100 tiles are overview LOD only and have no physics.
     pub fn from_seed(seed: &str) -> Self {
+        Self::from_seed_with_model(seed, GrowthModel::Legacy)
+    }
+
+    /// Like [`GeneratedWorld::from_seed`] with an explicit vegetation growth model.
+    /// The terrain, the sites and the genomes are identical for both models; only the
+    /// way a tree gets its size from its age differs.
+    pub fn from_seed_with_model(seed: &str, growth_model: GrowthModel) -> Self {
         let seed_hash = hash_seed(seed);
         // A seed-derived calendar epoch keeps the initial season reproducible.
         let season_phase_offset = (unit_noise(seed_hash ^ 0x6A09_E667_F3BC_C909) + 1.0) * 0.5;
@@ -873,6 +984,8 @@ impl GeneratedWorld {
             }
         }
         let (plants, morphotypes) = make_plants(seed_hash);
+        let plant_population = (growth_model == GrowthModel::ResourceBased)
+            .then(|| make_population(&plants, seed_hash, season_phase_offset));
         let mut world = Self {
             view_bounds: None,
             voxels: Vec::new(),
@@ -892,9 +1005,160 @@ impl GeneratedWorld {
             generated_growth_quarter: u32::MAX,
             generated_calendar_quarter: u64::MAX,
             geometry_revision: 0,
+            growth_model,
+            plant_population,
+            geometry_stamps: Vec::new(),
+            loaded_region: None,
         };
         world.rebuild_vegetation();
         world
+    }
+
+    pub fn growth_model(&self) -> GrowthModel {
+        self.growth_model
+    }
+
+    /// The resource-based plants (`GrowthModel::ResourceBased` only). Their state is
+    /// brought up to the world's age by [`GeneratedWorld::sync_plants`] and at every
+    /// geometry rebuild; between those it may lag by up to a quarter year.
+    pub fn plant_population(&self) -> Option<&PlantPopulation> {
+        self.plant_population.as_ref()
+    }
+
+    pub fn plant_count(&self) -> usize {
+        self.plants.len()
+    }
+
+    /// World position of a vegetation individual.
+    pub fn plant_position(&self, index: usize) -> Option<(f32, f32)> {
+        self.plants.get(index).map(|plant| (plant.x, plant.y))
+    }
+
+    /// Advance the plant state to the world's age by events. Generates no geometry,
+    /// so it is the only work growth costs for plants outside the loaded region.
+    pub fn sync_plants(&mut self) {
+        if let Some(population) = self.plant_population.as_mut() {
+            population.advance_to_days(f64::from(self.age_years) * PLANT_YEAR_DAYS);
+        }
+    }
+
+    /// Restrict geometry generation to plants within `radius_m` of (x, y); `None`
+    /// loads every plant. Growth itself never depends on the region.
+    pub fn set_loaded_region(&mut self, region: Option<(f32, f32, f32)>) {
+        self.loaded_region = region.filter(|(x, y, r)| x.is_finite() && y.is_finite() && r.is_finite() && *r >= 0.0);
+    }
+
+    fn plant_is_loaded(&self, index: usize) -> bool {
+        match (self.loaded_region, self.plants.get(index)) {
+            (None, _) => true,
+            (Some((x, y, radius)), Some(plant)) => {
+                (plant.x - x).powi(2) + (plant.y - y).powi(2) <= radius * radius
+            }
+            (Some(_), None) => false,
+        }
+    }
+
+    /// Loaded plants whose cached geometry is older than their state.
+    pub fn stale_geometry_count(&self) -> usize {
+        let Some(population) = self.plant_population.as_ref() else { return 0 };
+        (0..self.plants.len())
+            .filter(|&i| {
+                self.plant_is_loaded(i)
+                    && self.geometry_stamps.get(i).copied() != Some(population.revision(i))
+            })
+            .count()
+    }
+
+    /// Rebuild the geometry of at most `max_plants` stale loaded plants from their
+    /// current state and refresh the 1 cm lookup index. Returns how many were
+    /// rebuilt. This is the chunked path: a caller that loads a region calls it once
+    /// per frame with a small budget until `stale_geometry_count` is zero. The 10 cm
+    /// overview list is refreshed by the scheduled quarter rebuild, not here.
+    pub fn refresh_geometry_chunk(&mut self, max_plants: usize) -> usize {
+        let rebuilt = self.refresh_geometry_from_state(Some(max_plants));
+        if rebuilt > 0 {
+            self.plant_spatial_index = PlantSpatialIndex::build(
+                &self.plants,
+                &self.plant_growth,
+                &self.plant_branches,
+                self.age_years,
+            );
+            self.geometry_revision = self.geometry_revision.wrapping_add(1);
+        }
+        rebuilt
+    }
+
+    /// Geometry currently cached for a plant (what 1 cm queries see).
+    pub fn built_plant_geometry(&self, index: usize) -> Option<BuiltPlantGeometry> {
+        let growth = self.plant_growth.get(index)?;
+        let branches = self.plant_branches.get(index)?;
+        let wood = branches.iter().filter(|segment| !segment.is_root);
+        let (count, volume) = wood.fold((0usize, 0.0f32), |(count, volume), segment| {
+            (
+                count + 1,
+                volume
+                    + std::f32::consts::PI
+                        * segment.radius_m.powi(2)
+                        * (segment.end - segment.start).length(),
+            )
+        });
+        let stale = self.plant_population.as_ref().is_some_and(|population| {
+            self.geometry_stamps.get(index).copied() != Some(population.revision(index))
+        });
+        Some(BuiltPlantGeometry {
+            height_m: growth.height_m,
+            trunk_height_m: growth.trunk_height_m,
+            trunk_radius_m: growth.trunk_radius_m,
+            crown_radius_m: growth.crown_spread_m,
+            wood_branch_segments: count,
+            branch_wood_volume_m3: volume,
+            foliage_radius_m: growth.state.map(|state| state.leaf_radius_m),
+            stale,
+        })
+    }
+
+    /// Cut a resource-based tree with `Plant::cut_above`; see
+    /// [`PlantPopulation::cut`]. The tree's cached geometry becomes stale and is
+    /// rebuilt from the reduced state by `refresh_geometry_chunk`.
+    pub fn cut_plant(&mut self, plant_index: usize, mass_fraction: f64) -> Option<usize> {
+        self.sync_plants();
+        self.plant_population.as_mut()?.cut(plant_index, mass_fraction)
+    }
+
+    /// Bring the cached geometry of loaded stale plants up to the plant state.
+    fn refresh_geometry_from_state(&mut self, budget: Option<usize>) -> usize {
+        self.sync_plants();
+        let count = self.plants.len();
+        self.plant_growth.resize(count, PlantGrowth::default());
+        self.plant_branches.resize(count, Vec::new());
+        self.geometry_stamps.resize(count, u64::MAX);
+        let Some(population) = self.plant_population.as_ref() else { return 0 };
+        let mut stale: Vec<usize> = (0..count)
+            .filter(|&i| {
+                self.geometry_stamps[i] != population.revision(i) && self.plant_is_loaded(i)
+            })
+            .collect();
+        if let Some(budget) = budget {
+            stale.truncate(budget);
+        }
+        let seed = self.seed_hash;
+        let plants = &self.plants;
+        let rebuilt: Vec<(usize, PlantGrowth, Vec<BranchSegment>, u64)> = stale
+            .par_iter()
+            .map(|&i| {
+                let mut growth = PlantGrowth::from_state(&population.geometry(i));
+                let branches = plants[i].branch_segments(growth, seed);
+                growth.set_leaf_radius(&branches);
+                (i, growth, branches, population.revision(i))
+            })
+            .collect();
+        let rebuilt_count = rebuilt.len();
+        for (i, growth, branches, revision) in rebuilt {
+            self.plant_growth[i] = growth;
+            self.plant_branches[i] = branches;
+            self.geometry_stamps[i] = revision;
+        }
+        rebuilt_count
     }
 
     /// Advance the world's simulation clock by simulation seconds. At a 1x
@@ -1679,7 +1943,21 @@ impl GeneratedWorld {
         self.geometry_age_years = (self.age_years * 4.0).floor() * 0.25;
         let season_phase = self.season_phase();
         let growth_quarter = (self.age_years * 4.0).floor() as u32;
-        if growth_quarter != self.generated_growth_quarter {
+        if self.growth_model == GrowthModel::ResourceBased {
+            // Bring the plants to the present by events, then build geometry only
+            // for the loaded ones, from their current state.
+            self.refresh_geometry_from_state(None);
+            self.plant_spatial_index = PlantSpatialIndex::build(
+                &self.plants,
+                &self.plant_growth,
+                &self.plant_branches,
+                self.age_years,
+            );
+            if growth_quarter != self.generated_growth_quarter {
+                (self.mycelium_segments, self.mycelium_buckets) =
+                    make_mycelium(self.seed_hash, self.geometry_age_years, &self.plants);
+            }
+        } else if growth_quarter != self.generated_growth_quarter {
             let next_growth = compute_plant_growth(
                 &self.plants,
                 self.geometry_age_years,
@@ -2485,6 +2763,25 @@ impl Plant {
             });
         }
 
+        // A resource-based plant has a branch wood volume (branch pool over wood
+        // density); the radii of the generated axes are scaled to hold exactly that.
+        if let Some(state) = growth.state {
+            let layout_volume: f32 = segments
+                .iter()
+                .map(|segment| {
+                    std::f32::consts::PI
+                        * segment.radius_m.powi(2)
+                        * (segment.end - segment.start).length()
+                })
+                .sum();
+            if layout_volume > f32::EPSILON && state.branch_volume_m3 > 0.0 {
+                let scale = (state.branch_volume_m3 / layout_volume).sqrt().clamp(0.1, 6.0);
+                for segment in &mut segments {
+                    segment.radius_m = (segment.radius_m * scale).max(WORLD_REV_M * 0.55);
+                }
+            }
+        }
+
         // Root architecture follows each seed's inherited continuous traits.
         let (root_count, lateral_extent, depth_factor) = self.root_profile();
         let root_stage_scale = match growth.stage {
@@ -2575,10 +2872,7 @@ impl Plant {
             }
         }
 
-        let in_leaf_season = (0.20..0.84).contains(&season_phase);
-        if in_leaf_season || self.genome.leaf_retention >= 0.85 {
-            let leaf_radius =
-                (0.20 + growth.crown_spread_m * 0.055).clamp(0.22, LEAF_CLUSTER_RADIUS_M);
+        if let Some(leaf_radius) = growth.foliage_radius(self.genome.leaf_retention, season_phase) {
             for candidate in candidates {
                 let PlantSpatialRef::Branch { branch_index, .. } = *candidate else {
                     continue;
@@ -2865,9 +3159,10 @@ impl Plant {
         // the silhouette.
         // Larger foliage clusters keep the canopy continuous at render scale;
         // their size follows the grown crown rather than a fixed tree template.
-        let leaf_radius = (0.20 + growth.crown_spread_m * 0.055).clamp(0.22, 0.42);
+        let foliage_radius = growth.foliage_radius(self.genome.leaf_retention, season_phase);
+        let leaf_radius = foliage_radius.unwrap_or(0.0);
         let leaf_cells = (leaf_radius / WORLD_CELL_M).ceil() as i32;
-        if (0.20..0.84).contains(&season_phase) || self.genome.leaf_retention >= 0.85 {
+        if foliage_radius.is_some() {
             for (branch_index, branch) in branches
                 .iter()
                 .enumerate()
@@ -3249,9 +3544,50 @@ fn compute_plant_growth(
                 trunk_height_m: height_m * trunk_height_fraction,
                 trunk_radius_m,
                 crown_spread_m,
+                state: None,
             }
         })
         .collect()
+}
+
+/// What the 1 cm generator currently sees for one plant (see
+/// [`GeneratedWorld::built_plant_geometry`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BuiltPlantGeometry {
+    pub height_m: f32,
+    pub trunk_height_m: f32,
+    pub trunk_radius_m: f32,
+    pub crown_radius_m: f32,
+    /// Number of generated branch axes (roots excluded).
+    pub wood_branch_segments: usize,
+    /// Volume of the generated branch axes (m3); equals the branch pool's wood volume
+    /// for a resource-based plant unless the radius scale hit its clamp.
+    pub branch_wood_volume_m3: f32,
+    /// Radius of one foliage cluster (`None` for legacy plants, 0 when leafless).
+    pub foliage_radius_m: Option<f32>,
+    /// The plant's state has changed since this geometry was built.
+    pub stale: bool,
+}
+
+/// One resource-based plant per vegetation individual of the generated map.
+fn make_population(plants: &[Plant], seed_hash: u64, season_phase_offset: f32) -> PlantPopulation {
+    let sites: Vec<SiteInput> = plants
+        .iter()
+        .map(|plant| SiteInput {
+            genome: plant.genome,
+            x_m: f64::from(plant.x),
+            y_m: f64::from(plant.y),
+            moisture: f64::from(plant.moisture),
+            fertility: f64::from(plant.fertility),
+            temperature_k: f64::from(plant.temperature_kelvin),
+            germination_years: f64::from(plant.germination_age_years),
+        })
+        .collect();
+    PlantPopulation::new(
+        seed_hash,
+        &sites,
+        PopulationConfig { season_offset: f64::from(season_phase_offset), ..PopulationConfig::default() },
+    )
 }
 
 fn make_plants(seed: u64) -> (Vec<Plant>, Vec<Morphotype>) {
