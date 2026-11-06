@@ -198,8 +198,10 @@ pub(crate) struct TwoLevelWork {
 }
 
 /// Block Jacobi damping. The smoother is `omega * D^-1`; `omega` stays below
-/// 2 / lambda_max(D^-1 A) so the operator stays positive definite.
-pub(crate) const DEFAULT_DAMPING: f64 = 0.5;
+/// 2 / lambda_max(D^-1 A) so the operator stays positive definite. Measured on captured
+/// bulk systems (6 November): 0.5 gives 17 / 29 / 32 iterations at 360 / 5 488 / 16 000 cells,
+/// 0.8 gives 14 / 23 / 26; 1.0 collapses (57 at 360), so 0.8 keeps a margin below the edge.
+pub(crate) const DEFAULT_DAMPING: f64 = 0.8;
 
 /// Stop coarsening when a level has at most this many cells.
 const BOTTOM_CELLS: usize = 120;
@@ -782,6 +784,10 @@ mod tests {
         check_bulk_sizes(&[(14, 28, 4), (20, 40, 4)]);
     }
 
+    fn test_damping() -> f64 {
+        std::env::var("VOXEL_TL_DAMPING").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_DAMPING)
+    }
+
     fn check_bulk_sizes(sizes: &[(i32, i32, usize)]) {
         for &(width, height, warmup) in sizes {
             let systems = captured_bulk(width, height, warmup);
@@ -831,7 +837,7 @@ mod tests {
                     &captured.bodies,
                     masks,
                     0.01,
-                    DEFAULT_DAMPING,
+                    test_damping(),
                 )
                 .expect("coarse factor");
                 let mut work = TwoLevelWork::default();
@@ -872,7 +878,7 @@ mod tests {
                 let started = std::time::Instant::now();
                 let two = TwoLevel::build(
                     &system, &captured.edges, &captured.positions, &captured.lattice,
-                    &captured.bodies, &captured.masks, 0.01, DEFAULT_DAMPING,
+                    &captured.bodies, &captured.masks, 0.01, test_damping(),
                 ).unwrap();
                 eprintln!("  TIMING build: {:.1} ms levels={}", started.elapsed().as_secs_f64() * 1000.0, two.levels.len());
                 let mut work = TwoLevelWork::default();
