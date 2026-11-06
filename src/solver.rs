@@ -1,7 +1,7 @@
 use crate::{
     bond::EMPTY,
     collision,
-    scene::{CpuPreconditioner, Scene, AREA, CELL, DCELL},
+    scene::{sync_visited, visit, visit_thermal, CpuPreconditioner, Scene, AREA, CELL, DCELL},
     tool::Tool,
 };
 use glam::{DVec3, Mat3, Quat, Vec3};
@@ -282,7 +282,7 @@ fn apply_solid_viscoelastic_damping(
     // temperature-dependent damping), but defer the uniform microcell update.
     // Updating and re-summing 27 thermal cells for each dissipative bond is
     // redundant: positive dashpot heat is spatially uniform within each REV.
-    let mut deferred_thermal_cell_delta: Option<Vec<f64>> = None;
+    let mut deferred_thermal_cell_delta: rustc_hash::FxHashMap<usize, f64> = Default::default();
     // Constraints are the stable axis-major list of intact bonds with at least
     // one free translational degree of freedom. Fully fixed bonds have zero
     // damping mobility, so iterating this sparse list preserves the complete
@@ -416,18 +416,14 @@ fn apply_solid_viscoelastic_damping(
         let heat = (-kinetic_change).max(0.0) as f64;
         if heat > 0.0 {
             scene.energy.solid_viscoelastic_heat += heat;
-            let deferred_delta =
-                deferred_thermal_cell_delta.get_or_insert_with(|| vec![0.0; scene.voxels.len()]);
-            deferred_delta[i] +=
+            *deferred_thermal_cell_delta.entry(i).or_default() +=
                 scene.voxels[i].add_internal_energy_j_deferred_thermal_cells(heat * 0.5);
-            deferred_delta[j] +=
+            *deferred_thermal_cell_delta.entry(j).or_default() +=
                 scene.voxels[j].add_internal_energy_j_deferred_thermal_cells(heat * 0.5);
         }
     }
-    if let Some(deferred_delta) = deferred_thermal_cell_delta {
-        for (voxel, delta) in scene.voxels.iter_mut().zip(deferred_delta) {
-            voxel.distribute_deferred_thermal_energy_delta(delta);
-        }
+    for (index, delta) in deferred_thermal_cell_delta {
+        scene.voxels[index].distribute_deferred_thermal_energy_delta(delta);
     }
     cache_hits
 }
@@ -549,16 +545,25 @@ fn capture_nodal_mechanical_energy(
     edge_energy: &mut Vec<f64>,
     parallel: bool,
 ) -> f64 {
-    energy.clear();
-    energy.extend(scene.voxels.iter().map(|v| {
+    let live = scene.step_live.clone();
+    let voxel_count = scene.voxels.len();
+    let kinetic = |v: &crate::voxel::Voxel| {
         if v.kinematic { 0.0 } else {
             0.5 * f64::from(v.mass) * v.velocity.as_dvec3().length_squared()
         }
-    }));
-    for i in 0..scene.voxels.len() {
+    };
+    if live.is_some() && energy.len() == voxel_count {
+        // A sleeper's entry is its (zero) kinematic value from the first full build.
+        for i in visit(&live, voxel_count) {
+            energy[i] = kinetic(&scene.voxels[i]);
+        }
+    } else {
+        energy.clear();
+        energy.extend(scene.voxels.iter().map(kinetic));
+    }
+    for i in visit(&live, voxel_count) {
         energy[i] += if scene.voxels[i].kinematic { 0.0 } else { cell_spin_energy_j(scene, i) };
     }
-    let voxel_count = scene.voxels.len();
     edge_energy.resize(3 * voxel_count, 0.0);
     let compute_edge = |edge: usize| {
         let axis = edge / voxel_count;
@@ -572,7 +577,13 @@ fn capture_nodal_mechanical_energy(
             bond_stored_elastic_energy_j(scene, i, bond.neighbor as usize, axis)
         }
     };
-    if parallel && voxel_count > 0 {
+    if live.is_some() {
+        for axis in 0..3 {
+            for i in visit(&live, voxel_count) {
+                edge_energy[axis * voxel_count + i] = compute_edge(axis * voxel_count + i);
+            }
+        }
+    } else if parallel && voxel_count > 0 {
         edge_energy.par_iter_mut().enumerate().for_each(|(edge, value)| {
             *value = compute_edge(edge);
         });
@@ -583,7 +594,8 @@ fn capture_nodal_mechanical_energy(
     }
     let mut elastic = 0.0;
     for axis in 0..3 {
-        for (i, bond) in scene.bonds[axis].iter().enumerate() {
+        for i in visit(&live, voxel_count) {
+            let bond = &scene.bonds[axis][i];
             if bond.neighbor == EMPTY { continue; }
             let j = bond.neighbor as usize;
             let stored = edge_energy[axis * voxel_count + i];
@@ -641,19 +653,32 @@ fn free_implicit_dissipation(
         }
         index
     }
-    components.clear();
-    components.extend(0..scene.voxels.len());
+    let live = scene.step_live.clone();
+    let voxel_count = scene.voxels.len();
+    if live.is_some() && components.len() == voxel_count && budgets.len() == voxel_count {
+        for i in visit(&live, voxel_count) {
+            components[i] = i;
+            budgets[i] = FreeImplicitEnergyBudget::default();
+        }
+    } else {
+        components.clear();
+        components.extend(0..voxel_count);
+        budgets.clear();
+        budgets.resize(voxel_count, FreeImplicitEnergyBudget::default());
+        // A sleeper is a fixed REV: its own, excluded budget, never revisited.
+        for (budget, voxel) in budgets.iter_mut().zip(&scene.voxels) {
+            budget.excluded = voxel.kinematic;
+        }
+    }
     for constraint in &scratch.constraints {
         let i = root(components, constraint.i);
         let j = root(components, constraint.j);
         components[j] = i;
     }
-    for i in 0..components.len() { components[i] = root(components, i); }
-    budgets.clear();
-    budgets.resize(scene.voxels.len(), FreeImplicitEnergyBudget::default());
-    nodal_heat.clear();
-    nodal_heat.resize(scene.voxels.len(), 0.0);
-    for (i, voxel) in scene.voxels.iter().enumerate() {
+    for i in visit(&live, voxel_count) { components[i] = root(components, i); }
+    fill_visited(nodal_heat, voxel_count, 0.0, &live);
+    for i in visit(&live, voxel_count) {
+        let voxel = &scene.voxels[i];
         let budget = &mut budgets[components[i]];
         budget.before += before[i];
         budget.excluded |= voxel.kinematic || scene.aggregate_of[i].is_some()
@@ -674,7 +699,11 @@ fn free_implicit_dissipation(
         budgets[components[pair.i]].excluded = true;
         budgets[components[pair.j]].excluded = true;
     }
-    edge_energy.resize(scratch.constraints.len(), 0.0);
+    // Keep the buffer's length: the next capture reuses it at three entries per REV.
+    if edge_energy.len() < scratch.constraints.len() {
+        edge_energy.resize(scratch.constraints.len(), 0.0);
+    }
+    let edge_energy = &mut edge_energy[..scratch.constraints.len()];
     let stored_energy = |edge: usize| {
         let constraint = &scratch.constraints[edge];
         let cluster = components[constraint.i];
@@ -705,21 +734,25 @@ fn free_implicit_dissipation(
         nodal_heat[i] += loss.max(0.0) * 0.5;
         nodal_heat[j] += loss.max(0.0) * 0.5;
     }
-    for (i, &weight) in nodal_heat.iter().enumerate() {
-        budgets[components[i]].correction += weight;
+    for i in visit(&live, voxel_count) {
+        budgets[components[i]].correction += nodal_heat[i];
     }
-    for budget in budgets.iter_mut().filter(|budget| !budget.excluded) {
-        budget.heat = (budget.before - budget.after).max(0.0).min(budget.correction);
+    for i in visit(&live, voxel_count) {
+        let budget = &mut budgets[i];
+        if !budget.excluded {
+            budget.heat = (budget.before - budget.after).max(0.0).min(budget.correction);
+        }
     }
     let mut total = 0.0;
-    for (i, heat) in nodal_heat.iter_mut().enumerate() {
+    for i in visit(&live, voxel_count) {
+        let heat = &mut nodal_heat[i];
         let budget = budgets[components[i]];
         *heat = if budget.correction > 0.0 && !budget.excluded {
             *heat * (budget.heat / budget.correction)
         } else { 0.0 };
         total += *heat;
     }
-    let free_deficit = budgets.iter().filter(|budget| !budget.excluded)
+    let free_deficit = visit(&live, voxel_count).map(|i| &budgets[i]).filter(|budget| !budget.excluded)
         .map(|budget| budget.before - budget.after).sum();
     (total, free_deficit)
 }
@@ -841,7 +874,12 @@ mod energy_edge_parallel_tests {
         }
         assert_eq!(serial.2, parallel.2);
         assert_eq!(serial.3, parallel.3);
-        assert_eq!(serial.4, parallel.4);
+        // Only the entries of this call's constraints are written; the rest of the
+        // reused buffer keeps its stale (here NaN) values for the next capture.
+        let edges = scratch.constraints.len();
+        let bits = |values: &[f64]| values[..edges].iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&serial.4), bits(&parallel.4));
+        assert_eq!(serial.4.len(), parallel.4.len());
     }
 }
 
@@ -1098,22 +1136,17 @@ fn update_frames(scene: &mut Scene, scratch: &mut SolverScratch) -> f32 {
 /// Returns the largest quaternion angle changed by this fit.
 fn fit_rotations(scene: &mut Scene, scratch: &mut SolverScratch) -> f32 {
     let n = scene.voxels.len();
-    if !scene
-        .voxels
-        .iter()
-        .enumerate()
-        .any(|(i, voxel)| !voxel.kinematic && scene.aggregate_of[i].is_none())
+    let live = scene.step_live.clone();
+    if !visit(&live, n).any(|i| !scene.voxels[i].kinematic && scene.aggregate_of[i].is_none())
     {
         // Coarse rigid bodies carry their exact pose in RigidAggregate. Their
         // per-REV polar fits are only needed after a contact or load wakes them.
         return 0.0;
     }
-    scratch.rotation_gradients.resize(n, Mat3::ZERO);
-    scratch.rotation_gradients.fill(Mat3::ZERO);
-    scratch.rotation_counts.resize(n, Vec3::ZERO);
-    scratch.rotation_counts.fill(Vec3::ZERO);
+    fill_visited(&mut scratch.rotation_gradients, n, Mat3::ZERO, &live);
+    fill_visited(&mut scratch.rotation_counts, n, Vec3::ZERO, &live);
     for axis in 0..3 {
-        for i in 0..n {
+        for i in visit(&live, n) {
             let j = scene.bonds[axis][i].neighbor;
             if j == EMPTY {
                 continue;
@@ -1184,7 +1217,14 @@ fn fit_rotations(scene: &mut Scene, scratch: &mut SolverScratch) -> f32 {
         }
         2.0 * previous.dot(*q).abs().clamp(0.0, 1.0).acos()
     };
-    if !parallel_enabled_for(n) && n < ROTATION_PARALLEL_MIN_VOXELS {
+    if live.is_some() {
+        // Only awake REVs rotate; a sleeper returns 0 from `update_rotation`.
+        let mut largest = 0.0_f32;
+        for i in visit(&live, n) {
+            largest = largest.max(update_rotation((i, &mut scene.rotations[i])));
+        }
+        largest
+    } else if !parallel_enabled_for(n) && n < ROTATION_PARALLEL_MIN_VOXELS {
         scene
             .rotations
             .iter_mut()
@@ -1208,21 +1248,29 @@ fn atmosphere_loads(scene: &Scene, exposed_faces: &mut Vec<[u8; 3]>, loads: &mut
     let air = scene.config.atmosphere;
     let density = air.density_kg_m3();
     let voxel_count = scene.voxels.len();
-    loads.resize(voxel_count, Vec3::ZERO);
+    let live = scene.step_live.clone();
     if density <= 0.0 {
-        loads.fill(Vec3::ZERO);
+        fill_visited(loads, voxel_count, Vec3::ZERO, &live);
         return;
     }
+    // A sleeper is kinematic: its load is zero, whatever its faces see.
+    if live.is_none() || loads.len() != voxel_count {
+        loads.clear();
+        loads.resize(voxel_count, Vec3::ZERO);
+    }
 
-    exposed_faces.resize(voxel_count, [2u8; 3]);
-    exposed_faces.fill([2u8; 3]);
+    fill_visited(exposed_faces, voxel_count, [2u8; 3], &live);
     for axis in 0..3 {
-        for (i, bond) in scene.bonds[axis].iter().enumerate() {
+        for i in visit(&live, voxel_count) {
+            let bond = &scene.bonds[axis][i];
             if bond.neighbor == EMPTY {
                 continue;
             }
             let j = bond.neighbor as usize;
             if j >= scene.voxels.len() || i == j {
+                continue;
+            }
+            if live.as_ref().is_some_and(|live| !live.in_list[j]) {
                 continue;
             }
             exposed_faces[i][axis] = exposed_faces[i][axis].saturating_sub(1);
@@ -1269,7 +1317,11 @@ fn atmosphere_loads(scene: &Scene, exposed_faces: &mut Vec<[u8; 3]>, loads: &mut
         }
         *load = force;
     };
-    if atmosphere_parallel_enabled_for(voxel_count) {
+    if live.is_some() {
+        for i in visit(&live, voxel_count) {
+            evaluate_load(i, &mut loads[i]);
+        }
+    } else if atmosphere_parallel_enabled_for(voxel_count) {
         loads
             .par_iter_mut()
             .enumerate()
@@ -1600,6 +1652,22 @@ fn auto_register_quiescent_components(
 pub fn step(scene: &mut Scene, tool: &mut Option<Tool>) {
     step_with_targets(scene, tool, &[]);
 }
+
+/// `dst[i] = value` for the visited REVs; a destination of the wrong length is rebuilt
+/// whole, so entries of sleepers outside the visit list hold `value` from the start.
+fn fill_visited<T: Clone>(dst: &mut Vec<T>, n: usize, value: T, live: &Option<std::sync::Arc<crate::scene::Live>>) {
+    match live {
+        Some(live) if dst.len() == n => {
+            for &i in &live.list {
+                dst[i].clone_from(&value);
+            }
+        }
+        _ => {
+            dst.clear();
+            dst.resize(n, value);
+        }
+    }
+}
 pub fn step_with_targets(scene: &mut Scene, tool: &mut Option<Tool>, targets: &[Option<DVec3>]) {
     let axes: Vec<_> = targets
         .iter()
@@ -1627,6 +1695,7 @@ pub fn step_with_axis_targets_and_loads(
     let dt = f64::from(scene.config.fixed_dt);
     if !crate::live_tests::enabled() {
         advance_step_with_axis_targets_and_loads(scene, tool, targets, loads);
+        scene.set_step_live(None);
         scene.simulated_seconds += dt;
         return;
     }
@@ -1637,6 +1706,7 @@ pub fn step_with_axis_targets_and_loads(
         crate::live_tests::observe_scene(scene, test_name, 0.0, 0.0);
     }
     advance_step_with_axis_targets_and_loads(scene, tool, targets, loads);
+    scene.set_step_live(None);
     scene.simulated_seconds += dt;
     crate::live_tests::observe_scene(
         scene, test_name, scene.simulated_seconds, started.elapsed().as_secs_f64() * 1000.0,
@@ -1676,14 +1746,32 @@ fn advance_step_with_axis_targets_and_loads(
     targets: &[[Option<f64>; 3]],
     loads: &[Vec3],
 ) {
+    let step_entered = Instant::now();
     CONTACT_PCG_PROFILE.with(|slot| slot.set(ContactPcgProfile::default()));
     assert!(targets.is_empty() || targets.len() == scene.voxels.len());
     assert!(loads.is_empty() || loads.len() == scene.voxels.len());
     scene.solver_residual_audit = None;
     scene.last_step_diagnostics = None;
     scene.run_sleep();
+    let sleep_done = Instant::now();
+    // A scene with sleepers visits only the awake REVs (and the sleepers bonded to them)
+    // in the passes below; a sleeper is frozen, so skipping it changes nothing. Anything
+    // that can reach into a sleeper from outside the fixed-step model keeps the full pass.
+    let plain_step = tool.is_none()
+        && targets.is_empty()
+        && loads.is_empty()
+        && !scene.adaptive_substeps
+        && scene.skeletal_actuators.is_empty()
+        && scene.tier_governor.is_none()
+        && scene.thermal_bonding_rule().is_none()
+        && scene.thermal_fusion_rule().is_none()
+        && !scene.has_registered_rigid_candidates()
+        && scene.beam_regions.iter().all(Option::is_none);
+    let live = if plain_step { scene.sparse_live_for_step() } else { None };
+    scene.set_step_live(live.clone());
     if tool.is_none() && targets.is_empty() && loads.is_empty() && scene.mechanically_dormant() {
         dormant_step(scene);
+        scene.set_step_live(None);
         return;
     }
     scene.run_tier_governor();
@@ -1701,18 +1789,23 @@ fn advance_step_with_axis_targets_and_loads(
     // Explicit per-step coordinates override persistent constraints on that axis.
     let voxel_count = scene.voxels.len();
     let mut merged_targets = std::mem::take(&mut solver_scratch.merged_targets);
-    merged_targets.clear();
-    merged_targets.reserve(voxel_count);
-    merged_targets.extend(
-        scene.axis_targets.iter().enumerate().map(|(i, fixed)| {
-            std::array::from_fn(|a| targets.get(i).and_then(|t| t[a]).or(fixed[a]))
-        }),
-    );
-    assert!(merged_targets
-        .iter()
-        .flatten()
-        .flatten()
-        .all(|p| p.is_finite()));
+    if live.is_some() && merged_targets.len() == voxel_count {
+        // No per-step targets here: the merge is the persistent constraint itself, and a
+        // sleeper's constraint cannot change without waking it.
+        for i in visit(&live, voxel_count) {
+            merged_targets[i] = scene.axis_targets[i];
+        }
+    } else {
+        merged_targets.clear();
+        merged_targets.reserve(voxel_count);
+        merged_targets.extend(
+            scene.axis_targets.iter().enumerate().map(|(i, fixed)| {
+                std::array::from_fn(|a| targets.get(i).and_then(|t| t[a]).or(fixed[a]))
+            }),
+        );
+    }
+    assert!(visit(&live, voxel_count)
+        .all(|i| merged_targets[i].iter().flatten().all(|p| p.is_finite())));
     let targets = merged_targets.as_slice();
     if scene.has_registered_rigid_candidates() {
         let constrained: Vec<_> = targets
@@ -1744,7 +1837,8 @@ fn advance_step_with_axis_targets_and_loads(
             );
         }
     }
-    for (i, voxel) in scene.voxels.iter().enumerate() {
+    for i in visit(&live, voxel_count) {
+        let voxel = &scene.voxels[i];
         applied_loads[i] = if !voxel.kinematic {
             scene.external_forces[i]
                 + scene.external_accelerations[i] * voxel.mass
@@ -1804,6 +1898,7 @@ fn advance_step_with_axis_targets_and_loads(
         solver_scratch.applied_loads = applied_loads;
         solver_scratch.melted = melted;
         scene.solver_scratch = solver_scratch;
+        scene.set_step_live(None);
         return;
     }
     if may_adapt && scene.substep_index == 0 {
@@ -1864,10 +1959,7 @@ fn advance_step_with_axis_targets_and_loads(
     let mut reusable_cuda_solution = false;
     let voxel_count = scene.voxels.len();
     let mut substep_start_positions = std::mem::take(&mut solver_scratch.substep_start_positions);
-    substep_start_positions.resize(voxel_count, DVec3::ZERO);
     let mut substep_start_velocities = std::mem::take(&mut solver_scratch.substep_start_velocities);
-    substep_start_velocities.clear();
-    substep_start_velocities.reserve(voxel_count);
     let mut load_integrated_velocities =
         std::mem::take(&mut solver_scratch.load_integrated_velocities);
     load_integrated_velocities.resize(voxel_count, Vec3::ZERO);
@@ -1888,18 +1980,25 @@ fn advance_step_with_axis_targets_and_loads(
     let mut friction_used_ns = std::mem::take(&mut solver_scratch.friction_used_ns);
     let mut contact_physical_velocities =
         std::mem::take(&mut solver_scratch.contact_physical_velocities);
-    let mut contact_targets = targets.to_vec();
+    let mut contact_targets = std::mem::take(&mut solver_scratch.contact_targets);
     let mut substep_mechanical_energy = std::mem::take(&mut solver_scratch.substep_mechanical_energy);
     let mut energy_edge_values = std::mem::take(&mut solver_scratch.energy_edge_values);
     let mut free_implicit_budgets = std::mem::take(&mut solver_scratch.free_implicit_budgets);
     let mut free_implicit_components = std::mem::take(&mut solver_scratch.free_implicit_components);
     let mut free_implicit_heat = std::mem::take(&mut solver_scratch.free_implicit_heat);
+    let loop_entered = Instant::now();
     for _ in 0..effective_substeps {
         let mut phase_start = Instant::now();
         let mut detail_start = profile_step.then(Instant::now);
-        substep_start_positions.clone_from(&scene.positions);
-        substep_start_velocities.clear();
-        substep_start_velocities.extend(scene.voxels.iter().map(|voxel| voxel.velocity));
+        sync_visited(&mut substep_start_positions, &scene.positions, &live);
+        if substep_start_velocities.len() != voxel_count {
+            substep_start_velocities.clear();
+            substep_start_velocities.extend(scene.voxels.iter().map(|voxel| voxel.velocity));
+        } else {
+            for i in visit(&live, voxel_count) {
+                substep_start_velocities[i] = scene.voxels[i].velocity;
+            }
+        }
         // The energy budget starts before drift. A prediction made from an
         // impact's nonuniform velocities can already contain strain; treating
         // that trial strain as incoming energy counts it a second time.
@@ -1915,7 +2014,15 @@ fn advance_step_with_axis_targets_and_loads(
             )
         };
         if let Some(start) = energy_capture_start { energy_capture_time += start.elapsed(); }
-        scene.previous.clone_from(&scene.positions);
+        match &live {
+            // A sleeper's `previous` was set equal to its position when it fell asleep.
+            Some(live) => {
+                for &i in &live.list {
+                    scene.previous[i] = scene.positions[i];
+                }
+            }
+            None => scene.previous.clone_from(&scene.positions),
+        }
         if let Some(start) = detail_start {
             pre_solve_detail_time[0] += start.elapsed();
             detail_start = Some(Instant::now());
@@ -1939,7 +2046,8 @@ fn advance_step_with_axis_targets_and_loads(
         }
         let mut all_dynamic_coarse = scene.has_registered_rigid_candidates();
         let mut target_motion = false;
-        for (i, voxel) in scene.voxels.iter().enumerate() {
+        for i in visit(&live, voxel_count) {
+            let voxel = &scene.voxels[i];
             if !voxel.kinematic && scene.aggregate_of[i].is_none() {
                 all_dynamic_coarse = false;
             }
@@ -1956,12 +2064,8 @@ fn advance_step_with_axis_targets_and_loads(
         let coarse_prediction = tool.is_none() && all_dynamic_coarse && !target_motion;
         if !coarse_prediction {
             let aggregate_membership = &scene.aggregate_of;
-            for (i, (p, v)) in scene
-                .positions
-                .iter_mut()
-                .zip(&mut scene.voxels)
-                .enumerate()
-            {
+            for i in visit(&live, voxel_count) {
+                let (p, v) = (&mut scene.positions[i], &mut scene.voxels[i]);
                 if v.kinematic {
                     drift_velocity[i] = Vec3::ZERO;
                     continue;
@@ -1991,8 +2095,8 @@ fn advance_step_with_axis_targets_and_loads(
         }
         if !coarse_prediction {
             for work in &mut scene.workspace {
-                for w in work {
-                    w.lambda = Vec3::ZERO;
+                for i in visit(&live, voxel_count) {
+                    work[i].lambda = Vec3::ZERO;
                 }
             }
         }
@@ -2003,9 +2107,10 @@ fn advance_step_with_axis_targets_and_loads(
         if let Some(t) = tool {
             t.advance_into(scene, h, targets, &mut tool_contact_velocity);
         } else {
-            tool_contact_velocity.resize(scene.positions.len(), Vec3::ZERO);
             if !coarse_prediction {
-                tool_contact_velocity.fill(Vec3::ZERO);
+                fill_visited(&mut tool_contact_velocity, voxel_count, Vec3::ZERO, &live);
+            } else {
+                tool_contact_velocity.resize(scene.positions.len(), Vec3::ZERO);
             }
         }
         if let Some(t) = tool.as_ref() {
@@ -2027,7 +2132,7 @@ fn advance_step_with_axis_targets_and_loads(
                 *p += delta_v.as_dvec3() * (0.5 * h as f64);
             }
         }
-        predicted.clone_from(&scene.positions);
+        sync_visited(&mut predicted, &scene.positions, &live);
         // Fit material frames from the physical prediction. Geometric contact
         // projection can temporarily flatten multiple swept layers onto one
         // plane; that infeasible intermediate state must not rotate the rest
@@ -2044,18 +2149,21 @@ fn advance_step_with_axis_targets_and_loads(
         // that solve injected unresolved compression into bonds, whose huge
         // apparent strain energy was then spent on heat and fracture.
         // The inertial reference remains the unprojected prediction.
-        contact_targets.clone_from_slice(targets);
-        solver_scratch
-            .previous_contact_axis_normals
-            .clone_from(&solver_scratch.contact_axis_normals);
-        solver_scratch
-            .contact_axis_normals
-            .resize(voxel_count, [0.0; 3]);
-        solver_scratch.contact_axis_normals.fill([0.0; 3]);
-        solver_scratch.contact_lower.resize(voxel_count, [None; 3]);
-        solver_scratch.contact_lower.fill([None; 3]);
-        solver_scratch.contact_upper.resize(voxel_count, [None; 3]);
-        solver_scratch.contact_upper.fill([None; 3]);
+        sync_visited(&mut contact_targets, targets, &live);
+        if live.is_some() && solver_scratch.contact_axis_normals.len() == voxel_count {
+            sync_visited(
+                &mut solver_scratch.previous_contact_axis_normals,
+                &solver_scratch.contact_axis_normals,
+                &live,
+            );
+        } else {
+            solver_scratch
+                .previous_contact_axis_normals
+                .clone_from(&solver_scratch.contact_axis_normals);
+        }
+        fill_visited(&mut solver_scratch.contact_axis_normals, voxel_count, [0.0; 3], &live);
+        fill_visited(&mut solver_scratch.contact_lower, voxel_count, [None; 3], &live);
+        fill_visited(&mut solver_scratch.contact_upper, voxel_count, [None; 3], &live);
         if coarse_clear {
             // The whole-step conservative sweep already certified every body
             // against every other body and fixed REV. A looser collision-bin
@@ -2163,16 +2271,12 @@ fn advance_step_with_axis_targets_and_loads(
             }
             scene.positions[dynamic][axis] = plane;
         }
-        solver_scratch
-            .contact_feasible_positions
-            .clone_from(&scene.positions);
+        sync_visited(&mut solver_scratch.contact_feasible_positions, &scene.positions, &live);
         if solver_scratch.previous_contact_axis_normals.len() == voxel_count
-            && solver_scratch
-                .previous_contact_axis_normals
-                .iter()
-                .any(|axes| *axes != [0.0; 3])
+            && visit(&live, voxel_count)
+                .any(|i| solver_scratch.previous_contact_axis_normals[i] != [0.0; 3])
         {
-            for i in 0..voxel_count {
+            for i in visit(&live, voxel_count) {
                 for axis in 0..3 {
                     let normal = solver_scratch.contact_axis_normals[i][axis];
                     if normal != 0.0
@@ -2190,8 +2294,9 @@ fn advance_step_with_axis_targets_and_loads(
         stage_time[0] += phase_start.elapsed();
         phase_start = Instant::now();
         let mut contact_solver_energy_before = if solver_scratch.pair_contacts.iter().any(|p| p.active)
-            || solver_scratch.contact_axis_normals.iter().any(|axes| *axes != [0.0; 3]) {
-            let kinetic = scene.voxels.iter().enumerate()
+            || visit(&live, voxel_count).any(|i| solver_scratch.contact_axis_normals[i] != [0.0; 3]) {
+            let kinetic = visit(&live, voxel_count)
+                .map(|i| (i, &scene.voxels[i]))
                 .filter(|(i, voxel)| !voxel.kinematic && scene.aggregate_of[*i].is_none())
                 .map(|(i, voxel)| 0.5 * f64::from(voxel.mass)
                     * f64::from((substep_start_velocities[i] + tool_contact_velocity[i]).length_squared())
@@ -2243,7 +2348,7 @@ fn advance_step_with_axis_targets_and_loads(
                 // blocking bound along the segment from the feasible iterate.
                 let mut blocking = None;
                 let mut alpha = 1.0_f64;
-                for i in 0..voxel_count {
+                for i in visit(&live, voxel_count) {
                     for axis in 0..3 {
                         if targets[i][axis].is_some()
                             || solver_scratch.contact_axis_normals[i][axis] != 0.0
@@ -2279,20 +2384,18 @@ fn advance_step_with_axis_targets_and_loads(
                     break;
                 }
                 if let Some((i, axis, plane, normal)) = blocking {
-                    solved_positions.clone_from(&scene.positions);
-                    for (p, &old) in scene
-                        .positions
-                        .iter_mut()
-                        .zip(&solver_scratch.contact_feasible_positions)
-                    {
-                        *p = old + (*p - old) * alpha;
+                    sync_visited(&mut solved_positions, &scene.positions, &live);
+                    // A sleeper sits exactly on its feasible position: `old + 0 * alpha`.
+                    for i in visit(&live, voxel_count) {
+                        let old = solver_scratch.contact_feasible_positions[i];
+                        scene.positions[i] = old + (scene.positions[i] - old) * alpha;
                     }
                     contact_targets[i][axis] = Some(plane);
                     solver_scratch.contact_axis_normals[i][axis] = normal as f32;
                     scene.positions[i][axis] = plane;
                     // Activate simultaneous hits together (a flat contact face
                     // must not require one matrix factorization per surface REV).
-                    for j in 0..voxel_count {
+                    for j in visit(&live, voxel_count) {
                         for a in 0..3 {
                             if targets[j][a].is_some()
                                 || solver_scratch.contact_axis_normals[j][a] != 0.0
@@ -2319,15 +2422,11 @@ fn advance_step_with_axis_targets_and_loads(
                             }
                         }
                     }
-                    solver_scratch
-                        .contact_feasible_positions
-                        .clone_from(&scene.positions);
+                    sync_visited(&mut solver_scratch.contact_feasible_positions, &scene.positions, &live);
                     contact_pass += 1;
                     continue;
                 }
-                solver_scratch
-                    .contact_feasible_positions
-                    .clone_from(&scene.positions);
+                sync_visited(&mut solver_scratch.contact_feasible_positions, &scene.positions, &live);
                 // Unilateral contact can push away from a fixed surface; it cannot
                 // pull an interior voxel down onto that surface. During a large
                 // sweep several layers can touch in the prediction. Release those
@@ -2336,7 +2435,7 @@ fn advance_step_with_axis_targets_and_loads(
                 // loop terminates without an arbitrary physical force clamp.
                 compute_contact_reactions(scene, &mut solver_scratch, &predicted, &solve_loads, h);
                 let mut released = false;
-                for i in 0..voxel_count {
+                for i in visit(&live, voxel_count) {
                     for axis in 0..3 {
                         let normal = solver_scratch.contact_axis_normals[i][axis];
                         if normal == 0.0 {
@@ -2407,9 +2506,8 @@ fn advance_step_with_axis_targets_and_loads(
                     // mechanical energy so that this same-step contact solve
                     // can return its numerical dissipation as heat.
                     if contact_solver_energy_before.is_none() {
-                        let kinetic_before = substep_start_velocities
-                            .iter()
-                            .enumerate()
+                        let kinetic_before = visit(&live, voxel_count)
+                            .map(|i| (i, &substep_start_velocities[i]))
                             .filter(|(i, voxel_velocity)| {
                                 !scene.voxels[*i].kinematic
                                     && scene.aggregate_of[*i].is_none()
@@ -2425,7 +2523,7 @@ fn advance_step_with_axis_targets_and_loads(
                             Some((kinetic_before, substep_elastic_energy_before));
                     }
                     collision::project_into(scene, targets, &mut contacts);
-                    solver_scratch.contact_feasible_positions.clone_from(&scene.positions);
+                    sync_visited(&mut solver_scratch.contact_feasible_positions, &scene.positions, &live);
                     contact_pass += 1;
                     continue;
                 }
@@ -2518,13 +2616,13 @@ fn advance_step_with_axis_targets_and_loads(
         // velocity correction from the much smaller constraint displacement;
         // subtracting two large f32 positions every step otherwise accumulates
         // measurable kinetic error in simple free fall.
-        solved_positions.clone_from(&scene.positions);
+        sync_visited(&mut solved_positions, &scene.positions, &live);
         pre_contact_velocities.resize(voxel_count, Vec3::ZERO);
-        for i in 0..voxel_count {
+        for i in visit(&live, voxel_count) {
             pre_contact_velocities[i] = drift_velocity[i] + tool_contact_velocity[i];
         }
         if !coarse_clear { collision::detect_into(scene, targets, &mut contacts); }
-        contact_work_mode.fill(0);
+        fill_visited(&mut contact_work_mode, voxel_count, 0, &live);
         for contact in &contacts {
             let mode = if contact.new_impact { 2 } else { 1 };
             contact_work_mode[contact.i] = contact_work_mode[contact.i].max(mode);
@@ -2534,7 +2632,7 @@ fn advance_step_with_axis_targets_and_loads(
         let implicit_contact_heat = contact_solver_energy_before.map_or(0.0, |(kinetic_before, elastic_before)| {
             let mut kinetic_after = 0.0;
             let mut applied_work = 0.0;
-            for i in 0..voxel_count {
+            for i in visit(&live, voxel_count) {
                 if scene.voxels[i].kinematic || scene.aggregate_of[i].is_some() { continue; }
                 let velocity = drift_velocity[i] + tool_contact_velocity[i]
                     + ((solved_positions[i] - predicted[i]) / f64::from(h)).as_vec3();
@@ -2579,7 +2677,7 @@ fn advance_step_with_axis_targets_and_loads(
                 }
             }
         }
-        contact_work_mode.fill(0);
+        fill_visited(&mut contact_work_mode, voxel_count, 0, &live);
         for contact in &contacts {
             let mode = if contact.new_impact { 2 } else { 1 };
             contact_work_mode[contact.i] = contact_work_mode[contact.i].max(mode);
@@ -2653,12 +2751,8 @@ fn advance_step_with_axis_targets_and_loads(
             solver_scratch
                 .fracture_phase_strengths
                 .resize(voxel_count, (1.0, 1.0));
-            for (i, strength) in solver_scratch
-                .fracture_phase_strengths
-                .iter_mut()
-                .enumerate()
-            {
-                *strength = phase_strength(scene, i);
+            for i in visit(&live, voxel_count) {
+                solver_scratch.fracture_phase_strengths[i] = phase_strength(scene, i);
             }
             &solver_scratch.fracture_phase_strengths
         };
@@ -2766,7 +2860,7 @@ fn advance_step_with_axis_targets_and_loads(
         }
         stage_time[3] += phase_start.elapsed();
         phase_start = Instant::now();
-        for i in 0..scene.voxels.len() {
+        for i in visit(&live, voxel_count) {
             if !scene.voxels[i].kinematic && scene.aggregate_of[i].is_none() {
                 let constraint_velocity =
                     ((solved_positions[i] - predicted[i]) / h as f64).as_vec3();
@@ -2816,8 +2910,9 @@ fn advance_step_with_axis_targets_and_loads(
         );
         let heat = implicit_contact_heat + restitution_heat;
         if free_implicit_total > 0.0 {
-            for (voxel, &heat) in scene.voxels.iter_mut().zip(&free_implicit_heat) {
-                if heat > 0.0 { voxel.add_internal_energy_j(heat); }
+            for i in visit(&live, voxel_count) {
+                let heat = free_implicit_heat[i];
+                if heat > 0.0 { scene.voxels[i].add_internal_energy_j(heat); }
             }
             scene.energy.implicit_solver_heat += free_implicit_total;
         }
@@ -2914,7 +3009,7 @@ fn advance_step_with_axis_targets_and_loads(
         if let Some(start) = thermal_start {
             thermal_time += start.elapsed();
         }
-        for i in 0..scene.voxels.len() {
+        for i in visit(&live, voxel_count) {
             if !scene.voxels[i].kinematic {
                 let applied_force = applied_loads[i] + gravity * scene.voxels[i].mass;
                 let work = match contact_work_mode[i] {
@@ -2935,6 +3030,7 @@ fn advance_step_with_axis_targets_and_loads(
         scene.mark_render_changed();
         stage_time[4] += phase_start.elapsed();
     }
+    let loop_left = Instant::now();
     if let Some((i, j)) = scene.take_pending_fusion() {
         match scene.fuse_adjacent_voxels(i, j) {
             Ok(_) => {
@@ -2972,6 +3068,7 @@ fn advance_step_with_axis_targets_and_loads(
         aggregate_scan_time += scan_start.elapsed();
     }
     solver_scratch.merged_targets = merged_targets;
+    solver_scratch.contact_targets = contact_targets;
     solver_scratch.atmosphere_exposed_faces = atmosphere_exposed_faces;
     solver_scratch.ambient_loads = ambient_loads;
     solver_scratch.applied_loads = applied_loads;
@@ -2999,19 +3096,23 @@ fn advance_step_with_axis_targets_and_loads(
     solver_scratch.melted = melted;
     solver_scratch.normal_impulses_ns = normal_impulses_ns;
     solver_scratch.contact_physical_velocities = contact_physical_velocities;
-    solver_scratch.adaptive_gravity = Some(gravity);
-    solver_scratch
-        .adaptive_loads
-        .clone_from(&solver_scratch.applied_loads);
-    solver_scratch
-        .adaptive_positions
-        .clone_from(&scene.positions);
-    solver_scratch.adaptive_config = bincode::serialize(&scene.config).unwrap_or_default();
-    solver_scratch.adaptive_revision = Some(scene.render_revision);
-    solver_scratch.adaptive_energies.clear();
-    solver_scratch
-        .adaptive_energies
-        .extend(scene.voxels.iter().map(|v| v.thermal_energy_f32()));
+    if live.is_none() {
+        // Only the quiescence test reads these, and a sparse step never runs it
+        // (adaptive substeps are off); a stale record fails its checks and is not trusted.
+        solver_scratch.adaptive_gravity = Some(gravity);
+        solver_scratch
+            .adaptive_loads
+            .clone_from(&solver_scratch.applied_loads);
+        solver_scratch
+            .adaptive_positions
+            .clone_from(&scene.positions);
+        solver_scratch.adaptive_config = bincode::serialize(&scene.config).unwrap_or_default();
+        solver_scratch.adaptive_revision = Some(scene.render_revision);
+        solver_scratch.adaptive_energies.clear();
+        solver_scratch
+            .adaptive_energies
+            .extend(scene.voxels.iter().map(|v| v.thermal_energy_f32()));
+    }
     if profile_step {
         let contact_profile = CONTACT_PCG_PROFILE.with(std::cell::Cell::get);
         scene.last_step_diagnostics = Some(crate::scene::StepDiagnostics {
@@ -3061,6 +3162,12 @@ fn advance_step_with_axis_targets_and_loads(
     }
     scene.solver_scratch = solver_scratch;
     if log_profile_step {
+        eprintln!(
+            "profile outer ms: sleep={:.3} setup={:.3} tail={:.3}",
+            (sleep_done - step_entered).as_secs_f64() * 1000.0,
+            (loop_entered - sleep_done).as_secs_f64() * 1000.0,
+            loop_left.elapsed().as_secs_f64() * 1000.0
+        );
         eprintln!("profile energy ms: capture={:.3} contact={:.3} free_implicit={:.3}",
             energy_capture_time.as_secs_f64()*1000.0,
             contact_energy_time.as_secs_f64()*1000.0,
@@ -3096,26 +3203,32 @@ fn advance_step_with_axis_targets_and_loads(
 /// fully liquid REV. Called at the fixed-step boundary so all solver workspaces
 /// see one consistent topology for the whole step.
 fn break_fully_melted_bonds(scene: &mut Scene, melted: &mut Vec<bool>) -> bool {
-    melted.clear();
-    melted.extend(
-        scene
-            .voxels
-            .iter()
-            .zip(&scene.properties)
-            .map(|(voxel, material)| {
-                material
-                    .phase_state(voxel.mass, voxel.thermal_energy_f32())
-                    .solid_fraction
-                    <= 0.0
-            }),
-    );
-    if !melted.iter().any(|&value| value) {
+    let live = scene.step_live.clone();
+    let voxel_count = scene.voxels.len();
+    let is_melted = |i: usize| {
+        let (voxel, material) = (&scene.voxels[i], &scene.properties[i]);
+        material.phase_state(voxel.mass, voxel.thermal_energy_f32()).solid_fraction <= 0.0
+    };
+    if live.is_some() {
+        // A sleeper is never fully molten unless its cluster is on the lists (it would
+        // not have been put to sleep) and its energy cannot change without waking it,
+        // so only the REVs on the thermal list can melt.
+        melted.clear();
+        melted.resize(voxel_count, false);
+        for i in visit_thermal(&live, voxel_count) {
+            melted[i] = is_melted(i);
+        }
+    } else {
+        melted.clear();
+        melted.extend((0..voxel_count).map(is_melted));
+    }
+    if !visit_thermal(&live, voxel_count).any(|i| melted[i]) {
         return false;
     }
 
     let mut topology_changed = false;
     for axis in 0..3 {
-        for i in 0..scene.voxels.len() {
+        for i in visit_thermal(&live, voxel_count) {
             let bond = scene.bonds[axis][i];
             if bond.neighbor == EMPTY {
                 continue;
@@ -3188,6 +3301,8 @@ pub fn rebuild_clusters(scene: &mut Scene) {
         scene.clusters[i] = *ids.entry(r).or_insert(next);
     }
     scene.cluster_count = ids.len();
+    // Bonds may have changed: the sleepers that touch awake REVs may be different ones.
+    scene.refresh_live();
 }
 
 #[cfg(test)]
@@ -4918,6 +5033,8 @@ pub(crate) struct SolverScratch {
     adaptive_config: Vec<u8>,
     adaptive_revision: Option<u64>,
     merged_targets: Vec<[Option<f64>; 3]>,
+    contact_targets: Vec<[Option<f64>; 3]>,
+    cell_of: Vec<u32>,
     atmosphere_exposed_faces: Vec<[u8; 3]>,
     ambient_loads: Vec<Vec3>,
     applied_loads: Vec<Vec3>,
@@ -6022,7 +6139,7 @@ fn build_ic0(
             if std::env::var_os("VOXEL_PROFILE_STEP").is_some() {
                 eprintln!("CPU IC(0) breakdown row={row} Schur_block={:?}; using block Jacobi", factor_matrix[row]);
             }
-            build_block_jacobi(diagonal, factor_diagonal);
+            build_block_jacobi(diagonal, factor_diagonal, &None);
             factor_edges.fill(Mat3::ZERO);
             return false;
         };
@@ -6290,8 +6407,20 @@ fn build_ic0_with_optional_bipartite(
     false
 }
 
-fn build_block_jacobi(diagonal: &[Mat3], factor_diagonal: &mut Vec<Mat3>) {
+fn build_block_jacobi(
+    diagonal: &[Mat3],
+    factor_diagonal: &mut Vec<Mat3>,
+    live: &Option<std::sync::Arc<crate::scene::Live>>,
+) {
     let n = diagonal.len();
+    if live.is_some() && factor_diagonal.len() == n {
+        // A sleeper's row is the identity, whose factor is the identity.
+        for row in visit(live, n) {
+            factor_diagonal[row] = cholesky_lower(diagonal[row]);
+        }
+        return;
+    }
+    factor_diagonal.clear();
     factor_diagonal.resize(n, Mat3::IDENTITY);
     for row in 0..n {
         factor_diagonal[row] = cholesky_lower(diagonal[row]);
@@ -7855,7 +7984,7 @@ fn compute_contact_reactions(
 ) {
     let scale = 1.0 / f64::from(h).powi(2);
     scratch.contact_reactions.resize(scene.voxels.len(), DVec3::ZERO);
-    for i in 0..scene.voxels.len() {
+    for i in visit(&scene.step_live, scene.voxels.len()) {
         scratch.contact_reactions[i] = (scene.positions[i] - predicted[i])
             * (f64::from(scene.voxels[i].mass) * scale)
             - loads[i].as_dvec3();
@@ -7879,7 +8008,15 @@ fn apply_support_friction(
     applied_loads: &[Vec3],
     solve_loads: &mut [Vec3],
 ) {
-    solve_loads.copy_from_slice(applied_loads);
+    match scene.step_live.as_ref() {
+        // A sleeper carries no load, and neither does its (zero) entry in `solve_loads`.
+        Some(live) => {
+            for &i in &live.list {
+                solve_loads[i] = applied_loads[i];
+            }
+        }
+        None => solve_loads.copy_from_slice(applied_loads),
+    }
     let mut patch_rows = rustc_hash::FxHashMap::<usize, usize>::default();
     for row in rows {
         *patch_rows.entry(row.patch).or_default() += 1;
@@ -7935,8 +8072,8 @@ fn update_support_friction(
     for row in rows {
         body_total.entry(scene.clusters[row.voxel]).or_default();
     }
-    for (i, voxel) in scene.voxels.iter().enumerate() {
-        if voxel.kinematic {
+    for i in visit(&scene.step_live, scene.voxels.len()) {
+        if scene.voxels[i].kinematic {
             continue;
         }
         if let Some(total) = body_total.get_mut(&scene.clusters[i]) {
@@ -8109,11 +8246,8 @@ fn decide_cell_dofs(scene: &Scene) -> bool {
     if std::env::var_os("VOXEL_FACE_CELLS").is_some() {
         return true;
     }
-    let mechanical = scene
-        .voxels
-        .iter()
-        .enumerate()
-        .filter(|(i, voxel)| !voxel.kinematic && scene.aggregate_of[*i].is_none())
+    let mechanical = visit(&scene.step_live, scene.voxels.len())
+        .filter(|&i| !scene.voxels[i].kinematic && scene.aggregate_of[i].is_none())
         .count();
     let allowed = mechanical <= CELL_DOF_MAX_REVS;
     if !allowed {
@@ -8144,7 +8278,8 @@ fn basis_precise(axis: usize, rotation: glam::DQuat) -> glam::DMat3 {
 fn sync_precise_rotations(scene: &mut Scene) {
     let n = scene.rotations.len();
     scene.precise_rotations.resize(n, glam::DQuat::IDENTITY);
-    for i in 0..n {
+    let live = scene.step_live.clone();
+    for i in visit(&live, n) {
         if scene.precise_rotations[i].as_quat() != scene.rotations[i] {
             scene.precise_rotations[i] = scene.rotations[i].as_dquat().normalize();
         }
@@ -8529,10 +8664,10 @@ fn solve_face_cells_sparse(
     let cell = f64::from(CELL);
     scratch.substep_theta.resize(n, DVec3::ZERO);
     sync_precise_rotations(scene);
-    scratch.spin_at_substep_start.resize(n, DVec3::ZERO);
+    let live = scene.step_live.clone();
     if new_substep {
-        scratch.spin_at_substep_start.clone_from(&scene.angular_velocities);
-        for i in 0..n {
+        sync_visited(&mut scratch.spin_at_substep_start, &scene.angular_velocities, &live);
+        for i in visit(&live, n) {
             scratch.substep_theta[i] = DVec3::ZERO;
             if !scene.voxels[i].kinematic {
                 let step = scene.angular_velocities[i] * f64::from(h);
@@ -8542,9 +8677,13 @@ fn solve_face_cells_sparse(
         }
     }
     // Cells that take part: any cell with a free translation or rotation.
-    let mut cell_of = vec![u32::MAX; n];
+    if scratch.spin_at_substep_start.len() != n {
+        scratch.spin_at_substep_start.resize(n, DVec3::ZERO);
+    }
+    let mut cell_of = std::mem::take(&mut scratch.cell_of);
+    fill_visited(&mut cell_of, n, u32::MAX, &live);
     let mut cells = Vec::<usize>::new();
-    for i in 0..n {
+    for i in visit(&live, n) {
         if !scene.voxels[i].kinematic && scene.aggregate_of[i].is_none() {
             cell_of[i] = cells.len() as u32;
             cells.push(i);
@@ -8553,6 +8692,7 @@ fn solve_face_cells_sparse(
     let count = cells.len();
     if count == 0 {
         scene.solver_residual = 0.0;
+        scratch.cell_of = cell_of;
         return 0;
     }
     let masks: Vec<[f64; 6]> = cells
@@ -8957,6 +9097,7 @@ fn solve_face_cells_sparse(
         }
     }
     cell_profile_add(2, cg_started);
+    scratch.cell_of = std::mem::take(&mut cell_of);
     CELL_PROFILE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     CELL_PROFILE[3].fetch_add(iterations as u64, std::sync::atomic::Ordering::Relaxed);
     scratch.cell_factor_iterations = iterations;
@@ -8991,14 +9132,23 @@ fn solve_face_cells_sparse(
 /// Fixed rows stay at the identity block and a zero right-hand side.
 fn refresh_mechanical_sets(scene: &Scene, scratch: &mut SolverScratch) {
     let n = scene.voxels.len();
-    scratch.mechanical_mask.clear();
-    scratch
-        .mechanical_mask
-        .extend(scene.voxels.iter().map(|voxel| !voxel.kinematic));
+    let live = scene.step_live.clone();
+    // A sleeper is kinematic with no mechanical bond: mask false, slots empty, row at
+    // identity. Those entries never change, so a sparse refresh leaves them alone.
+    if live.is_some() && scratch.mechanical_mask.len() == n && scratch.constraint_slots.len() == 3 * n {
+        for i in visit(&live, n) {
+            scratch.mechanical_mask[i] = !scene.voxels[i].kinematic;
+        }
+    } else {
+        scratch.mechanical_mask.clear();
+        scratch
+            .mechanical_mask
+            .extend(scene.voxels.iter().map(|voxel| !voxel.kinematic));
+    }
     scratch.constraint_slots.resize_with(3 * n, || None);
     scratch.mechanical_slots.clear();
     for axis in 0..3 {
-        for i in 0..n {
+        for i in visit(&live, n) {
             let neighbor = scene.bonds[axis][i].neighbor;
             let slot = axis * n + i;
             if neighbor == EMPTY {
@@ -9018,13 +9168,10 @@ fn refresh_mechanical_sets(scene: &Scene, scratch: &mut SolverScratch) {
     scratch.mechanical_revs.clear();
     scratch
         .mechanical_revs
-        .extend((0..n).filter(|&i| scratch.mechanical_mask[i]));
-    scratch.free.resize(n, Vec3::ZERO);
-    scratch.free.fill(Vec3::ZERO);
-    scratch.diagonal.resize(n, Mat3::IDENTITY);
-    scratch.diagonal.fill(Mat3::IDENTITY);
-    scratch.rhs.resize(n, Vec3::ZERO);
-    scratch.rhs.fill(Vec3::ZERO);
+        .extend(visit(&live, n).filter(|&i| scratch.mechanical_mask[i]));
+    fill_visited(&mut scratch.free, n, Vec3::ZERO, &live);
+    fill_visited(&mut scratch.diagonal, n, Mat3::IDENTITY, &live);
+    fill_visited(&mut scratch.rhs, n, Vec3::ZERO, &live);
 }
 
 fn solve_coupled(
@@ -9100,8 +9247,8 @@ fn solve_coupled(
         }));
     }
     scratch.active.clear();
-    scratch.active_index.resize(n, u32::MAX);
-    scratch.active_index.fill(u32::MAX);
+    let live = scene.step_live.clone();
+    fill_visited(&mut scratch.active_index, n, u32::MAX, &live);
     for &i in &mechanical_revs {
         if scratch.free[i] != Vec3::ZERO {
             scratch.active_index[i] =
@@ -9136,10 +9283,8 @@ fn solve_coupled(
     // The bond graph is face-connected, so each voxel can touch at most six
     // constraints. Fixed slots avoid millions of tiny heap allocations on a
     // large scene, while preserving the same per-node gather in the solver.
-    scratch.incidence.resize(n, [u32::MAX; 6]);
-    scratch.incidence.fill([u32::MAX; 6]);
-    scratch.incidence_len.resize(n, 0);
-    scratch.incidence_len.fill(0);
+    fill_visited(&mut scratch.incidence, n, [u32::MAX; 6], &live);
+    fill_visited(&mut scratch.incidence_len, n, 0, &live);
     let mechanical_mask = &scratch.mechanical_mask;
     let initialize_row = |i: usize, diagonal: &mut Mat3, rhs: &mut Vec3| {
         let mass = scratch.masses[i];
@@ -9394,7 +9539,7 @@ fn solve_coupled(
     let assembly_time = assembly_start.elapsed();
     if scene.cell_dofs {
         let solve_start = Instant::now();
-        build_block_jacobi(&scratch.diagonal, &mut scratch.factor_diagonal);
+        build_block_jacobi(&scratch.diagonal, &mut scratch.factor_diagonal, &live);
         let iterations =
             solve_face_cells_sparse(scene, h, scratch, !reuse_preconditioner, predicted, loads);
         return (iterations, [assembly_time, Duration::ZERO, solve_start.elapsed()]);
@@ -9515,7 +9660,7 @@ fn solve_coupled(
                     )
                 }
                 CpuPreconditioner::BlockJacobi | CpuPreconditioner::AggregationMultigrid => {
-                    build_block_jacobi(&scratch.diagonal, &mut scratch.factor_diagonal)
+                    build_block_jacobi(&scratch.diagonal, &mut scratch.factor_diagonal, &live)
                 }
             }
             if bipartite_ic0_graph && !scratch.cpu_preconditioner_bipartite {
@@ -9967,7 +10112,7 @@ fn solve_coupled(
                 )
             }
             CpuPreconditioner::BlockJacobi | CpuPreconditioner::AggregationMultigrid => {
-                build_block_jacobi(&scratch.diagonal, &mut scratch.factor_diagonal)
+                build_block_jacobi(&scratch.diagonal, &mut scratch.factor_diagonal, &None)
             }
         }
         if scene.config.cpu_preconditioner == CpuPreconditioner::IncompleteCholesky0 {

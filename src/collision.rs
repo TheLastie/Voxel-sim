@@ -1,4 +1,4 @@
-use crate::scene::{Scene, CELL, DCELL};
+use crate::scene::{sync_visited, visit, Scene, CELL, DCELL};
 use glam::{DVec3, Vec3};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -42,11 +42,20 @@ pub(crate) struct CollisionScratch {
     dynamic_bounds_by_index: Vec<Option<([i32; 3], [i32; 3])>>,
     static_lower_by_index: Vec<[i32; 3]>,
     static_ready: bool,
+    /// Slot of each fixed REV in `static_indices` (`u32::MAX` for the others), the visit
+    /// list the bins were built for, and how many fixed REVs that list holds. A sparse
+    /// step checks only those REVs: the fixed ones outside it are sleepers, which are
+    /// frozen and cannot make the bins stale without a sleep or wake event.
+    static_slot: Vec<u32>,
+    static_live_id: u64,
+    static_live_kinematic: usize,
     static_requires_sparse: bool,
     candidate_pairs_valid: bool,
     pairs: Vec<(usize, usize)>,
     adjacency: Vec<[u32; 6]>,
     adjacency_topology: [Vec<u32>; 3],
+    /// The visit list whose bonds the adjacency cache was last compared against in full.
+    adjacency_live_id: u64,
 }
 
 /// Project voxel pairs apart and detect swept contacts before they can cross.
@@ -79,7 +88,8 @@ fn contacts_into(scene: &mut Scene, targets: &[[Option<f64>; 3]], contacts: &mut
     let mut phase_start = Instant::now();
     let mut scratch = std::mem::take(&mut scene.collision_scratch);
     let mut starts = std::mem::take(&mut scratch.starts);
-    starts.clone_from(&scene.previous);
+    let live = scene.step_live.clone();
+    sync_visited(&mut starts, &scene.previous, &live);
     if skip_separated_aggregate_collision(scene, &starts, &mut scratch, contacts) {
         scratch.starts = starts;
         scene.collision_scratch = scratch;
@@ -89,6 +99,7 @@ fn contacts_into(scene: &mut Scene, targets: &[[Option<f64>; 3]], contacts: &mut
         scene,
         &mut scratch.adjacency,
         &mut scratch.adjacency_topology,
+        &mut scratch.adjacency_live_id,
     );
     let setup_time = phase_start.elapsed();
     phase_start = Instant::now();
@@ -593,8 +604,7 @@ pub(crate) fn resolve_velocities_with_precontact_into(
             }
         }
     }
-    physical_velocities.resize(pre_contact_velocities.len(), Vec3::ZERO);
-    physical_velocities.copy_from_slice(pre_contact_velocities);
+    sync_visited(physical_velocities, pre_contact_velocities, &scene.step_live.clone());
     for iteration in 0..4 {
         let mut changed = false;
         for (contact_index, c) in contacts.iter().enumerate() {
@@ -887,6 +897,7 @@ fn candidate_pairs(
     scratch: &mut CollisionScratch,
     topology_changed: bool,
 ) {
+    let live = scene.step_live.clone();
     let static_changed = ensure_static_bins(scene, starts, scratch);
     let bounds_len_changed = scratch.dynamic_bounds_by_index.len() != scene.voxels.len();
     scratch
@@ -896,7 +907,8 @@ fn candidate_pairs(
         .dynamic_lower_by_index
         .resize(scene.voxels.len(), [0; 3]);
     let mut dynamic_bounds_changed = bounds_len_changed;
-    for i in 0..scene.voxels.len() {
+    // A sleeper has no dynamic bounds (`None`, lower corner zero) from the start.
+    for i in visit(&live, scene.voxels.len()) {
         let bounds = if scene.voxels[i].kinematic {
             None
         } else {
@@ -919,11 +931,9 @@ fn candidate_pairs(
     }
 
     let requires_sparse = scratch.static_requires_sparse
-        || scratch
-            .dynamic_bounds_by_index
-            .iter()
-            .flatten()
-            .any(|&(lo, hi)| bin_volume_exceeds_limit(lo, hi));
+        || visit(&live, scene.voxels.len())
+            .filter_map(|i| scratch.dynamic_bounds_by_index[i])
+            .any(|(lo, hi)| bin_volume_exceeds_limit(lo, hi));
     if requires_sparse {
         candidate_pairs_sparse(scene, starts, scratch);
         scratch.candidate_pairs_valid = true;
@@ -937,8 +947,8 @@ fn candidate_pairs(
     scratch.pairs.clear();
     let bins = &mut scratch.bins;
     let bin_pool = &mut scratch.bin_pool;
-    for (i, bounds) in scratch.dynamic_bounds_by_index.iter().enumerate() {
-        let Some((lo, hi)) = bounds else {
+    for i in visit(&live, scene.voxels.len()) {
+        let Some((lo, hi)) = &scratch.dynamic_bounds_by_index[i] else {
             continue;
         };
         for z in lo[2]..=hi[2] {
@@ -956,8 +966,9 @@ fn candidate_pairs(
         let static_lower_by_index = &scratch.static_lower_by_index;
         let adjacent = &scratch.adjacency;
         let static_bins = &scratch.static_bins;
-        bins.par_iter()
-            .fold(Vec::new, |mut local_pairs, (key, ids)| {
+        // The pairs are sorted below, so the order bins are visited in does not matter.
+        // A handful of bins (one falling body) is not worth waking the thread pool for.
+        let fold_bin = |mut local_pairs: Vec<(usize, usize)>, (key, ids): (&[i32; 3], &Vec<usize>)| {
                 for a in 0..ids.len() {
                     for b in (a + 1)..ids.len() {
                         let i = ids[a].min(ids[b]);
@@ -1006,11 +1017,17 @@ fn candidate_pairs(
                     }
                 }
                 local_pairs
-            })
-            .reduce(Vec::new, |mut a, mut b| {
-                a.append(&mut b);
-                a
-            })
+        };
+        if bins.len() <= 64 {
+            bins.iter().fold(Vec::new(), fold_bin)
+        } else {
+            bins.par_iter()
+                .fold(Vec::new, fold_bin)
+                .reduce(Vec::new, |mut a, mut b| {
+                    a.append(&mut b);
+                    a
+                })
+        }
     };
     scratch.pairs.clear();
     scratch.pairs.extend(generated_pairs);
@@ -1229,26 +1246,57 @@ fn internal_kinematic_face_contact(
 }
 
 fn ensure_static_bins(scene: &Scene, starts: &[DVec3], scratch: &mut CollisionScratch) -> bool {
+    let live = scene.step_live.clone();
+    let live_id = live.as_ref().map_or(0, |live| live.id);
+    let n = scene.voxels.len();
     let mut changed = !scratch.static_ready;
-    let mut fixed_slot = 0;
-    for (i, voxel) in scene.voxels.iter().enumerate() {
-        if !voxel.kinematic {
-            continue;
+    if let Some(live) = live.as_ref().filter(|_| !changed) {
+        if scratch.static_live_id != live_id || scratch.static_slot.len() != n {
+            changed = true;
+        } else {
+            let mut fixed_in_list = 0;
+            for &i in &live.list {
+                let slot = scratch.static_slot[i];
+                if !scene.voxels[i].kinematic {
+                    // Awake now, but the bins still hold it as fixed.
+                    changed |= slot != u32::MAX;
+                    continue;
+                }
+                fixed_in_list += 1;
+                if slot == u32::MAX
+                    || scratch.static_positions[slot as usize] != scene.positions[i]
+                    || starts[i] != scene.positions[i]
+                {
+                    changed = true;
+                }
+            }
+            changed |= fixed_in_list != scratch.static_live_kinematic;
         }
-        if scratch.static_indices.get(fixed_slot) != Some(&i)
-            || scratch.static_positions.get(fixed_slot) != Some(&scene.positions[i])
-            || starts[i] != scene.positions[i]
-        {
+    } else if live.is_none() {
+        let mut fixed_slot = 0;
+        for (i, voxel) in scene.voxels.iter().enumerate() {
+            if !voxel.kinematic {
+                continue;
+            }
+            if scratch.static_indices.get(fixed_slot) != Some(&i)
+                || scratch.static_positions.get(fixed_slot) != Some(&scene.positions[i])
+                || starts[i] != scene.positions[i]
+            {
+                changed = true;
+            }
+            fixed_slot += 1;
+        }
+        if fixed_slot != scratch.static_indices.len() {
             changed = true;
         }
-        fixed_slot += 1;
-    }
-    if fixed_slot != scratch.static_indices.len() {
-        changed = true;
     }
     if !changed {
         return false;
     }
+    scratch.static_live_id = live_id;
+    scratch.static_slot.clear();
+    scratch.static_slot.resize(n, u32::MAX);
+    scratch.static_live_kinematic = 0;
     scratch.static_bins.clear();
     scratch.static_requires_sparse = false;
     scratch.static_indices.clear();
@@ -1260,6 +1308,10 @@ fn ensure_static_bins(scene: &Scene, starts: &[DVec3], scratch: &mut CollisionSc
     for (i, voxel) in scene.voxels.iter().enumerate() {
         if !voxel.kinematic {
             continue;
+        }
+        scratch.static_slot[i] = scratch.static_indices.len() as u32;
+        if live.as_ref().map_or(true, |live| live.in_list[i]) {
+            scratch.static_live_kinematic += 1;
         }
         scratch.static_indices.push(i);
         scratch.static_positions.push(scene.positions[i]);
@@ -1290,7 +1342,12 @@ fn adjacency(
     scene: &Scene,
     result: &mut Vec<[u32; 6]>,
     cached_topology: &mut [Vec<u32>; 3],
+    compared_live_id: &mut u64,
 ) -> bool {
+    // The bonds of fixed REVs outside the visit list are compared in full whenever the
+    // list is new; after that only the listed REVs can have changed.
+    let live = scene.step_live.clone().filter(|live| live.id == *compared_live_id);
+    *compared_live_id = scene.step_live.as_ref().map_or(0, |live| live.id);
     let topology_unchanged = result.len() == scene.voxels.len()
         && scene
             .bonds
@@ -1298,10 +1355,14 @@ fn adjacency(
             .zip(cached_topology.iter())
             .all(|(bonds, cached)| {
                 bonds.len() == cached.len()
-                    && bonds
-                        .iter()
-                        .zip(cached)
-                        .all(|(bond, &neighbor)| bond.neighbor == neighbor)
+                    && match &live {
+                        // Bonds of sleepers away from awake REVs cannot have changed.
+                        Some(live) => live.list.iter().all(|&i| bonds[i].neighbor == cached[i]),
+                        None => bonds
+                            .iter()
+                            .zip(cached)
+                            .all(|(bond, &neighbor)| bond.neighbor == neighbor),
+                    }
             });
     if topology_unchanged {
         return false;
@@ -1514,13 +1575,13 @@ mod tests {
         let mut scene = Scene::new(config);
         let mut a = Vec::new();
         let mut cached_topology: [Vec<u32>; 3] = std::array::from_fn(|_| Vec::new());
-        adjacency(&scene, &mut a, &mut cached_topology);
+        adjacency(&scene, &mut a, &mut cached_topology, &mut 0);
         assert!(local_continuum_pair(&scene, &a, 0, 4));
         assert!(!local_continuum_pair(&scene, &a, 0, 2));
         scene.previous.clone_from(&scene.positions);
         assert!(project(&mut scene, &[]).is_empty());
         scene.bonds[0][0].neighbor = EMPTY;
-        adjacency(&scene, &mut a, &mut cached_topology);
+        adjacency(&scene, &mut a, &mut cached_topology, &mut 0);
         assert!(!local_continuum_pair(&scene, &a, 0, 1));
         scene.previous.clone_from(&scene.positions);
         assert!(project(&mut scene, &[])
@@ -1855,6 +1916,7 @@ mod tests {
             &scene,
             &mut scratch.adjacency,
             &mut scratch.adjacency_topology,
+            &mut scratch.adjacency_live_id,
         );
         candidate_pairs(&scene, &starts, &mut scratch, true);
 
@@ -1888,6 +1950,7 @@ mod tests {
             &scene,
             &mut scratch.adjacency,
             &mut scratch.adjacency_topology,
+            &mut scratch.adjacency_live_id,
         );
         candidate_pairs(&scene, &starts, &mut scratch, true);
 
@@ -1919,6 +1982,7 @@ mod tests {
             &scene,
             &mut scratch.adjacency,
             &mut scratch.adjacency_topology,
+            &mut scratch.adjacency_live_id,
         );
 
         candidate_pairs(&scene, &starts, &mut scratch, true);
@@ -1945,6 +2009,7 @@ mod tests {
             &scene,
             &mut scratch.adjacency,
             &mut scratch.adjacency_topology,
+            &mut scratch.adjacency_live_id,
         );
 
         candidate_pairs(&scene, &starts, &mut scratch, true);
@@ -1994,6 +2059,7 @@ mod tests {
             &scene,
             &mut scratch.adjacency,
             &mut scratch.adjacency_topology,
+            &mut scratch.adjacency_live_id,
         );
 
         candidate_pairs(&scene, &starts, &mut scratch, true);

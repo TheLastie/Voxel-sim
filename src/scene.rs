@@ -144,6 +144,9 @@ struct ThermalScratch {
     temperature: Vec<f64>,
     energy_delta: Vec<f64>,
     cell_energy: Vec<f64>,
+    /// Heat reached a sleeper during this step: conduction visits every REV until the
+    /// step ends (the sleeper wakes at the start of the next one).
+    sparse_disabled: bool,
 }
 
 /// Cumulative material and energy removed by world-boundary deletion.
@@ -445,6 +448,7 @@ mod beam_region;
 mod tier_governor;
 mod sleep;
 pub use sleep::SleepConfig;
+pub(crate) use sleep::{sync_visited, visit, visit_thermal, Live};
 pub use tier_governor::{TierCensus, TierGovernorConfig};
 
 /// Positions are separate arrays; material identity exists only in composition.
@@ -513,6 +517,9 @@ pub struct Scene {
     pub(crate) tier_governor: Option<Box<tier_governor::TierGovernor>>,
     /// Sleeping tier for settled clusters; see `sleep`.
     pub(crate) sleep: Option<Box<sleep::SleepState>>,
+    /// REVs a sparse fixed step visits (see `sleep::Live`); set by the solver for the
+    /// duration of one step and `None` otherwise, so every pass is complete by default.
+    pub(crate) step_live: Option<std::sync::Arc<Live>>,
     /// Whether this step solves cell rotations; decided at the start of each step.
     pub(crate) cell_dofs: bool,
     /// Double-precision cell rotations; `rotations` holds the same values as f32.
@@ -1158,6 +1165,7 @@ impl Scene {
             beam_regions: Vec::new(),
             tier_governor: None,
             sleep: None,
+            step_live: None,
             support_load_n: Vec::new(),
             precise_rotations: Vec::with_capacity(spawns.len()),
             angular_velocities: Vec::with_capacity(spawns.len()),
@@ -1709,7 +1717,8 @@ impl Scene {
     pub(crate) fn mobile_elastic_bond_energy_j(&self) -> f64 {
         let mut energy_j = 0.0;
         for axis in 0..3 {
-            for (i, bond) in self.bonds[axis].iter().enumerate() {
+            for i in visit(&self.step_live, self.voxels.len()) {
+                let bond = &self.bonds[axis][i];
                 if bond.neighbor != EMPTY
                     && !(self.voxels[i].kinematic && self.voxels[bond.neighbor as usize].kinematic)
                 {
@@ -2246,15 +2255,20 @@ impl Scene {
             return 0;
         };
         let old_count = self.voxels.len();
-        let keep: Vec<bool> = self
-            .positions
-            .iter()
-            .map(|p| p.cmpge(bounds.min).all() && p.cmple(bounds.max).all())
-            .collect();
+        let inside = |p: &DVec3| p.cmpge(bounds.min).all() && p.cmple(bounds.max).all();
+        // Sleepers do not move, so a sparse step only has to look at the others.
+        if self.step_live.is_some()
+            && visit_thermal(&self.step_live, old_count).all(|i| inside(&self.positions[i]))
+        {
+            return 0;
+        }
+        let keep: Vec<bool> = self.positions.iter().map(inside).collect();
         let removed_count = keep.iter().filter(|&&kept| !kept).count();
         if removed_count == 0 {
             return 0;
         }
+        // Removal renumbers the REVs: a visit list built for the old numbering is void.
+        self.step_live = None;
         // Removal shifts REV indices, which beam regions and sleepers keep.
         self.wake_all();
         self.expand_all_beams();
@@ -2722,6 +2736,12 @@ impl Scene {
         true
     }
 
+    /// Install the visit list for the coming fixed step (`None` = visit every REV).
+    pub(crate) fn set_step_live(&mut self, live: Option<std::sync::Arc<Live>>) {
+        self.step_live = live;
+        self.thermal_scratch.sparse_disabled = false;
+    }
+
     /// Conduct heat through 3×3×3 thermal control volumes inside each
     /// mechanical REV. Internal cell faces remain conductive when the REV is
     /// mechanically detached; cross-REV faces respect bond damage. Pairwise
@@ -2738,12 +2758,17 @@ impl Scene {
 
         let voxel_count = self.voxels.len();
         let cells_per_voxel = crate::voxel::THERMAL_CELL_COUNT;
+        // A sparse step looks only at awake REVs and the sleepers that touch them: a
+        // sleeper is frozen and was thermally even when it fell asleep, so no heat
+        // flows between two sleepers. Heat reaching a sleeper ends the shortcut.
+        let live = if self.thermal_scratch.sparse_disabled { None } else { self.step_live.clone() };
         let scratch = &mut self.thermal_scratch;
         scratch.macro_temperature.resize(voxel_count, 0.0);
         scratch.active_mask.resize(voxel_count, false);
         scratch.active_seed.resize(voxel_count, false);
         scratch.active_mask.fill(false);
-        for (i, voxel) in self.voxels.iter().enumerate() {
+        for i in visit_thermal(&live, voxel_count) {
+            let voxel = &self.voxels[i];
             scratch.macro_temperature[i] =
                 self.properties[i].temperature(voxel.mass, voxel.thermal_energy_f32());
             scratch.active_mask[i] = voxel.thermal_cell_energy_j.is_some();
@@ -2753,8 +2778,10 @@ impl Scene {
         // gradient or a retained intra-REV gradient. Uniform, equilibrated
         // regions need no per-cell updates. This keeps the 27-cell model
         // tractable in large worlds without changing any active flux.
+        let mut heat_reaches_sleeper = false;
         for axis in 0..3 {
-            for (i, bond) in self.bonds[axis].iter().enumerate() {
+            for i in visit_thermal(&live, voxel_count) {
+                let bond = &self.bonds[axis][i];
                 if bond.neighbor == EMPTY
                     || bond.damage >= 1.0
                     || self.properties[i].thermal_cond <= 0.0
@@ -2762,14 +2789,24 @@ impl Scene {
                     continue;
                 }
                 let j = bond.neighbor as usize;
+                if live.as_ref().is_some_and(|live| !live.thermal_in_list[j]) {
+                    continue;
+                }
                 if self.properties[j].thermal_cond <= 0.0 {
                     continue;
                 }
                 if scratch.macro_temperature[i] != scratch.macro_temperature[j] {
                     scratch.active_mask[i] = true;
                     scratch.active_mask[j] = true;
+                    if live.as_ref().is_some_and(|live| live.cold[i] || live.cold[j]) {
+                        heat_reaches_sleeper = true;
+                    }
                 }
             }
+        }
+        if heat_reaches_sleeper {
+            self.thermal_scratch.sparse_disabled = true;
+            return self.conduct_heat(elapsed_seconds);
         }
         if !scratch.active_mask.iter().any(|&active| active) {
             return Ok(0);
@@ -2779,7 +2816,8 @@ impl Scene {
         // finite-volume flux can advance naturally across REV boundaries.
         scratch.active_seed.clone_from(&scratch.active_mask);
         for axis in 0..3 {
-            for (i, bond) in self.bonds[axis].iter().enumerate() {
+            for i in visit_thermal(&live, voxel_count) {
+                let bond = &self.bonds[axis][i];
                 if bond.neighbor == EMPTY
                     || bond.damage >= 1.0
                     || self.properties[i].thermal_cond <= 0.0
@@ -2787,6 +2825,9 @@ impl Scene {
                     continue;
                 }
                 let j = bond.neighbor as usize;
+                if live.as_ref().is_some_and(|live| !live.thermal_in_list[j]) {
+                    continue;
+                }
                 if self.properties[j].thermal_cond <= 0.0 {
                     continue;
                 }
@@ -2799,7 +2840,7 @@ impl Scene {
         scratch.active_voxels.clear();
         scratch
             .active_voxels
-            .extend((0..voxel_count).filter(|&i| scratch.active_mask[i]));
+            .extend(visit_thermal(&live, voxel_count).filter(|&i| scratch.active_mask[i]));
         let active_voxel_count = scratch.active_voxels.len();
         let Some(thermal_cell_count) = active_voxel_count.checked_mul(cells_per_voxel) else {
             return Err("thermal active region is too large");
@@ -2903,18 +2944,14 @@ impl Scene {
                 .zip(&scratch.active_voxels)
                 .any(|(cached, &voxel)| *cached != self.properties[voxel].thermal_cond.to_bits())
             || scratch.cached_bond_neighbors.len() != voxel_count
-            || scratch
-                .cached_bond_neighbors
-                .iter()
-                .enumerate()
-                .any(|(i, cached)| {
-                    *cached
-                        != [
-                            self.bonds[0][i].neighbor,
-                            self.bonds[1][i].neighbor,
-                            self.bonds[2][i].neighbor,
-                        ]
-                });
+            || visit_thermal(&live, voxel_count).any(|i| {
+                scratch.cached_bond_neighbors[i]
+                    != [
+                        self.bonds[0][i].neighbor,
+                        self.bonds[1][i].neighbor,
+                        self.bonds[2][i].neighbor,
+                    ]
+            });
         if interface_topology_changed {
             scratch.interface_faces.clear();
             for axis in 0..3 {
@@ -2923,7 +2960,8 @@ impl Scene {
                     1 => [0, 2],
                     _ => [0, 1],
                 };
-                for (i, bond) in self.bonds[axis].iter().enumerate() {
+                for i in visit_thermal(&live, voxel_count) {
+                    let bond = &self.bonds[axis][i];
                     if bond.neighbor == EMPTY {
                         continue;
                     }
@@ -2978,16 +3016,18 @@ impl Scene {
                     .iter()
                     .map(|&voxel| self.properties[voxel].thermal_cond.to_bits()),
             );
-            scratch.cached_bond_neighbors.clear();
-            scratch
-                .cached_bond_neighbors
-                .extend((0..voxel_count).map(|i| {
-                    [
-                        self.bonds[0][i].neighbor,
-                        self.bonds[1][i].neighbor,
-                        self.bonds[2][i].neighbor,
-                    ]
-                }));
+            let current = |i: usize| {
+                [self.bonds[0][i].neighbor, self.bonds[1][i].neighbor, self.bonds[2][i].neighbor]
+            };
+            if live.is_some() && scratch.cached_bond_neighbors.len() == voxel_count {
+                // Entries of sleepers away from awake REVs are never compared.
+                for i in visit_thermal(&live, voxel_count) {
+                    scratch.cached_bond_neighbors[i] = current(i);
+                }
+            } else {
+                scratch.cached_bond_neighbors.clear();
+                scratch.cached_bond_neighbors.extend((0..voxel_count).map(current));
+            }
         }
 
         // Connectivity and undamaged conductance are cached. Current bond
@@ -3260,6 +3300,7 @@ impl Scene {
             beam_regions: Vec::new(),
             tier_governor: None,
             sleep: None,
+            step_live: None,
             support_load_n: Vec::new(),
             precise_rotations: vec![glam::DQuat::IDENTITY; n],
             angular_velocities: vec![glam::DVec3::ZERO; n],

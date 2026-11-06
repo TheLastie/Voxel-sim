@@ -55,6 +55,21 @@ fn report(label: &str, times: &[f64]) {
     let mut sorted = times.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let at = |f: f64| sorted[((sorted.len() - 1) as f64 * f) as usize];
+    // Steps slower than 20 ms with their index: these are the sleep and wake events.
+    let slow: Vec<(usize, f64)> = times.iter().enumerate().filter(|(_, t)| **t > 20.0).map(|(i, t)| (i, t.round())).collect();
+    eprintln!("  slow steps (index, ms): {} of {}, last at {:?}", slow.len(), times.len(), slow.last().map(|s| s.0));
+    if let Some(&(last, _)) = slow.last() {
+        // Steps after the last sleep or wake event: the steady cost of the sleeping scene.
+        let mut steady = times[last + 1..].to_vec();
+        if !steady.is_empty() {
+            steady.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let at = |f: f64| steady[((steady.len() - 1) as f64 * f) as usize];
+            eprintln!(
+                "  steady after the last event ({} steps): p50={:.2} ms p95={:.2} ms max={:.2} ms",
+                steady.len(), at(0.5), at(0.95), steady[steady.len() - 1]
+            );
+        }
+    }
     eprintln!(
         "{label}: first={:.1} ms p50={:.1} ms p95={:.1} ms max={:.1} ms last5={:?}",
         times[0],
@@ -68,10 +83,14 @@ fn report(label: &str, times: &[f64]) {
 #[test]
 #[ignore = "timing probe, tens of seconds"]
 fn a_block_at_rest_costs_little_when_it_sleeps() {
+    // REST_ONLY_AWAKE=1 runs just the "sleep on + 1 awake" case (the other two are slow at 27k).
+    let only_awake = std::env::var_os("REST_ONLY_AWAKE").is_some();
     for (width, height) in [(14, 14), (20, 25), (30, 30)] {
         let active = width * width * height;
-        report(&format!("rest {width}x{width}x{height} ({active} REVs) sleep off          "), &resting(width, height, 60, false, false));
-        report(&format!("rest {width}x{width}x{height} ({active} REVs) sleep on, dormant  "), &resting(width, height, 60, true, false));
-        report(&format!("rest {width}x{width}x{height} ({active} REVs) sleep on + 1 awake "), &resting(width, height, 60, true, true));
+        if !only_awake {
+            report(&format!("rest {width}x{width}x{height} ({active} REVs) sleep off          "), &resting(width, height, 60, false, false));
+            report(&format!("rest {width}x{width}x{height} ({active} REVs) sleep on, dormant  "), &resting(width, height, 60, true, false));
+        }
+        report(&format!("rest {width}x{width}x{height} ({active} REVs) sleep on + 1 awake "), &resting(width, height, 150, true, true));
     }
 }

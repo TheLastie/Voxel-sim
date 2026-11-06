@@ -16,9 +16,116 @@
 //! than `external_forces` must not be left to sleep (keep sleep disabled for such scenes).
 use super::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Edge of the coarse grid used to find sleepers near a moving REV, in cells.
 const GRID_CELLS: f64 = 4.0;
+
+static NEXT_LIVE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The REVs a sparse step has to visit while clusters sleep. A sleeper is kinematic
+/// and frozen, and so is a fixed REV that nobody touches and that does not move: their
+/// position, velocity and every solver entry derived from them stay as they are, so a
+/// pass that would only copy or zero those entries can skip them without changing any
+/// result. What a step must still visit is
+///
+/// * `list` (mechanics): every free REV, every fixed or sleeping REV that shares a bond
+///   with a free one or with the other side of a sleep boundary (the "rim", whose bonds
+///   the solver reads), every REV of a thermally unsettled sleeper, and every fixed REV
+///   that moved since the last step;
+/// * `thermal_list` (heat, melting, bounds): additionally every fixed REV, whose
+///   energy can change by conduction or external heating without any mechanical sign.
+pub(crate) struct Live {
+    /// Distinguishes lists: caches built for one list are not trusted for another.
+    pub(crate) id: u64,
+    /// Ascending REV indices for the mechanical passes.
+    pub(crate) list: Vec<usize>,
+    /// Ascending REV indices for the thermal passes (a superset of `list`).
+    pub(crate) thermal_list: Vec<usize>,
+    /// Fixed, unsleeping REVs outside `list`: checked each step for movement.
+    pub(crate) fixed: Vec<usize>,
+    /// REV `i` is asleep (it may still be on the lists as rim).
+    pub(crate) asleep: Vec<bool>,
+    /// REV `i` is in `list`.
+    pub(crate) in_list: Vec<bool>,
+    /// REV `i` is in `thermal_list`.
+    pub(crate) thermal_in_list: Vec<bool>,
+    /// REV `i` sleeps in a region whose heat is settled: nothing flows through it, so
+    /// the thermal pass need not look inside, and heat arriving at it ends the shortcut.
+    pub(crate) cold: Vec<bool>,
+}
+
+/// Indices a pass visits: all REVs, or only the live ones during a sparse step.
+pub(crate) enum Visit<'a> {
+    All(std::ops::Range<usize>),
+    Some(std::iter::Copied<std::slice::Iter<'a, usize>>),
+}
+
+impl Iterator for Visit<'_> {
+    type Item = usize;
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            Visit::All(range) => range.next(),
+            Visit::Some(iter) => iter.next(),
+        }
+    }
+}
+
+/// Walk `0..n`, or the live list when a sparse step is running.
+#[inline]
+pub(crate) fn visit<'a>(live: &'a Option<Arc<Live>>, n: usize) -> Visit<'a> {
+    match live {
+        Some(live) => Visit::Some(live.list.iter().copied()),
+        None => Visit::All(0..n),
+    }
+}
+
+/// Like `visit`, over the thermal list.
+#[inline]
+pub(crate) fn visit_thermal<'a>(live: &'a Option<Arc<Live>>, n: usize) -> Visit<'a> {
+    match live {
+        Some(live) => Visit::Some(live.thermal_list.iter().copied()),
+        None => Visit::All(0..n),
+    }
+}
+
+impl Live {
+    /// The same lists with fixed REVs that moved this step added to the mechanical one.
+    fn with_moving(&self, moving: &[usize]) -> Live {
+        let mut in_list = self.in_list.clone();
+        for &i in moving {
+            in_list[i] = true;
+        }
+        let list = (0..in_list.len()).filter(|&i| in_list[i]).collect();
+        Live {
+            id: NEXT_LIVE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            list,
+            thermal_list: self.thermal_list.clone(),
+            fixed: self.fixed.iter().copied().filter(|i| !moving.contains(i)).collect(),
+            asleep: self.asleep.clone(),
+            in_list,
+            thermal_in_list: self.thermal_in_list.clone(),
+            cold: self.cold.clone(),
+        }
+    }
+}
+
+/// `dst[i] = src[i]` for every visited index. A destination of the wrong length is
+/// rebuilt whole, so entries of REVs outside the live list always mirror the source.
+pub(crate) fn sync_visited<T: Clone>(dst: &mut Vec<T>, src: &[T], live: &Option<Arc<Live>>) {
+    match live {
+        Some(live) if dst.len() == src.len() && src.len() == live.asleep.len() => {
+            for &i in &live.list {
+                dst[i].clone_from(&src[i]);
+            }
+        }
+        _ => {
+            dst.clear();
+            dst.extend_from_slice(src);
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SleepConfig {
@@ -37,6 +144,10 @@ pub struct SleepConfig {
     pub stress_ratio_limit: f32,
     /// Awake REVs slower than this do not wake neighbours.
     pub mover_speed_m_s: f64,
+    /// Let a step that has sleepers visit only the REVs that are awake (plus the bonded
+    /// rim of the sleepers), instead of every REV. Results do not change; turn it off to
+    /// compare against the full pass.
+    pub sparse_passes: bool,
 }
 
 impl Default for SleepConfig {
@@ -49,12 +160,18 @@ impl Default for SleepConfig {
             wake_margin_cells: 1.5,
             stress_ratio_limit: 0.3,
             mover_speed_m_s: 1.0e-3,
+            sparse_passes: true,
         }
     }
 }
 
 struct SleepRegion {
     members: Vec<usize>,
+    /// Heat was still moving in or around the cluster when it fell asleep (an uneven
+    /// field, a gradient across one of its bonds, a molten member). Its REVs stay on
+    /// the visit list, so conduction and melting go on as they do for awake REVs; the
+    /// change of energy then wakes it at the next step, as always.
+    unsettled: bool,
     /// Internal energy and mass of each member when it fell asleep, as bits. A change
     /// means heat, a reaction or a composition change reached the sleeper.
     signature: Vec<(u64, u32)>,
@@ -71,6 +188,8 @@ pub(crate) struct SleepState {
     since: u32,
     voxel_count: usize,
     gravity: [f32; 3],
+    /// Visit list for sparse passes; `None` while nothing sleeps.
+    live: Option<Arc<Live>>,
 }
 
 fn grid_key(p: DVec3) -> [i32; 3] {
@@ -94,6 +213,7 @@ impl Scene {
             since: 0,
             voxel_count: self.voxels.len(),
             gravity: self.config.gravity,
+            live: None,
         }));
         Ok(())
     }
@@ -141,7 +261,95 @@ impl Scene {
         self.sleep.as_ref().is_some_and(|state| state.regions.iter().any(Option::is_some))
             && !self.has_registered_rigid_candidates()
             && self.beam_regions.iter().all(Option::is_none)
-            && self.voxels.iter().all(|v| v.kinematic)
+            && match self.sparse_live() {
+                // Sleepers are kinematic by construction; only the rest needs a look.
+                Some(live) => live.list.iter().all(|&i| self.voxels[i].kinematic),
+                None => self.voxels.iter().all(|v| v.kinematic),
+            }
+    }
+
+    /// The visit list for sparse passes, when sleepers exist and sparse passes are on.
+    pub(crate) fn sparse_live(&self) -> Option<Arc<Live>> {
+        let state = self.sleep.as_ref()?;
+        if !state.config.sparse_passes {
+            return None;
+        }
+        state.live.as_ref().filter(|live| live.asleep.len() == self.voxels.len()).cloned()
+    }
+
+    /// The visit list for this step: the standing one plus the fixed REVs that moved
+    /// since the last step (a platform, a hand), which touch whatever they now overlap.
+    pub(crate) fn sparse_live_for_step(&self) -> Option<Arc<Live>> {
+        let live = self.sparse_live()?;
+        let moving: Vec<usize> = live
+            .fixed
+            .iter()
+            .copied()
+            .filter(|&i| self.positions[i] != self.previous[i])
+            .collect();
+        Some(if moving.is_empty() { live } else { Arc::new(live.with_moving(&moving)) })
+    }
+
+    /// Recompute the visit list after the bond graph changed.
+    pub(crate) fn refresh_live(&mut self) {
+        if let Some(mut state) = self.sleep.take() {
+            state.live = self.compute_live(&state.regions);
+            self.sleep = Some(state);
+        }
+    }
+
+    fn compute_live(&self, regions: &[Option<SleepRegion>]) -> Option<Arc<Live>> {
+        if !regions.iter().any(Option::is_some) {
+            return None;
+        }
+        let n = self.voxels.len();
+        let mut asleep = vec![false; n];
+        for region in regions.iter().flatten() {
+            for &i in &region.members {
+                if i < n {
+                    asleep[i] = true;
+                }
+            }
+        }
+        let mut cold = asleep.clone();
+        let mut touch = vec![false; n];
+        for region in regions.iter().flatten().filter(|region| region.unsettled) {
+            for &i in &region.members {
+                if i < n {
+                    touch[i] = true;
+                    cold[i] = false;
+                }
+            }
+        }
+        for axis in 0..3 {
+            for (i, bond) in self.bonds[axis].iter().enumerate() {
+                if bond.neighbor == EMPTY {
+                    continue;
+                }
+                let j = bond.neighbor as usize;
+                if j < n
+                    && (asleep[i] != asleep[j] || self.voxels[i].kinematic != self.voxels[j].kinematic)
+                {
+                    touch[i] = true;
+                    touch[j] = true;
+                }
+            }
+        }
+        let in_list: Vec<bool> = (0..n).map(|i| !self.voxels[i].kinematic || touch[i]).collect();
+        let thermal_in_list: Vec<bool> = (0..n).map(|i| !asleep[i] || touch[i]).collect();
+        let list = (0..n).filter(|&i| in_list[i]).collect();
+        let thermal_list = (0..n).filter(|&i| thermal_in_list[i]).collect();
+        let fixed = (0..n).filter(|&i| thermal_in_list[i] && !in_list[i]).collect();
+        Some(Arc::new(Live {
+            id: NEXT_LIVE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            list,
+            thermal_list,
+            fixed,
+            asleep,
+            in_list,
+            thermal_in_list,
+            cold,
+        }))
     }
 
     /// Free REVs currently asleep.
@@ -178,6 +386,7 @@ impl Scene {
         let _ = self.set_voxels_kinematic_raw(&members, false);
         state.grid_dirty = true;
         state.quiet.clear();
+        state.live = self.compute_live(&state.regions);
     }
 
     /// Called at the start of every fixed step.
@@ -190,6 +399,9 @@ impl Scene {
             self.wake_regions(&mut state, &all);
             state.voxel_count = self.voxels.len();
             state.gravity = self.config.gravity;
+        }
+        if state.regions.iter().any(Option::is_some) && state.live.is_none() {
+            state.live = self.compute_live(&state.regions);
         }
         if state.regions.iter().any(Option::is_some) {
             self.wake_disturbed(&mut state);
@@ -240,9 +452,10 @@ impl Scene {
         // Movers: awake free REVs, and fixed REVs that moved since the last step.
         let dt = f64::from(self.config.fixed_dt);
         let cell = f64::from(CELL);
-        let asleep = self.sleeping_flags();
-        for i in 0..self.voxels.len() {
-            if asleep[i] {
+        let live = state.live.clone();
+        let asleep = if live.is_some() { Vec::new() } else { self.sleeping_flags() };
+        for i in visit_thermal(&live, self.voxels.len()) {
+            if live.as_ref().map_or_else(|| asleep[i], |live| live.asleep[i]) {
                 continue;
             }
             let speed = if self.voxels[i].kinematic {
@@ -285,7 +498,7 @@ impl Scene {
             }
         }
         let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
-        for i in 0..self.voxels.len() {
+        for i in visit(&state.live, self.voxels.len()) {
             if self.voxels[i].kinematic || in_beam[i] || self.aggregate_of[i].is_some() {
                 continue;
             }
@@ -321,15 +534,16 @@ impl Scene {
         if sleep_now.is_empty() {
             return;
         }
+        let unsettled = self.thermally_unsettled(&sleep_now);
         let mut all = Vec::new();
-        for members in sleep_now {
+        for (members, unsettled) in sleep_now.into_iter().zip(unsettled) {
             all.extend_from_slice(&members);
             let slot = state.regions.iter().position(Option::is_none).unwrap_or(state.regions.len());
             let signature = members
                 .iter()
                 .map(|&i| (self.voxels[i].total_internal_energy_j().to_bits(), self.voxels[i].mass.to_bits()))
                 .collect();
-            let region = SleepRegion { members, signature };
+            let region = SleepRegion { members, unsettled, signature };
             if slot == state.regions.len() {
                 state.regions.push(Some(region));
             } else {
@@ -338,6 +552,57 @@ impl Scene {
         }
         let _ = self.set_voxels_kinematic_raw(&all, true);
         state.grid_dirty = true;
+        state.live = self.compute_live(&state.regions);
+    }
+
+    /// Per cluster: is heat still moving in or around it? True when a member is fully
+    /// molten, keeps an uneven field inside the REV, or has a bond to a REV at another
+    /// temperature (the test that seeds conduction). The sparse thermal pass only looks
+    /// at the bonds around REVs on the visit list, so such a cluster stays on it.
+    fn thermally_unsettled(&self, groups: &[Vec<usize>]) -> Vec<bool> {
+        let n = self.voxels.len();
+        let mut group_of = vec![usize::MAX; n];
+        let mut unsettled = vec![false; groups.len()];
+        for (g, members) in groups.iter().enumerate() {
+            for &i in members {
+                group_of[i] = g;
+                let voxel = &self.voxels[i];
+                if voxel.thermal_cell_energy_j.is_some()
+                    || self.properties[i].phase_state(voxel.mass, voxel.thermal_energy_f32()).solid_fraction <= 0.0
+                {
+                    unsettled[g] = true;
+                }
+            }
+        }
+        let temperature = |i: usize| {
+            self.properties[i].temperature(self.voxels[i].mass, self.voxels[i].thermal_energy_f32())
+        };
+        for axis in 0..3 {
+            for (i, bond) in self.bonds[axis].iter().enumerate() {
+                if bond.neighbor == EMPTY {
+                    continue;
+                }
+                let j = bond.neighbor as usize;
+                let (a, b) = (group_of[i], group_of[j]);
+                if a == usize::MAX && b == usize::MAX {
+                    continue;
+                }
+                if bond.damage >= 1.0
+                    || self.properties[i].thermal_cond <= 0.0
+                    || self.properties[j].thermal_cond <= 0.0
+                {
+                    continue;
+                }
+                if temperature(i) != temperature(j) {
+                    for g in [a, b] {
+                        if g != usize::MAX {
+                            unsettled[g] = true;
+                        }
+                    }
+                }
+            }
+        }
+        unsettled
     }
 
     /// Voxels as a checkpoint must store them: sleepers are free, not fixed.
