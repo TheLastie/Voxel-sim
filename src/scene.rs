@@ -502,6 +502,9 @@ pub struct Scene {
     pub(crate) cell_dofs: bool,
     /// Double-precision cell rotations; `rotations` holds the same values as f32.
     pub(crate) precise_rotations: Vec<glam::DQuat>,
+    /// Normal reaction of a fixed support on each REV in the last substep, newtons.
+    /// Zero for REVs that do not rest on a fixed support. Derived, not saved.
+    pub support_load_n: Vec<f32>,
     /// Angular velocity of each cell about its own centre, rad/s, world axes.
     pub angular_velocities: Vec<glam::DVec3>,
     /// Derived connectivity labels; rebuilt only when topology changes.
@@ -1136,6 +1139,7 @@ impl Scene {
             chemistry_pending_s: 0.0,
             chemistry_registry: None,
             cell_dofs: false,
+            support_load_n: Vec::new(),
             precise_rotations: Vec::with_capacity(spawns.len()),
             angular_velocities: Vec::with_capacity(spawns.len()),
             clusters: Vec::with_capacity(spawns.len()),
@@ -2379,6 +2383,7 @@ impl Scene {
             keep
         });
         old_index = 0;
+        self.support_load_n.clear();
         self.precise_rotations.retain(|_| {
             let keep = keep[old_index];
             old_index += 1;
@@ -3200,6 +3205,7 @@ impl Scene {
             chemistry_pending_s: 0.0,
             chemistry_registry: None,
             cell_dofs: false,
+            support_load_n: Vec::new(),
             precise_rotations: vec![glam::DQuat::IDENTITY; n],
             angular_velocities: vec![glam::DVec3::ZERO; n],
             clusters: vec![0; n],

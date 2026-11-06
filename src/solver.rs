@@ -2463,6 +2463,17 @@ fn advance_step_with_axis_targets_and_loads(
                 solve_detail_time[index] += detail_time[index];
             }
         }
+        // Report what each fixed support carries: the reaction at a constrained row,
+        // compressive part only. Sensors read it; nothing in the solve depends on it.
+        scene.support_load_n.clear();
+        scene.support_load_n.resize(voxel_count, 0.0);
+        if !support_friction_rows.is_empty() {
+            compute_contact_reactions(scene, &mut solver_scratch, &predicted, &solve_loads, h);
+            for row in &support_friction_rows {
+                let reaction = solver_scratch.contact_reactions[row.voxel][row.axis] * f64::from(row.normal);
+                scene.support_load_n[row.voxel] = reaction.max(0.0) as f32;
+            }
+        }
         stage_time[1] += phase_start.elapsed();
         phase_start = Instant::now();
         // Preserve the accurately integrated drift velocity. Recover only the

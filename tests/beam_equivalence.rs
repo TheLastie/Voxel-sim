@@ -72,3 +72,43 @@ fn a_lattice_that_is_not_a_chain_is_refused() {
     let positions = vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(3.0 * CELL, 0.0, 0.0)];
     assert!(reduce_lattice_along_x(&positions, CELL, iron_material()).is_none());
 }
+
+/// Demoting cells to a beam and promoting it back must reproduce the cell state and its
+/// energy within the tolerance, so a region can change tier without losing or inventing
+/// energy.
+#[test]
+fn a_loaded_cantilever_survives_a_round_trip_between_cells_and_beam() {
+    let (mut scene, root, tip) = cantilever_scene(31, 3);
+    let rest: Vec<DVec3> = scene.positions.clone();
+    scene.fix_voxels(&root).unwrap();
+    let force = 90.0f32;
+    for &i in &tip {
+        solver::set_force(&mut scene, i, Vec3::new(0.0, 0.0, force / tip.len() as f32)).unwrap();
+    }
+    for _ in 0..400 {
+        solver::step(&mut scene, &mut None);
+    }
+    let velocities: Vec<DVec3> = scene.voxels.iter().map(|v| v.velocity.as_dvec3()).collect();
+    let cell_energy = scene.elastic_bond_energy_j();
+
+    let (mut beam, groups) = reduce_lattice_along_x(&rest, CELL, iron_material()).unwrap();
+    beam.set_from_cells(&groups, &rest, &scene.positions, &velocities);
+    let promoted = beam.expand_positions(&groups, &rest);
+
+    let deflection = scene.positions[tip[0]].z - rest[tip[0]].z;
+    let worst = promoted
+        .iter()
+        .zip(&scene.positions)
+        .map(|(a, b)| (*a - *b).length())
+        .fold(0.0, f64::max);
+    let beam_energy = beam.strain_energy();
+    eprintln!(
+        "ROUND TRIP worst position error {:.2}% of the tip deflection, strain energy cells={cell_energy:.3e} beam={beam_energy:.3e}",
+        100.0 * worst / deflection.abs()
+    );
+    assert!(worst < 0.10 * deflection.abs(), "positions differ by {worst:e} against deflection {deflection:e}");
+    assert!((beam_energy / cell_energy - 1.0).abs() < 0.15, "energy {beam_energy:e} against {cell_energy:e}");
+    // A resting cantilever has no velocity to carry across.
+    let carried = beam.expand_velocities(&groups, &rest);
+    assert!(carried.iter().all(|v| v.length() < 1.0e-3));
+}

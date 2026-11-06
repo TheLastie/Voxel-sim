@@ -441,6 +441,91 @@ impl Beam {
         total
     }
 
+    /// Rest position of node `i`.
+    pub fn rest_position(&self, i: usize) -> DVec3 {
+        self.rest[i]
+    }
+
+    /// Strain energy `1/2 u^T K u` of the current displacement, joules.
+    pub fn strain_energy(&self) -> f64 {
+        let ku = self.apply_stiffness(&self.displacement);
+        (1..self.rest.len())
+            .map(|i| (0..6).map(|p| 0.5 * self.displacement[i][p] * ku[i][p]).sum::<f64>())
+            .sum()
+    }
+
+    /// Demote cells to this beam: fit each node to its slice. Translation is the mean
+    /// displacement of the slice's cells; rotation is the small rigid rotation that best
+    /// explains the rest of their displacement, `sum |u_i - u - theta x r_i|^2` minimised
+    /// (a slice of one cell has no observable rotation and keeps zero). Velocities are fitted
+    /// the same way. `groups` are the cell indices of each node, as returned by
+    /// `reduce_lattice_along_x`; `rest` and the state arrays are indexed by cell.
+    pub fn set_from_cells(
+        &mut self,
+        groups: &[Vec<usize>],
+        rest: &[DVec3],
+        positions: &[DVec3],
+        velocities: &[DVec3],
+    ) {
+        for (node, cells) in groups.iter().enumerate() {
+            let count = cells.len() as f64;
+            let mean = |values: &dyn Fn(usize) -> DVec3| {
+                cells.iter().fold(DVec3::ZERO, |sum, &i| sum + values(i)) / count
+            };
+            let u = mean(&|i| positions[i] - rest[i]);
+            let v = mean(&|i| velocities[i]);
+            let fit = |field: &dyn Fn(usize) -> DVec3, centre: DVec3| {
+                let mut a = glam::DMat3::ZERO;
+                let mut b = DVec3::ZERO;
+                for &i in cells {
+                    let r = rest[i] - self.rest[node];
+                    a += glam::DMat3::from_diagonal(DVec3::splat(r.length_squared()))
+                        - glam::DMat3::from_cols(r * r.x, r * r.y, r * r.z);
+                    b += r.cross(field(i) - centre);
+                }
+                let trace = a.x_axis.x + a.y_axis.y + a.z_axis.z;
+                if trace <= 0.0 {
+                    return DVec3::ZERO;
+                }
+                (a + glam::DMat3::from_diagonal(DVec3::splat(trace * 1.0e-9))).inverse() * b
+            };
+            let theta = fit(&|i| positions[i] - rest[i], u);
+            let omega = fit(&|i| velocities[i], v);
+            self.displacement[node] = [u.x, u.y, u.z, theta.x, theta.y, theta.z];
+            self.velocity[node] = [v.x, v.y, v.z, omega.x, omega.y, omega.z];
+        }
+        self.displacement[0] = [0.0; 6];
+        self.velocity[0] = [0.0; 6];
+        self.acceleration = vec![[0.0; 6]; self.rest.len()];
+    }
+
+    /// Promote this beam to cells: each cell is a rigid part of its section,
+    /// `p = rest + u + theta x (rest - node_rest)`.
+    pub fn expand_positions(&self, groups: &[Vec<usize>], rest: &[DVec3]) -> Vec<DVec3> {
+        let mut out = rest.to_vec();
+        for (node, cells) in groups.iter().enumerate() {
+            let d = &self.displacement[node];
+            let (u, theta) = (DVec3::new(d[0], d[1], d[2]), DVec3::new(d[3], d[4], d[5]));
+            for &i in cells {
+                out[i] = rest[i] + u + theta.cross(rest[i] - self.rest[node]);
+            }
+        }
+        out
+    }
+
+    /// Cell velocities of the promoted beam: `v = v_node + omega x r`.
+    pub fn expand_velocities(&self, groups: &[Vec<usize>], rest: &[DVec3]) -> Vec<DVec3> {
+        let mut out = vec![DVec3::ZERO; rest.len()];
+        for (node, cells) in groups.iter().enumerate() {
+            let d = &self.velocity[node];
+            let (v, omega) = (DVec3::new(d[0], d[1], d[2]), DVec3::new(d[3], d[4], d[5]));
+            for &i in cells {
+                out[i] = v + omega.cross(rest[i] - self.rest[node]);
+            }
+        }
+        out
+    }
+
     /// Largest normal stress at either end of element `e` (joining `parent[e + 1]` to
     /// node `e + 1`): axial plus bending, Pa.
     pub fn max_stress(&self, e: usize) -> f64 {
