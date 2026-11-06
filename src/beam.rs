@@ -45,28 +45,6 @@ pub struct BeamMaterial {
     pub yield_stress: f64,
 }
 
-/// A beam along a chain of nodes. Node 0 is clamped.
-pub struct Beam {
-    rest: Vec<DVec3>,
-    sections: Vec<Section>,
-    materials: Vec<BeamMaterial>,
-    stiffness_diagonal: Vec<Block>,
-    stiffness_upper: Vec<Block>,
-    mass: Vec<Dof6>,
-    pub displacement: Vec<Dof6>,
-    pub velocity: Vec<Dof6>,
-    acceleration: Vec<Dof6>,
-    dt: f64,
-    effective: Option<Vec<EffectiveBlock>>,
-}
-
-/// Factor of one diagonal block of the effective matrix and the coupling to the next.
-struct EffectiveBlock {
-    cholesky: Block,
-    /// `D'^-1 U` for the coupling to the next node.
-    carry: Block,
-}
-
 fn local_axes(direction: DVec3) -> [DVec3; 3] {
     let ex = direction.normalize();
     let reference = if ex.dot(DVec3::Y).abs() < 0.99 { DVec3::Y } else { DVec3::Z };
@@ -207,55 +185,96 @@ fn transpose_mul_vec(a: &Block, v: &Dof6) -> Dof6 {
     std::array::from_fn(|j| (0..6).map(|i| a[i][j] * v[i]).sum())
 }
 
+/// A beam structure: nodes joined by elements into a tree, so a trunk can carry branches.
+/// `parent[c] < c` for every node `c >= 1`; element `c - 1` joins `parent[c]` to `c`. Node 0
+/// is the root and is clamped. A chain is the special case `parent[c] = c - 1`.
+pub struct Beam {
+    rest: Vec<DVec3>,
+    parent: Vec<usize>,
+    sections: Vec<Section>,
+    materials: Vec<BeamMaterial>,
+    stiffness_diagonal: Vec<Block>,
+    /// `coupling[c]` is the block (row `parent[c]`, column `c`) of the stiffness matrix.
+    coupling: Vec<Block>,
+    mass: Vec<Dof6>,
+    pub displacement: Vec<Dof6>,
+    pub velocity: Vec<Dof6>,
+    acceleration: Vec<Dof6>,
+    dt: f64,
+    effective: Option<Vec<EffectiveBlock>>,
+}
+
+/// Factor of one diagonal block of the effective matrix and `D'^-1 U^T` for its parent link.
+struct EffectiveBlock {
+    cholesky: Block,
+    carry: Block,
+}
+
 impl Beam {
-    /// A beam through `nodes` with one section and material per element.
+    /// A chain through `nodes` with one section and material per element.
     pub fn new(nodes: Vec<DVec3>, sections: Vec<Section>, materials: Vec<BeamMaterial>) -> Self {
-        let elements = nodes.len() - 1;
-        assert!(elements >= 1 && sections.len() == elements && materials.len() == elements);
+        let parent: Vec<usize> = (0..nodes.len()).map(|c| c.saturating_sub(1)).collect();
+        Self::new_tree(nodes, parent, sections, materials)
+    }
+
+    /// A tree of elements. `sections[c - 1]` and `materials[c - 1]` belong to the element
+    /// joining `parent[c]` to node `c`.
+    pub fn new_tree(
+        nodes: Vec<DVec3>,
+        parent: Vec<usize>,
+        sections: Vec<Section>,
+        materials: Vec<BeamMaterial>,
+    ) -> Self {
         let n = nodes.len();
+        assert!(n >= 2 && parent.len() == n && sections.len() == n - 1 && materials.len() == n - 1);
+        assert!((1..n).all(|c| parent[c] < c), "parents must precede their children");
         let mut diagonal = vec![ZERO; n];
-        let mut upper = vec![ZERO; elements];
+        let mut coupling = vec![ZERO; n];
         let mut mass = vec![[0.0; 6]; n];
-        for e in 0..elements {
-            let direction = nodes[e + 1] - nodes[e];
+        for c in 1..n {
+            let p = parent[c];
+            let direction = nodes[c] - nodes[p];
             let length = direction.length();
             let axes = local_axes(direction);
             let t = transform(&axes);
-            let k_local = local_stiffness(length, &sections[e], &materials[e]);
+            let k_local = local_stiffness(length, &sections[c - 1], &materials[c - 1]);
             let k_global = mul12(&transpose12(&t), &mul12(&k_local, &t));
             for i in 0..6 {
                 for j in 0..6 {
-                    diagonal[e][i][j] += k_global[i][j];
-                    diagonal[e + 1][i][j] += k_global[6 + i][6 + j];
-                    upper[e][i][j] += k_global[i][6 + j];
+                    diagonal[p][i][j] += k_global[i][j];
+                    diagonal[c][i][j] += k_global[6 + i][6 + j];
+                    coupling[c][i][j] += k_global[i][6 + j];
                 }
             }
-            // Lumped mass: half of the element at each node, rotary inertia from the section.
-            let m = materials[e].density * sections[e].area * length;
-            let rotary = materials[e].density * length * 0.5
-                * (sections[e].iy + sections[e].iz + sections[e].torsion)
+            // Lumped mass: half of the element at each end, rotary inertia from the section.
+            let m = materials[c - 1].density * sections[c - 1].area * length;
+            let rotary = materials[c - 1].density * length * 0.5
+                * (sections[c - 1].iy + sections[c - 1].iz + sections[c - 1].torsion)
                 / 3.0;
-            for node in [e, e + 1] {
-                for p in 0..3 {
-                    mass[node][p] += 0.5 * m;
-                    mass[node][p + 3] += rotary.max(1.0e-12 * m * length * length);
+            for node in [p, c] {
+                for q in 0..3 {
+                    mass[node][q] += 0.5 * m;
+                    mass[node][q + 3] += rotary.max(1.0e-12 * m * length * length);
                 }
             }
         }
-        // Clamp node 0.
+        // Clamp the root: identity row, no coupling to its children.
         diagonal[0] = ZERO;
         for i in 0..6 {
             diagonal[0][i][i] = 1.0;
         }
-        upper[0] = ZERO;
-        let extents = sections.len();
-        let _ = extents;
+        for c in 1..n {
+            if parent[c] == 0 {
+                coupling[c] = ZERO;
+            }
+        }
         Self {
             rest: nodes,
+            parent,
             sections,
             materials,
             stiffness_diagonal: diagonal,
-            stiffness_upper: upper,
+            coupling,
             mass,
             displacement: vec![[0.0; 6]; n],
             velocity: vec![[0.0; 6]; n],
@@ -269,62 +288,65 @@ impl Beam {
         self.rest.len()
     }
 
-    /// Block Thomas factorisation of `K + scale * M`.
+    /// Eliminate nodes from the leaves to the root for `K + scale * M`.
     fn factor(&self, mass_scale: f64) -> Vec<EffectiveBlock> {
         let n = self.rest.len();
-        let mut out: Vec<EffectiveBlock> = Vec::with_capacity(n);
-        for i in 0..n {
-            let mut d = self.stiffness_diagonal[i];
-            for p in 0..6 {
-                d[p][p] += mass_scale * self.mass[i][p];
-            }
-            if i > 0 {
-                // D_i' = D_i - U_{i-1}^T D_{i-1}'^-1 U_{i-1}.
-                let carry = &out[i - 1].carry; // D'^-1 U for the previous node
-                let upper = &self.stiffness_upper[i - 1];
-                for r in 0..6 {
-                    for c in 0..6 {
-                        let value: f64 = (0..6).map(|k| upper[k][r] * carry[k][c]).sum();
-                        d[r][c] -= value;
-                    }
+        let mut reduced: Vec<Block> = (0..n)
+            .map(|i| {
+                let mut d = self.stiffness_diagonal[i];
+                for p in 0..6 {
+                    d[p][p] += mass_scale * self.mass[i][p];
                 }
-            }
-            let l = cholesky(&d);
+                d
+            })
+            .collect();
+        let mut out: Vec<EffectiveBlock> = (0..n)
+            .map(|_| EffectiveBlock { cholesky: ZERO, carry: ZERO })
+            .collect();
+        for c in (1..n).rev() {
+            let p = self.parent[c];
+            let l = cholesky(&reduced[c]);
+            let u = &self.coupling[c];
             let mut carry = ZERO;
-            if i + 1 < n {
-                let upper = &self.stiffness_upper[i];
-                for c in 0..6 {
-                    let column: Dof6 = std::array::from_fn(|r| upper[r][c]);
-                    let solved = solve_with(&l, &column);
-                    for r in 0..6 {
-                        carry[r][c] = solved[r];
-                    }
+            for column in 0..6 {
+                // Column `column` of U^T is row `column` of U.
+                let rhs: Dof6 = u[column];
+                let solved = solve_with(&l, &rhs);
+                for row in 0..6 {
+                    carry[row][column] = solved[row];
                 }
             }
-            out.push(EffectiveBlock { cholesky: l, carry });
+            // D_p' -= U D_c'^-1 U^T = U * carry.
+            for r in 0..6 {
+                for col in 0..6 {
+                    let value: f64 = (0..6).map(|k| u[r][k] * carry[k][col]).sum();
+                    reduced[p][r][col] -= value;
+                }
+            }
+            out[c] = EffectiveBlock { cholesky: l, carry };
         }
+        out[0].cholesky = cholesky(&reduced[0]);
         out
     }
 
     fn solve_factored(&self, factor: &[EffectiveBlock], rhs: &[Dof6]) -> Vec<Dof6> {
         let n = self.rest.len();
-        let mut y: Vec<Dof6> = Vec::with_capacity(n);
-        for i in 0..n {
-            let mut b = rhs[i];
-            if i > 0 {
-                // b_i -= U_{i-1}^T y_{i-1}.
-                let contribution = transpose_mul_vec(&self.stiffness_upper[i - 1], &y[i - 1]);
-                for p in 0..6 {
-                    b[p] -= contribution[p];
-                }
+        let mut b = rhs.to_vec();
+        let mut y = vec![[0.0; 6]; n];
+        for c in (1..n).rev() {
+            y[c] = solve_with(&factor[c].cholesky, &b[c]);
+            let p = self.parent[c];
+            let contribution = mul_vec(&self.coupling[c], &y[c]);
+            for q in 0..6 {
+                b[p][q] -= contribution[q];
             }
-            y.push(solve_with(&factor[i].cholesky, &b));
         }
         let mut x = y;
-        for i in (0..n - 1).rev() {
-            let correction = mul_vec(&factor[i].carry, &x[i + 1]);
-            for p in 0..6 {
-                x[i][p] -= correction[p];
+        x[0] = solve_with(&factor[0].cholesky, &b[0]);
+        for c in 1..n {
+            let correction = mul_vec(&factor[c].carry, &x[self.parent[c]]);
+            for q in 0..6 {
+                x[c][q] -= correction[q];
             }
         }
         x
@@ -342,22 +364,15 @@ impl Beam {
 
     fn apply_stiffness(&self, u: &[Dof6]) -> Vec<Dof6> {
         let n = self.rest.len();
-        let mut out = vec![[0.0; 6]; n];
-        for i in 0..n {
-            let mut value = mul_vec(&self.stiffness_diagonal[i], &u[i]);
-            if i + 1 < n {
-                let up = mul_vec(&self.stiffness_upper[i], &u[i + 1]);
-                for p in 0..6 {
-                    value[p] += up[p];
-                }
+        let mut out: Vec<Dof6> = (0..n).map(|i| mul_vec(&self.stiffness_diagonal[i], &u[i])).collect();
+        for c in 1..n {
+            let p = self.parent[c];
+            let up = mul_vec(&self.coupling[c], &u[c]);
+            let down = transpose_mul_vec(&self.coupling[c], &u[p]);
+            for q in 0..6 {
+                out[p][q] += up[q];
+                out[c][q] += down[q];
             }
-            if i > 0 {
-                let down = transpose_mul_vec(&self.stiffness_upper[i - 1], &u[i - 1]);
-                for p in 0..6 {
-                    value[p] += down[p];
-                }
-            }
-            out[i] = value;
         }
         out[0] = [0.0; 6];
         out
@@ -426,17 +441,20 @@ impl Beam {
         total
     }
 
-    /// Largest normal stress at either end of element `e`: axial plus bending, Pa.
+    /// Largest normal stress at either end of element `e` (joining `parent[e + 1]` to
+    /// node `e + 1`): axial plus bending, Pa.
     pub fn max_stress(&self, e: usize) -> f64 {
-        let direction = self.rest[e + 1] - self.rest[e];
+        let c = e + 1;
+        let p = self.parent[c];
+        let direction = self.rest[c] - self.rest[p];
         let length = direction.length();
         let axes = local_axes(direction);
         let t = transform(&axes);
         let k = local_stiffness(length, &self.sections[e], &self.materials[e]);
         let mut u = [0.0; 12];
-        for p in 0..6 {
-            u[p] = self.displacement[e][p];
-            u[6 + p] = self.displacement[e + 1][p];
+        for q in 0..6 {
+            u[q] = self.displacement[p][q];
+            u[6 + q] = self.displacement[c][q];
         }
         let mut local_u = [0.0; 12];
         for i in 0..12 {
@@ -454,8 +472,8 @@ impl Beam {
         worst
     }
 
-    /// Stress above which the beam model stops being valid for any element, as a
-    /// fraction of its material limit; 1.0 or more means cells must take over.
+    /// Largest stress over all elements as a fraction of its material limit; 1.0 or more
+    /// means the model is no longer valid and cells must take over.
     pub fn validity(&self) -> f64 {
         (0..self.rest.len() - 1)
             .map(|e| self.max_stress(e) / self.materials[e].yield_stress)
@@ -697,6 +715,91 @@ mod tests {
         let tilted_tip = DVec3::new(tilted.displacement[20][0], tilted.displacement[20][1], tilted.displacement[20][2]);
         let straight_tip = straight.displacement[20][1];
         assert!((tilted_tip.length() / straight_tip - 1.0).abs() < 1.0e-6);
+    }
+
+    fn square_section() -> Section {
+        let mut offsets = Vec::new();
+        for a in -1..=1 {
+            for b in -1..=1 {
+                offsets.push((f64::from(a) * CELL, f64::from(b) * CELL));
+            }
+        }
+        section_of_cells(&offsets, CELL)
+    }
+
+    /// A trunk along X of `trunk` nodes with a side branch of `branch` nodes along +Y
+    /// starting at trunk node `at`.
+    fn trunk_with_branch(trunk: usize, at: usize, branch: usize) -> Beam {
+        let mut nodes: Vec<DVec3> = (0..trunk).map(|i| DVec3::new(i as f64 * CELL, 0.0, 0.0)).collect();
+        let mut parent: Vec<usize> = (0..trunk).map(|c| c.saturating_sub(1)).collect();
+        for j in 1..=branch {
+            nodes.push(DVec3::new(at as f64 * CELL, j as f64 * CELL, 0.0));
+            parent.push(if j == 1 { at } else { nodes.len() - 2 });
+        }
+        let elements = nodes.len() - 1;
+        Beam::new_tree(nodes, parent, vec![square_section(); elements], vec![iron(); elements])
+    }
+
+    #[test]
+    fn an_unloaded_branch_does_not_change_the_trunk_deflection() {
+        let force = [0.0, 0.0, 90.0, 0.0, 0.0, 0.0];
+        let mut plain = cantilever(31);
+        plain.solve_static(&tip_load(&plain, force));
+        let mut tree = trunk_with_branch(31, 15, 10);
+        let mut loads = vec![[0.0; 6]; tree.node_count()];
+        loads[30] = force;
+        tree.solve_static(&loads);
+        let (a, b) = (plain.displacement[30][2], tree.displacement[30][2]);
+        assert!((a / b - 1.0).abs() < 1.0e-9, "{a:e} against {b:e}");
+        // The unloaded branch carries no stress: it only moves with the node it grows from.
+        assert!(tree.max_stress(31) < 1.0e-6 * tree.max_stress(0), "an unloaded branch carries stress");
+    }
+
+    #[test]
+    fn an_l_shaped_frame_matches_the_analytic_deflection() {
+        // Column of 31 nodes up Z (H = 0.3 m), then an arm of 20 elements along +X (A = 0.2 m).
+        let mut nodes: Vec<DVec3> = (0..31).map(|i| DVec3::new(0.0, 0.0, i as f64 * CELL)).collect();
+        let mut parent: Vec<usize> = (0..31usize).map(|c| c.saturating_sub(1)).collect();
+        for j in 1..=20 {
+            nodes.push(DVec3::new(j as f64 * CELL, 0.0, 0.3));
+            parent.push(if j == 1 { 30 } else { nodes.len() - 2 });
+        }
+        let elements = nodes.len() - 1;
+        let tip = nodes.len() - 1;
+        let mut frame = Beam::new_tree(nodes, parent, vec![square_section(); elements], vec![iron(); elements]);
+        let mut loads = vec![[0.0; 6]; frame.node_count()];
+        let load = 50.0;
+        loads[tip] = [0.0, 0.0, -load, 0.0, 0.0, 0.0];
+        frame.solve_static(&loads);
+        let (h, a) = (0.3f64, 0.2f64);
+        let (e, g) = (200e9f64, 77e9f64);
+        let (area, inertia) = (9.0e-4f64, 6.75e-8f64);
+        let expected = load * a.powi(3) / (3.0 * e * inertia)
+            + load * a * a * h / (e * inertia)
+            + load * h / (e * area)
+            + load * a / (5.0 / 6.0 * g * area);
+        let measured = -frame.displacement[tip][2];
+        assert!((measured / expected - 1.0).abs() < 0.01, "{measured:e} against {expected:e}");
+    }
+
+    #[test]
+    fn a_branched_tree_conserves_energy_in_free_vibration() {
+        let mut tree = trunk_with_branch(31, 15, 12);
+        let mut loads = vec![[0.0; 6]; tree.node_count()];
+        loads[30] = [0.0, 4.0, 15.0, 0.0, 0.0, 0.0];
+        let last = tree.node_count() - 1;
+        loads[last] = [6.0, 0.0, -5.0, 0.0, 0.0, 0.0];
+        tree.solve_static(&loads);
+        let zero = vec![[0.0; 6]; tree.node_count()];
+        tree.release(&zero);
+        let start = tree.energy();
+        assert!(start > 0.0);
+        let mut worst: f64 = 0.0;
+        for _ in 0..2000 {
+            tree.step(2.0e-5, &zero);
+            worst = worst.max((tree.energy() - start).abs() / start);
+        }
+        assert!(worst < 1.0e-8, "energy drifted by {worst}");
     }
 
     #[test]
