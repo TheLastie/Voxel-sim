@@ -1650,6 +1650,7 @@ fn advance_step_with_axis_targets_and_loads(
     assert!(loads.is_empty() || loads.len() == scene.voxels.len());
     scene.solver_residual_audit = None;
     scene.last_step_diagnostics = None;
+    scene.advance_beam_regions(f64::from(scene.config.fixed_dt));
     scene.cell_dofs = decide_cell_dofs(scene);
     scene.solver_max_audited_residual = None;
     // Keep the large per-step and per-substep work arrays alive across calls.

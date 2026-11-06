@@ -441,6 +441,7 @@ pub struct StepDiagnostics {
 }
 
 mod checkpoint;
+mod beam_region;
 
 /// Positions are separate arrays; material identity exists only in composition.
 pub struct Scene {
@@ -498,6 +499,8 @@ pub struct Scene {
     pub(crate) chemistry_pending_s: f64,
     /// Recipes used by the fixed-step hook; `None` is the built-in registry.
     pub(crate) chemistry_registry: Option<crate::recipes::RecipeRegistry>,
+    /// Slender parts simulated as beams (tier T2); see `scene/beam_region.rs`.
+    pub(crate) beam_regions: Vec<Option<beam_region::BeamRegion>>,
     /// Whether this step solves cell rotations; decided at the start of each step.
     pub(crate) cell_dofs: bool,
     /// Double-precision cell rotations; `rotations` holds the same values as f32.
@@ -1139,6 +1142,7 @@ impl Scene {
             chemistry_pending_s: 0.0,
             chemistry_registry: None,
             cell_dofs: false,
+            beam_regions: Vec::new(),
             support_load_n: Vec::new(),
             precise_rotations: Vec::with_capacity(spawns.len()),
             angular_velocities: Vec::with_capacity(spawns.len()),
@@ -2213,6 +2217,8 @@ impl Scene {
         if removed_count == 0 {
             return 0;
         }
+        // Removal shifts REV indices, which a beam region keeps.
+        self.expand_all_beams();
 
         let mut remap = vec![EMPTY; old_count];
         let mut next = 0u32;
@@ -3205,6 +3211,7 @@ impl Scene {
             chemistry_pending_s: 0.0,
             chemistry_registry: None,
             cell_dofs: false,
+            beam_regions: Vec::new(),
             support_load_n: Vec::new(),
             precise_rotations: vec![glam::DQuat::IDENTITY; n],
             angular_velocities: vec![glam::DVec3::ZERO; n],

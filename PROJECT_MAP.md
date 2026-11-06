@@ -34,6 +34,7 @@ Pause (Space) оставляет полное физическое состоя�
 - Аналитические эталоны физики с допуском 10%: `tests/physics_reference.rs`.
 - Опрокидывание блока и размеры: `tests/bulk_tipping.rs` (`--ignored` для замеров времени).
 - Балка против решателя ячеек: `tests/beam_equivalence.rs`.
+- Область сцены, шагаемая как балка (`Scene::reduce_to_beam`, `src/scene/beam_region.rs`): `tests/beam_region.rs`.
 - Свежие результаты прогонов и их логи: `VALIDATION_2026-11-05.md`, `validation/live-tests/`.
 
 ## Модули `src/`

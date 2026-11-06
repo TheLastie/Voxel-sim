@@ -224,6 +224,9 @@ impl Scene {
         if path.extension().and_then(|e| e.to_str()) != Some("vxstate") {
             return Err("checkpoint path must end in .vxstate".into());
         }
+        if self.beam_regions.iter().any(Option::is_some) {
+            return Err("expand the beam regions before saving the physical state".into());
+        }
         let payload = bincode::serialize(&self.to_checkpoint())
             .map_err(|error| format!("encode checkpoint: {error}"))?;
         let temporary = path.with_extension("vxstate.tmp");

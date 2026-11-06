@@ -390,6 +390,18 @@ impl Beam {
         }
     }
 
+    /// Make the stored acceleration consistent with the current state and loads,
+    /// `M a = F - K u`, keeping the velocity. Needed once when a beam takes over a moving
+    /// state, so the first step of the integrator starts from the true acceleration.
+    pub fn sync_acceleration(&mut self, forces: &[Dof6]) {
+        let ku = self.apply_stiffness(&self.displacement);
+        for i in 1..self.rest.len() {
+            for p in 0..6 {
+                self.acceleration[i][p] = (forces[i][p] - ku[i][p]) / self.mass[i][p];
+            }
+        }
+    }
+
     /// Advance one step of `dt` seconds under nodal loads `forces`.
     pub fn step(&mut self, dt: f64, forces: &[Dof6]) {
         if self.effective.is_none() || (self.dt - dt).abs() > 1.0e-15 {
@@ -439,6 +451,11 @@ impl Beam {
             }
         }
         total
+    }
+
+    /// Lumped translational mass of node `i`, kilograms.
+    pub fn node_mass(&self, i: usize) -> f64 {
+        self.mass[i][0]
     }
 
     /// Rest position of node `i`.
