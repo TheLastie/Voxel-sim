@@ -15,6 +15,15 @@ fn world() -> (Scene, Vec<usize>, Vec<usize>) {
 
 /// The same, plus one free iron REV at `pebble` (a cell) when given.
 fn world_plus(pebble: Option<[i32; 3]>) -> (Scene, Vec<usize>, Vec<usize>, Option<usize>) {
+    let (scene, block, ball, pebble, _) = world_plus_extra(pebble, Vec::new());
+    (scene, block, ball, pebble)
+}
+
+/// `world_plus` with `extra` REVs appended last; returns their index range.
+fn world_plus_extra(
+    pebble: Option<[i32; 3]>,
+    extra: Vec<VoxelSpawn>,
+) -> (Scene, Vec<usize>, Vec<usize>, Option<usize>, std::ops::Range<usize>) {
     let iron = Material::component_id("iron").unwrap();
     let stone = Material::component_id("stone").unwrap();
     let mut config = SceneConfig::default();
@@ -50,9 +59,30 @@ fn world_plus(pebble: Option<[i32; 3]>) -> (Scene, Vec<usize>, Vec<usize>, Optio
         spawns.push(VoxelSpawn::at_cell(cell, iron));
         spawns.len() - 1
     });
+    let extra_start = spawns.len();
+    spawns.extend(extra);
+    let extra_range = extra_start..spawns.len();
     let mut scene = Scene::from_voxels(config, spawns).unwrap();
     scene.fix_voxels(&ball).unwrap();
-    (scene, block, ball, pebble_index)
+    (scene, block, ball, pebble_index, extra_range)
+}
+
+/// An iron cantilever 21 x 3 x 3 cells, clear of the floor, root slice at the first x.
+fn cantilever_spawns() -> (Vec<VoxelSpawn>, Vec<usize>) {
+    let iron = Material::component_id("iron").unwrap();
+    let mut spawns = Vec::new();
+    let mut root = Vec::new();
+    for x in 0..21 {
+        for y in 0..3 {
+            for z in 0..3 {
+                if x == 0 {
+                    root.push(spawns.len());
+                }
+                spawns.push(VoxelSpawn::at_cell([20 + x, 20 + y, 30 + z], iron));
+            }
+        }
+    }
+    (spawns, root)
 }
 
 fn mean(scene: &Scene, ids: &[usize]) -> DVec3 {
@@ -234,12 +264,18 @@ fn sparse_passes_give_the_same_state_as_full_passes() {
         BallWakesBlock,
         PebblePushedAcrossSleepingBlock,
         FixedBallMovesFarAway,
+        StepLoadsOnPebbleAndSleeper,
+        StepTargetsMoveFixedBall,
+        BeamBesideSleepers,
     }
     for case in [
         Case::PebbleLandsOnFloor,
         Case::BallWakesBlock,
         Case::PebblePushedAcrossSleepingBlock,
         Case::FixedBallMovesFarAway,
+        Case::StepLoadsOnPebbleAndSleeper,
+        Case::StepTargetsMoveFixedBall,
+        Case::BeamBesideSleepers,
     ] {
         let run = |sparse: bool| {
             let pebble_cell = match case {
@@ -248,7 +284,14 @@ fn sparse_passes_give_the_same_state_as_full_passes() {
                 Case::PebblePushedAcrossSleepingBlock => [0, 0, 7],
                 _ => [-20, -20, 2000],
             };
-            let (mut scene, block, ball, pebble) = world_plus(Some(pebble_cell));
+            let (extra, root) = if case == Case::BeamBesideSleepers { cantilever_spawns() } else { (Vec::new(), Vec::new()) };
+            let (mut scene, block, ball, pebble, extra_range) = world_plus_extra(Some(pebble_cell), extra);
+            if case == Case::BeamBesideSleepers {
+                let root: Vec<usize> = root.iter().map(|&local| extra_range.start + local).collect();
+                scene.fix_voxels(&root).unwrap();
+                let cells: Vec<usize> = extra_range.clone().collect();
+                scene.reduce_to_beam(&cells, 40).expect("reduce the cantilever to a beam");
+            }
             let mut config = SleepConfig::default();
             config.sparse_passes = sparse;
             scene.enable_sleep(config).unwrap();
@@ -270,7 +313,28 @@ fn sparse_passes_give_the_same_state_as_full_passes() {
                         scene.positions[i].x += 2.0e-4;
                     }
                 }
-                solver::step(&mut scene, &mut None);
+                let n = scene.voxels.len();
+                match case {
+                    Case::StepLoadsOnPebbleAndSleeper if step >= 90 => {
+                        // A load on an awake REV acts; one on a sleeper is ignored.
+                        let mut loads = vec![glam::Vec3::ZERO; n];
+                        loads[pebble.unwrap()] = glam::Vec3::new(0.0, 0.03, 0.0);
+                        loads[block[0]] = glam::Vec3::new(0.5, 0.0, 0.0);
+                        solver::step_with_axis_targets_and_loads(&mut scene, &mut None, &[], &loads);
+                    }
+                    Case::StepTargetsMoveFixedBall if step >= 90 => {
+                        // Per-step targets drag the fixed ball sideways and hold the
+                        // falling pebble's x.
+                        let mut targets = vec![[None; 3]; n];
+                        for &i in &ball {
+                            targets[i][0] = Some(scene.positions[i].x + 2.0e-4);
+                        }
+                        let p = pebble.unwrap();
+                        targets[p][0] = Some(scene.positions[p].x);
+                        solver::step_with_axis_targets(&mut scene, &mut None, &targets);
+                    }
+                    _ => solver::step(&mut scene, &mut None),
+                }
                 asleep_steps += usize::from(scene.sleeping_rev_count() > 0);
                 trace.push((state(&scene), scene.sleeping_rev_count()));
             }

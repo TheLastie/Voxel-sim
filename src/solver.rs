@@ -1755,27 +1755,42 @@ fn advance_step_with_axis_targets_and_loads(
     scene.run_sleep();
     let sleep_done = Instant::now();
     // A scene with sleepers visits only the awake REVs (and the sleepers bonded to them)
-    // in the passes below; a sleeper is frozen, so skipping it changes nothing. Anything
-    // that can reach into a sleeper from outside the fixed-step model keeps the full pass.
-    let plain_step = tool.is_none()
-        && targets.is_empty()
-        && loads.is_empty()
+    // in the passes below; a sleeper is frozen, so skipping it changes nothing. REVs the
+    // step drives from outside (actuators, per-step targets, beam regions) are added to
+    // the list. A tool (its own scene-wide contact search, and it may touch sleepers),
+    // adaptive substeps, contact welding and rigid aggregates keep the full pass.
+    let sparse_step = tool.is_none()
         && !scene.adaptive_substeps
-        && scene.skeletal_actuators.is_empty()
-        && scene.tier_governor.is_none()
         && scene.thermal_bonding_rule().is_none()
         && scene.thermal_fusion_rule().is_none()
-        && !scene.has_registered_rigid_candidates()
-        && scene.beam_regions.iter().all(Option::is_none);
-    let live = if plain_step { scene.sparse_live_for_step() } else { None };
-    scene.set_step_live(live.clone());
+        && !scene.has_registered_rigid_candidates();
     if tool.is_none() && targets.is_empty() && loads.is_empty() && scene.mechanically_dormant() {
+        let live = if sparse_step { scene.sparse_live_for_step(&[]) } else { None };
+        scene.set_step_live(live);
         dormant_step(scene);
         scene.set_step_live(None);
         return;
     }
+    scene.set_step_live(None);
     scene.run_tier_governor();
     scene.advance_beam_regions(f64::from(scene.config.fixed_dt));
+    let live = if sparse_step && !scene.has_registered_rigid_candidates() && scene.sparse_live().is_some() {
+        let n = scene.voxels.len();
+        let mut extra = Vec::new();
+        for actuator in &scene.skeletal_actuators {
+            extra.extend(actuator.voxel_range().filter(|&i| i < n));
+        }
+        for region in scene.beam_regions.iter().flatten() {
+            extra.extend_from_slice(region.members());
+        }
+        if !targets.is_empty() {
+            extra.extend((0..n).filter(|&i| targets[i].iter().any(Option::is_some)));
+        }
+        scene.sparse_live_for_step(&extra)
+    } else {
+        None
+    };
+    scene.set_step_live(live.clone());
     scene.cell_dofs = decide_cell_dofs(scene);
     scene.solver_max_audited_residual = None;
     // Keep the large per-step and per-substep work arrays alive across calls.
@@ -1789,7 +1804,8 @@ fn advance_step_with_axis_targets_and_loads(
     // Explicit per-step coordinates override persistent constraints on that axis.
     let voxel_count = scene.voxels.len();
     let mut merged_targets = std::mem::take(&mut solver_scratch.merged_targets);
-    if live.is_some() && merged_targets.len() == voxel_count {
+    let step_targets = !targets.is_empty();
+    if live.is_some() && merged_targets.len() == voxel_count && !step_targets && !solver_scratch.merged_had_step_targets {
         // No per-step targets here: the merge is the persistent constraint itself, and a
         // sleeper's constraint cannot change without waking it.
         for i in visit(&live, voxel_count) {
@@ -1804,6 +1820,7 @@ fn advance_step_with_axis_targets_and_loads(
             }),
         );
     }
+    solver_scratch.merged_had_step_targets = step_targets;
     assert!(visit(&live, voxel_count)
         .all(|i| merged_targets[i].iter().flatten().all(|p| p.is_finite())));
     let targets = merged_targets.as_slice();
@@ -1825,7 +1842,8 @@ fn advance_step_with_axis_targets_and_loads(
     applied_loads.resize(voxel_count, Vec3::ZERO);
     let has_skeletal_actuators = !scene.skeletal_actuators.is_empty();
     if has_skeletal_actuators {
-        applied_loads.fill(Vec3::ZERO);
+        // Actuated REVs are on the visit list; the others' entries are already zero.
+        fill_visited(&mut applied_loads, voxel_count, Vec3::ZERO, &live);
         for actuator in &mut scene.skeletal_actuators {
             let _ = actuator.accumulate_forces(
                 &scene.positions,
@@ -2085,7 +2103,9 @@ fn advance_step_with_axis_targets_and_loads(
             }
         }
         if target_motion {
-            for (i, target) in targets.iter().enumerate() {
+            // Every REV with a target is on the visit list.
+            for i in visit(&live, voxel_count) {
+                let target = &targets[i];
                 for axis in 0..3 {
                     if let Some(p) = target[axis] {
                         scene.positions[i][axis] = p;
@@ -5033,6 +5053,8 @@ pub(crate) struct SolverScratch {
     adaptive_config: Vec<u8>,
     adaptive_revision: Option<u64>,
     merged_targets: Vec<[Option<f64>; 3]>,
+    /// `merged_targets` holds per-step targets of the last step: rebuild it whole.
+    merged_had_step_targets: bool,
     contact_targets: Vec<[Option<f64>; 3]>,
     cell_of: Vec<u32>,
     atmosphere_exposed_faces: Vec<[u8; 3]>,

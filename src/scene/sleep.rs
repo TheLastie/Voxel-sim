@@ -91,8 +91,8 @@ pub(crate) fn visit_thermal<'a>(live: &'a Option<Arc<Live>>, n: usize) -> Visit<
 }
 
 impl Live {
-    /// The same lists with fixed REVs that moved this step added to the mechanical one.
-    fn with_moving(&self, moving: &[usize]) -> Live {
+    /// The same lists with `moving` (sorted) added to the mechanical one.
+    fn with_extra(&self, moving: &[usize]) -> Live {
         let mut in_list = self.in_list.clone();
         for &i in moving {
             in_list[i] = true;
@@ -102,7 +102,7 @@ impl Live {
             id: NEXT_LIVE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             list,
             thermal_list: self.thermal_list.clone(),
-            fixed: self.fixed.iter().copied().filter(|i| !moving.contains(i)).collect(),
+            fixed: self.fixed.iter().copied().filter(|i| moving.binary_search(i).is_err()).collect(),
             asleep: self.asleep.clone(),
             in_list,
             thermal_in_list: self.thermal_in_list.clone(),
@@ -278,16 +278,20 @@ impl Scene {
     }
 
     /// The visit list for this step: the standing one plus the fixed REVs that moved
-    /// since the last step (a platform, a hand), which touch whatever they now overlap.
-    pub(crate) fn sparse_live_for_step(&self) -> Option<Arc<Live>> {
+    /// since the last step (a platform, a hand), which touch whatever they now overlap,
+    /// plus `extra`: REVs this step drives from outside (actuated, targeted, beam members).
+    pub(crate) fn sparse_live_for_step(&self, extra: &[usize]) -> Option<Arc<Live>> {
         let live = self.sparse_live()?;
-        let moving: Vec<usize> = live
+        let mut added: Vec<usize> = live
             .fixed
             .iter()
             .copied()
             .filter(|&i| self.positions[i] != self.previous[i])
             .collect();
-        Some(if moving.is_empty() { live } else { Arc::new(live.with_moving(&moving)) })
+        added.extend(extra.iter().copied().filter(|&i| i < live.in_list.len() && !live.in_list[i]));
+        added.sort_unstable();
+        added.dedup();
+        Some(if added.is_empty() { live } else { Arc::new(live.with_extra(&added)) })
     }
 
     /// Recompute the visit list after the bond graph changed.
@@ -335,7 +339,10 @@ impl Scene {
                 }
             }
         }
-        let in_list: Vec<bool> = (0..n).map(|i| !self.voxels[i].kinematic || touch[i]).collect();
+        // A persistent axis target may move a fixed REV to it at any step: keep those listed.
+        let in_list: Vec<bool> = (0..n)
+            .map(|i| !self.voxels[i].kinematic || touch[i] || self.axis_targets[i].iter().any(Option::is_some))
+            .collect();
         let thermal_in_list: Vec<bool> = (0..n).map(|i| !asleep[i] || touch[i]).collect();
         let list = (0..n).filter(|&i| in_list[i]).collect();
         let thermal_list = (0..n).filter(|&i| thermal_in_list[i]).collect();
