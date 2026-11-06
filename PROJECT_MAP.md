@@ -47,13 +47,17 @@ NVIDIA), `electrical`.
 
 **Уровни физики и бюджет.** `budget` (регулятор: на каком уровне считать область, не
 замедляя и не пропуская время), `beam` (сокращённая модель T2: балки и деревья балок,
-переход к ячейкам и обратно), `aggregation` (T1 жёсткие тела).
+переход к ячейкам и обратно), `scene/beam_region` (область сцены как балка в живой сцене:
+`reduce_to_beam`, `expand_beam`, автораскрытие при напряжении ≥95% предела), `aggregation`
+(T1 жёсткие тела).
 
 **Материя и химия.** `material`, `material_asset`, `voxel`, `recipes`, `recipe_data`
 (реакции как данные, горение, дубление, гниение), `combustion`, `scene_welding`.
 
-**Живое.** `plant` (рост по ресурсам и событиям, геном, рубка), `creature` (датчики из
-состояния сцены, учёт энергии, импульсная сеть, обучение), `skeletal_actuator` (силы по
+**Живое.** `plant` (рост по ресурсам и событиям, геном, рубка), `plant_world` (популяция растений
+в мире, общая почва, учёт массы; включается `GrowthModel::ResourceBased`), `creature` (датчики
+из состояния сцены, точные нагрузки стоп из `Scene::support_load_n`, учёт энергии, импульсная
+сеть, обучение, `creature/organs` — граф органов, несколько приводов), `skeletal_actuator` (силы по
 позе скелета), `procedural_animation`, `world` (мир из сида, окно физической области),
 `world_physics`.
 
@@ -61,7 +65,8 @@ NVIDIA), `electrical`.
 `.vxscene`, `.vxproj`, ручные связи, MakeUnique), `scene_presets`, `mesh_import`,
 `model_export`, `model_history`.
 
-**Окно и наблюдение.** `render`, `ui`, `ui_text`, `editor_settings`, `physics_metrics`,
+**Окно и наблюдение.** `render`, `ui`, `ui_text`, `run_panel` (панель запуска: p50/p95/max
+стоимость шага), `creature_inspector`, `scene_chemistry` (настройки химии сцены), `editor_settings`, `physics_metrics`,
 `runtime_metrics`, `live_tests`, `live_test_feed`.
 
 ## Бинарные файлы `src/bin/`
