@@ -488,6 +488,16 @@ pub struct Scene {
     /// boundary. Off by default so scenes with no chemistry do not pay for a scan
     /// of every REV; a scene that burns or rots turns it on.
     pub chemistry_enabled: bool,
+    /// Simulated time (s) between reaction updates while `chemistry_enabled`;
+    /// fixed-step time is accumulated until it is reached. `0` (default) reacts
+    /// at every fixed step, right for fast chemistry such as combustion. Slow
+    /// chemistry (rot, tanning) changes a REV by less than the `f32` resolution
+    /// of its composition in one millisecond step, so such a scene sets an
+    /// interval of seconds to minutes; see `Scene::set_chemistry_interval`.
+    pub(crate) chemistry_interval_s: f64,
+    pub(crate) chemistry_pending_s: f64,
+    /// Recipes used by the fixed-step hook; `None` is the built-in registry.
+    pub(crate) chemistry_registry: Option<crate::recipes::RecipeRegistry>,
     /// Whether this step solves cell rotations; decided at the start of each step.
     pub(crate) cell_dofs: bool,
     /// Double-precision cell rotations; `rotations` holds the same values as f32.
@@ -1122,6 +1132,9 @@ impl Scene {
             properties: Vec::with_capacity(spawns.len()),
             rotations: Vec::with_capacity(spawns.len()),
             chemistry_enabled: false,
+            chemistry_interval_s: 0.0,
+            chemistry_pending_s: 0.0,
+            chemistry_registry: None,
             cell_dofs: false,
             precise_rotations: Vec::with_capacity(spawns.len()),
             angular_velocities: Vec::with_capacity(spawns.len()),
@@ -3183,6 +3196,9 @@ impl Scene {
             properties,
             rotations: vec![Quat::IDENTITY; n],
             chemistry_enabled: false,
+            chemistry_interval_s: 0.0,
+            chemistry_pending_s: 0.0,
+            chemistry_registry: None,
             cell_dofs: false,
             precise_rotations: vec![glam::DQuat::IDENTITY; n],
             angular_velocities: vec![glam::DVec3::ZERO; n],

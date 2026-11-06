@@ -1,7 +1,8 @@
 //! Combustion as material reactions (WORLD_PARADIGM.md 7.7, WORLD_RUNTIME_PLAN.md).
 //!
-//! There is no "burning" flag and no prescribed flame temperature. A recipe has
-//! reactants, products and mass coefficients `nu_k` per kilogram of fuel with
+//! There is no "burning" flag and no prescribed flame temperature. Combustion
+//! is one recipe of the data-driven registry in `crate::recipes`: reactants,
+//! products and mass coefficients `nu_k` per kilogram of fuel with
 //! `sum(nu_k) = 0`; one step computes an extent of reaction `xi` (kg of fuel
 //! consumed) and changes every component mass by `nu_k * xi`. Chemical energy
 //! lives in the equation of state as a per-kilogram formation energy
@@ -23,6 +24,11 @@
 //! cannot cool the REV below the boiling point. Until the water is gone the
 //! temperature stays at the boiling point, which delays ignition.
 //!
+//! [`CombustionModel`] is the single-recipe view kept for direct use and for
+//! the combustion tests; [`crate::recipes::RecipeRegistry::builtin`] runs the
+//! same recipe together with tanning and decay, and `Scene::react` is the one
+//! scene hook for all of them.
+//!
 //! Scope, stated plainly: the REV is a *closed* reactor. Products stay in the
 //! REV; there is no transport of gas, oxygen or heat of products between REVs
 //! here (heat conduction between REVs is the existing thermal update), no
@@ -31,52 +37,15 @@
 //! capacities per component (no temperature-dependent cp, no dissociation).
 
 use crate::material::Material;
-use crate::scene::Scene;
+pub use crate::recipes::{
+    ReactionExtent, ReactionOutcome, ReactionReport, Recipe, RecipeRegistry,
+};
+#[allow(unused_imports)]
+use crate::recipes::{
+    add_mass, component_by_name, composition_from_masses, mass_of, set_mass, state_of,
+};
+use crate::recipes::{Dependence, Evaporation, RateLaw};
 use crate::voxel::Composition;
-
-const GAS_CONSTANT_J_MOL_K: f64 = 8.314_462_618_153_24;
-/// Boiling point of water at 1 atm, kelvin; matches the built-in `water` entry.
-const WATER_BOILING_K: f64 = 373.15;
-const MAX_SUBSTEPS: usize = 256;
-const MAX_FUEL_FRACTION_PER_SUBSTEP: f64 = 0.25;
-const MAX_HEATING_PER_SUBSTEP_K: f64 = 25.0;
-
-/// One reaction: component mass coefficients per kilogram of fuel.
-#[derive(Clone, Debug)]
-pub struct Recipe {
-    pub name: &'static str,
-    pub fuel: u16,
-    pub oxidizer: u16,
-    /// `(component, nu)` in kg per kg of fuel; reactants are negative and the
-    /// fuel is exactly `-1`. The sum is zero (mass is conserved).
-    pub terms: Vec<(u16, f64)>,
-}
-
-impl Recipe {
-    pub fn validate(&self) -> Result<(), &'static str> {
-        let sum: f64 = self.terms.iter().map(|&(_, nu)| nu).sum();
-        let fuel = self.terms.iter().find(|&&(id, _)| id == self.fuel);
-        let oxidizer = self.terms.iter().find(|&&(id, _)| id == self.oxidizer);
-        match (fuel, oxidizer) {
-            (Some(&(_, f)), Some(&(_, o))) if f == -1.0 && o < 0.0 => {}
-            _ => return Err("recipe needs fuel with coefficient -1 and a consumed oxidizer"),
-        }
-        if sum.abs() > 1e-12 {
-            return Err("recipe mass coefficients must sum to zero");
-        }
-        Ok(())
-    }
-
-    /// Heat released per kilogram of fuel, J/kg, from the materials' formation
-    /// energies: `-sum(nu_k * h_k)`.
-    pub fn heat_of_reaction_j_per_kg(&self, materials: &[Material]) -> f64 {
-        -self
-            .terms
-            .iter()
-            .map(|&(id, nu)| nu * materials[id as usize].formation_energy_j_per_kg as f64)
-            .sum::<f64>()
-    }
-}
 
 /// Reaction-rate parameters. Illustrative values, not calibrated data.
 #[derive(Clone, Copy, Debug)]
@@ -103,60 +72,71 @@ impl Default for Kinetics {
     }
 }
 
-/// What one REV step did. Energy is returned unchanged: reactions only move
-/// energy between the chemical and thermal parts of the same stored energy.
-#[derive(Clone, Debug)]
-pub struct ReactionOutcome {
-    pub composition: Composition,
-    /// Total internal energy of the REV, identical to the input (J).
-    pub internal_energy_j: f64,
-    pub extent: ReactionExtent,
-    pub temperature_before_k: f32,
-    pub temperature_after_k: f32,
-}
-
-/// Integrated amounts of one step (f64, SI).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ReactionExtent {
-    /// Dry fuel consumed, kg (the extent of reaction).
-    pub fuel_burned_kg: f64,
-    pub water_evaporated_kg: f64,
-    /// Chemical energy turned into sensible heat by combustion, J.
-    pub combustion_heat_j: f64,
-    /// Sensible heat turned into latent chemical energy by evaporation, J.
-    pub evaporation_heat_j: f64,
-    pub substeps: usize,
-}
-
-impl ReactionExtent {
-    pub fn is_empty(&self) -> bool {
-        self.fuel_burned_kg == 0.0 && self.water_evaporated_kg == 0.0
-    }
-
-    fn accumulate(&mut self, other: &Self) {
-        self.fuel_burned_kg += other.fuel_burned_kg;
-        self.water_evaporated_kg += other.water_evaporated_kg;
-        self.combustion_heat_j += other.combustion_heat_j;
-        self.evaporation_heat_j += other.evaporation_heat_j;
-        self.substeps += other.substeps;
+impl Kinetics {
+    /// The same law as a generic rate law with an unbounded oxidizer factor.
+    pub fn rate_law(&self, oxidizer: u16) -> RateLaw {
+        let mut law =
+            RateLaw::arrhenius(self.pre_exponential_per_s, self.activation_energy_j_mol);
+        law.minimum_temperature_k = self.decomposition_temperature_k;
+        law.dependencies = vec![Dependence {
+            component: oxidizer,
+            reference_mass_fraction: self.reference_oxidizer_mass_fraction,
+            cap: f64::INFINITY,
+        }];
+        law.max_fraction_per_substep = 0.25;
+        law.max_heating_per_substep_k = 25.0;
+        law
     }
 }
 
-/// Totals of one [`Scene::react`] call.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ReactionReport {
-    pub reacting_revs: usize,
-    pub extent: ReactionExtent,
+/// The built-in combustion recipe: cellulose-like fuel + oxidizer -> CO2 +
+/// water vapour + ash, with ids resolved from a material table (`dry_wood`,
+/// `oxygen`, `carbon_dioxide`, `water_vapor`, `ash`). `None` when one is missing.
+pub fn combustion_recipe(materials: &[Material]) -> Option<Recipe> {
+    let (fuel, oxidizer, co2, vapor, ash) = (
+        component_by_name(materials, "dry_wood")?,
+        component_by_name(materials, "oxygen")?,
+        component_by_name(materials, "carbon_dioxide")?,
+        component_by_name(materials, "water_vapor")?,
+        component_by_name(materials, "ash")?,
+    );
+    // Fuel: 99% cellulose C6H10O5 + 1% mineral ash by mass.
+    // C6H10O5 + 6 O2 -> 6 CO2 + 5 H2O, from atomic masses (g/mol).
+    let (c, h, o) = (12.011, 1.008, 15.999);
+    let cellulose = 6.0 * c + 10.0 * h + 5.0 * o;
+    let (o2, co2_m, h2o) = (2.0 * o, c + 2.0 * o, 2.0 * h + o);
+    let moles_per_kg_fuel = 0.99 / cellulose;
+    let nu_o2 = 6.0 * moles_per_kg_fuel * o2;
+    let nu_co2 = 6.0 * moles_per_kg_fuel * co2_m;
+    let nu_h2o = 5.0 * moles_per_kg_fuel * h2o;
+    // The ash coefficient closes the mass balance exactly (about 0.01).
+    let nu_ash = 1.0 + nu_o2 - nu_co2 - nu_h2o;
+    let recipe = Recipe {
+        name: "dry_wood + oxygen -> carbon_dioxide + water_vapor + ash".into(),
+        key: fuel,
+        terms: vec![
+            (fuel, -1.0),
+            (oxidizer, -nu_o2),
+            (co2, nu_co2),
+            (vapor, nu_h2o),
+            (ash, nu_ash),
+        ],
+        rate: Kinetics::default().rate_law(oxidizer),
+        is_combustion: true,
+    };
+    recipe.validate().ok()?;
+    Some(recipe)
 }
 
-/// Cellulose-like fuel + oxidizer -> CO2 + water vapour + ash, with the
-/// component ids resolved from a material table.
+/// Combustion + evaporation with the component ids resolved from a material
+/// table; a single-recipe view over [`RecipeRegistry`].
 #[derive(Clone, Debug)]
 pub struct CombustionModel {
     pub recipe: Recipe,
     pub kinetics: Kinetics,
     pub water: u16,
     pub water_vapor: u16,
+    oxidizer: u16,
     heat_of_combustion_j_per_kg: f64,
     evaporation_enthalpy_j_per_kg: f64,
     evaporation_cp_change: f64,
@@ -166,61 +146,40 @@ impl CombustionModel {
     /// Resolve `dry_wood`, `oxygen`, `carbon_dioxide`, `water_vapor`, `ash` and
     /// `water` by name. `None` when the table lacks any of them.
     pub fn for_materials(materials: &[Material]) -> Option<Self> {
-        let id = |name: &str| {
-            materials
-                .iter()
-                .position(|m| m.name == name)
-                .and_then(|i| u16::try_from(i).ok())
-        };
-        let (fuel, oxidizer, co2, vapor, ash, water) = (
-            id("dry_wood")?,
-            id("oxygen")?,
-            id("carbon_dioxide")?,
-            id("water_vapor")?,
-            id("ash")?,
-            id("water")?,
-        );
-        // Fuel: 99% cellulose C6H10O5 + 1% mineral ash by mass.
-        // C6H10O5 + 6 O2 -> 6 CO2 + 5 H2O, from atomic masses (g/mol).
-        let (c, h, o) = (12.011, 1.008, 15.999);
-        let cellulose = 6.0 * c + 10.0 * h + 5.0 * o;
-        let (o2, co2_m, h2o) = (2.0 * o, c + 2.0 * o, 2.0 * h + o);
-        let moles_per_kg_fuel = 0.99 / cellulose;
-        let nu_o2 = 6.0 * moles_per_kg_fuel * o2;
-        let nu_co2 = 6.0 * moles_per_kg_fuel * co2_m;
-        let nu_h2o = 5.0 * moles_per_kg_fuel * h2o;
-        // The ash coefficient closes the mass balance exactly (about 0.01).
-        let nu_ash = 1.0 + nu_o2 - nu_co2 - nu_h2o;
-        let recipe = Recipe {
-            name: "dry_wood + oxygen -> carbon_dioxide + water_vapor + ash",
-            fuel,
-            oxidizer,
-            terms: vec![
-                (fuel, -1.0),
-                (oxidizer, -nu_o2),
-                (co2, nu_co2),
-                (vapor, nu_h2o),
-                (ash, nu_ash),
-            ],
-        };
-        recipe.validate().ok()?;
+        let recipe = combustion_recipe(materials)?;
+        let evaporation = Evaporation::for_materials(materials)?;
         let heat = recipe.heat_of_reaction_j_per_kg(materials);
-        let (w, v) = (&materials[water as usize], &materials[vapor as usize]);
+        let oxidizer = recipe.terms[1].0;
         Some(Self {
             recipe,
             kinetics: Kinetics::default(),
-            water,
-            water_vapor: vapor,
+            water: evaporation.water,
+            water_vapor: evaporation.vapor,
+            oxidizer,
             heat_of_combustion_j_per_kg: heat,
-            evaporation_enthalpy_j_per_kg: (v.formation_energy_j_per_kg
-                - w.formation_energy_j_per_kg) as f64,
-            evaporation_cp_change: (v.heat_capacity - w.heat_capacity) as f64,
+            evaporation_enthalpy_j_per_kg: evaporation.enthalpy_j_per_kg,
+            evaporation_cp_change: evaporation.cp_change,
         })
     }
 
     /// Heat released per kilogram of dry fuel, J/kg.
     pub fn heat_of_combustion_j_per_kg(&self) -> f64 {
         self.heat_of_combustion_j_per_kg
+    }
+
+    /// The registry holding this model's recipe (with the current `kinetics`)
+    /// and evaporation.
+    pub fn registry(&self, materials: &[Material]) -> Result<RecipeRegistry, &'static str> {
+        let mut recipe = self.recipe.clone();
+        recipe.rate = self.kinetics.rate_law(self.oxidizer);
+        let evaporation = Evaporation {
+            water: self.water,
+            vapor: self.water_vapor,
+            enthalpy_j_per_kg: self.evaporation_enthalpy_j_per_kg,
+            cp_change: self.evaporation_cp_change,
+            boiling_k: crate::recipes::WATER_BOILING_K,
+        };
+        RecipeRegistry::new(materials, vec![recipe], Some(evaporation))
     }
 
     /// Advance one REV by `dt_s`. `composition` holds mass fractions of the
@@ -236,26 +195,14 @@ impl CombustionModel {
         internal_energy_j: f64,
         dt_s: f64,
     ) -> Result<ReactionOutcome, &'static str> {
-        if !mass_kg.is_finite() || mass_kg <= 0.0 {
-            return Err("REV mass must be positive and finite");
-        }
-        composition
-            .validate(materials.len())
-            .map_err(|_| "invalid composition")?;
-        let mut masses: Vec<(u16, f64)> = composition
-            .components
-            .iter()
-            .map(|&(id, fraction)| (id, fraction as f64 * mass_kg as f64))
-            .collect();
-        let before = self.temperature(materials, &masses, internal_energy_j)?;
-        let extent = self.step_masses(materials, &mut masses, internal_energy_j, dt_s)?;
-        let after = self.temperature(materials, &masses, internal_energy_j)?;
+        let registry = self.registry(materials)?;
+        let outcome = registry.step(materials, composition, mass_kg, internal_energy_j, dt_s)?;
         Ok(ReactionOutcome {
-            composition: composition_from_masses(&masses),
-            internal_energy_j,
-            extent,
-            temperature_before_k: before,
-            temperature_after_k: after,
+            composition: outcome.composition,
+            internal_energy_j: outcome.internal_energy_j,
+            extent: registry.legacy_extent(&outcome.extent),
+            temperature_before_k: outcome.temperature_before_k,
+            temperature_after_k: outcome.temperature_after_k,
         })
     }
 
@@ -269,123 +216,9 @@ impl CombustionModel {
         internal_energy_j: f64,
         dt_s: f64,
     ) -> Result<ReactionExtent, &'static str> {
-        if !dt_s.is_finite() || dt_s < 0.0 {
-            return Err("reaction time step must be finite and nonnegative");
-        }
-        if !internal_energy_j.is_finite() || internal_energy_j < 0.0 {
-            return Err("internal energy must be finite and nonnegative");
-        }
-        if masses.iter().any(|&(_, m)| !m.is_finite() || m < 0.0)
-            || masses.iter().map(|&(_, m)| m).sum::<f64>() <= 0.0
-        {
-            return Err("component masses must be finite, nonnegative and not all zero");
-        }
-        let k = self.kinetics;
-        let heat = self.heat_of_combustion_j_per_kg;
-        let nu_ox = -self
-            .recipe
-            .terms
-            .iter()
-            .find(|&&(id, _)| id == self.recipe.oxidizer)
-            .map(|&(_, nu)| nu)
-            .unwrap_or(-1.0);
-        let mut total = ReactionExtent::default();
-        let mut remaining = dt_s;
-        while remaining > 0.0 {
-            let m_fuel = mass_of(masses, self.recipe.fuel);
-            let m_ox = mass_of(masses, self.recipe.oxidizer);
-            let m_water = mass_of(masses, self.water);
-            let can_burn = m_fuel > 0.0 && m_ox > 0.0;
-            if !can_burn && m_water <= 0.0 {
-                break;
-            }
-            let (mut temp, mixed) = self.state(materials, masses, internal_energy_j)?;
-            let sum: f64 = masses.iter().map(|&(_, m)| m).sum();
-
-            // Sub-step length from the combustion rate at the start state.
-            let rate = |temp: f64, masses: &[(u16, f64)]| -> f64 {
-                if temp < k.decomposition_temperature_k {
-                    return 0.0;
-                }
-                let oxygen_factor = (mass_of(masses, self.recipe.oxidizer) / sum)
-                    / k.reference_oxidizer_mass_fraction;
-                k.pre_exponential_per_s
-                    * (-k.activation_energy_j_mol / (GAS_CONSTANT_J_MOL_K * temp)).exp()
-                    * oxygen_factor
-            };
-            let mut rate_per_s = if can_burn { rate(temp, masses) } else { 0.0 };
-            let mut h = remaining;
-            if rate_per_s > 0.0 && total.substeps + 1 < MAX_SUBSTEPS {
-                let heating_w = rate_per_s * m_fuel * heat;
-                h = h
-                    .min(MAX_FUEL_FRACTION_PER_SUBSTEP / rate_per_s)
-                    .min(MAX_HEATING_PER_SUBSTEP_K * sum * mixed.heat_capacity as f64 / heating_w);
-            }
-            let h = h.max(remaining * 1e-12).min(remaining);
-            let mut active = rate_per_s > 0.0;
-
-            // 1. Moisture: boil off at constant energy, never below boiling.
-            if m_water > 0.0 && mixed.boil_temp.is_infinite() && temp > WATER_BOILING_K {
-                let cp = mixed.heat_capacity as f64;
-                let denominator =
-                    self.evaporation_enthalpy_j_per_kg + WATER_BOILING_K * self.evaporation_cp_change;
-                let energy_limit = if denominator > 0.0 {
-                    cp * (temp - WATER_BOILING_K) / denominator * sum
-                } else {
-                    0.0
-                };
-                let mut evaporated = energy_limit.min(m_water);
-                if evaporated > 0.0 {
-                    if evaporated >= m_water {
-                        evaporated = m_water;
-                        set_mass(masses, self.water, 0.0);
-                    } else {
-                        add_mass(masses, self.water, -evaporated);
-                    }
-                    add_mass(masses, self.water_vapor, evaporated);
-                    total.water_evaporated_kg += evaporated;
-                    total.evaporation_heat_j += evaporated * self.evaporation_enthalpy_j_per_kg;
-                    active = true;
-                    // The latent heat lowered the temperature; refresh it.
-                    let state = self.state(materials, masses, internal_energy_j)?;
-                    temp = state.0;
-                    rate_per_s = if can_burn { rate(temp, masses) } else { 0.0 };
-                }
-            }
-
-            // 2. Fuel + oxidizer -> products. Extent limited by both reactants.
-            if rate_per_s > 0.0 {
-                let raw = m_fuel * -(-rate_per_s * h).exp_m1();
-                let by_oxidizer = m_ox / nu_ox;
-                let oxidizer_limited = raw >= by_oxidizer;
-                let extent = if oxidizer_limited { by_oxidizer } else { raw }.min(m_fuel);
-                if extent > 0.0 {
-                    for &(id, nu) in &self.recipe.terms {
-                        if id == self.recipe.fuel && extent >= m_fuel {
-                            set_mass(masses, id, 0.0);
-                        } else if id == self.recipe.oxidizer && oxidizer_limited {
-                            set_mass(masses, id, 0.0);
-                        } else {
-                            add_mass(masses, id, nu * extent);
-                        }
-                    }
-                    total.fuel_burned_kg += extent;
-                    total.combustion_heat_j += extent * heat;
-                    active = true;
-                }
-            }
-            total.substeps += 1;
-            if !active {
-                break;
-            }
-            // Past the sub-step budget `h` is the whole remainder: one limited
-            // step; reactants stay conserved, only the thermal feedback is coarser.
-            remaining -= h;
-            if remaining <= dt_s * 1e-12 {
-                break;
-            }
-        }
-        Ok(total)
+        let registry = self.registry(materials)?;
+        let extent = registry.step_masses(materials, masses, internal_energy_j, dt_s)?;
+        Ok(registry.legacy_extent(&extent))
     }
 
     fn state(
@@ -394,128 +227,13 @@ impl CombustionModel {
         masses: &[(u16, f64)],
         internal_energy_j: f64,
     ) -> Result<(f64, Material), &'static str> {
-        let composition = composition_from_masses(masses);
-        if composition.components.is_empty() {
-            return Err("composition has no mass");
-        }
-        let total: f64 = masses.iter().map(|&(_, m)| m).sum();
-        let mixed = Material::mixed(&composition, materials);
-        let temperature = mixed.temperature(total as f32, internal_energy_j as f32) as f64;
-        Ok((temperature, mixed))
-    }
-
-    fn temperature(
-        &self,
-        materials: &[Material],
-        masses: &[(u16, f64)],
-        internal_energy_j: f64,
-    ) -> Result<f32, &'static str> {
-        Ok(self.state(materials, masses, internal_energy_j)?.0 as f32)
+        state_of(materials, masses, internal_energy_j)
     }
 }
 
-fn mass_of(masses: &[(u16, f64)], id: u16) -> f64 {
-    masses
-        .iter()
-        .find(|&&(component, _)| component == id)
-        .map_or(0.0, |&(_, m)| m)
-}
+#[cfg(test)]
+use crate::scene::Scene;
 
-fn set_mass(masses: &mut Vec<(u16, f64)>, id: u16, value: f64) {
-    match masses.iter_mut().find(|(component, _)| *component == id) {
-        Some(entry) => entry.1 = value,
-        None => masses.push((id, value)),
-    }
-}
-
-fn add_mass(masses: &mut Vec<(u16, f64)>, id: u16, delta: f64) {
-    match masses.iter_mut().find(|(component, _)| *component == id) {
-        Some(entry) => entry.1 = (entry.1 + delta).max(0.0),
-        None => masses.push((id, delta.max(0.0))),
-    }
-}
-
-/// Mass fractions of `masses`; components of exactly zero mass are dropped.
-fn composition_from_masses(masses: &[(u16, f64)]) -> Composition {
-    let total: f64 = masses.iter().map(|&(_, m)| m).sum();
-    let mut composition = Composition {
-        components: Default::default(),
-    };
-    for &(id, mass) in masses {
-        let fraction = (mass / total) as f32;
-        if mass > 0.0 && fraction > 0.0 {
-            composition.components.push((id, fraction));
-        }
-    }
-    composition
-}
-
-impl Scene {
-    /// Advance chemical reactions of every REV by `dt` seconds. Call it once
-    /// per fixed physical step, after the step (like the thermal update it
-    /// works on the stored energy); it is not run by `tick` so scenes without
-    /// fuel pay nothing. Each REV is a closed reactor: component masses change
-    /// by the recipe coefficients, the REV mass and stored internal energy are
-    /// untouched, and `properties` is recomputed from the new composition, so
-    /// the heat appears as derived temperature. Returns the totals.
-    ///
-    /// Products do not leave the REV (no transport yet), which also means a
-    /// closed oxygen supply runs out and the burn dies down.
-    pub fn react(&mut self, dt: f32) -> Result<ReactionReport, &'static str> {
-        if !dt.is_finite() || dt < 0.0 {
-            return Err("reaction time step must be finite and nonnegative");
-        }
-        let mut report = ReactionReport::default();
-        let Some(model) = CombustionModel::for_materials(&self.materials) else {
-            return Ok(report);
-        };
-        if dt == 0.0 {
-            return Ok(report);
-        }
-        let k = model.kinetics;
-        let mut changed = false;
-        for index in 0..self.voxels.len() {
-            let voxel = &self.voxels[index];
-            let (mut fuel, mut oxygen, mut water) = (false, false, false);
-            for &(id, _) in &voxel.composition.components {
-                fuel |= id == model.recipe.fuel;
-                oxygen |= id == model.recipe.oxidizer;
-                water |= id == model.water;
-            }
-            let burnable = fuel && oxygen;
-            let wet = water && voxel.composition.components.len() > 1;
-            if !burnable && !wet {
-                continue;
-            }
-            let temperature = self.properties[index]
-                .temperature(voxel.mass, voxel.thermal_energy_f32()) as f64;
-            let threshold = match (burnable, wet) {
-                (true, true) => k.decomposition_temperature_k.min(WATER_BOILING_K),
-                (true, false) => k.decomposition_temperature_k,
-                _ => WATER_BOILING_K,
-            };
-            if temperature < threshold {
-                continue;
-            }
-            let energy = voxel.total_internal_energy_j();
-            let outcome = model
-                .step(&self.materials, &voxel.composition, voxel.mass, energy, dt as f64)?;
-            if outcome.extent.is_empty() {
-                continue;
-            }
-            self.voxels[index].composition = outcome.composition;
-            self.properties[index] =
-                Material::mixed(&self.voxels[index].composition, &self.materials);
-            report.reacting_revs += 1;
-            report.extent.accumulate(&outcome.extent);
-            changed = true;
-        }
-        if changed {
-            self.mark_render_changed();
-        }
-        Ok(report)
-    }
-}
 
 #[cfg(test)]
 mod tests {

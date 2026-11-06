@@ -2909,7 +2909,7 @@ fn advance_step_with_axis_targets_and_loads(
     // Reactions change composition at constant internal energy, so they run once per
     // fixed step after mechanics and heat, never inside the implicit solve.
     if scene.chemistry_enabled {
-        let _ = scene.react(scene.config.fixed_dt);
+        let _ = scene.advance_chemistry(scene.config.fixed_dt as f64);
     }
     let completed_fixed_steps = scene.substep_index / (scene.config.substeps.max(1) as u64);
     if completed_fixed_steps > 0

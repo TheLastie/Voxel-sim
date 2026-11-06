@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "recipes": [
+    {
+      "name": "decay of wood",
+      "key": "wood",
+      "terms": [
+        { "component": "wood", "nu": -1.0 },
+        { "component": "oxygen", "nu": -0.75 },
+        { "component": "humus", "nu": 0.5 },
+        { "component": "carbon_dioxide", "nu": 0.875 },
+        { "component": "water", "nu": 0.375 }
+      ],
+      "rate": {
+        "reference_rate_per_s": 2.0e-8,
+        "reference_temperature_k": 300.0,
+        "activation_energy_j_mol": 60000.0,
+        "minimum_temperature_k": 275.0,
+        "maximum_temperature_k": 338.0,
+        "deactivation": { "midpoint_k": 318.0, "width_k": 4.0 },
+        "dependencies": [
+          { "component": "oxygen", "reference_mass_fraction": 0.232, "cap": 1.0 }
+        ],
+        "moisture": { "water": "water", "minimum_ratio": 0.2, "reference_ratio": 0.6 },
+        "max_heating_per_substep_k": 1.0
+      }
+    }
+  ]
+}

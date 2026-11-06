@@ -6,6 +6,8 @@ pub mod beam;
 pub mod bond;
 pub mod collision;
 pub mod combustion;
+pub mod recipe_data;
+pub mod recipes;
 mod contact_constraint;
 pub mod coordinates;
 pub mod creature;
