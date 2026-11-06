@@ -83,7 +83,7 @@ impl Scene {
             aggregates: self.rigid_aggregates.clone(),
             aggregate_of: self.aggregate_of.clone(),
             config: self.config.clone(),
-            voxels: self.voxels.clone(),
+            voxels: self.voxels_with_sleepers_awake(),
             source_cells: self.source_cells.clone(),
             external_forces: self.external_forces.clone(),
             external_accelerations: self.external_accelerations.clone(),

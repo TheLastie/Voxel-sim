@@ -443,6 +443,8 @@ pub struct StepDiagnostics {
 mod checkpoint;
 mod beam_region;
 mod tier_governor;
+mod sleep;
+pub use sleep::SleepConfig;
 pub use tier_governor::{TierCensus, TierGovernorConfig};
 
 /// Positions are separate arrays; material identity exists only in composition.
@@ -509,6 +511,8 @@ pub struct Scene {
     pub(crate) beam_regions: Vec<Option<beam_region::BeamRegion>>,
     /// Automatic beam tier for clamped slender parts; see `tier_governor`.
     pub(crate) tier_governor: Option<Box<tier_governor::TierGovernor>>,
+    /// Sleeping tier for settled clusters; see `sleep`.
+    pub(crate) sleep: Option<Box<sleep::SleepState>>,
     /// Whether this step solves cell rotations; decided at the start of each step.
     pub(crate) cell_dofs: bool,
     /// Double-precision cell rotations; `rotations` holds the same values as f32.
@@ -1153,6 +1157,7 @@ impl Scene {
             cell_dofs: false,
             beam_regions: Vec::new(),
             tier_governor: None,
+            sleep: None,
             support_load_n: Vec::new(),
             precise_rotations: Vec::with_capacity(spawns.len()),
             angular_velocities: Vec::with_capacity(spawns.len()),
@@ -1767,6 +1772,17 @@ impl Scene {
         voxels: &[usize],
         fixed: bool,
     ) -> Result<(), &'static str> {
+        // A sleeper is kinematic only because it sleeps: wake it so the caller sees and
+        // changes its real state.
+        self.wake_voxels(voxels);
+        self.set_voxels_kinematic_raw(voxels, fixed)
+    }
+
+    pub(crate) fn set_voxels_kinematic_raw(
+        &mut self,
+        voxels: &[usize],
+        fixed: bool,
+    ) -> Result<(), &'static str> {
         if voxels.iter().any(|&voxel| voxel >= self.voxels.len()) {
             return Err("voxel index out of range");
         }
@@ -2239,7 +2255,8 @@ impl Scene {
         if removed_count == 0 {
             return 0;
         }
-        // Removal shifts REV indices, which a beam region keeps.
+        // Removal shifts REV indices, which beam regions and sleepers keep.
+        self.wake_all();
         self.expand_all_beams();
 
         let mut remap = vec![EMPTY; old_count];
@@ -3242,6 +3259,7 @@ impl Scene {
             cell_dofs: false,
             beam_regions: Vec::new(),
             tier_governor: None,
+            sleep: None,
             support_load_n: Vec::new(),
             precise_rotations: vec![glam::DQuat::IDENTITY; n],
             angular_velocities: vec![glam::DVec3::ZERO; n],

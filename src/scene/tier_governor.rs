@@ -84,6 +84,8 @@ pub(crate) struct TierGovernor {
 /// topology change); the beam tier is `reduce_to_beam`; everything else is fine cells.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TierCensus {
+    /// Free REVs asleep (T0): kinematic only because the sleeping tier froze them.
+    pub sleeping: usize,
     /// Fixed (kinematic) REVs that are not cells of the solver.
     pub fixed: usize,
     /// Members of rigid aggregates.
@@ -96,7 +98,7 @@ pub struct TierCensus {
 
 impl TierCensus {
     pub fn total(&self) -> usize {
-        self.fixed + self.rigid + self.beam + self.cells
+        self.sleeping + self.fixed + self.rigid + self.beam + self.cells
     }
 }
 
@@ -112,8 +114,11 @@ impl Scene {
                 }
             }
         }
+        let asleep = self.sleeping_flags();
         for i in 0..self.voxels.len() {
-            if in_beam[i] {
+            if asleep[i] {
+                census.sleeping += 1;
+            } else if in_beam[i] {
                 census.beam += 1;
             } else if self.aggregate_of.get(i).copied().flatten().is_some() {
                 census.rigid += 1;

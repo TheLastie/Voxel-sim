@@ -912,6 +912,7 @@ pub fn fracture_strength(scene: &Scene, i: usize, j: usize, direction: Vec3) -> 
 
 /// Set a world-space force that remains active until changed or cleared.
 pub fn set_force(scene: &mut Scene, voxel: usize, force: Vec3) -> Result<(), &'static str> {
+    scene.wake_voxels(&[voxel]);
     let body = scene.voxels.get(voxel).ok_or("voxel index out of range")?;
     if body.kinematic {
         return Err("cannot apply a force to a fixed voxel");
@@ -939,6 +940,7 @@ pub fn set_acceleration(
     voxel: usize,
     acceleration: Vec3,
 ) -> Result<(), &'static str> {
+    scene.wake_voxels(&[voxel]);
     let body = scene.voxels.get(voxel).ok_or("voxel index out of range")?;
     let mass = body.mass;
     if body.kinematic {
@@ -956,6 +958,7 @@ pub fn set_acceleration(
 
 /// Set a voxel's initial or current world-space velocity in m/s.
 pub fn set_velocity(scene: &mut Scene, voxel: usize, velocity: Vec3) -> Result<(), &'static str> {
+    scene.wake_voxels(&[voxel]);
     let body = scene
         .voxels
         .get_mut(voxel)
@@ -978,6 +981,7 @@ pub fn set_velocity(scene: &mut Scene, voxel: usize, velocity: Vec3) -> Result<(
 
 /// Apply a one-time impulse in N·s, conserving the corresponding momentum.
 pub fn apply_impulse(scene: &mut Scene, voxel: usize, impulse: Vec3) -> Result<(), &'static str> {
+    scene.wake_voxels(&[voxel]);
     let body = scene
         .voxels
         .get_mut(voxel)
@@ -1650,6 +1654,7 @@ fn advance_step_with_axis_targets_and_loads(
     assert!(loads.is_empty() || loads.len() == scene.voxels.len());
     scene.solver_residual_audit = None;
     scene.last_step_diagnostics = None;
+    scene.run_sleep();
     scene.run_tier_governor();
     scene.advance_beam_regions(f64::from(scene.config.fixed_dt));
     scene.cell_dofs = decide_cell_dofs(scene);
