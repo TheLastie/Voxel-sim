@@ -35,6 +35,18 @@ pub(crate) struct BeamRegion {
     primed: bool,
 }
 
+impl BeamRegion {
+    /// Scene indices of the member REVs.
+    pub(crate) fn members(&self) -> &[usize] {
+        &self.members
+    }
+
+    /// Whether member `local` was fixed before the region took it over.
+    pub(crate) fn saved_kinematic(&self, local: usize) -> bool {
+        self.saved_kinematic[local]
+    }
+}
+
 impl Scene {
     /// Replace the REVs `cells`, a chain of slices along X whose first slice is fixed, by
     /// a beam stepped `substeps` times per fixed step. Returns the region id.

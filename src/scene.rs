@@ -442,6 +442,8 @@ pub struct StepDiagnostics {
 
 mod checkpoint;
 mod beam_region;
+mod tier_governor;
+pub use tier_governor::TierGovernorConfig;
 
 /// Positions are separate arrays; material identity exists only in composition.
 pub struct Scene {
@@ -505,6 +507,8 @@ pub struct Scene {
     pub(crate) chemistry_registry: Option<crate::recipes::RecipeRegistry>,
     /// Slender parts simulated as beams (tier T2); see `scene/beam_region.rs`.
     pub(crate) beam_regions: Vec<Option<beam_region::BeamRegion>>,
+    /// Automatic beam tier for clamped slender parts; see `tier_governor`.
+    pub(crate) tier_governor: Option<Box<tier_governor::TierGovernor>>,
     /// Whether this step solves cell rotations; decided at the start of each step.
     pub(crate) cell_dofs: bool,
     /// Double-precision cell rotations; `rotations` holds the same values as f32.
@@ -1148,6 +1152,7 @@ impl Scene {
             chemistry_registry: None,
             cell_dofs: false,
             beam_regions: Vec::new(),
+            tier_governor: None,
             support_load_n: Vec::new(),
             precise_rotations: Vec::with_capacity(spawns.len()),
             angular_velocities: Vec::with_capacity(spawns.len()),
@@ -3236,6 +3241,7 @@ impl Scene {
             chemistry_registry: None,
             cell_dofs: false,
             beam_regions: Vec::new(),
+            tier_governor: None,
             support_load_n: Vec::new(),
             precise_rotations: vec![glam::DQuat::IDENTITY; n],
             angular_velocities: vec![glam::DVec3::ZERO; n],
