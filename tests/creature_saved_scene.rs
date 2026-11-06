@@ -137,11 +137,14 @@ fn spider_runs_40_steps_with_network_and_ledger_attached() {
             touching_steps += 1;
         }
         let load: f32 = reading.foot_normal_load_n.iter().sum();
-        assert!((load - reading.support_load_n).abs() <= 1e-4 * reading.support_load_n.max(1e-6));
+        // Exact loads: the feet are part of the body's solver reactions. With
+        // the untrained network thrashing the legs, the instantaneous reaction of
+        // the last substep swings far from the weight (reported below); the
+        // time-averaged weight balance is checked on the relaxed spider.
+        assert_eq!(reading.load_source, voxel_physics_lab::creature::LoadSource::SolverReaction);
+        assert!(load <= reading.support_load_n * (1.0 + 1e-5) + 1e-9);
         if tick > 15 && reading.foot_contact.iter().any(|&c| c) {
-            // Standing on the ground: the environment carries about the weight.
             let ratio = reading.support_load_n / reading.body_weight_n;
-            assert!((0.6..1.4).contains(&ratio), "tick {tick}: support / weight = {ratio}");
             supported_ratio.push(ratio);
         }
         if tick % 10 == 0 {
@@ -280,4 +283,101 @@ fn an_empty_store_leaves_the_spider_passive_and_a_relaxed_spider_costs_only_basa
     assert!((stored0 - relaxed.ledger().stored_j() - basal).abs() <= 1e-9 * stored0);
     let reading: SensorReading = relaxed.sense(&scene).unwrap();
     assert!(reading.is_finite());
+}
+
+/// A relaxed spider dropped on the floor: the foot loads are the solver's own
+/// per-REV reactions, and once it has settled they carry its weight.
+#[test]
+fn spider_foot_loads_are_solver_reactions_and_carry_the_weight_at_rest() {
+    let mut scene = load_spider();
+    let range = scene.skeletal_actuators[0].voxel_range();
+    let body_mass_kg: f64 = range.clone().map(|i| f64::from(scene.voxels[i].mass)).sum();
+    let mut creature = build_creature(&scene, body_mass_kg, 0.5);
+    let mut advance = |s: &mut Scene| solver::step(s, &mut None);
+    let steps: usize = std::env::var("SPIDER_REST_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+    let mut series = Vec::new();
+    for tick in 1..=steps {
+        creature.drive_step(&mut scene, &mut PassiveController, &mut advance).unwrap();
+        let r = creature.sense(&scene).unwrap();
+        assert_eq!(r.load_source, voxel_physics_lab::creature::LoadSource::SolverReaction);
+        let in_scene: f64 = range.clone().map(|i| f64::from(scene.support_load_n[i])).sum();
+        // The sensor reports exactly what the solver reported for the body's REVs.
+        assert!((f64::from(r.support_load_n) - in_scene).abs() <= 1e-5 * in_scene.max(1e-9));
+        let feet: f32 = r.foot_normal_load_n.iter().sum();
+        assert!(feet <= r.support_load_n * (1.0 + 1e-5) + 1e-9, "feet cannot carry more than the body");
+        series.push((feet / r.body_weight_n, r.support_load_n / r.body_weight_n));
+        if tick % 10 == 0 {
+            eprintln!("SPIDER_REST tick={tick} feet/weight={:.3} support/weight={:.3}", series[tick - 1].0, series[tick - 1].1);
+        }
+    }
+    let tail = &series[series.len() - 20..];
+    let mean_feet = tail.iter().map(|s| s.0).sum::<f32>() / 20.0;
+    let mean_support = tail.iter().map(|s| s.1).sum::<f32>() / 20.0;
+    eprintln!("SPIDER_REST last-20-step mean feet/weight={mean_feet:.3} support/weight={mean_support:.3}");
+    assert!((mean_feet - 1.0).abs() < 0.05, "feet carry {mean_feet} of the weight");
+}
+
+/// An organ graph on the 9 thousand REV spider: stable ids over the saved
+/// topology, paths through its real bonds, and the loss of the brain tissue
+/// takes away control but not the body.
+#[test]
+fn spider_organ_graph_follows_the_bonds_and_losing_the_brain_leaves_a_passive_body() {
+    use voxel_physics_lab::creature::{ChannelKind, OrganPlan, OrganRole, RecordedAnimationController};
+    let mut scene = load_spider();
+    let range = scene.skeletal_actuators[0].voxel_range();
+    let body_mass_kg: f64 = range.clone().map(|i| f64::from(scene.voxels[i].mass)).sum();
+    let mut creature = build_creature(&scene, body_mass_kg, 0.5);
+    let feet = SensorLayout::lowest_revs(&scene, range.clone(), 0.005).unwrap();
+    let mass_total: f64 = range.clone().map(|i| f64::from(scene.voxels[i].mass)).sum();
+    let com = range.clone().fold(DVec3::ZERO, |s, i| s + scene.positions[i] * f64::from(scene.voxels[i].mass)) / mass_total;
+    let mut by_distance: Vec<usize> = range.clone().collect();
+    by_distance.sort_by(|&a, &b| {
+        (scene.positions[a] - com).length().total_cmp(&(scene.positions[b] - com).length())
+    });
+    let brain = range.clone().max_by(|&a, &b| scene.positions[a].z.total_cmp(&scene.positions[b].z)).unwrap();
+    let plan = OrganPlan {
+        brain: vec![brain],
+        stomach: vec![by_distance[0]],
+        store: vec![by_distance[1]],
+        foot_sense: feet.iter().map(|&f| range.start + f).collect(),
+        foot_indices: (0..feet.len()).collect(),
+        body_sense: vec![by_distance[2]],
+    };
+    let started = std::time::Instant::now();
+    creature.build_standard_organs(&scene, &plan, 0.1).unwrap();
+    let build_s = started.elapsed().as_secs_f64();
+    let graph = creature.organs().unwrap();
+    let signal_paths: Vec<usize> = graph
+        .channels()
+        .iter()
+        .filter(|c| c.kind == ChannelKind::Signal)
+        .map(|c| c.route_ids().len())
+        .collect();
+    eprintln!(
+        "SPIDER_ORGANS build+refresh {build_s:.3} s (debug), nodes={} channels={} signal route lengths {signal_paths:?} cost {:?}",
+        graph.nodes().len(), graph.channels().len(), graph.cost()
+    );
+    assert!(graph.channels().iter().all(|c| c.availability() == 1.0), "intact spider: all paths open");
+    assert!((graph.owned_mass_kg(&scene) - mass_total).abs() <= 1e-9 * mass_total, "the muscle node spans the whole body, counted once");
+
+    // Remove the brain REV from the world; the body keeps stepping.
+    let mut controller = RecordedAnimationController;
+    let mut advance = |s: &mut Scene| solver::step(s, &mut None);
+    let before = scene.total_mass_kg();
+    scene.set_world_bounds(DVec3::splat(-100.0), DVec3::splat(100.0)).unwrap();
+    scene.positions[brain] = DVec3::new(1.0e3, 0.0, 1.0);
+    assert_eq!(scene.set_world_bounds(DVec3::splat(-100.0), DVec3::splat(100.0)).unwrap(), 1);
+    let removed = scene.boundary_removals();
+    assert!((scene.total_mass_kg() + removed.mass_kg - before).abs() <= 1e-9 * before);
+    for _ in 0..5 {
+        let r = creature.drive_step(&mut scene, &mut controller, &mut advance).unwrap();
+        assert!(r.topology_changed);
+        assert_eq!(r.applied, 0.0, "no brain, no commands");
+        assert!(state_is_finite(&scene));
+    }
+    let graph = creature.organs().unwrap();
+    assert_eq!(graph.first_node(OrganRole::Brain).unwrap().integrity(), 0.0);
+    assert!(graph.first_node(OrganRole::Store).unwrap().integrity() > 0.99, "other organs still resolve to their own tissue");
+    assert_eq!(creature.undeposited_heat_j(), 0.0);
+    assert!(creature.ledger().conservation_residual_j().abs() <= 1e-9 * creature.ledger().params().store_capacity_j);
 }

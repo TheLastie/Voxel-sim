@@ -465,6 +465,10 @@ pub struct Scene {
     pub voxels: Vec<Voxel>,
     /// Optional generated-world identity for each REV, compacted with topology.
     pub(crate) source_cells: Vec<Option<[i32; 3]>>,
+    /// Stable identity of each REV: assigned once at construction, compacted
+    /// with the topology and never renumbered, so it stays strictly increasing.
+    /// Higher layers (organ graphs) refer to tissue by this id, not by index.
+    pub(crate) rev_ids: Vec<u64>,
     /// Persistent per-voxel forces in newtons, retained until explicitly reset.
     pub external_forces: Vec<Vec3>,
     /// Transient skeleton-driven motors, applied through the ordinary solver.
@@ -1120,6 +1124,7 @@ impl Scene {
             aggregate_of: vec![None; spawns.len()],
             voxels: Vec::with_capacity(spawns.len()),
             source_cells: vec![None; spawns.len()],
+            rev_ids: (0..spawns.len() as u64).collect(),
             external_forces: Vec::with_capacity(spawns.len()),
             skeletal_actuators: Vec::new(),
             external_accelerations: Vec::with_capacity(spawns.len()),
@@ -1660,6 +1665,17 @@ impl Scene {
         formed
     }
 
+    /// Stable id of the REV at `index` (never reused, unchanged by compaction).
+    pub fn rev_id(&self, index: usize) -> Option<u64> {
+        self.rev_ids.get(index).copied()
+    }
+
+    /// Current index of the REV with stable `id`; `None` once it was removed
+    /// (outside the world bounds, or consumed by a fusion).
+    pub fn rev_index(&self, id: u64) -> Option<usize> {
+        self.rev_ids.binary_search(&id).ok()
+    }
+
     pub fn world_bounds(&self) -> Option<WorldBounds> {
         self.world_bounds
     }
@@ -2171,6 +2187,7 @@ impl Scene {
             }};
         }
         compact!(voxels);
+        compact!(rev_ids);
         compact!(positions);
         compact!(rest_positions);
         compact!(reference_temperatures_kelvin);
@@ -2324,6 +2341,12 @@ impl Scene {
         });
         old_index = 0;
         self.source_cells.retain(|_| {
+            let keep = keep[old_index];
+            old_index += 1;
+            keep
+        });
+        old_index = 0;
+        self.rev_ids.retain(|_| {
             let keep = keep[old_index];
             old_index += 1;
             keep
@@ -3185,6 +3208,7 @@ impl Scene {
             rigid_aggregates: Vec::new(),
             aggregate_of: vec![None; n],
             source_cells: vec![None; n],
+            rev_ids: (0..n as u64).collect(),
             external_forces: vec![Vec3::ZERO; n],
             skeletal_actuators: Vec::new(),
             external_accelerations: vec![Vec3::ZERO; n],
