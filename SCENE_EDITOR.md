@@ -105,7 +105,9 @@ These controls call the same engine API as the MCP tools of the same name
 - **Project dock > Run** shows state (Run, Pause, Failed), measured world speed,
   backlog, the worker cost per 10 ms of physics as latest, p50, p95 and max over
   the last 128 batches, the active mechanical REV count and the solver mode (cell
-  rotations or translation only, from `solver::uses_cell_rotations`).
+  rotations or translation only, from `solver::uses_cell_rotations`) and the tier
+  governor: governed beam count and the latest plan (total cost against budget,
+  overloaded flag), published by the physics worker with each frame.
 - **Project dock > Creature** exists only when `<scene>.creatures.json` lists a
   creature that fits the scene. It is read-only: resource ledger, sensor channels
   with units (paged), sensor and network cost counters. The editor does not drive
@@ -117,3 +119,15 @@ These controls call the same engine API as the MCP tools of the same name
 
 Layout of all of these is tested at 1920×1009 and 1280×720. The real window was
 not opened or looked at for this work.
+
+### Physics tiers
+
+**Inspector > Physics tiers** (collapsed by default) controls the automatic tier
+governor: *Governor on/off*, *Budget (ms/step)*, *Cell cost (ms/REV)*,
+*Tolerance* (fraction), *Interval (steps)* and *Beam substeps*. Settings are
+saved at once in `<scene>.physics.json` beside the scene and handed to the scene
+(`enable_tier_governor` / `disable_tier_governor`) when a run starts, like the
+chemistry settings; changing them needs the authored scene (press R after a
+run). An invalid value shows an error and changes nothing. The status line under
+the fields and the last row of the Run tab show what the governor is doing now,
+read from the physics worker's last frame.

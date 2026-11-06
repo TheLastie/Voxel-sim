@@ -9,6 +9,7 @@
 //! value, because a mean hides the tail a frame-by-frame game feels.
 
 use crate::budget::CostWindow;
+use crate::physics_tiers::GovernorReading;
 use serde_json::{json, Value};
 
 /// Batches kept for p50, p95 and max.
@@ -131,6 +132,7 @@ impl RunPanel {
             cost_samples: self.window.len(),
             active_mechanical_revs: input.active_mechanical_revs,
             solver_mode: input.solver_mode,
+            tier_governor: input.tier_governor,
         }
     }
 }
@@ -144,6 +146,8 @@ pub struct RunPanelInput {
     pub backlog_s: Option<f64>,
     pub active_mechanical_revs: Option<usize>,
     pub solver_mode: Option<SolverMode>,
+    /// `None` when the scene has no tier governor.
+    pub tier_governor: Option<GovernorReading>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -159,6 +163,8 @@ pub struct RunPanelSnapshot {
     pub cost_samples: usize,
     pub active_mechanical_revs: Option<usize>,
     pub solver_mode: Option<SolverMode>,
+    /// `None` when the scene has no tier governor.
+    pub tier_governor: Option<GovernorReading>,
 }
 
 fn ms(value: Option<f64>) -> String {
@@ -198,6 +204,7 @@ impl RunPanelSnapshot {
                 self.cost_samples
             ),
             format!("Active mechanical REVs {revs}   Solver: {mode}"),
+            GovernorReading::line(self.tier_governor.as_ref()),
         ]
     }
 
@@ -219,6 +226,7 @@ impl RunPanelSnapshot {
             },
             "active_mechanical_revs": self.active_mechanical_revs,
             "solver_mode": self.solver_mode.map(SolverMode::key),
+            "tier_governor": GovernorReading::to_json(self.tier_governor.as_ref()),
         })
     }
 }
@@ -235,6 +243,7 @@ mod tests {
             backlog_s: Some(0.25),
             active_mechanical_revs: Some(512),
             solver_mode: Some(SolverMode::CellRotations),
+            tier_governor: None,
         }
     }
 
@@ -331,6 +340,7 @@ mod tests {
             backlog_s: Some(f64::NAN),
             active_mechanical_revs: None,
             solver_mode: None,
+            tier_governor: None,
         });
         let lines = snapshot.lines().join("\n");
         assert!(lines.contains("State Pause   World speed —"), "{lines}");
@@ -369,5 +379,40 @@ mod tests {
         assert!(frame.cell_rotations);
         assert_eq!(SolverMode::from_cell_rotations(frame.cell_rotations), SolverMode::CellRotations);
         assert_eq!(SolverMode::from_cell_rotations(false).name(), "translation only");
+    }
+}
+
+#[cfg(test)]
+mod governor_tests {
+    use super::*;
+    use crate::physics_tiers::PlanReading;
+
+    #[test]
+    fn the_governor_is_part_of_the_run_panel_lines_and_json() {
+        let input = |reading| RunPanelInput {
+            state: RunState::Run,
+            requested_speed: 1.0,
+            measured_speed: Some(1.0),
+            backlog_s: Some(0.0),
+            active_mechanical_revs: Some(10),
+            solver_mode: Some(SolverMode::CellRotations),
+            tier_governor: reading,
+        };
+        let off = RunPanel::new().snapshot(input(None));
+        assert_eq!(off.lines().last().unwrap(), "Tier governor: off");
+        assert_eq!(off.to_json()["tier_governor"], json!({"enabled": false}));
+
+        let reading = GovernorReading {
+            governed_beams: 3,
+            plan: Some(PlanReading { total_cost_ms: 4.25, budget_ms: 5.0, overloaded: false, over_tolerance_regions: 0 }),
+        };
+        let on = RunPanel::new().snapshot(input(Some(reading)));
+        assert_eq!(on.lines().len(), 5);
+        assert_eq!(on.lines().last().unwrap(), "Tier governor: 3 governed beams, plan 4.25 / 5.00 ms");
+        let json = on.to_json();
+        assert_eq!(json["tier_governor"]["enabled"], true);
+        assert_eq!(json["tier_governor"]["governed_beam_count"], 3);
+        assert_eq!(json["tier_governor"]["plan"]["total_cost_ms"], 4.25);
+        assert_eq!(json["tier_governor"]["plan"]["overloaded"], false);
     }
 }

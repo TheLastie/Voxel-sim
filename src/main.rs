@@ -26,6 +26,7 @@ use tool::{Shape, Tool};
 use ui::{EditorInfo, EditorTool, ReticleState, SceneSelectionMode, Ui, UiAction};
 use voxel_physics_lab::world::{GeneratedWorld, GrowthScheduler, WorldCharacter, WORLD_SIDE_M};
 use voxel_physics_lab::creature_inspector::{inspect as inspect_creature, CreatureFile, NamedCreature};
+use voxel_physics_lab::physics_tiers::{GovernorReading, TierPatch, TierSettings};
 use voxel_physics_lab::run_panel::{RunPanel, RunPanelInput, RunState, SolverMode};
 use voxel_physics_lab::scene_chemistry::ChemistrySettings;
 use voxel_physics_lab::scene_welding::ThermalBondingSettings;
@@ -512,6 +513,41 @@ fn edit_scene_chemistry(
     Ok((next, message))
 }
 
+/// The settings change a Physics tiers control asks for.
+fn tier_patch_from_action(action: &UiAction) -> Result<TierPatch, String> {
+    match action {
+        UiAction::SetPhysicsTiersEnabled(enabled) => Ok(TierPatch::enabled(*enabled)),
+        UiAction::SetPhysicsTiersValue { field, value } => TierPatch::field(*field, *value),
+        _ => Err("not a physics tier action".to_owned()),
+    }
+}
+
+/// Change the physics tier governor settings of the open scene. This is the
+/// window's side of the API shared with the MCP `set_scene_physics_tiers`
+/// tool (`TierSettings`). The result is validated, applied to `scene` and then
+/// written beside the scene; an error leaves settings, scene and file as they were.
+fn edit_scene_tiers(
+    current: &TierSettings,
+    patch: TierPatch,
+    scene_path: Option<&Path>,
+    scene: &mut Scene,
+) -> Result<(TierSettings, String), String> {
+    let next = current.updated(patch)?;
+    next.apply(scene)?;
+    let mut message = format!("Physics tiers: {}", next.summary());
+    match scene_path {
+        Some(path) => {
+            if let Err(error) = next.save(path) {
+                let _ = current.apply(scene);
+                return Err(error);
+            }
+            message.push_str(" (saved)");
+        }
+        None => message.push_str(" (save the scene to keep it)"),
+    }
+    Ok((next, message))
+}
+
 /// The edit a Chemistry control asks for; `pick_recipe` runs the file dialog
 /// of "Load recipe…" and returns `None` when it is cancelled.
 fn chemistry_edit_from_action(
@@ -660,6 +696,119 @@ mod chemistry_window_tests {
     }
 }
 
+
+#[cfg(test)]
+mod physics_tier_window_tests {
+    use super::*;
+    use voxel_physics_lab::documents::save_document;
+    use voxel_physics_lab::physics_tiers::TierField;
+
+    fn project(name: &str) -> (PathBuf, PathBuf, Scene) {
+        let dir = PathBuf::from(format!(
+            "E:/voxel-window-tiers-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let scene_path = dir.join("bar.vxscene");
+        let document = SceneDocument::new("bar", SceneConfig::default()).unwrap();
+        save_document(&scene_path, &document).unwrap();
+        let scene = document.build_scene(&scene_path).unwrap();
+        (dir, scene_path, scene)
+    }
+
+    #[test]
+    fn tier_actions_map_to_patches() {
+        assert_eq!(
+            tier_patch_from_action(&UiAction::SetPhysicsTiersEnabled(true)).unwrap(),
+            TierPatch::enabled(true)
+        );
+        assert_eq!(
+            tier_patch_from_action(&UiAction::SetPhysicsTiersValue { field: TierField::BudgetMs, value: 2.0 })
+                .unwrap()
+                .budget_ms,
+            Some(2.0)
+        );
+        assert!(tier_patch_from_action(&UiAction::SetPhysicsTiersValue { field: TierField::IntervalSteps, value: 1.5 }).is_err());
+        assert!(tier_patch_from_action(&UiAction::FrameSelection).is_err());
+    }
+
+    #[test]
+    fn window_edits_configure_the_scene_governor_and_are_saved_where_the_mcp_tool_reads_them() {
+        let (dir, scene_path, mut scene) = project("edits");
+        let mut settings = TierSettings::default();
+        for patch in [
+            TierPatch::enabled(true),
+            TierPatch::field(TierField::BudgetMs, 2.0).unwrap(),
+            TierPatch::field(TierField::IntervalSteps, 5.0).unwrap(),
+        ] {
+            let (next, message) = edit_scene_tiers(&settings, patch, Some(&scene_path), &mut scene).unwrap();
+            assert!(message.contains("(saved)"), "{message}");
+            settings = next;
+        }
+        assert!(GovernorReading::from_scene(&scene).is_some(), "the scene's governor is on");
+        let saved = TierSettings::load(&scene_path).unwrap();
+        assert_eq!(saved, settings);
+        assert_eq!((saved.enabled, saved.budget_ms, saved.interval_steps), (true, 2.0, 5));
+
+        let (off, _) = edit_scene_tiers(&settings, TierPatch::enabled(false), Some(&scene_path), &mut scene).unwrap();
+        assert!(GovernorReading::from_scene(&scene).is_none());
+        assert_eq!(TierSettings::load(&scene_path).unwrap(), off);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_tier_edits_change_nothing() {
+        let (dir, scene_path, mut scene) = project("errors");
+        let (settings, _) =
+            edit_scene_tiers(&TierSettings::default(), TierPatch::enabled(true), Some(&scene_path), &mut scene).unwrap();
+        let file = TierSettings::sidecar_path(&scene_path);
+        let saved = std::fs::read_to_string(&file).unwrap();
+        for patch in [
+            TierPatch { budget_ms: Some(0.0), ..Default::default() },
+            TierPatch { tolerance: Some(2.0), ..Default::default() },
+            TierPatch { interval_steps: Some(0), ..Default::default() },
+            TierPatch { beam_substeps: Some(0), ..Default::default() },
+        ] {
+            assert!(edit_scene_tiers(&settings, patch, Some(&scene_path), &mut scene).is_err(), "{patch:?}");
+            assert!(GovernorReading::from_scene(&scene).is_some());
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), saved);
+        }
+        // A directory that cannot take the file: the error is reported and the scene keeps its settings.
+        let missing = dir.join("no_such_dir").join("x.vxscene");
+        let error = edit_scene_tiers(&settings, TierPatch::enabled(false), Some(&missing), &mut scene).unwrap_err();
+        assert!(error.contains("cannot write"), "{error}");
+        assert!(GovernorReading::from_scene(&scene).is_some(), "the previous governor is back on the scene");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unsaved_scene_applies_now_and_the_sidecar_appears_when_saved() {
+        let (dir, scene_path, mut scene) = project("unsaved");
+        let (settings, message) =
+            edit_scene_tiers(&TierSettings::default(), TierPatch::enabled(true), None, &mut scene).unwrap();
+        assert!(message.contains("save the scene"), "{message}");
+        assert!(!TierSettings::sidecar_path(&scene_path).exists());
+        assert!(GovernorReading::from_scene(&scene).is_some());
+        settings.save(&scene_path).unwrap();
+        assert_eq!(TierSettings::load(&scene_path).unwrap(), settings);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_run_start_hands_the_saved_settings_to_the_worker_and_its_frame_reports_them() {
+        let (dir, scene_path, mut scene) = project("run");
+        let settings = TierSettings::default()
+            .updated(TierPatch { enabled: Some(true), interval_steps: Some(1), ..Default::default() })
+            .unwrap();
+        settings.save(&scene_path).unwrap();
+        // What the event loop does when a run starts.
+        TierSettings::load(&scene_path).unwrap().apply(&mut scene).unwrap();
+        let worker = PhysicsWorker::new(scene).unwrap();
+        assert!(worker.frame.tier_governor.is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
 #[cfg(test)]
 mod scene_instance_edit_tests {
     use super::*;
@@ -4199,6 +4348,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                                 | UiAction::SaveSceneMaterial | UiAction::CreateSceneMaterial
                                 | UiAction::SetChemistryEnabled(_) | UiAction::SetChemistryInterval { .. }
                                 | UiAction::ChooseChemistryRecipe | UiAction::UseBuiltinChemistryRecipes
+                                | UiAction::SetPhysicsTiersEnabled(_) | UiAction::SetPhysicsTiersValue { .. }
                                 | UiAction::CreateImpactScene { .. })) => pending_scene_action = Some(action),
                             Some(UiAction::Shape(shape)) => {
                                 if mode == AppMode::Interactive && generated_world.is_none() {
@@ -4314,6 +4464,17 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                                                     }
                                                 }
                                                 ui.scene_chemistry = moved;
+                                                // Physics tier settings have no relative paths: write them as they are.
+                                                if ui.scene_tiers != TierSettings::default()
+                                                    || TierSettings::sidecar_path(&path).exists()
+                                                {
+                                                    if let Err(error) = ui.scene_tiers.save(&path) {
+                                                        eprintln!("physics tier settings: {error}");
+                                                        ui.set_status_message(format!(
+                                                            "Error: scene saved, but its physics tier settings were not: {error}"
+                                                        ));
+                                                    }
+                                                }
                                                 chemistry_synced_for = Some(Some(path.clone()));
                                             }
                                             Err(error) => {
@@ -6308,6 +6469,33 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                                     });
                                 }
                             }
+                            action @ (UiAction::SetPhysicsTiersEnabled(_) | UiAction::SetPhysicsTiersValue { .. }) => {
+                                let patch = tier_patch_from_action(&action);
+                                let result = if authored_physics.is_some() {
+                                    Err("Press R to restore the authored scene before changing physics tiers.".to_owned())
+                                } else if active_scene_document.is_none() {
+                                    Err("Open a scene first.".to_owned())
+                                } else {
+                                    patch.and_then(|patch| {
+                                        edit_scene_tiers(
+                                            &ui.scene_tiers,
+                                            patch,
+                                            active_scene_document_path.as_deref(),
+                                            &mut scene,
+                                        )
+                                    })
+                                };
+                                match result {
+                                    Ok((settings, message)) => {
+                                        ui.scene_tiers = settings;
+                                        ui.set_status_message(message);
+                                    }
+                                    Err(error) => {
+                                        eprintln!("physics tiers: {error}");
+                                        ui.set_status_message(format!("Error: {error}"));
+                                    }
+                                }
+                            }
                             action @ (UiAction::SetChemistryEnabled(_)
                                 | UiAction::SetChemistryInterval { .. }
                                 | UiAction::ChooseChemistryRecipe
@@ -6547,6 +6735,13 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                             }),
                             None => ChemistrySettings::default(),
                         };
+                        ui.scene_tiers = match active_scene_document_path.as_deref() {
+                            Some(path) => TierSettings::load(path).unwrap_or_else(|error| {
+                                ui.set_status_message(format!("Error: {error}"));
+                                TierSettings::default()
+                            }),
+                            None => TierSettings::default(),
+                        };
                         chemistry_synced_for = chemistry_scene;
                     }
                     if active_scene_document.is_none() {
@@ -6561,7 +6756,8 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                             // (a restored or reloaded scene starts without them).
                             let applied = ui
                                 .scene_chemistry
-                                .apply(&mut scene, active_scene_document_path.as_deref());
+                                .apply(&mut scene, active_scene_document_path.as_deref())
+                                .and_then(|()| ui.scene_tiers.apply(&mut scene));
                             if let Err(error) = &applied {
                                 ui.paused = true;
                                 ui.set_status_message(format!(
@@ -6937,11 +7133,12 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                             (physics.is_some() && rate_valid).then_some(speed),
                         );
                         // Run panel: the same values the MCP `get_run_panel` tool serves.
-                        let (mechanical_revs, cell_rotations) = match physics {
-                            Some(worker) => (worker.frame.mechanical_revs, worker.frame.cell_rotations),
+                        let (mechanical_revs, cell_rotations, tier_governor) = match physics {
+                            Some(worker) => (worker.frame.mechanical_revs, worker.frame.cell_rotations, worker.frame.tier_governor),
                             None => (
                                 solver::mechanical_rev_count(&scene),
                                 solver::uses_cell_rotations(&scene),
+                                GovernorReading::from_scene(&scene),
                             ),
                         };
                         let run_panel_snapshot = run_panel.snapshot(RunPanelInput {
@@ -6951,6 +7148,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                             backlog_s: ui.physics_backlog_seconds,
                             active_mechanical_revs: Some(mechanical_revs),
                             solver_mode: Some(SolverMode::from_cell_rotations(cell_rotations)),
+                            tier_governor,
                         });
                         if runtime_metrics_server.is_some() {
                             voxel_physics_lab::runtime_metrics::publish(

@@ -138,6 +138,8 @@ pub struct PhysicsFrame {
     /// Solver mode for this scene: true for cell rotations, false for the
     /// translation-only solve. Read from `solver::uses_cell_rotations`.
     pub cell_rotations: bool,
+    /// The tier governor of the scene when it is enabled: governed beams and the latest plan.
+    pub tier_governor: Option<crate::physics_tiers::GovernorReading>,
 }
 
 /// Ordered clock increments are retained even when the solver runs slower
@@ -280,6 +282,7 @@ impl PhysicsFrame {
             broken: scene.broken,
             mechanical_revs: crate::solver::mechanical_rev_count(scene),
             cell_rotations: crate::solver::uses_cell_rotations(scene),
+            tier_governor: crate::physics_tiers::GovernorReading::from_scene(scene),
         })
     }
 }

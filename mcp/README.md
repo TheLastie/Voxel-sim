@@ -81,6 +81,18 @@ existing directory beneath that root. Parent directories are never created.
   settings file in place and atomically (it is a settings file, not an authored
   asset). It never edits the `.vxscene`. A running editor reads the file when
   it opens the scene.
+- `get_scene_physics_tiers`, `set_scene_physics_tiers` — the editor's **Physics
+  tiers** section: the automatic tier governor that puts clamped slender parts
+  on the beam tier when the fine solver would exceed its budget
+  (`Scene::enable_tier_governor`). Settings (`enabled`, `budget_ms` per fixed
+  step, `cell_ms_per_rev`, `tolerance` as a fraction, `interval_steps`,
+  `beam_substeps`) live in `<scene>.physics.json` beside the `.vxscene`; without
+  the file the governor is off. `set_scene_physics_tiers` takes any subset,
+  validates the whole result together, applies it to a scratch scene and only
+  then updates the file in place (atomically); an invalid value changes
+  nothing. The editor applies the file when a run starts. The live result,
+  governed beam count and the latest plan (total cost against budget,
+  `overloaded`), is the `tier_governor` object of `get_run_panel`.
 - `inspect_creatures` — read-only creature inspector for the scene's creatures,
   listed in `<scene>.creatures.json` (name, skeletal actuator index, genome,
   optional learned state). Reports the resource ledger (stored energy, work,

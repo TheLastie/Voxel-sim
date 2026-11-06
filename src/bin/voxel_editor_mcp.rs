@@ -20,6 +20,7 @@ use voxel_physics_lab::{
     model_export::export_obj,
     procedural_animation::{author_walk, WalkOptions},
     scene::{SceneBuilder, SceneConfig},
+    physics_tiers::{TierPatch, TierSettings},
     scene_chemistry::ChemistrySettings,
     voxel::Composition,
 };
@@ -256,7 +257,7 @@ fn initialize(params: &Value) -> Result<Value, (i64, String)> {
         "protocolVersion": LEGACY_PROTOCOL_VERSION,
         "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {"name":"voxel-editor-local","version":env!("CARGO_PKG_VERSION")},
-        "instructions":"File tools operate on saved .vxm/.vxscene/.obj/.glb files beneath the configured project root; mutations write new files and refuse overwrite. get_runtime_status, read_runtime_metrics, get_runtime_objects and get_run_panel are read-only queries to the running native engine and do not edit live state. get_scene_chemistry, set_scene_chemistry and inspect_creatures work on the scene files beside a .vxscene."
+        "instructions":"File tools operate on saved .vxm/.vxscene/.obj/.glb files beneath the configured project root; mutations write new files and refuse overwrite. get_runtime_status, read_runtime_metrics, get_runtime_objects and get_run_panel are read-only queries to the running native engine and do not edit live state. get_scene_chemistry, set_scene_chemistry, get_scene_physics_tiers, set_scene_physics_tiers and inspect_creatures work on the scene files beside a .vxscene."
     }))
 }
 
@@ -295,6 +296,8 @@ fn tool_definitions() -> Vec<Value> {
         tool_definition("get_scene_chemistry", "Read a scene's chemistry settings (reactions on or off, interval in simulated seconds, recipe file) from <scene>.chemistry.json beside the .vxscene and check that the recipe file still loads against the scene's material table. A scene without the file reports the defaults (reactions off, built-in recipes). Read-only.", json!({"type":"object","properties":{"scene_path":{"type":"string","description":"Project-relative .vxscene."}},"required":["scene_path"],"additionalProperties":false}), true),
         tool_definition("set_scene_chemistry", "Change a scene's chemistry settings, the same operation as the editor's Chemistry section: enabled turns reactions on or off, interval_s sets the simulated time between reaction updates (0 = every step), recipe_path loads a recipe JSON (see recipes/wood_rot.json; it replaces the built-in recipes) and use_builtin_recipes returns to the built-in ones. The recipe is parsed and resolved against the scene's materials and the result is applied to a scratch scene before anything is written. Updates <scene>.chemistry.json in place (atomically); it never edits the .vxscene. A running editor reads the file when it opens the scene.", json!({"type":"object","properties":{"scene_path":{"type":"string"},"enabled":{"type":"boolean"},"interval_s":{"type":"number","minimum":0,"maximum":31557600},"recipe_path":{"type":"string","description":"Project-relative recipe .json."},"use_builtin_recipes":{"type":"boolean"}},"required":["scene_path"],"additionalProperties":false}), false),
         tool_definition("inspect_creatures", "Read-only creature inspector: for each creature listed in <scene>.creatures.json beside the .vxscene, report the resource ledger (stored energy, work, heat), every sensor channel with its unit and value, the sensor read cost counters and the network size and cost counters. A scene without that file has no creatures and reports an empty list. Inspecting changes nothing; a creature the editor does not drive shows its birth ledger.", json!({"type":"object","properties":{"scene_path":{"type":"string","description":"Project-relative .vxscene."}},"required":["scene_path"],"additionalProperties":false}), true),
+        tool_definition("get_scene_physics_tiers", "Read a scene's physics tier governor settings (on or off, budget_ms per fixed step, cell_ms_per_rev, tolerance, interval_steps, beam_substeps) from <scene>.physics.json beside the .vxscene. A scene without the file reports the defaults with the governor off. The governor puts clamped slender parts on the beam tier when the fine solver would exceed the budget; live results (governed beam count, latest plan) are in get_run_panel. Read-only.", json!({"type":"object","properties":{"scene_path":{"type":"string","description":"Project-relative .vxscene."}},"required":["scene_path"],"additionalProperties":false}), true),
+        tool_definition("set_scene_physics_tiers", "Change a scene's physics tier governor settings, the same operation as the editor's Physics tiers section: enabled, budget_ms (0-1000, ms per fixed step), cell_ms_per_rev (0-100), tolerance (fraction, above 0 up to 1), interval_steps (1-1000000), beam_substeps (1-10000). All values are validated together and applied to a scratch scene before anything is written; an invalid value changes nothing. Updates <scene>.physics.json in place (atomically); it never edits the .vxscene. A running editor reads the file when it opens the scene and applies it when a run starts.", json!({"type":"object","properties":{"scene_path":{"type":"string"},"enabled":{"type":"boolean"},"budget_ms":{"type":"number","exclusiveMinimum":0,"maximum":1000},"cell_ms_per_rev":{"type":"number","exclusiveMinimum":0,"maximum":100},"tolerance":{"type":"number","exclusiveMinimum":0,"maximum":1},"interval_steps":{"type":"integer","minimum":1,"maximum":1000000},"beam_substeps":{"type":"integer","minimum":1,"maximum":10000}},"required":["scene_path"],"additionalProperties":false}), false),
     ]
 }
 
@@ -394,6 +397,8 @@ fn call_tool_validated(app: &App, name: &str, args: &Value) -> Value {
         "get_scene_chemistry" => get_scene_chemistry(app, &args),
         "set_scene_chemistry" => set_scene_chemistry(app, &args),
         "inspect_creatures" => inspect_creatures(app, &args),
+        "get_scene_physics_tiers" => get_scene_physics_tiers(app, &args),
+        "set_scene_physics_tiers" => set_scene_physics_tiers(app, &args),
         _ => return tool_error(&format!("unknown tool: {name}")),
     };
     match result {
@@ -552,6 +557,44 @@ fn set_scene_chemistry(app: &App, args: &Value) -> Result<Value, String> {
     let recipes = settings.check_recipe(Some(&scene_path), &scratch.materials);
     settings.save(&scene_path)?;
     Ok(chemistry_result(app, &scene_path, &settings, recipes))
+}
+
+fn tiers_result(app: &App, scene_path: &Path, settings: &TierSettings) -> Value {
+    json!({
+        "scene_path": relative(&app.root, scene_path),
+        "settings_file": relative(&app.root, &TierSettings::sidecar_path(scene_path)),
+        "settings": settings.to_json(),
+        "summary": settings.summary(),
+    })
+}
+
+fn get_scene_physics_tiers(app: &App, args: &Value) -> Result<Value, String> {
+    let scene_path = scene_document_path(app, args)?;
+    let _: SceneDocument = load_document(&scene_path)?;
+    let settings = TierSettings::load(&scene_path)?;
+    Ok(tiers_result(app, &scene_path, &settings))
+}
+
+fn set_scene_physics_tiers(app: &App, args: &Value) -> Result<Value, String> {
+    let scene_path = scene_document_path(app, args)?;
+    let patch = TierPatch {
+        enabled: args.get("enabled").and_then(Value::as_bool),
+        budget_ms: args.get("budget_ms").and_then(Value::as_f64),
+        cell_ms_per_rev: args.get("cell_ms_per_rev").and_then(Value::as_f64),
+        tolerance: args.get("tolerance").and_then(Value::as_f64),
+        interval_steps: args.get("interval_steps").and_then(Value::as_u64).map(|v| v.min(u64::from(u32::MAX)) as u32),
+        beam_substeps: args.get("beam_substeps").and_then(Value::as_u64).map(|v| v as usize),
+    };
+    if patch.is_empty() {
+        return Err("give at least one of enabled, budget_ms, cell_ms_per_rev, tolerance, interval_steps, beam_substeps".into());
+    }
+    let document: SceneDocument = load_document(&scene_path)?;
+    let mut scratch = document.build_scene(&scene_path)?;
+    let current = TierSettings::load(&scene_path)?;
+    let next = current.updated(patch)?;
+    next.apply(&mut scratch)?;
+    next.save(&scene_path)?;
+    Ok(tiers_result(app, &scene_path, &next))
 }
 
 fn inspect_creatures(app: &App, args: &Value) -> Result<Value, String> {
@@ -2445,6 +2488,7 @@ mod editor_controls_tests {
 
     #[test]
     fn get_run_panel_reads_what_the_editor_publishes() {
+        let _guard = RUN_PANEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = PathBuf::from(format!(
             "E:/voxel-editor-mcp-runpanel-test-{}-{}",
             std::process::id(),
@@ -2467,6 +2511,7 @@ mod editor_controls_tests {
             backlog_s: Some(0.02),
             active_mechanical_revs: Some(2048),
             solver_mode: Some(SolverMode::CellRotations),
+            tier_governor: None,
         });
         voxel_physics_lab::runtime_metrics::publish("run_panel", snapshot.to_json());
 
@@ -2490,6 +2535,7 @@ mod editor_controls_tests {
             backlog_s: None,
             active_mechanical_revs: Some(2048),
             solver_mode: Some(SolverMode::TranslationOnly),
+            tier_governor: None,
         });
         voxel_physics_lab::runtime_metrics::publish("run_panel", paused.to_json());
         let latest = ok(&app, "get_run_panel", json!({}));
@@ -2510,3 +2556,190 @@ mod editor_controls_tests {
         app()
     }
 }
+
+#[cfg(test)]
+mod physics_tier_tool_tests {
+    use super::*;
+    use voxel_physics_lab::{
+        physics_tiers::{GovernorReading, PlanReading},
+        run_panel::{RunPanel, RunPanelInput, RunState, SolverMode},
+    };
+
+    fn app() -> App {
+        let root = PathBuf::from(format!(
+            "E:/tiers-mcp-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        fs::write(root.join(SETTINGS_FILE), json!({"version":1,"mcp_enabled":true}).to_string()).unwrap();
+        App { root }
+    }
+
+    fn call(app: &App, name: &str, arguments: Value) -> Value {
+        call_tool(app, &json!({"name":name,"arguments":arguments})).unwrap()
+    }
+
+    fn ok(app: &App, name: &str, arguments: Value) -> Value {
+        let result = call(app, name, arguments);
+        assert_ne!(result["isError"], true, "{name} failed: {}", result["content"][0]["text"]);
+        result["structuredContent"].clone()
+    }
+
+    fn error_text(app: &App, name: &str, arguments: Value) -> String {
+        let result = call(app, name, arguments);
+        assert_eq!(result["isError"], true, "{name} unexpectedly succeeded");
+        result["content"][0]["text"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn tier_tools_are_listed_with_strict_schemas() {
+        let tools = tool_definitions();
+        for (name, read_only) in [("get_scene_physics_tiers", true), ("set_scene_physics_tiers", false)] {
+            let definition = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            assert_eq!(definition["annotations"]["readOnlyHint"], read_only);
+            assert_eq!(definition["inputSchema"]["additionalProperties"], false);
+        }
+        for bad in [
+            json!({"scene_path":"a.vxscene","budget_ms":0}),
+            json!({"scene_path":"a.vxscene","budget_ms":2000}),
+            json!({"scene_path":"a.vxscene","tolerance":1.5}),
+            json!({"scene_path":"a.vxscene","interval_steps":0}),
+            json!({"scene_path":"a.vxscene","interval_steps":2.5}),
+            json!({"scene_path":"a.vxscene","beam_substeps":-1}),
+            json!({"scene_path":"a.vxscene","enabled":1}),
+            json!({"budget_ms":1.0}),
+            json!({"scene_path":"a.vxscene","extra":true}),
+        ] {
+            assert!(validate_tool_arguments("set_scene_physics_tiers", &bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn tier_tools_write_the_settings_the_window_reads_and_apply_to_a_scene() {
+        let app = app();
+        ok(&app, "create_scene", json!({"output_path":"bar.vxscene"}));
+        let before = ok(&app, "get_scene_physics_tiers", json!({"scene_path":"bar.vxscene"}));
+        assert_eq!(before["settings"], TierSettings::default().to_json());
+        assert_eq!(before["settings"]["enabled"], false);
+        assert!(!app.root.join("bar.physics.json").exists(), "reading must not create the file");
+
+        let set = ok(
+            &app,
+            "set_scene_physics_tiers",
+            json!({"scene_path":"bar.vxscene","enabled":true,"budget_ms":2.0,"interval_steps":4}),
+        );
+        assert_eq!(set["settings"]["enabled"], true);
+        assert_eq!(set["settings"]["budget_ms"], 2.0);
+        assert_eq!(set["settings"]["interval_steps"], 4);
+        assert_eq!(set["settings"]["beam_substeps"], 40, "unchanged values keep their defaults");
+        assert_eq!(set["settings_file"], "bar.physics.json");
+
+        // The editor's loader reads exactly this and applies it through the engine.
+        let scene_path = app.root.join("bar.vxscene");
+        let loaded = TierSettings::load(&scene_path).unwrap();
+        assert!(loaded.enabled && loaded.budget_ms == 2.0 && loaded.interval_steps == 4);
+        let document: SceneDocument = load_document(&scene_path).unwrap();
+        let mut scene = document.build_scene(&scene_path).unwrap();
+        loaded.apply(&mut scene).unwrap();
+        assert!(voxel_physics_lab::physics_tiers::GovernorReading::from_scene(&scene).is_some());
+
+        // A partial change keeps the rest, and it works in a batch.
+        let batch = ok(
+            &app,
+            "batch_actions",
+            json!({"actions":[
+                {"id":"set","name":"set_scene_physics_tiers","arguments":{"scene_path":"bar.vxscene","tolerance":0.2,"cell_ms_per_rev":0.3,"beam_substeps":10}},
+                {"id":"get","name":"get_scene_physics_tiers","arguments":{"scene_path":"bar.vxscene"}}
+            ]}),
+        );
+        let settings = &batch["results"][1]["result"]["settings"];
+        assert_eq!((settings["tolerance"].as_f64(), settings["cell_ms_per_rev"].as_f64()), (Some(0.2), Some(0.3)));
+        assert_eq!((settings["budget_ms"].as_f64(), settings["beam_substeps"].as_u64()), (Some(2.0), Some(10)));
+        let off = ok(&app, "set_scene_physics_tiers", json!({"scene_path":"bar.vxscene","enabled":false}));
+        assert_eq!(off["settings"]["enabled"], false);
+        assert_eq!(off["settings"]["tolerance"], 0.2);
+        let _ = fs::remove_dir_all(app.root);
+    }
+
+    #[test]
+    fn invalid_tier_requests_are_errors_and_change_nothing() {
+        let app = app();
+        ok(&app, "create_scene", json!({"output_path":"bar.vxscene"}));
+        ok(&app, "set_scene_physics_tiers", json!({"scene_path":"bar.vxscene","enabled":true,"budget_ms":3.0}));
+        let file = app.root.join("bar.physics.json");
+        let saved = fs::read_to_string(&file).unwrap();
+
+        // A bad value next to good ones changes none of them.
+        let bad_mix = json!({"scene_path":"bar.vxscene","budget_ms":1.0,"tolerance":0.0});
+        assert!(validate_tool_arguments("set_scene_physics_tiers", &bad_mix).is_err());
+        assert!(error_text(&app, "set_scene_physics_tiers", json!({"scene_path":"bar.vxscene"})).contains("at least one"));
+        assert!(error_text(&app, "set_scene_physics_tiers", json!({"scene_path":"missing.vxscene","enabled":true})).contains("resolve"));
+        assert!(error_text(&app, "set_scene_physics_tiers", json!({"scene_path":"../x.vxscene","enabled":true})).contains("x.vxscene"));
+        ok(&app, "create_model", json!({"output_path":"m.vxm"}));
+        assert!(error_text(&app, "set_scene_physics_tiers", json!({"scene_path":"m.vxm","enabled":true})).contains(".vxscene"));
+        assert_eq!(fs::read_to_string(&file).unwrap(), saved);
+
+        // A damaged settings file is reported by both tools and left alone.
+        fs::write(&file, "garbage").unwrap();
+        assert!(error_text(&app, "get_scene_physics_tiers", json!({"scene_path":"bar.vxscene"})).contains("physics.json"));
+        assert!(error_text(&app, "set_scene_physics_tiers", json!({"scene_path":"bar.vxscene","enabled":false})).contains("physics.json"));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "garbage");
+        let _ = fs::remove_dir_all(app.root);
+    }
+
+    #[test]
+    fn get_run_panel_carries_the_governor_reading() {
+        let _guard = RUN_PANEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = PathBuf::from(format!(
+            "E:/voxel-editor-mcp-tier-panel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let server = voxel_physics_lab::runtime_metrics::start_server(&root).unwrap();
+        let app = App { root: root.clone() };
+        let reading = GovernorReading {
+            governed_beams: 2,
+            plan: Some(PlanReading { total_cost_ms: 6.5, budget_ms: 5.0, overloaded: true, over_tolerance_regions: 1 }),
+        };
+        let snapshot = RunPanel::new().snapshot(RunPanelInput {
+            state: RunState::Run,
+            requested_speed: 1.0,
+            measured_speed: Some(1.0),
+            backlog_s: Some(0.0),
+            active_mechanical_revs: Some(100),
+            solver_mode: Some(SolverMode::CellRotations),
+            tier_governor: Some(reading),
+        });
+        voxel_physics_lab::runtime_metrics::publish("run_panel", snapshot.to_json());
+        let result = ok(&app, "get_run_panel", json!({}));
+        let governor = &result["run_panel"]["tier_governor"];
+        assert_eq!(governor["enabled"], true);
+        assert_eq!(governor["governed_beam_count"], 2);
+        assert_eq!(governor["plan"]["total_cost_ms"], 6.5);
+        assert_eq!(governor["plan"]["budget_ms"], 5.0);
+        assert_eq!(governor["plan"]["overloaded"], true);
+        assert_eq!(result["run_panel"], snapshot.to_json());
+
+        let off = RunPanel::new().snapshot(RunPanelInput {
+            state: RunState::Pause,
+            requested_speed: 1.0,
+            measured_speed: None,
+            backlog_s: None,
+            active_mechanical_revs: None,
+            solver_mode: None,
+            tier_governor: None,
+        });
+        voxel_physics_lab::runtime_metrics::publish("run_panel", off.to_json());
+        let result = ok(&app, "get_run_panel", json!({}));
+        assert_eq!(result["run_panel"]["tier_governor"], json!({"enabled": false}));
+        drop(server);
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+/// The telemetry ring is process-global: tests that publish and then read the
+/// latest run panel must not interleave.
+#[cfg(test)]
+static RUN_PANEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

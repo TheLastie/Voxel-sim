@@ -18,6 +18,7 @@ pub mod fracture;
 pub mod impact_experiment;
 pub mod live_test_feed;
 pub mod live_tests;
+pub mod physics_tiers;
 pub mod run_panel;
 pub mod runtime_metrics;
 pub mod material;
