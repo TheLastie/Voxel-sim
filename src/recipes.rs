@@ -961,6 +961,17 @@ impl Scene {
         Ok(())
     }
 
+    /// Time between reaction updates of the fixed-step hook, seconds (read-only).
+    pub fn chemistry_interval_seconds(&self) -> f64 {
+        self.chemistry_interval_s
+    }
+
+    /// Whether a recipe registry was set with [`Scene::set_chemistry_registry`]
+    /// (otherwise the built-in recipes are used) (read-only).
+    pub fn has_custom_chemistry_registry(&self) -> bool {
+        self.chemistry_registry.is_some()
+    }
+
     /// Time between reaction updates of the fixed-step hook, seconds; `0`
     /// reacts at every fixed step. Pending time is kept.
     pub fn set_chemistry_interval(&mut self, interval_s: f64) -> Result<(), &'static str> {

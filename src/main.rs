@@ -25,6 +25,9 @@ use std::{
 use tool::{Shape, Tool};
 use ui::{EditorInfo, EditorTool, ReticleState, SceneSelectionMode, Ui, UiAction};
 use voxel_physics_lab::world::{GeneratedWorld, GrowthScheduler, WorldCharacter, WORLD_SIDE_M};
+use voxel_physics_lab::creature_inspector::{inspect as inspect_creature, CreatureFile, NamedCreature};
+use voxel_physics_lab::run_panel::{RunPanel, RunPanelInput, RunState, SolverMode};
+use voxel_physics_lab::scene_chemistry::ChemistrySettings;
 use voxel_physics_lab::scene_welding::ThermalBondingSettings;
 use voxel_physics_lab::world_physics::{self, GrabTarget, PhysicsFrame, PhysicsWorker};
 use winit::{
@@ -460,6 +463,201 @@ fn apply_scene_instance_edit(
     ui.show_bonds = false;
     ui.editor_tool = EditorTool::Select;
     Ok(())
+}
+
+/// What the Chemistry controls of the inspector ask for.
+#[derive(Clone, Debug, PartialEq)]
+enum ChemistryEdit {
+    Enabled(bool),
+    Interval(f64),
+    Recipe(PathBuf),
+    BuiltinRecipes,
+}
+
+/// Change the chemistry of the open scene. This is the window's side of the
+/// API shared with the MCP `set_scene_chemistry` tool: both use
+/// `ChemistrySettings`. The settings are checked and applied to `scene` first
+/// and written beside the scene only when that worked, so an error leaves the
+/// saved file, the settings and the scene as they were.
+fn edit_scene_chemistry(
+    current: &ChemistrySettings,
+    edit: ChemistryEdit,
+    scene_path: Option<&Path>,
+    scene: &mut Scene,
+) -> Result<(ChemistrySettings, String), String> {
+    let mut next = current.clone();
+    match edit {
+        ChemistryEdit::Enabled(enabled) => next.set_enabled(enabled),
+        ChemistryEdit::Interval(seconds) => next.set_interval(seconds)?,
+        ChemistryEdit::BuiltinRecipes => next.clear_recipe(),
+        ChemistryEdit::Recipe(recipe) => match scene_path {
+            Some(path) => next.set_recipe_file(path, &recipe, &scene.materials)?,
+            None => next.set_recipe_file_absolute(&recipe, &scene.materials)?,
+        },
+    }
+    // `apply` leaves the scene untouched when it fails; a failed write puts
+    // the previous settings back on the scene.
+    next.apply(scene, scene_path)?;
+    let mut message = format!("Chemistry: {}", next.summary());
+    match scene_path {
+        Some(path) => {
+            if let Err(error) = next.save(path) {
+                let _ = current.apply(scene, scene_path);
+                return Err(error);
+            }
+            message.push_str(" (saved)");
+        }
+        None => message.push_str(" (save the scene to keep it)"),
+    }
+    Ok((next, message))
+}
+
+/// The edit a Chemistry control asks for; `pick_recipe` runs the file dialog
+/// of "Load recipe…" and returns `None` when it is cancelled.
+fn chemistry_edit_from_action(
+    action: UiAction,
+    pick_recipe: impl FnOnce() -> Option<PathBuf>,
+) -> Option<ChemistryEdit> {
+    match action {
+        UiAction::SetChemistryEnabled(enabled) => Some(ChemistryEdit::Enabled(enabled)),
+        UiAction::SetChemistryInterval { seconds } => Some(ChemistryEdit::Interval(seconds)),
+        UiAction::UseBuiltinChemistryRecipes => Some(ChemistryEdit::BuiltinRecipes),
+        UiAction::ChooseChemistryRecipe => pick_recipe().map(ChemistryEdit::Recipe),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod chemistry_window_tests {
+    use super::*;
+    use voxel_physics_lab::documents::{save_document, EditorDocument};
+
+    fn project(name: &str) -> (PathBuf, PathBuf, Scene) {
+        let dir = PathBuf::from(format!(
+            "E:/voxel-window-chemistry-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let scene_path = dir.join("world.vxscene");
+        let document = SceneDocument::new("world", SceneConfig::default()).unwrap();
+        save_document(&scene_path, &document).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("recipes").join("wood_rot.json"),
+            dir.join("wood_rot.json"),
+        )
+        .unwrap();
+        let scene = document.build_scene(&scene_path).unwrap();
+        (dir, scene_path, scene)
+    }
+
+    #[test]
+    fn every_chemistry_action_maps_to_its_edit_and_other_actions_to_none() {
+        let never = || -> Option<PathBuf> { panic!("no dialog expected") };
+        assert_eq!(
+            chemistry_edit_from_action(UiAction::SetChemistryEnabled(true), never),
+            Some(ChemistryEdit::Enabled(true))
+        );
+        assert_eq!(
+            chemistry_edit_from_action(UiAction::SetChemistryInterval { seconds: 5.0 }, never),
+            Some(ChemistryEdit::Interval(5.0))
+        );
+        assert_eq!(
+            chemistry_edit_from_action(UiAction::UseBuiltinChemistryRecipes, never),
+            Some(ChemistryEdit::BuiltinRecipes)
+        );
+        assert_eq!(
+            chemistry_edit_from_action(UiAction::ChooseChemistryRecipe, || Some(PathBuf::from("r.json"))),
+            Some(ChemistryEdit::Recipe(PathBuf::from("r.json")))
+        );
+        assert_eq!(chemistry_edit_from_action(UiAction::ChooseChemistryRecipe, || None), None);
+        assert_eq!(chemistry_edit_from_action(UiAction::FrameSelection, never), None);
+    }
+
+    #[test]
+    fn window_edits_apply_to_the_scene_and_are_saved_where_the_mcp_tool_reads_them() {
+        let (dir, scene_path, mut scene) = project("edits");
+        let mut settings = ChemistrySettings::default();
+        let steps = [
+            ChemistryEdit::Enabled(true),
+            ChemistryEdit::Interval(600.0),
+            ChemistryEdit::Recipe(dir.join("wood_rot.json")),
+        ];
+        for edit in steps {
+            let (next, message) = edit_scene_chemistry(&settings, edit, Some(&scene_path), &mut scene).unwrap();
+            assert!(message.contains("(saved)"), "{message}");
+            settings = next;
+        }
+        assert!(scene.chemistry_enabled);
+        let saved = ChemistrySettings::load(&scene_path).unwrap();
+        assert_eq!(saved, settings);
+        assert_eq!(saved.interval_s, 600.0);
+        assert_eq!(saved.recipe_file.as_deref(), Some("wood_rot.json"));
+
+        let (builtin, _) =
+            edit_scene_chemistry(&settings, ChemistryEdit::BuiltinRecipes, Some(&scene_path), &mut scene).unwrap();
+        assert!(builtin.recipe_file.is_none());
+        let (off, _) =
+            edit_scene_chemistry(&builtin, ChemistryEdit::Enabled(false), Some(&scene_path), &mut scene).unwrap();
+        assert!(!scene.chemistry_enabled);
+        assert_eq!(ChemistrySettings::load(&scene_path).unwrap(), off);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_window_edits_show_an_error_and_change_nothing() {
+        let (dir, scene_path, mut scene) = project("errors");
+        let (settings, _) =
+            edit_scene_chemistry(&ChemistrySettings::default(), ChemistryEdit::Enabled(true), Some(&scene_path), &mut scene).unwrap();
+        let saved = std::fs::read_to_string(ChemistrySettings::sidecar_path(&scene_path)).unwrap();
+        std::fs::write(dir.join("broken.json"), "{ nope").unwrap();
+        for edit in [
+            ChemistryEdit::Interval(-1.0),
+            ChemistryEdit::Interval(f64::NAN),
+            ChemistryEdit::Recipe(dir.join("missing.json")),
+            ChemistryEdit::Recipe(dir.join("broken.json")),
+        ] {
+            let error = edit_scene_chemistry(&settings, edit.clone(), Some(&scene_path), &mut scene).unwrap_err();
+            assert!(!error.is_empty(), "{edit:?}");
+            assert!(scene.chemistry_enabled && scene.chemistry_interval_seconds() == 0.0, "{edit:?} touched the scene");
+            assert_eq!(std::fs::read_to_string(ChemistrySettings::sidecar_path(&scene_path)).unwrap(), saved);
+        }
+        // A scene whose directory cannot take the settings file reports it and keeps its settings.
+        let missing_dir = dir.join("no_such_dir").join("x.vxscene");
+        let error = edit_scene_chemistry(&ChemistrySettings::default(), ChemistryEdit::Enabled(true), Some(&missing_dir), &mut scene).unwrap_err();
+        assert!(error.contains("cannot write"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unsaved_scene_applies_now_and_moves_its_settings_when_saved() {
+        let (dir, scene_path, mut scene) = project("unsaved");
+        // Relative recipe paths need a scene file; an unsaved scene stores the absolute path.
+        let (settings, message) = edit_scene_chemistry(
+            &ChemistrySettings::default(),
+            ChemistryEdit::Recipe(dir.join("wood_rot.json")),
+            None,
+            &mut scene,
+        )
+        .unwrap();
+        assert!(message.contains("save the scene"), "{message}");
+        assert!(Path::new(settings.recipe_file.as_deref().unwrap()).is_absolute());
+        assert!(!ChemistrySettings::sidecar_path(&scene_path).exists());
+        let (settings, _) = edit_scene_chemistry(&settings, ChemistryEdit::Enabled(true), None, &mut scene).unwrap();
+        assert!(scene.chemistry_enabled);
+
+        // Saving the scene writes the settings beside it with a path relative to it.
+        let moved = settings.rebased(None, &scene_path);
+        assert_eq!(moved.recipe_file.as_deref(), Some("wood_rot.json"));
+        moved.save(&scene_path).unwrap();
+        let mut fresh = SceneDocument::new("world", SceneConfig::default()).unwrap().build_scene(&scene_path).unwrap();
+        ChemistrySettings::load(&scene_path).unwrap().apply(&mut fresh, Some(&scene_path)).unwrap();
+        assert!(fresh.chemistry_enabled && fresh.has_custom_chemistry_registry());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]
@@ -1779,6 +1977,23 @@ fn pick_voxel_model_document_path(
     } else {
         dialog.pick_file()
     };
+    ui.paused = was_paused;
+    *accumulator = 0.0;
+    *last = Instant::now();
+    path
+}
+
+fn pick_recipe_file_path(
+    ui: &mut Ui,
+    accumulator: &mut f64,
+    last: &mut Instant,
+) -> Option<PathBuf> {
+    let was_paused = ui.paused;
+    ui.paused = true;
+    *accumulator = 0.0;
+    let path = rfd::FileDialog::new()
+        .add_filter("Chemistry recipes (JSON)", &["json"])
+        .pick_file();
     ui.paused = was_paused;
     *accumulator = 0.0;
     *last = Instant::now();
@@ -3142,6 +3357,13 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
         mpsc::Receiver<Result<(SceneDocument, Scene, Option<PathBuf>), String>>,
     > = None;
     let mut authored_physics: Option<PhysicsWorker> = None;
+    let mut run_panel = RunPanel::new();
+    // Scene whose chemistry settings the UI shows: `None` until synced, then
+    // `Some(None)` for an unsaved scene and `Some(Some(path))` for a saved one.
+    let mut chemistry_synced_for: Option<Option<PathBuf>> = None;
+    // Creatures of the open scene (from `<scene>.creatures.json`) and what they were built for.
+    let mut scene_creatures: Vec<NamedCreature> = Vec::new();
+    let mut scene_creatures_key: Option<(PathBuf, usize, usize)> = None;
     let mut authored_render_source: Option<AuthoredPhysicsRenderSource> = None;
     let mut reported_physics_failure: Option<u64> = None;
     let mut fps = 0.0;
@@ -3975,6 +4197,8 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                                 | UiAction::SetSceneThermalBonding(_)
                                 | UiAction::CycleSceneMaterial | UiAction::LoadSceneMaterial
                                 | UiAction::SaveSceneMaterial | UiAction::CreateSceneMaterial
+                                | UiAction::SetChemistryEnabled(_) | UiAction::SetChemistryInterval { .. }
+                                | UiAction::ChooseChemistryRecipe | UiAction::UseBuiltinChemistryRecipes
                                 | UiAction::CreateImpactScene { .. })) => pending_scene_action = Some(action),
                             Some(UiAction::Shape(shape)) => {
                                 if mode == AppMode::Interactive && generated_world.is_none() {
@@ -4066,6 +4290,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                                         match result {
                                             Ok(saved) => {
                                                 active_scene_document = Some(saved);
+                                                let previous_scene_path = active_scene_document_path.clone();
                                                 active_scene_document_path = Some(path.clone());
                                                 ui.set_status_message(format!(
                                                     "Saved authored scene; live physics is not a checkpoint: {}",
@@ -4073,6 +4298,23 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                                                         .and_then(|name| name.to_str())
                                                         .unwrap_or(".vxscene"),
                                                 ));
+                                                // The chemistry settings live beside the scene file, so a
+                                                // scene saved under a new name takes them along.
+                                                let moved = ui
+                                                    .scene_chemistry
+                                                    .rebased(previous_scene_path.as_deref(), &path);
+                                                if moved != ChemistrySettings::default()
+                                                    || ChemistrySettings::sidecar_path(&path).exists()
+                                                {
+                                                    if let Err(error) = moved.save(&path) {
+                                                        eprintln!("chemistry settings: {error}");
+                                                        ui.set_status_message(format!(
+                                                            "Error: scene saved, but its chemistry settings were not: {error}"
+                                                        ));
+                                                    }
+                                                }
+                                                ui.scene_chemistry = moved;
+                                                chemistry_synced_for = Some(Some(path.clone()));
                                             }
                                             Err(error) => {
                                                 ui.set_status_message(format!("Error: {error}"));
@@ -6066,6 +6308,38 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                                     });
                                 }
                             }
+                            action @ (UiAction::SetChemistryEnabled(_)
+                                | UiAction::SetChemistryInterval { .. }
+                                | UiAction::ChooseChemistryRecipe
+                                | UiAction::UseBuiltinChemistryRecipes) => {
+                                let edit = chemistry_edit_from_action(action, || {
+                                    pick_recipe_file_path(&mut ui, &mut accumulator, &mut last)
+                                });
+                                if let Some(edit) = edit {
+                                    let result = if authored_physics.is_some() {
+                                        Err("Press R to restore the authored scene before changing chemistry.".to_owned())
+                                    } else if active_scene_document.is_none() {
+                                        Err("Open a scene first.".to_owned())
+                                    } else {
+                                        edit_scene_chemistry(
+                                            &ui.scene_chemistry,
+                                            edit,
+                                            active_scene_document_path.as_deref(),
+                                            &mut scene,
+                                        )
+                                    };
+                                    match result {
+                                        Ok((settings, message)) => {
+                                            ui.scene_chemistry = settings;
+                                            ui.set_status_message(message);
+                                        }
+                                        Err(error) => {
+                                            eprintln!("chemistry: {error}");
+                                            ui.set_status_message(format!("Error: {error}"));
+                                        }
+                                    }
+                                }
+                            }
                             action => {
                                 let result = if authored_physics.is_some() || !ui.paused {
                                     Err("Pause and press R before editing the authored scene.".into())
@@ -6260,11 +6534,43 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                         camera.move_freecam(right, forward, up, elapsed.min(0.1), fast);
                     }
 
+                    // Keep the Chemistry section in step with the open scene: a different
+                    // scene brings its own saved settings (`<scene>.chemistry.json`).
+                    let chemistry_scene = active_scene_document
+                        .as_ref()
+                        .map(|_| active_scene_document_path.clone());
+                    if chemistry_synced_for != chemistry_scene {
+                        ui.scene_chemistry = match active_scene_document_path.as_deref() {
+                            Some(path) => ChemistrySettings::load(path).unwrap_or_else(|error| {
+                                ui.set_status_message(format!("Error: {error}"));
+                                ChemistrySettings::default()
+                            }),
+                            None => ChemistrySettings::default(),
+                        };
+                        chemistry_synced_for = chemistry_scene;
+                    }
                     if active_scene_document.is_none() {
                         authored_physics = None;
                         ui.set_physics_cost_ms_per_10ms(None);
                         if let Some(source) = authored_render_source.take() { renderer.set_authored_physics_frame(&source, None); }
-                    } else if !ui.paused && authored_physics.is_none() {
+                    } else if !ui.paused
+                        && authored_physics.is_none()
+                        && {
+                            // The Chemistry section is the source of the scene's reaction
+                            // settings; give them to the scene the worker is about to own
+                            // (a restored or reloaded scene starts without them).
+                            let applied = ui
+                                .scene_chemistry
+                                .apply(&mut scene, active_scene_document_path.as_deref());
+                            if let Err(error) = &applied {
+                                ui.paused = true;
+                                ui.set_status_message(format!(
+                                    "Error: scene not started, chemistry settings could not be applied: {error}"
+                                ));
+                            }
+                            applied.is_ok()
+                        }
+                    {
                         let source = AuthoredPhysicsRenderSource::from_scene(&scene);
                         let empty = Scene::from_voxels(scene.config.clone(), Vec::new()).expect("empty scene is valid");
                         let runtime = std::mem::replace(&mut scene, empty);
@@ -6285,6 +6591,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                     }
                     if let Some(physics) = authored_physics.as_mut() {
                         physics.advance(f64::from(elapsed) * f64::from(ui.simulation_time_scale), ui.paused);
+                        run_panel.record(physics.frame.generation, physics.frame.revision, physics.frame.full_worker_ms_per_10ms_simulated);
                         ui.set_physics_cost_ms_per_10ms(
                             physics.frame.full_worker_ms_per_10ms_simulated,
                         );
@@ -6353,6 +6660,7 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                         });
                         physics.set_grab_target(grab_target);
                         physics.advance(f64::from(elapsed)*f64::from(ui.simulation_time_scale),ui.paused);
+                        run_panel.record(physics.frame.generation, physics.frame.revision, physics.frame.full_worker_ms_per_10ms_simulated);
                         ui.set_physics_cost_ms_per_10ms(
                             physics.frame.full_worker_ms_per_10ms_simulated,
                         );
@@ -6367,6 +6675,9 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                                 reported_physics_failure = Some(physics.frame.generation);
                             }
                         }
+                    }
+                    if authored_physics.is_none() && world_physics.is_none() {
+                        run_panel.clear();
                     }
 
                     if generated_world.is_none()
@@ -6625,6 +6936,72 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
                         ui.set_measured_simulation_rate(
                             (physics.is_some() && rate_valid).then_some(speed),
                         );
+                        // Run panel: the same values the MCP `get_run_panel` tool serves.
+                        let (mechanical_revs, cell_rotations) = match physics {
+                            Some(worker) => (worker.frame.mechanical_revs, worker.frame.cell_rotations),
+                            None => (
+                                solver::mechanical_rev_count(&scene),
+                                solver::uses_cell_rotations(&scene),
+                            ),
+                        };
+                        let run_panel_snapshot = run_panel.snapshot(RunPanelInput {
+                            state: RunState::from_flags(ui.paused, ui.physics_failed),
+                            requested_speed: ui.simulation_time_scale,
+                            measured_speed: ui.measured_simulation_rate,
+                            backlog_s: ui.physics_backlog_seconds,
+                            active_mechanical_revs: Some(mechanical_revs),
+                            solver_mode: Some(SolverMode::from_cell_rotations(cell_rotations)),
+                        });
+                        if runtime_metrics_server.is_some() {
+                            voxel_physics_lab::runtime_metrics::publish(
+                                "run_panel",
+                                run_panel_snapshot.to_json(),
+                            );
+                        }
+                        ui.set_run_panel(Some(run_panel_snapshot));
+                        // Creature inspector: read-only, and only while the scene is not
+                        // owned by the physics worker.
+                        if authored_physics.is_some() {
+                            ui.set_creature_stale(true);
+                        } else {
+                            let creature_scene = active_scene_document_path
+                                .as_ref()
+                                .filter(|_| active_scene_document.is_some() && !scene.skeletal_actuators.is_empty());
+                            match creature_scene {
+                                Some(path) => {
+                                    let key = (path.clone(), scene.positions.as_ptr() as usize, scene.render_revision as usize);
+                                    if scene_creatures_key.as_ref() != Some(&key) {
+                                        scene_creatures = match CreatureFile::load(path)
+                                            .and_then(|file| file.map_or(Ok(Vec::new()), |file| file.build(&scene)))
+                                        {
+                                            Ok(list) => list,
+                                            Err(error) => {
+                                                ui.set_status_message(format!("Error: creatures: {error}"));
+                                                Vec::new()
+                                            }
+                                        };
+                                        scene_creatures_key = Some(key);
+                                    }
+                                    let inspections: Result<Vec<_>, String> = scene_creatures
+                                        .iter()
+                                        .map(|named| inspect_creature(&named.name, &named.creature, &scene, None))
+                                        .collect();
+                                    match inspections {
+                                        Ok(list) => ui.set_creature_inspections(list),
+                                        Err(error) => {
+                                            ui.set_status_message(format!("Error: creature inspector: {error}"));
+                                            ui.set_creature_inspections(Vec::new());
+                                        }
+                                    }
+                                }
+                                None => {
+                                    scene_creatures.clear();
+                                    scene_creatures_key = None;
+                                    ui.set_creature_inspections(Vec::new());
+                                }
+                            }
+                            ui.set_creature_stale(false);
+                        }
                         if runtime_metrics_server.is_some() {
                         voxel_physics_lab::runtime_metrics::publish("app", serde_json::json!({
                             "scene_name":active_scene_document.as_ref().map(|doc| &doc.name),

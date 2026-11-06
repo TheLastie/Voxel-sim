@@ -16,9 +16,11 @@ use voxel_physics_lab::{
     },
     material::Material,
     mesh_import::{import_mesh, VoxelizationMode, VoxelizationOptions},
+    creature_inspector::{inspect as inspect_creature, CreatureFile},
     model_export::export_obj,
     procedural_animation::{author_walk, WalkOptions},
     scene::{SceneBuilder, SceneConfig},
+    scene_chemistry::ChemistrySettings,
     voxel::Composition,
 };
 const LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -254,7 +256,7 @@ fn initialize(params: &Value) -> Result<Value, (i64, String)> {
         "protocolVersion": LEGACY_PROTOCOL_VERSION,
         "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {"name":"voxel-editor-local","version":env!("CARGO_PKG_VERSION")},
-        "instructions":"File tools operate on saved .vxm/.vxscene/.obj/.glb files beneath the configured project root; mutations write new files and refuse overwrite. get_runtime_status, read_runtime_metrics, and get_runtime_objects are read-only queries to the running native engine and do not edit live state."
+        "instructions":"File tools operate on saved .vxm/.vxscene/.obj/.glb files beneath the configured project root; mutations write new files and refuse overwrite. get_runtime_status, read_runtime_metrics, get_runtime_objects and get_run_panel are read-only queries to the running native engine and do not edit live state. get_scene_chemistry, set_scene_chemistry and inspect_creatures work on the scene files beside a .vxscene."
     }))
 }
 
@@ -289,6 +291,10 @@ fn tool_definitions() -> Vec<Value> {
         tool_definition("sample_animation", "Sample interpolated local bone poses and global joints from a clip at a time in seconds.", json!({"type":"object","properties":{"path":{"type":"string"},"clip_index":{"type":"integer","minimum":0},"time_s":{"type":"number","minimum":0}},"required":["path","clip_index","time_s"],"additionalProperties":false}), true),
         tool_definition("edit_voxel_model", "Edit a .vxm on its REV grid: add, move, duplicate or remove one REV; stamp a block, sphere, cylinder or frame; add a built-in material preset or assign a material already stored in the model. Every change writes a validated new file.", json!({"type":"object","properties":{"source_path":{"type":"string"},"output_path":{"type":"string"},"operation":{"type":"string","enum":["add_voxel","remove_voxel","move_voxel","duplicate_voxel","add_material","assign_material","stamp_shape"]},"voxel_index":{"type":"integer","minimum":0},"cell":{"type":"array","items":{"type":"integer"},"minItems":3,"maxItems":3},"min_cell":{"type":"array","items":{"type":"integer"},"minItems":3,"maxItems":3},"max_cell":{"type":"array","items":{"type":"integer"},"minItems":3,"maxItems":3},"shape":{"type":"string","enum":["block","sphere","cylinder","frame"]},"material_name":{"type":"string"}},"required":["source_path","output_path","operation"],"additionalProperties":false}), false),
         tool_definition("edit_scene", "Add, move, duplicate or remove .vxm instances in a saved .vxscene, preserving project-relative references and returning resulting transforms. Also authors explicit bonds between REVs of two instances (add_manual_bond, set_manual_bond, remove_manual_bond; rest_length_m defaults to 0.01, pretension_n to 0) and make_unique, which copies one instance's .vxm to new_asset_path (never overwriting) and points only that instance at the copy.", json!({"type":"object","properties":{"source_path":{"type":"string"},"output_path":{"type":"string"},"operation":{"type":"string","enum":["add_instance","move_instance","duplicate_instance","remove_instance","add_manual_bond","set_manual_bond","remove_manual_bond","make_unique"]},"instance_index":{"type":"integer","minimum":0},"bond_index":{"type":"integer","minimum":0},"instance_a":{"type":"integer","minimum":0},"voxel_a":{"type":"integer","minimum":0},"instance_b":{"type":"integer","minimum":0},"voxel_b":{"type":"integer","minimum":0},"rest_length_m":{"type":"number","exclusiveMinimum":0},"pretension_n":{"type":"number"},"new_asset_path":{"type":"string"},"asset_path":{"type":"string"},"translation_m":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"rotation_xyzw":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4},"scale":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"delta_cells":{"type":"array","items":{"type":"integer"},"minItems":3,"maxItems":3}},"required":["source_path","output_path","operation"],"additionalProperties":false}), false),
+        tool_definition("get_run_panel", "Read the editor's run panel: state (Run, Pause, Failed), measured world speed, backlog, worker cost per 10 ms of physics (latest, p50, p95, max over the last 128 batches), active mechanical REV count and solver mode (cell rotations or translation only). The editor publishes the same values it shows in its Run tab. Read-only; errors when no editor is running or nothing was published yet.", json!({"type":"object","properties":{},"additionalProperties":false}), true),
+        tool_definition("get_scene_chemistry", "Read a scene's chemistry settings (reactions on or off, interval in simulated seconds, recipe file) from <scene>.chemistry.json beside the .vxscene and check that the recipe file still loads against the scene's material table. A scene without the file reports the defaults (reactions off, built-in recipes). Read-only.", json!({"type":"object","properties":{"scene_path":{"type":"string","description":"Project-relative .vxscene."}},"required":["scene_path"],"additionalProperties":false}), true),
+        tool_definition("set_scene_chemistry", "Change a scene's chemistry settings, the same operation as the editor's Chemistry section: enabled turns reactions on or off, interval_s sets the simulated time between reaction updates (0 = every step), recipe_path loads a recipe JSON (see recipes/wood_rot.json; it replaces the built-in recipes) and use_builtin_recipes returns to the built-in ones. The recipe is parsed and resolved against the scene's materials and the result is applied to a scratch scene before anything is written. Updates <scene>.chemistry.json in place (atomically); it never edits the .vxscene. A running editor reads the file when it opens the scene.", json!({"type":"object","properties":{"scene_path":{"type":"string"},"enabled":{"type":"boolean"},"interval_s":{"type":"number","minimum":0,"maximum":31557600},"recipe_path":{"type":"string","description":"Project-relative recipe .json."},"use_builtin_recipes":{"type":"boolean"}},"required":["scene_path"],"additionalProperties":false}), false),
+        tool_definition("inspect_creatures", "Read-only creature inspector: for each creature listed in <scene>.creatures.json beside the .vxscene, report the resource ledger (stored energy, work, heat), every sensor channel with its unit and value, the sensor read cost counters and the network size and cost counters. A scene without that file has no creatures and reports an empty list. Inspecting changes nothing; a creature the editor does not drive shows its birth ledger.", json!({"type":"object","properties":{"scene_path":{"type":"string","description":"Project-relative .vxscene."}},"required":["scene_path"],"additionalProperties":false}), true),
     ]
 }
 
@@ -384,6 +390,10 @@ fn call_tool_validated(app: &App, name: &str, args: &Value) -> Value {
         "sample_animation" => sample_animation(app, &args),
         "edit_voxel_model" => edit_voxel_model(app, &args),
         "edit_scene" => edit_scene(app, &args),
+        "get_run_panel" => get_run_panel(app),
+        "get_scene_chemistry" => get_scene_chemistry(app, &args),
+        "set_scene_chemistry" => set_scene_chemistry(app, &args),
+        "inspect_creatures" => inspect_creatures(app, &args),
         _ => return tool_error(&format!("unknown tool: {name}")),
     };
     match result {
@@ -447,6 +457,126 @@ fn runtime_query(app: &App, command: &str, mut request: Value) -> Result<Value, 
         .ok_or("runtime request arguments must be an object")?;
     object.insert("command".into(), json!(command));
     voxel_physics_lab::runtime_metrics::query_runtime(&app.root, &request)
+}
+
+/// The run panel the editor last published (the values of its Run tab).
+fn get_run_panel(app: &App) -> Result<Value, String> {
+    let response = runtime_query(app, "latest", json!({"topic":"run_panel"}))?;
+    if response["ok"] != true {
+        return Err(format!(
+            "runtime refused the run panel request: {}",
+            response["error"].as_str().unwrap_or("unknown error")
+        ));
+    }
+    if response["data"].is_null() {
+        return Err("the editor has not published a run panel yet".into());
+    }
+    Ok(json!({
+        "run_panel": response["data"],
+        "sequence": response["sequence"],
+        "age_ms": response["age_ms"],
+        "session_id": response["session_id"],
+    }))
+}
+
+fn scene_document_path(app: &App, args: &Value) -> Result<PathBuf, String> {
+    let path = existing_path(app, required_string(args, "scene_path")?)?;
+    if extension(&path).as_deref() != Some("vxscene") {
+        return Err("scene_path must refer to a .vxscene file".into());
+    }
+    Ok(path)
+}
+
+fn chemistry_result(
+    app: &App,
+    scene_path: &Path,
+    settings: &ChemistrySettings,
+    recipe_count: Result<Option<usize>, String>,
+) -> Value {
+    let (count, error) = match recipe_count {
+        Ok(count) => (count, None),
+        Err(error) => (None, Some(error)),
+    };
+    json!({
+        "scene_path": relative(&app.root, scene_path),
+        "settings_file": relative(&app.root, &ChemistrySettings::sidecar_path(scene_path)),
+        "settings": settings.to_json(),
+        "summary": settings.summary(),
+        "recipe_count": count,
+        "recipe_error": error,
+    })
+}
+
+fn get_scene_chemistry(app: &App, args: &Value) -> Result<Value, String> {
+    let scene_path = scene_document_path(app, args)?;
+    let document: SceneDocument = load_document(&scene_path)?;
+    let scene = document.build_scene(&scene_path)?;
+    let settings = ChemistrySettings::load(&scene_path)?;
+    let recipes = settings.check_recipe(Some(&scene_path), &scene.materials);
+    Ok(chemistry_result(app, &scene_path, &settings, recipes))
+}
+
+fn set_scene_chemistry(app: &App, args: &Value) -> Result<Value, String> {
+    let scene_path = scene_document_path(app, args)?;
+    let enabled = args.get("enabled").and_then(Value::as_bool);
+    let interval_s = args.get("interval_s").and_then(Value::as_f64);
+    let recipe = args.get("recipe_path").and_then(Value::as_str);
+    let builtin = args.get("use_builtin_recipes").and_then(Value::as_bool) == Some(true);
+    if enabled.is_none() && interval_s.is_none() && recipe.is_none() && !builtin {
+        return Err("give at least one of enabled, interval_s, recipe_path, use_builtin_recipes".into());
+    }
+    if recipe.is_some() && builtin {
+        return Err("recipe_path and use_builtin_recipes are mutually exclusive".into());
+    }
+    let document: SceneDocument = load_document(&scene_path)?;
+    let mut scratch = document.build_scene(&scene_path)?;
+    let mut settings = ChemistrySettings::load(&scene_path)?;
+    if let Some(enabled) = enabled {
+        settings.set_enabled(enabled);
+    }
+    if let Some(interval_s) = interval_s {
+        settings.set_interval(interval_s)?;
+    }
+    if builtin {
+        settings.clear_recipe();
+    }
+    if let Some(recipe) = recipe {
+        let recipe_file = existing_path(app, recipe)?;
+        if extension(&recipe_file).as_deref() != Some("json") {
+            return Err("recipe_path must refer to a .json recipe file".into());
+        }
+        settings.set_recipe_file(&scene_path, &recipe_file, &scratch.materials)?;
+    }
+    // Prove the whole result works on a scene before it is written.
+    settings.apply(&mut scratch, Some(&scene_path))?;
+    let recipes = settings.check_recipe(Some(&scene_path), &scratch.materials);
+    settings.save(&scene_path)?;
+    Ok(chemistry_result(app, &scene_path, &settings, recipes))
+}
+
+fn inspect_creatures(app: &App, args: &Value) -> Result<Value, String> {
+    let scene_path = scene_document_path(app, args)?;
+    let document: SceneDocument = load_document(&scene_path)?;
+    let scene = document.build_scene(&scene_path)?;
+    let Some(file) = CreatureFile::load(&scene_path)? else {
+        return Ok(json!({
+            "scene_path": relative(&app.root, &scene_path),
+            "creature_count": 0,
+            "creatures": [],
+            "note": "no creature file beside the scene; the scene has no creature",
+        }));
+    };
+    let creatures = file.build(&scene)?;
+    let inspections = creatures
+        .iter()
+        .map(|named| inspect_creature(&named.name, &named.creature, &scene, None).map(|view| view.to_json()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "scene_path": relative(&app.root, &scene_path),
+        "creature_count": inspections.len(),
+        "creatures": inspections,
+        "note": "read-only; the editor does not drive creatures, so ledgers show the birth state and the network is not running",
+    }))
 }
 
 fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
@@ -1966,4 +2096,417 @@ fn write_message(writer: &mut impl Write, value: &Value) -> Result<(), String> {
         .write_all(b"\n")
         .and_then(|_| writer.flush())
         .map_err(|e| format!("write JSON-RPC: {e}"))
+}
+
+#[cfg(test)]
+mod editor_controls_tests {
+    use super::*;
+    use voxel_physics_lab::{
+        creature::{genome_for_body, OrganParams, SensorLayout},
+        creature_inspector::{CreatureSpec, CREATURE_FILE_VERSION},
+        documents::VoxelBoneWeightDocument,
+        run_panel::{RunPanel, RunPanelInput, RunState, SolverMode},
+        scene::VoxelSpawn,
+    };
+
+    fn app() -> App {
+        let root = PathBuf::from(format!(
+            "E:/controls-mcp-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        fs::write(
+            root.join(SETTINGS_FILE),
+            json!({"version":1,"mcp_enabled":true}).to_string(),
+        )
+        .unwrap();
+        App { root }
+    }
+
+    fn call(app: &App, name: &str, arguments: Value) -> Value {
+        call_tool(app, &json!({"name":name,"arguments":arguments})).unwrap()
+    }
+
+    fn ok(app: &App, name: &str, arguments: Value) -> Value {
+        let result = call(app, name, arguments);
+        assert_ne!(result["isError"], true, "{name} failed: {}", result["content"][0]["text"]);
+        result["structuredContent"].clone()
+    }
+
+    fn error_text(app: &App, name: &str, arguments: Value) -> String {
+        let result = call(app, name, arguments);
+        assert_eq!(result["isError"], true, "{name} unexpectedly succeeded");
+        result["content"][0]["text"].as_str().unwrap().to_owned()
+    }
+
+    fn new_scene(app: &App, path: &str) {
+        ok(app, "create_scene", json!({"output_path":path}));
+    }
+
+    fn copy_recipe(app: &App, name: &str) {
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("recipes").join("wood_rot.json"),
+            app.root.join(name),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn new_tools_are_listed_with_strict_schemas_and_correct_read_only_hints() {
+        let tools = tool_definitions();
+        for (name, read_only) in [
+            ("get_run_panel", true),
+            ("get_scene_chemistry", true),
+            ("set_scene_chemistry", false),
+            ("inspect_creatures", true),
+        ] {
+            let definition = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(definition["annotations"]["readOnlyHint"], read_only, "{name}");
+            assert_eq!(definition["inputSchema"]["additionalProperties"], false, "{name}");
+        }
+        assert!(validate_tool_arguments("get_run_panel", &json!({})).is_ok());
+        assert!(validate_tool_arguments("get_run_panel", &json!({"x":1})).is_err());
+        assert!(validate_tool_arguments("set_scene_chemistry", &json!({}))
+            .unwrap_err()
+            .contains("scene_path"));
+        assert!(validate_tool_arguments(
+            "set_scene_chemistry",
+            &json!({"scene_path":"a.vxscene","interval_s":-1.0})
+        )
+        .is_err());
+        assert!(validate_tool_arguments(
+            "set_scene_chemistry",
+            &json!({"scene_path":"a.vxscene","enabled":"yes"})
+        )
+        .is_err());
+        assert!(validate_tool_arguments(
+            "inspect_creatures",
+            &json!({"scene_path":"a.vxscene","extra":1})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn chemistry_tools_write_the_same_settings_the_window_reads() {
+        let app = app();
+        new_scene(&app, "world.vxscene");
+        copy_recipe(&app, "wood_rot.json");
+
+        // Defaults for a scene without a settings file.
+        let before = ok(&app, "get_scene_chemistry", json!({"scene_path":"world.vxscene"}));
+        assert_eq!(before["settings"]["enabled"], false);
+        assert_eq!(before["settings"]["interval_s"], 0.0);
+        assert!(before["settings"]["recipe_file"].is_null());
+        assert!(
+            !app.root.join("world.chemistry.json").exists(),
+            "reading must not create the file"
+        );
+
+        let after = ok(
+            &app,
+            "set_scene_chemistry",
+            json!({"scene_path":"world.vxscene","enabled":true,"interval_s":3600.0,"recipe_path":"wood_rot.json"}),
+        );
+        assert_eq!(after["settings"]["enabled"], true);
+        assert_eq!(after["settings"]["recipe_file"], "wood_rot.json");
+        assert_eq!(after["recipe_count"], 1);
+        assert!(after["recipe_error"].is_null());
+        assert_eq!(after["settings_file"], "world.chemistry.json");
+
+        // The editor's own loader reads exactly what the tool wrote, and
+        // applying it configures a scene through the engine hooks.
+        let scene_path = app.root.join("world.vxscene");
+        let loaded = ChemistrySettings::load(&scene_path).unwrap();
+        assert!(loaded.enabled && loaded.interval_s == 3600.0);
+        let document: SceneDocument = load_document(&scene_path).unwrap();
+        let mut scene = document.build_scene(&scene_path).unwrap();
+        loaded.apply(&mut scene, Some(&scene_path)).unwrap();
+        assert!(scene.chemistry_enabled);
+
+        // A partial change keeps the rest.
+        let changed = ok(
+            &app,
+            "set_scene_chemistry",
+            json!({"scene_path":"world.vxscene","enabled":false}),
+        );
+        assert_eq!(changed["settings"]["enabled"], false);
+        assert_eq!(changed["settings"]["interval_s"], 3600.0);
+        assert_eq!(changed["settings"]["recipe_file"], "wood_rot.json");
+        let builtin = ok(
+            &app,
+            "set_scene_chemistry",
+            json!({"scene_path":"world.vxscene","use_builtin_recipes":true}),
+        );
+        assert!(builtin["settings"]["recipe_file"].is_null());
+        assert!(builtin["recipe_count"].is_null());
+
+        // It works inside a batch like the other file tools.
+        let batch = ok(
+            &app,
+            "batch_actions",
+            json!({"actions":[
+                {"id":"on","name":"set_scene_chemistry","arguments":{"scene_path":"world.vxscene","enabled":true}},
+                {"id":"read","name":"get_scene_chemistry","arguments":{"scene_path":"world.vxscene"}}
+            ]}),
+        );
+        assert_eq!(batch["results"][1]["result"]["settings"]["enabled"], true);
+        let _ = fs::remove_dir_all(app.root);
+    }
+
+    #[test]
+    fn chemistry_errors_are_reported_and_leave_the_saved_settings_alone() {
+        let app = app();
+        new_scene(&app, "world.vxscene");
+        copy_recipe(&app, "wood_rot.json");
+        ok(
+            &app,
+            "set_scene_chemistry",
+            json!({"scene_path":"world.vxscene","enabled":true,"interval_s":60.0}),
+        );
+        let settings_file = app.root.join("world.chemistry.json");
+        let saved = fs::read_to_string(&settings_file).unwrap();
+
+        fs::write(app.root.join("broken.json"), "{ not json").unwrap();
+        fs::write(app.root.join("notes.txt"), "hello").unwrap();
+        let cases: [(Value, &str); 7] = [
+            (json!({"scene_path":"world.vxscene"}), "at least one"),
+            (
+                json!({"scene_path":"world.vxscene","recipe_path":"wood_rot.json","use_builtin_recipes":true}),
+                "mutually exclusive",
+            ),
+            (json!({"scene_path":"world.vxscene","recipe_path":"missing.json"}), "resolve"),
+            (json!({"scene_path":"world.vxscene","recipe_path":"broken.json"}), "broken.json"),
+            (json!({"scene_path":"world.vxscene","recipe_path":"notes.txt"}), ".json"),
+            (json!({"scene_path":"missing.vxscene","enabled":true}), "resolve"),
+            (json!({"scene_path":"../outside.vxscene","enabled":true}), "outside"),
+        ];
+        for (arguments, expected) in cases {
+            let message = error_text(&app, "set_scene_chemistry", arguments.clone());
+            assert!(message.contains(expected), "{arguments}: {message}");
+            assert_eq!(
+                fs::read_to_string(&settings_file).unwrap(),
+                saved,
+                "{arguments} changed the file"
+            );
+        }
+        ok(&app, "create_model", json!({"output_path":"m.vxm"}));
+        assert!(
+            error_text(&app, "set_scene_chemistry", json!({"scene_path":"m.vxm","enabled":true}))
+                .contains(".vxscene")
+        );
+
+        // A damaged settings file is an error, not silently replaced.
+        fs::write(&settings_file, "garbage").unwrap();
+        assert!(error_text(&app, "get_scene_chemistry", json!({"scene_path":"world.vxscene"}))
+            .contains("chemistry.json"));
+        assert!(error_text(
+            &app,
+            "set_scene_chemistry",
+            json!({"scene_path":"world.vxscene","enabled":false})
+        )
+        .contains("chemistry.json"));
+        assert_eq!(fs::read_to_string(&settings_file).unwrap(), "garbage");
+
+        // A recipe that disappears later is reported by the read tool, not a panic.
+        fs::write(
+            &settings_file,
+            r#"{"version":1,"enabled":true,"interval_s":1.0,"recipe_file":"gone.json"}"#,
+        )
+        .unwrap();
+        let reported = ok(&app, "get_scene_chemistry", json!({"scene_path":"world.vxscene"}));
+        assert!(reported["recipe_error"].as_str().unwrap().contains("gone.json"));
+        let _ = fs::remove_dir_all(app.root);
+    }
+
+    fn rigged_creature_scene(app: &App) {
+        let source = SceneBuilder::standard()
+            .add_voxel(VoxelSpawn::at_cell([0, 0, 0], 1))
+            .add_voxel(VoxelSpawn::at_cell([1, 0, 0], 1))
+            .build()
+            .unwrap();
+        let mut model = VoxelModelDocument::from_scene("rigged", &source);
+        let mut skeleton = SkeletonDocument::with_root_bone("root", DVec3::ZERO);
+        let limb = skeleton
+            .add_bone("limb", Some(0), DVec3::new(0.01, 0.0, 0.0))
+            .unwrap();
+        for voxel_index in 0..model.voxels.len() {
+            skeleton.voxel_weights.push(VoxelBoneWeightDocument {
+                voxel_index: voxel_index as u32,
+                bone_index: limb as u32,
+                weight: 1.0,
+            });
+        }
+        let clip = skeleton.add_animation_clip("bend", 1.0).unwrap();
+        for (time_s, z) in [(0.0, 0.0), (1.0, 0.01)] {
+            skeleton
+                .set_keyframe(
+                    clip,
+                    limb,
+                    BoneKeyframeDocument {
+                        time_s,
+                        translation_m: DVec3::new(0.01, 0.0, z),
+                        rotation: Quat::IDENTITY,
+                    },
+                )
+                .unwrap();
+        }
+        model.skeleton = Some(skeleton);
+        save_document(&app.root.join("rigged.vxm"), &model).unwrap();
+        let mut document = SceneDocument::new("creature scene", SceneConfig::default()).unwrap();
+        document
+            .add_model(ModelInstanceDocument {
+                asset_path: PathBuf::from("rigged.vxm"),
+                translation_m: DVec3::ZERO,
+                rotation: Quat::IDENTITY,
+                scale: Vec3::ONE,
+            })
+            .unwrap();
+        save_document(&app.root.join("zoo.vxscene"), &document).unwrap();
+    }
+
+    #[test]
+    fn inspect_creatures_reports_none_without_a_file_and_the_real_ledger_and_sensors_with_one() {
+        use voxel_physics_lab::creature_inspector::CreatureFile as File;
+        let app = app();
+        rigged_creature_scene(&app);
+        let none = ok(&app, "inspect_creatures", json!({"scene_path":"zoo.vxscene"}));
+        assert_eq!(none["creature_count"], 0);
+        assert_eq!(none["creatures"], json!([]));
+
+        let scene_path = app.root.join("zoo.vxscene");
+        let document: SceneDocument = load_document(&scene_path).unwrap();
+        let scene = document.build_scene(&scene_path).unwrap();
+        let layout = SensorLayout::new(&scene.skeletal_actuators[0], vec![0]).unwrap();
+        let organs = OrganParams {
+            store_capacity_j: 80.0,
+            birth_store_fraction: 0.25,
+            stomach_capacity_j: 20.0,
+            digestion_power_w: 2.0,
+            absorption_efficiency: 0.8,
+            muscle_efficiency: 0.25,
+            basal_power_w: 0.0,
+            peak_mechanical_power_w: 1.0,
+            weak_fraction: 0.1,
+            exhaustion_fraction: 0.0,
+        };
+        let genome = genome_for_body("rigged", &layout, organs, 3, 6, 1).unwrap();
+        let file = File {
+            version: CREATURE_FILE_VERSION,
+            creatures: vec![CreatureSpec {
+                name: "Ant".into(),
+                actuator_index: 0,
+                genome,
+                learned: None,
+            }],
+        };
+        fs::write(File::sidecar_path(&scene_path), serde_json::to_string(&file).unwrap()).unwrap();
+
+        let result = ok(&app, "inspect_creatures", json!({"scene_path":"zoo.vxscene"}));
+        assert_eq!(result["creature_count"], 1);
+        let ant = &result["creatures"][0];
+        assert_eq!(ant["name"], "Ant");
+        assert_eq!(ant["ledger"]["stored_energy_j"], 20.0);
+        assert_eq!(ant["ledger"]["store_capacity_j"], 80.0);
+        assert_eq!(ant["ledger"]["work_j"], 0.0);
+        assert_eq!(ant["ledger"]["heat_j"], 0.0);
+        let sensors = ant["sensors"].as_array().unwrap();
+        assert!(sensors.len() > 10);
+        assert!(sensors.iter().all(|s| s["id"].is_string() && s["unit"].is_string()));
+        let energy = sensors.iter().find(|s| s["id"] == "stored_energy").unwrap();
+        assert_eq!(
+            (energy["value"].as_f64(), energy["unit"].as_str()),
+            (Some(0.25), Some("1"))
+        );
+        assert!(sensors.iter().any(|s| s["unit"] == "m") && sensors.iter().any(|s| s["unit"] == "N"));
+        assert_eq!(ant["sensor_cost"]["this_read"]["reads"], 1);
+        assert!(ant["network"]["cost"].is_null());
+
+        // Inspecting twice gives the same answer: it counts nothing.
+        let again = ok(&app, "inspect_creatures", json!({"scene_path":"zoo.vxscene"}));
+        assert_eq!(again["creatures"], result["creatures"]);
+
+        // A creature that does not fit the scene is an error naming it.
+        let mut wrong = file;
+        wrong.creatures[0].actuator_index = 4;
+        fs::write(File::sidecar_path(&scene_path), serde_json::to_string(&wrong).unwrap()).unwrap();
+        assert!(
+            error_text(&app, "inspect_creatures", json!({"scene_path":"zoo.vxscene"})).contains("Ant")
+        );
+        let _ = fs::remove_dir_all(app.root);
+    }
+
+    #[test]
+    fn get_run_panel_reads_what_the_editor_publishes() {
+        let root = PathBuf::from(format!(
+            "E:/voxel-editor-mcp-runpanel-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let server = voxel_physics_lab::runtime_metrics::start_server(&root).unwrap();
+        let app = App { root: root.clone() };
+
+        let mut panel = RunPanel::new();
+        for (revision, cost) in [(1, 1.0), (2, 2.0), (3, 6.5)] {
+            panel.record(7, revision, Some(cost));
+        }
+        let snapshot = panel.snapshot(RunPanelInput {
+            state: RunState::Run,
+            requested_speed: 1.0,
+            measured_speed: Some(0.98),
+            backlog_s: Some(0.02),
+            active_mechanical_revs: Some(2048),
+            solver_mode: Some(SolverMode::CellRotations),
+        });
+        voxel_physics_lab::runtime_metrics::publish("run_panel", snapshot.to_json());
+
+        let result = call(&app, "get_run_panel", json!({}));
+        assert_ne!(result["isError"], true, "{}", result["content"][0]["text"]);
+        let data = &result["structuredContent"]["run_panel"];
+        assert_eq!(data, &snapshot.to_json(), "MCP returns exactly the window's values");
+        assert_eq!(data["state"], "Run");
+        assert_eq!(data["worker_cost_ms_per_10ms"]["max"], 6.5);
+        assert_eq!(data["worker_cost_ms_per_10ms"]["p50"], 2.0);
+        assert_eq!(data["active_mechanical_revs"], 2048);
+        assert_eq!(data["solver_mode"], "cell_rotations");
+        assert!(result["structuredContent"]["age_ms"].is_u64());
+
+        // A newer publication replaces it.
+        panel.record(7, 4, Some(0.5));
+        let paused = panel.snapshot(RunPanelInput {
+            state: RunState::Pause,
+            requested_speed: 1.0,
+            measured_speed: None,
+            backlog_s: None,
+            active_mechanical_revs: Some(2048),
+            solver_mode: Some(SolverMode::TranslationOnly),
+        });
+        voxel_physics_lab::runtime_metrics::publish("run_panel", paused.to_json());
+        let latest = ok(&app, "get_run_panel", json!({}));
+        assert_eq!(latest["run_panel"]["state"], "Pause");
+        assert_eq!(latest["run_panel"]["solver_mode"], "translation_only");
+        assert!(latest["run_panel"]["measured_world_speed"].is_null());
+
+        // With no runtime the tool errors clearly instead of inventing values.
+        drop(server);
+        let missing = app_without_runtime();
+        let text = error_text(&missing, "get_run_panel", json!({}));
+        assert!(!text.is_empty());
+        let _ = fs::remove_dir_all(&missing.root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn app_without_runtime() -> App {
+        app()
+    }
 }
