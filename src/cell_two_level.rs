@@ -33,12 +33,12 @@ const ZERO6: Block6 = [[0.0; 6]; 6];
 /// Row-form 6x6 block matrix with a stored lower triangle.
 pub(crate) struct CellSystem {
     pub(crate) count: usize,
-    diagonal: Vec<Block6>,
+    pub(crate) diagonal: Vec<Block6>,
     /// Lower blocks `H[row][col]`, `row > col`; the upper block is the transpose.
-    blocks: Vec<Block6>,
-    row_start: Vec<usize>,
+    pub(crate) blocks: Vec<Block6>,
+    pub(crate) row_start: Vec<usize>,
     /// For each row entry: neighbour cell, block index, whether to transpose it.
-    entries: Vec<(u32, u32, bool)>,
+    pub(crate) entries: Vec<(u32, u32, bool)>,
 }
 
 impl CellSystem {
@@ -90,6 +90,40 @@ impl CellSystem {
                 *o = self.row_apply(i, v);
             }
         }
+    }
+}
+
+/// One bond of the cell matrix in factored form. With `S = skew(rest) / 2` the
+/// bond strain is `e = u_j - u_i + S (phi_i + phi_j)` and its blocks are
+/// `G^T k G` (`G_i = [-I, S]`, `G_j = [I, S]`) plus the face rotation stiffness
+/// `stiff (phi_i - phi_j)`. Rigid motions give `e = 0` and equal rotations
+/// exactly, so an operator applied in this form keeps them in its null space
+/// even in single precision; assembled 6x6 blocks rounded to f32 do not.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CellBond {
+    pub(crate) i: u32,
+    pub(crate) j: u32,
+    pub(crate) k: glam::DMat3,
+    pub(crate) rest: DVec3,
+    pub(crate) stiff: glam::DMat3,
+}
+
+impl CellBond {
+    /// The diagonal blocks `H_ii`, `H_jj` this bond adds, as in the solver's assembly.
+    pub(crate) fn diagonal_blocks(&self) -> (Block6, Block6) {
+        let r = self.rest;
+        let skew = glam::DMat3::from_cols(
+            DVec3::new(0.0, r.z, -r.y),
+            DVec3::new(-r.z, 0.0, r.x),
+            DVec3::new(r.y, -r.x, 0.0),
+        );
+        let half = skew * 0.5;
+        let k_s = self.k * half;
+        let s_k_s = half.transpose() * k_s;
+        (
+            crate::solver::block6_from(self.k, -k_s, -k_s.transpose(), s_k_s + self.stiff),
+            crate::solver::block6_from(self.k, k_s, k_s.transpose(), s_k_s + self.stiff),
+        )
     }
 }
 
@@ -152,34 +186,38 @@ fn prolongation_block(offset: DVec3, mask: &[f64; 6]) -> Block6 {
 
 /// One level of the hierarchy. Every level except the last aggregates its cells
 /// again; the last is solved exactly with a skyline factor.
-struct LevelData {
-    masks: Vec<[f64; 6]>,
+pub(crate) struct LevelData {
+    pub(crate) masks: Vec<[f64; 6]>,
     /// Damped inverse of each masked diagonal block, `omega * D^-1`.
-    smoother: Vec<Block6>,
-    transfer: Option<Transfer>,
+    pub(crate) smoother: Vec<Block6>,
+    pub(crate) transfer: Option<Transfer>,
 }
 
 /// Fine-to-coarse map of one level: cell -> aggregate, and the offset of the
 /// cell from its aggregate centre, which fixes the rigid-body prolongation.
-struct Transfer {
-    aggregate: Vec<u32>,
-    offset: Vec<DVec3>,
-    coarse_count: usize,
+pub(crate) struct Transfer {
+    pub(crate) aggregate: Vec<u32>,
+    pub(crate) offset: Vec<DVec3>,
+    pub(crate) coarse_count: usize,
     /// Cells of each aggregate, as `members[member_start[a]..member_start[a + 1]]`,
     /// so restriction can run one aggregate per task without shared writes.
-    member_start: Vec<usize>,
-    members: Vec<u32>,
+    pub(crate) member_start: Vec<usize>,
+    pub(crate) members: Vec<u32>,
 }
 
 /// Multilevel preconditioner (symmetric V-cycle, rigid-body aggregation).
 /// Kept under the name `TwoLevel`: with a small body it has two levels.
 pub(crate) struct TwoLevel {
-    levels: Vec<LevelData>,
+    pub(crate) levels: Vec<LevelData>,
     /// Operators of the coarse levels; level 0 is the caller's system.
-    systems: Vec<CellSystem>,
+    pub(crate) systems: Vec<CellSystem>,
     bottom: CellFactor,
     graph_signature: (usize, usize),
+    /// Unique per build, so a resident GPU copy can tell whether it is current.
+    id: u64,
 }
+
+static NEXT_HIERARCHY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Buffers of one level, reused by every application.
 #[derive(Default)]
@@ -442,6 +480,7 @@ impl TwoLevel {
                         systems,
                         bottom,
                         graph_signature: (system.count, edges.len()),
+                        id: NEXT_HIERARCHY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     });
                 }
                 Some((transfer, coarse_diagonal, coarse_edges, coarse_masks, center, lattice_center, coarse_body)) => {
@@ -465,6 +504,44 @@ impl TwoLevel {
     /// singular there and stalls conjugate gradients.
     pub(crate) fn matches(&self, count: usize, edge_count: usize, masks: &[[f64; 6]]) -> bool {
         self.graph_signature == (count, edge_count) && self.levels[0].masks == masks
+    }
+
+    /// Identity of this build; a rebuilt hierarchy gets a new one.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The bottom solve as a dense matrix, row-major, `dofs x dofs` with
+    /// `dofs = 6 * cells` of the last level: column `j` is the masked skyline solve
+    /// of the unit vector `e_j`, so `z = B r` is exactly the CPU bottom step.
+    /// Its size is quadratic in `bottom_dofs()`; callers check that first.
+    pub(crate) fn bottom_dense(&self) -> (usize, Vec<f64>) {
+        let masks = &self.levels.last().expect("bottom level").masks;
+        let cells = masks.len();
+        let dofs = cells * 6;
+        let mut dense = vec![0.0f64; dofs * dofs];
+        let columns: Vec<Vec<f64>> = (0..dofs)
+            .into_par_iter()
+            .map(|j| {
+                let mut unit = vec![[0.0f64; 6]; cells];
+                unit[j / 6][j % 6] = 1.0;
+                let mut z = vec![[0.0f64; 6]; cells];
+                let mut work = Vec::new();
+                self.bottom.solve(&unit, &mut z, &mut work);
+                (0..dofs).map(|row| z[row / 6][row % 6] * masks[row / 6][row % 6]).collect()
+            })
+            .collect();
+        for (j, column) in columns.iter().enumerate() {
+            for (row, value) in column.iter().enumerate() {
+                dense[row * dofs + j] = *value;
+            }
+        }
+        (dofs, dense)
+    }
+
+    /// Degrees of freedom of the bottom level.
+    pub(crate) fn bottom_dofs(&self) -> usize {
+        self.levels.last().map_or(0, |level| level.masks.len() * 6)
     }
 
     fn smooth(level: &LevelData, residual: &[Vec6], z: &mut [Vec6], add: bool) {
@@ -601,7 +678,7 @@ impl TwoLevel {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A chain of `n` cells with SPD coupling, for checking the operator algebra.
@@ -676,7 +753,7 @@ mod tests {
         assert!(dot(&u, &mu) > 0.0 && dot(&w, &mw) > 0.0);
     }
 
-    fn pcg(
+    pub(crate) fn pcg(
         system: &CellSystem,
         rhs: &[Vec6],
         masks: &[[f64; 6]],
@@ -735,7 +812,7 @@ mod tests {
 
     /// The systems of one step of a bulk iron block tipping on a fixed floor, after
     /// `warmup` steps so friction patches are established.
-    fn captured_bulk(width: i32, height: i32, warmup: usize) -> Vec<crate::solver::CapturedCellSystem> {
+    pub(crate) fn captured_bulk(width: i32, height: i32, warmup: usize) -> Vec<crate::solver::CapturedCellSystem> {
         use crate::material::Material;
         use crate::scene::{Scene, SceneConfig, VoxelSpawn};
         let iron = Material::component_id("iron").unwrap();

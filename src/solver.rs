@@ -5121,6 +5121,9 @@ pub(crate) struct SolverScratch {
     cell_factor_iterations: usize,
     two_level: Option<crate::cell_two_level::TwoLevel>,
     two_level_work: crate::cell_two_level::TwoLevelWork,
+    /// Resident GPU copy of `two_level` for `VOXEL_CELL_GPU=1`.
+    #[cfg(feature = "desktop")]
+    gpu_cells: Option<crate::cell_gpu::GpuCellSolver>,
     last_force_residual_n: f64,
     mechanical_mask: Vec<bool>,
     mechanical_revs: Vec<usize>,
@@ -8607,6 +8610,7 @@ pub(crate) struct CapturedCellSystem {
     pub(crate) edges: Vec<(u32, u32, Block6)>,
     pub(crate) masks: Vec<[f64; 6]>,
     pub(crate) rhs: Vec<Vec6>,
+    pub(crate) bonds: Vec<crate::cell_two_level::CellBond>,
     pub(crate) positions: Vec<DVec3>,
     pub(crate) lattice: Vec<DVec3>,
     pub(crate) bodies: Vec<u32>,
@@ -8637,6 +8641,10 @@ pub static CELL_PROFILE: [std::sync::atomic::AtomicU64; 8] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
+
+/// Cell systems solved by the opt-in GPU path (`VOXEL_CELL_GPU=1`); the rest of
+/// the count in `CELL_PROFILE[4]` ran on the CPU.
+pub static CELL_GPU_SOLVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn cell_profile_add(phase: usize, started: Instant) {
     CELL_PROFILE[phase].fetch_add(
@@ -8733,6 +8741,7 @@ fn solve_face_cells_sparse(
         h_ii: Block6,
         h_jj: Block6,
         edge: Option<(u32, u32, Block6)>,
+        bond: Option<crate::cell_two_level::CellBond>,
         rhs_i: Vec6,
         rhs_j: Vec6,
     }
@@ -8780,7 +8789,8 @@ fn solve_face_cells_sparse(
             rhs_i[p + 3] = couple[p] - moment[p];
             rhs_j[p + 3] = -(couple[p] + moment[p]);
         }
-        Some(BondBlocks { slot_i, slot_j, h_ii, h_jj, edge, rhs_i, rhs_j })
+        let bond = edge.as_ref().map(|_| crate::cell_two_level::CellBond { i: slot_i, j: slot_j, k, rest: r, stiff });
+        Some(BondBlocks { slot_i, slot_j, h_ii, h_jj, edge, bond, rhs_i, rhs_j })
     };
     let computed: Vec<Option<BondBlocks>> = if scratch.constraints.len() >= 512 {
         scratch.constraints.par_iter().map(bond_blocks).collect()
@@ -8788,6 +8798,17 @@ fn solve_face_cells_sparse(
         scratch.constraints.iter().map(bond_blocks).collect()
     };
     let mut edges = Vec::<(u32, u32, Block6)>::with_capacity(computed.len());
+    // Bonds in factored form, for the GPU operator (cell_gpu) and captures.
+    let mut collect_bonds = false;
+    #[cfg(feature = "desktop")]
+    {
+        collect_bonds |= crate::cell_gpu::opt_in();
+    }
+    #[cfg(test)]
+    {
+        collect_bonds |= CAPTURED_CELL_SYSTEM.with(|slot| slot.borrow().is_some());
+    }
+    let mut cell_bonds = Vec::<crate::cell_two_level::CellBond>::new();
     for blocks in computed.into_iter().flatten() {
         if blocks.slot_i != u32::MAX {
             let slot = blocks.slot_i as usize;
@@ -8805,6 +8826,9 @@ fn solve_face_cells_sparse(
         }
         if let Some(edge) = blocks.edge {
             edges.push(edge);
+        }
+        if collect_bonds {
+            cell_bonds.extend(blocks.bond);
         }
     }
     // Eliminate fixed axes.
@@ -8839,6 +8863,7 @@ fn solve_face_cells_sparse(
                     edges: edges.clone(),
                     masks: masks.clone(),
                     rhs: rhs.clone(),
+                    bonds: cell_bonds.clone(),
                     positions: cells.iter().map(|&i| scene.positions[i]).collect(),
                     lattice: cells.iter().map(|&i| scene.rest_positions[i]).collect(),
                     bodies: cells.iter().map(|&i| scene.clusters[i]).collect(),
@@ -9049,11 +9074,7 @@ fn solve_face_cells_sparse(
     };
     let mut x = vec![[0.0; 6]; count];
     let mut r = rhs.clone();
-    let mut z = vec![[0.0; 6]; count];
     let mut ap = vec![[0.0; 6]; count];
-    precondition(&r, &mut z);
-    let mut p = z.clone();
-    let mut rz = dot(&r, &z);
     let (force0, moment0) = (force_norm(&r), moment_norm(&r));
     let tolerance = f64::from(scene.config.solver_relative_tolerance);
     let limit = scene.config.iterations.max(1) * 10;
@@ -9062,7 +9083,38 @@ fn solve_face_cells_sparse(
             && moment_norm(r) <= tolerance * moment0.max(1.0e-12)
     };
     let mut iterations = 0;
-    while !converged(&r) && iterations < limit {
+    // Opt-in GPU path (`VOXEL_CELL_GPU=1`): the same PCG and V-cycle on wgpu. It
+    // returns only a solution whose true residual meets the tolerance; on any
+    // error the CPU loop below runs instead. Contact projections stay on the CPU.
+    let mut solved_on_gpu = false;
+    #[cfg(feature = "desktop")]
+    if projection.is_none() && crate::cell_gpu::opt_in() {
+        if let Some(two) = &two_level {
+            if let Some((solution, gpu_iterations)) = crate::cell_gpu::solve_with_fallback(
+                &mut scratch.gpu_cells, &system, &cell_bonds, two, &masks, &rhs, tolerance, limit,
+            ) {
+                system.apply(&solution, &mut ap);
+                for slot in 0..count {
+                    for t in 0..6 {
+                        r[slot][t] = rhs[slot][t] - ap[slot][t];
+                    }
+                }
+                x = solution;
+                iterations = gpu_iterations;
+                solved_on_gpu = true;
+                CELL_GPU_SOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    let mut z = vec![[0.0; 6]; count];
+    let mut p = Vec::new();
+    let mut rz = 0.0;
+    if !solved_on_gpu {
+        precondition(&r, &mut z);
+        p = z.clone();
+        rz = dot(&r, &z);
+    }
+    while !solved_on_gpu && !converged(&r) && iterations < limit {
         apply(&p, &mut ap);
         let denominator = dot(&p, &ap);
         iterations += 1;
