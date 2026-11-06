@@ -501,6 +501,11 @@ impl RecipeRegistry {
         &self.recipes
     }
 
+    /// Size of the material table this registry was built for.
+    pub fn material_count(&self) -> usize {
+        self.relevant.len()
+    }
+
     pub fn evaporation(&self) -> Option<&Evaporation> {
         self.evaporation.as_ref()
     }
@@ -945,6 +950,53 @@ impl ReactionClock {
 }
 
 impl Scene {
+    /// Recipes for the fixed-step hook ([`Scene::chemistry_enabled`]) instead
+    /// of the built-in registry. The registry must have been built for this
+    /// scene's material table.
+    pub fn set_chemistry_registry(&mut self, registry: RecipeRegistry) -> Result<(), &'static str> {
+        if registry.material_count() != self.materials.len() {
+            return Err("recipe registry was built for a different material table");
+        }
+        self.chemistry_registry = Some(registry);
+        Ok(())
+    }
+
+    /// Time between reaction updates of the fixed-step hook, seconds; `0`
+    /// reacts at every fixed step. Pending time is kept.
+    pub fn set_chemistry_interval(&mut self, interval_s: f64) -> Result<(), &'static str> {
+        if !interval_s.is_finite() || interval_s < 0.0 {
+            return Err("chemistry interval must be finite and nonnegative");
+        }
+        self.chemistry_interval_s = interval_s;
+        Ok(())
+    }
+
+    /// The fixed-step hook: add `dt_s` of simulated time and, once the chemistry
+    /// interval is reached, react every REV for all the accumulated time with
+    /// the scene's registry (built-in by default). Called by the solver after
+    /// mechanics and heat when `chemistry_enabled`, never inside the implicit
+    /// solve. Returns the report of the update, or `None` while accumulating.
+    pub(crate) fn advance_chemistry(
+        &mut self,
+        dt_s: f64,
+    ) -> Result<Option<ReactionReport>, &'static str> {
+        if !dt_s.is_finite() || dt_s < 0.0 {
+            return Err("reaction time step must be finite and nonnegative");
+        }
+        self.chemistry_pending_s += dt_s;
+        if self.chemistry_pending_s < self.chemistry_interval_s || self.chemistry_pending_s <= 0.0 {
+            return Ok(None);
+        }
+        let pending = std::mem::take(&mut self.chemistry_pending_s);
+        let registry = match self.chemistry_registry.take() {
+            Some(registry) if registry.material_count() == self.materials.len() => registry,
+            _ => RecipeRegistry::builtin(&self.materials),
+        };
+        let report = self.react_with(&registry, pending as f32);
+        self.chemistry_registry = Some(registry);
+        report.map(Some)
+    }
+
     /// Advance chemical reactions of every REV by `dt` seconds with the
     /// built-in registry (combustion, evaporation, tanning, decay). Call it
     /// once per chemistry step after the physical step (like the thermal
@@ -1815,6 +1867,57 @@ mod tests {
             assert!(consumed(300.0, 0.4) < consumed(300.0, 1.0));
             assert_eq!(consumed(300.0, 0.1), 0.0);
         }
+    }
+
+    #[test]
+    fn the_fixed_step_hook_accumulates_time_for_slow_chemistry() {
+        let table = Material::table();
+        let make = || {
+            let mut spawn = VoxelSpawn::at_cell([0, 0, 0], id(&table, "hide"));
+            spawn.composition = Composition {
+                components: smallvec::smallvec![
+                    (id(&table, "hide"), 0.25),
+                    (id(&table, "oxygen"), 0.5),
+                    (id(&table, "water"), 0.25)
+                ],
+            };
+            spawn.temperature_kelvin = 300.0;
+            Scene::from_voxels(SceneConfig::default(), vec![spawn]).unwrap()
+        };
+        let hide_fraction = |scene: &Scene| scene.voxels[0].composition.components[0].1;
+        // At every step (interval 0) a millisecond of rot is below f32
+        // resolution: deferred and reported, nothing applied, nothing lost.
+        let mut every_step = make();
+        let before = hide_fraction(&every_step);
+        let report = every_step.advance_chemistry(0.001).unwrap().unwrap();
+        assert_eq!((report.reacting_revs, report.deferred_revs), (0, 1));
+        assert_eq!(hide_fraction(&every_step), before);
+        // With an interval the fixed steps accumulate and one update applies them.
+        let mut scene = make();
+        scene.set_chemistry_interval(3600.0).unwrap();
+        for _ in 0..59 {
+            assert!(scene.advance_chemistry(60.0).unwrap().is_none());
+        }
+        let report = scene.advance_chemistry(60.0).unwrap().expect("interval reached");
+        assert_eq!(report.reacting_revs, 1);
+        assert!(hide_fraction(&scene) < before);
+        assert_eq!(scene.chemistry_pending_s, 0.0);
+        // The time was applied once: the same hour in one call gives the same state.
+        let mut once = make();
+        once.react(3600.0).unwrap();
+        assert_eq!(hide_fraction(&once).to_bits(), hide_fraction(&scene).to_bits());
+        // Interval and registry are validated.
+        assert!(scene.set_chemistry_interval(-1.0).is_err());
+        assert!(scene.set_chemistry_interval(f64::NAN).is_err());
+        let small = RecipeRegistry::builtin(&table[..21]);
+        assert!(scene.set_chemistry_registry(small).is_err());
+        let custom = RecipeRegistry::new(&table, Vec::new(), None).unwrap();
+        scene.set_chemistry_registry(custom).unwrap();
+        scene.set_chemistry_interval(0.0).unwrap();
+        let before = hide_fraction(&scene);
+        let report = scene.advance_chemistry(3600.0).unwrap().unwrap();
+        assert_eq!(report.reacting_revs, 0, "an empty registry changes nothing");
+        assert_eq!(hide_fraction(&scene), before);
     }
 
     #[test]
