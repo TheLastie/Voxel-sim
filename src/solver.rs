@@ -1643,6 +1643,33 @@ pub fn step_with_axis_targets_and_loads(
     );
 }
 
+/// One fixed step of a scene in which nothing mechanical is awake (every REV fixed or
+/// asleep): heat conduction and chemistry only. Positions, velocities, strain and the
+/// mechanical energy ledger are untouched because nothing can change them; a sleeper
+/// whose heat or composition changes wakes at the start of the next step.
+fn dormant_step(scene: &mut Scene) {
+    let substeps = scene.config.substeps.max(1);
+    let h = scene.config.fixed_dt / substeps as f32;
+    scene.last_step_diagnostics = None;
+    for _ in 0..substeps {
+        match scene.conduct_heat(h) {
+            Ok(used) if used > 0 => scene.mark_render_changed(),
+            Ok(_) => {}
+            Err(reason) => eprintln!("thermal transport skipped: {reason}"),
+        }
+        scene.substep_index += 1;
+    }
+    if let Some((i, j)) = scene.take_pending_fusion() {
+        match scene.fuse_adjacent_voxels(i, j) {
+            Ok(_) => rebuild_clusters(scene),
+            Err(reason) => eprintln!("automatic thermal fusion cancelled for REV {i}/{j}: {reason}"),
+        }
+    }
+    if scene.chemistry_enabled {
+        let _ = scene.advance_chemistry(f64::from(scene.config.fixed_dt));
+    }
+}
+
 fn advance_step_with_axis_targets_and_loads(
     scene: &mut Scene,
     tool: &mut Option<Tool>,
@@ -1655,6 +1682,10 @@ fn advance_step_with_axis_targets_and_loads(
     scene.solver_residual_audit = None;
     scene.last_step_diagnostics = None;
     scene.run_sleep();
+    if tool.is_none() && targets.is_empty() && loads.is_empty() && scene.mechanically_dormant() {
+        dormant_step(scene);
+        return;
+    }
     scene.run_tier_governor();
     scene.advance_beam_regions(f64::from(scene.config.fixed_dt));
     scene.cell_dofs = decide_cell_dofs(scene);

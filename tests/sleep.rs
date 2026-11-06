@@ -132,3 +132,37 @@ fn a_checkpoint_stores_sleepers_as_free() {
     std::fs::remove_file(&path).ok();
     assert!(block.iter().all(|&i| !restored.voxels[i].kinematic), "sleepers must not be stored as fixed");
 }
+
+#[test]
+fn heat_reaching_a_sleeper_wakes_it() {
+    let (mut scene, block, _) = world();
+    scene.enable_sleep(SleepConfig::default()).unwrap();
+    for _ in 0..80 {
+        solver::step(&mut scene, &mut None);
+    }
+    assert_eq!(scene.sleeping_rev_count(), block.len());
+    assert!(scene.add_heat_joules(block[0], 50.0));
+    solver::step(&mut scene, &mut None);
+    assert_eq!(scene.sleeping_rev_count(), 0, "a change of internal energy must wake the cluster");
+}
+
+#[test]
+fn a_scene_where_everything_sleeps_only_advances_time() {
+    let (mut scene, block, _) = world();
+    scene.enable_sleep(SleepConfig::default()).unwrap();
+    for _ in 0..80 {
+        solver::step(&mut scene, &mut None);
+    }
+    assert_eq!(scene.sleeping_rev_count(), block.len());
+    let (positions, substeps, seconds) = (scene.positions.clone(), scene.substep_index, scene.simulated_seconds);
+    let started = Instant::now();
+    for _ in 0..50 {
+        solver::step(&mut scene, &mut None);
+    }
+    let per_step_ms = started.elapsed().as_secs_f64() * 1000.0 / 50.0;
+    eprintln!("DORMANT step {per_step_ms:.3} ms");
+    assert_eq!(scene.positions, positions);
+    assert_eq!(scene.substep_index, substeps + 50 * 4);
+    assert!((scene.simulated_seconds - seconds - 0.5).abs() < 1.0e-6, "time must keep running");
+    assert_eq!(scene.sleeping_rev_count(), block.len());
+}

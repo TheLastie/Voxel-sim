@@ -55,6 +55,9 @@ impl Default for SleepConfig {
 
 struct SleepRegion {
     members: Vec<usize>,
+    /// Internal energy and mass of each member when it fell asleep, as bits. A change
+    /// means heat, a reaction or a composition change reached the sleeper.
+    signature: Vec<(u64, u32)>,
 }
 
 pub(crate) struct SleepState {
@@ -130,6 +133,15 @@ impl Scene {
             self.wake_regions(&mut state, &ids);
         }
         self.sleep = Some(state);
+    }
+
+    /// True when nothing mechanical is awake: every REV is fixed or asleep, no rigid
+    /// aggregate or beam region exists. Such a step only conducts heat and runs chemistry.
+    pub(crate) fn mechanically_dormant(&self) -> bool {
+        self.sleep.as_ref().is_some_and(|state| state.regions.iter().any(Option::is_some))
+            && !self.has_registered_rigid_candidates()
+            && self.beam_regions.iter().all(Option::is_none)
+            && self.voxels.iter().all(|v| v.kinematic)
     }
 
     /// Free REVs currently asleep.
@@ -208,6 +220,15 @@ impl Scene {
         // Applied forces and accelerations on a sleeper.
         for (id, region) in state.regions.iter().enumerate() {
             let Some(region) = region else { continue };
+            let changed = region.members.iter().zip(&region.signature).any(|(&i, &(energy, mass))| {
+                self.voxels
+                    .get(i)
+                    .map_or(true, |v| v.total_internal_energy_j().to_bits() != energy || v.mass.to_bits() != mass)
+            });
+            if changed {
+                wake.push(id);
+                continue;
+            }
             let loaded = region.members.iter().any(|&i| {
                 self.external_forces.get(i).is_some_and(|f| *f != Vec3::ZERO)
                     || self.external_accelerations.get(i).is_some_and(|a| *a != Vec3::ZERO)
@@ -304,7 +325,11 @@ impl Scene {
         for members in sleep_now {
             all.extend_from_slice(&members);
             let slot = state.regions.iter().position(Option::is_none).unwrap_or(state.regions.len());
-            let region = SleepRegion { members };
+            let signature = members
+                .iter()
+                .map(|&i| (self.voxels[i].total_internal_energy_j().to_bits(), self.voxels[i].mass.to_bits()))
+                .collect();
+            let region = SleepRegion { members, signature };
             if slot == state.regions.len() {
                 state.regions.push(Some(region));
             } else {

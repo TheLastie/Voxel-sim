@@ -9,7 +9,7 @@ use voxel_physics_lab::{
     solver,
 };
 
-fn resting(width: i32, height: i32, steps: usize, sleep: bool) -> Vec<f64> {
+fn resting(width: i32, height: i32, steps: usize, sleep: bool, pebble: bool) -> Vec<f64> {
     let iron = Material::component_id("iron").unwrap();
     let stone = Material::component_id("stone").unwrap();
     let mut config = SceneConfig::default();
@@ -31,6 +31,10 @@ fn resting(width: i32, height: i32, steps: usize, sleep: bool) -> Vec<f64> {
                 spawns.push(VoxelSpawn::at_cell([x, y, z], iron));
             }
         }
+    }
+    if pebble {
+        // One awake REV falling from 20 m for the whole run: the world is not dormant.
+        spawns.push(VoxelSpawn::at_cell([lo - 6, lo - 6, 2000], iron));
     }
     let mut scene = Scene::from_voxels(config, spawns).unwrap();
     if sleep {
@@ -66,7 +70,8 @@ fn report(label: &str, times: &[f64]) {
 fn a_block_at_rest_costs_little_when_it_sleeps() {
     for (width, height) in [(14, 14), (20, 25), (30, 30)] {
         let active = width * width * height;
-        report(&format!("rest {width}x{width}x{height} ({active} REVs) sleep off"), &resting(width, height, 60, false));
-        report(&format!("rest {width}x{width}x{height} ({active} REVs) sleep on "), &resting(width, height, 60, true));
+        report(&format!("rest {width}x{width}x{height} ({active} REVs) sleep off          "), &resting(width, height, 60, false, false));
+        report(&format!("rest {width}x{width}x{height} ({active} REVs) sleep on, dormant  "), &resting(width, height, 60, true, false));
+        report(&format!("rest {width}x{width}x{height} ({active} REVs) sleep on + 1 awake "), &resting(width, height, 60, true, true));
     }
 }
