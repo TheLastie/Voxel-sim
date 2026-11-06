@@ -2,11 +2,25 @@
 //! section 2.4: resource accounting, sensors, a small spiking controller,
 //! learning kept apart from heredity, and one controller boundary.
 //!
-//! What this module is not: it does not make a creature walk. The network that
-//! is trained here learns a trivial signal-following task in tests; learned
-//! walking is not implemented. Digestion, transport and the brain live in this
-//! module's plain data, not yet in dedicated organ REVs (see the TODO list in
-//! the commit report).
+//! What this module is not: it does not make a creature walk. The only
+//! learned behaviour is [`ActivationTask`]: raising one muscle channel while a
+//! sensor condition holds. Digestion, transport and the brain live in this
+//! module's plain data, not yet in dedicated organ REVs.
+//!
+//! Sensing ([`SensorLayout`], [`SensorReading`]) reads the real scene: contact,
+//! the support force and its share per foot (momentum balance of the body), the
+//! height of the centre of mass, tilt, joint angles, pose error against the
+//! actuator's commanded pose, actuator load and bond stress per bone. Every
+//! channel has a stable id ([`SensorId`]), one unit and a cost counter
+//! ([`SensorCost`]); readings are noise-free.
+//!
+//! Control: a [`Controller`] answers with a strength factor in `0..=1` per
+//! actuator. [`Creature::drive_step`] scales the [`SkeletalActuator`] by it
+//! (never writing a pose), runs one solver step, debits the muscle work from
+//! the [`ResourceLedger`] and returns the losses to the muscle REVs as
+//! internal energy. The solver evaluates actuator loads once per fixed step,
+//! so a factor holds for the whole step; only the spiking network itself runs
+//! at a finer step (1 ms by default).
 //!
 //! Units are SI throughout: joules, watts, seconds, newtons, metres, kelvin.
 //! Controllers only produce a dimensionless strength in `0..=1` per actuator.
@@ -383,6 +397,148 @@ struct BoneGroup {
     voxels: Vec<usize>,
 }
 
+/// One bond that touches a creature REV, named by its owner REV and axis.
+#[derive(Clone, Copy, Debug)]
+struct IncidentBond {
+    axis: u8,
+    owner: u32,
+}
+
+/// What a sensor measures. Every kind has one fixed unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SensorKind {
+    /// Another REV outside the creature touches the foot REV (1 or 0).
+    FootContact,
+    /// Share of the body's support force carried by a touching foot REV (N).
+    FootNormalLoad,
+    /// Net force the environment exerts on the whole creature along world up (N).
+    SupportLoad,
+    /// Height of the centre of mass along world up (m, world coordinate).
+    ComHeight,
+    /// Height of the centre of mass above the lowest creature REV (m).
+    BodyHeight,
+    /// Angle between the body's original vertical and world up (rad).
+    BodyTilt,
+    /// One component of the whole-body angular velocity (rad/s, world axes).
+    AngularVelocity,
+    /// One component of the centre-of-mass velocity (m/s, world axes).
+    ComVelocity,
+    /// Rotation angle of a bone relative to its sensed ancestor (rad).
+    JointAngle,
+    /// Sum of the magnitudes of the actuator loads on a bone's REVs (N).
+    MuscleLoad,
+    /// Largest bond stress (force over REV face area) at a bone's REVs (Pa).
+    TissueStress,
+    /// `TissueStress` over the REV's Young modulus: linear-elastic strain.
+    TissueStrain,
+    /// RMS distance of REVs from the pose the clip commands (m); a body-wide
+    /// reading has no bone.
+    PoseError,
+    /// Stored chemical energy over capacity (1).
+    StoredEnergy,
+    /// Derived hunger (1).
+    Hunger,
+}
+
+impl SensorKind {
+    pub fn unit(self) -> &'static str {
+        match self {
+            Self::FootContact | Self::StoredEnergy | Self::Hunger | Self::TissueStrain => "1",
+            Self::FootNormalLoad | Self::SupportLoad | Self::MuscleLoad => "N",
+            Self::ComHeight | Self::BodyHeight | Self::PoseError => "m",
+            Self::BodyTilt | Self::JointAngle => "rad",
+            Self::AngularVelocity => "rad/s",
+            Self::ComVelocity => "m/s",
+            Self::TissueStress => "Pa",
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::FootContact => "foot_contact",
+            Self::FootNormalLoad => "foot_normal_load",
+            Self::SupportLoad => "support_load",
+            Self::ComHeight => "com_height",
+            Self::BodyHeight => "body_height",
+            Self::BodyTilt => "body_tilt",
+            Self::AngularVelocity => "angular_velocity",
+            Self::ComVelocity => "com_velocity",
+            Self::JointAngle => "joint_angle",
+            Self::MuscleLoad => "muscle_load",
+            Self::TissueStress => "tissue_stress",
+            Self::TissueStrain => "tissue_strain",
+            Self::PoseError => "pose_error",
+            Self::StoredEnergy => "stored_energy",
+            Self::Hunger => "hunger",
+        }
+    }
+}
+
+/// Stable identity of one sensor channel. `rev` is the creature-local REV index
+/// (the index in the model, which does not change when the creature's block in
+/// the scene arrays moves); `bone` is the skeleton bone index; `axis` selects
+/// a vector component (0 = x, 1 = y, 2 = z).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SensorId {
+    pub kind: SensorKind,
+    pub rev: Option<u32>,
+    pub bone: Option<u32>,
+    pub axis: Option<u8>,
+}
+
+impl SensorId {
+    fn new(kind: SensorKind) -> Self {
+        Self { kind, rev: None, bone: None, axis: None }
+    }
+    /// Text form, for example `foot_normal_load/rev=12` or `joint_angle/bone=3`.
+    pub fn label(&self) -> String {
+        let mut text = self.kind.name().to_owned();
+        if let Some(rev) = self.rev {
+            text += &format!("/rev={rev}");
+        }
+        if let Some(bone) = self.bone {
+            text += &format!("/bone={bone}");
+        }
+        if let Some(axis) = self.axis {
+            text += &format!("/{}", ["x", "y", "z"][axis.min(2) as usize]);
+        }
+        text
+    }
+}
+
+/// One entry of a creature's sensor catalogue; the catalogue order equals the
+/// order of [`SensorReading::values`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SensorDescriptor {
+    pub id: SensorId,
+    pub unit: &'static str,
+}
+
+/// Counters that make the cost of sensing visible. All sensors are noise-free.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SensorCost {
+    pub reads: u64,
+    pub values: u64,
+    /// Per-REV state reads (positions, masses, velocities, loads).
+    pub rev_reads: u64,
+    /// Bond force reads.
+    pub bond_reads: u64,
+    /// Foot-versus-other-REV distance tests of the contact sensor.
+    pub pair_tests: u64,
+}
+
+impl SensorCost {
+    pub fn operations(&self) -> u64 {
+        self.rev_reads + self.bond_reads + self.pair_tests
+    }
+    pub fn accumulate(&mut self, other: SensorCost) {
+        self.reads += other.reads;
+        self.values += other.values;
+        self.rev_reads += other.rev_reads;
+        self.bond_reads += other.bond_reads;
+        self.pair_tests += other.pair_tests;
+    }
+}
+
 /// Where a creature's sensors read, fixed when the creature is built.
 #[derive(Clone, Debug)]
 pub struct SensorLayout {
@@ -393,6 +549,10 @@ pub struct SensorLayout {
     rest_m: Vec<DVec3>,
     groups: Vec<BoneGroup>,
     root_group: Option<usize>,
+    /// Rotation the model was placed with in the scene.
+    instance_rotation: Quat,
+    /// Bonds touching each creature REV; filled by [`SensorLayout::bind`].
+    incident: Option<Vec<Vec<IncidentBond>>>,
 }
 
 /// Rotation of one sensed bone relative to its nearest sensed ancestor.
@@ -411,14 +571,57 @@ impl JointReading {
     }
 }
 
+/// Load and strain of the tissue that moves one bone.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MuscleReading {
+    pub bone_index: usize,
+    /// Sum of |actuator load| over the bone's REVs (N); zero while the
+    /// actuator is off.
+    pub actuator_load_n: f32,
+    /// Largest bond stress at the bone's REVs (Pa).
+    pub peak_tissue_stress_pa: f32,
+    /// `peak_tissue_stress_pa` over the Young modulus of the REV (1).
+    pub peak_tissue_strain: f32,
+    /// RMS distance from the commanded pose (m); `None` without an actuator.
+    pub pose_error_rms_m: Option<f32>,
+}
+
 /// What a creature can sense of the real engine state in one instant.
 ///
-/// Not available without changing the solver, and therefore absent: contact
-/// normal force, friction state, light, and any exteroception beyond touch.
+/// Every number is computed from scene state at read time; nothing is noisy or
+/// remembered. Not available without changing the solver, and therefore
+/// absent: the solver's own contact impulses (support is measured on the whole
+/// body by momentum balance and shared among the touching feet), friction
+/// state, light, and exteroception beyond touch.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SensorReading {
     /// For each foot REV: is another REV outside the creature touching it?
     pub foot_contact: Vec<bool>,
+    /// For each foot REV: its share of `support_load_n` (N); zero for a foot
+    /// that does not touch anything. The solver does not export contact
+    /// impulses, and bond forces are too noisy on a stiff body to attribute the
+    /// support to single REVs, so the support is divided equally among the
+    /// touching feet. List every REV that can bear weight as a foot (for
+    /// example with [`SensorLayout::lowest_revs`]) or the shares are too large.
+    pub foot_normal_load_n: Vec<f32>,
+    /// Net force the environment (contacts and bonds to outside REVs) exerts on
+    /// the whole creature along world up (N): `M a - M g - F_external -
+    /// F_actuator` projected on up, clamped at zero, and zero when no foot
+    /// touches. Internal bond forces cancel, so it is exact up to the accuracy
+    /// of the velocities. It includes the inertial term only when accelerations
+    /// were supplied (see `inertia_included`); otherwise the body is assumed
+    /// not to accelerate.
+    pub support_load_n: f32,
+    /// True when the foot loads include the measured acceleration.
+    pub inertia_included: bool,
+    /// Creature weight `M |g|` (N), for scaling the loads.
+    pub body_weight_n: f32,
+    /// Height of the centre of mass along world up (m).
+    pub com_height_m: Option<f32>,
+    /// Height of the centre of mass above the lowest creature REV (m).
+    pub body_height_m: Option<f32>,
+    /// Angle between the body's original vertical and world up (rad).
+    pub tilt_rad: Option<f32>,
     /// Body orientation relative to the rest placement (rigid fit of the root
     /// bone's REVs, or of all REVs when the model has no usable root group).
     pub body_orientation: Option<Quat>,
@@ -429,15 +632,22 @@ pub struct SensorReading {
     /// Velocity of the centre of mass (m/s, world axes).
     pub com_velocity_m_s: Vec3,
     pub joints: Vec<JointReading>,
+    /// One entry per sensed bone group, in the order of the layout.
+    pub muscles: Vec<MuscleReading>,
+    /// RMS distance of all dynamic creature REVs from the commanded pose (m).
+    pub pose_error_rms_m: Option<f32>,
     /// Stored chemical energy over capacity, `0..=1`.
     pub stored_energy_fraction: f32,
     /// Derived from the ledger, `0..=1`.
     pub hunger: f32,
+    /// What this single read cost.
+    pub cost: SensorCost,
 }
 
 impl SensorLayout {
     /// Build the layout for `actuator`'s REV range. `foot_local` lists
-    /// creature-local REV indices that act as feet.
+    /// creature-local REV indices that act as feet. Call [`bind`](Self::bind)
+    /// before reading.
     pub fn new(actuator: &SkeletalActuator, foot_local: Vec<usize>) -> Result<Self, String> {
         let model = actuator.model();
         let range = actuator.voxel_range();
@@ -502,7 +712,46 @@ impl SensorLayout {
             rest_m,
             groups,
             root_group,
+            instance_rotation: actuator.instance_rotation_f32(),
+            incident: None,
         })
+    }
+
+    /// Record which bonds touch the creature's REVs. Needed for loads and
+    /// stresses; call once per topology (a creature does it when built).
+    pub fn bind(&mut self, scene: &Scene) -> Result<(), String> {
+        let n = scene.voxels.len();
+        if n != self.total_scene_voxels || scene.workspace.iter().any(|w| w.len() != n) {
+            return Err("scene topology differs from the sensor layout".into());
+        }
+        let mut incident: Vec<Vec<IncidentBond>> = vec![Vec::new(); self.range.len()];
+        for axis in 0..3 {
+            for owner in 0..n {
+                let neighbor = scene.workspace[axis][owner].rest_neighbor;
+                if neighbor == crate::bond::EMPTY {
+                    continue;
+                }
+                if self.range.contains(&owner) {
+                    incident[owner - self.range.start].push(IncidentBond {
+                        axis: axis as u8,
+                        owner: owner as u32,
+                    });
+                }
+                let neighbor = neighbor as usize;
+                if self.range.contains(&neighbor) {
+                    incident[neighbor - self.range.start].push(IncidentBond {
+                        axis: axis as u8,
+                        owner: owner as u32,
+                    });
+                }
+            }
+        }
+        self.incident = Some(incident);
+        Ok(())
+    }
+
+    pub fn is_bound(&self) -> bool {
+        self.incident.is_some()
     }
 
     /// Creature-local REVs lowest along the scene's gravity, within `band_m` of
@@ -529,21 +778,112 @@ impl SensorLayout {
     pub fn foot_count(&self) -> usize {
         self.foot_local.len()
     }
+    /// Creature-local REV indices of the feet, in sensor order.
+    pub fn foot_revs(&self) -> &[usize] {
+        &self.foot_local
+    }
     pub fn joint_count(&self) -> usize {
         self.groups.iter().filter(|g| g.reference.is_some()).count()
     }
+    pub fn muscle_count(&self) -> usize {
+        self.groups.len()
+    }
     /// Length of the vector produced by [`SensorReading::encode`].
     pub fn input_count(&self) -> usize {
-        self.foot_count() + 3 + 3 + self.joint_count() + 2
+        2 * self.foot_count() + 3 + 3 + self.joint_count() + 2 + 2
+    }
+
+    /// Every sensor channel with its stable id and unit, in the order of
+    /// [`SensorReading::values`].
+    pub fn catalog(&self) -> Vec<SensorDescriptor> {
+        let mut list = Vec::new();
+        let mut push = |id: SensorId| {
+            list.push(SensorDescriptor { unit: id.kind.unit(), id });
+        };
+        for &f in &self.foot_local {
+            push(SensorId { rev: Some(f as u32), ..SensorId::new(SensorKind::FootContact) });
+        }
+        for &f in &self.foot_local {
+            push(SensorId { rev: Some(f as u32), ..SensorId::new(SensorKind::FootNormalLoad) });
+        }
+        push(SensorId::new(SensorKind::SupportLoad));
+        push(SensorId::new(SensorKind::ComHeight));
+        push(SensorId::new(SensorKind::BodyHeight));
+        push(SensorId::new(SensorKind::BodyTilt));
+        for axis in 0..3 {
+            push(SensorId { axis: Some(axis), ..SensorId::new(SensorKind::AngularVelocity) });
+        }
+        for axis in 0..3 {
+            push(SensorId { axis: Some(axis), ..SensorId::new(SensorKind::ComVelocity) });
+        }
+        for group in self.groups.iter().filter(|g| g.reference.is_some()) {
+            push(SensorId {
+                bone: Some(group.bone_index as u32),
+                ..SensorId::new(SensorKind::JointAngle)
+            });
+        }
+        push(SensorId::new(SensorKind::PoseError));
+        for group in &self.groups {
+            for kind in [
+                SensorKind::MuscleLoad,
+                SensorKind::TissueStress,
+                SensorKind::TissueStrain,
+                SensorKind::PoseError,
+            ] {
+                push(SensorId { bone: Some(group.bone_index as u32), ..SensorId::new(kind) });
+            }
+        }
+        push(SensorId::new(SensorKind::StoredEnergy));
+        push(SensorId::new(SensorKind::Hunger));
+        list
     }
 }
 
 impl SensorReading {
+    /// A reading with `foot_count` feet and nothing else known (all feet off
+    /// the ground, no body fit). Useful as a base for hand-made readings.
+    pub fn empty(foot_count: usize) -> Self {
+        Self {
+            foot_contact: vec![false; foot_count],
+            foot_normal_load_n: vec![0.0; foot_count],
+            support_load_n: 0.0,
+            inertia_included: false,
+            body_weight_n: 0.0,
+            com_height_m: None,
+            body_height_m: None,
+            tilt_rad: None,
+            body_orientation: None,
+            up_in_body: None,
+            angular_velocity_rad_s: Vec3::ZERO,
+            com_velocity_m_s: Vec3::ZERO,
+            joints: Vec::new(),
+            muscles: Vec::new(),
+            pose_error_rms_m: None,
+            stored_energy_fraction: 0.0,
+            hunger: 0.0,
+            cost: SensorCost::default(),
+        }
+    }
+
     /// Read the real engine state of one creature. Does not mutate the scene.
+    /// Foot loads assume the feet are not accelerating; use
+    /// [`read_with_motion`](Self::read_with_motion) when accelerations are known.
     pub fn read(
         scene: &Scene,
         layout: &SensorLayout,
         ledger: &ResourceLedger,
+    ) -> Result<Self, String> {
+        Self::read_with_motion(scene, layout, ledger, None)
+    }
+
+    /// As [`read`](Self::read). `acceleration_m_s2`, indexed from the start of
+    /// the creature's REV range, is the measured acceleration of each REV over
+    /// the last step; with it the foot loads include the inertial term.
+    pub fn read_with_motion(
+        scene: &Scene,
+        layout: &SensorLayout,
+        ledger: &ResourceLedger,
+        acceleration_m_s2: Option<&[Vec3]>,
     ) -> Result<Self, String> {
         let range = layout.range.clone();
         if scene.positions.len() != layout.total_scene_voxels
@@ -551,30 +891,49 @@ impl SensorReading {
         {
             return Err("scene topology changed; sensor layout is stale".into());
         }
+        let incident = layout
+            .incident
+            .as_ref()
+            .ok_or("sensor layout is not bound to a scene (call SensorLayout::bind)")?;
+        if acceleration_m_s2.is_some_and(|a| a.len() != range.len()) {
+            return Err("acceleration slice must cover the creature's REV range".into());
+        }
+        let mut cost = SensorCost { reads: 1, ..SensorCost::default() };
         let pos = &scene.positions;
         let usable = |i: usize| {
             let v = &scene.voxels[i];
             !v.kinematic && v.mass.is_finite() && v.mass > 0.0 && pos[i].is_finite()
         };
+        let gravity = Vec3::from_array(scene.config.gravity).as_dvec3();
+        let up = (gravity.length() > 1e-9).then(|| -gravity.normalize());
+        let actuator = scene.skeletal_actuators.iter().find(|a| {
+            a.voxel_range() == range && a.matches_scene_topology(layout.total_scene_voxels)
+        });
 
-        let foot_contact = layout
-            .foot_local
-            .iter()
-            .map(|&f| {
-                let p = pos[range.start + f];
-                (0..pos.len()).any(|j| {
-                    if range.contains(&j) {
-                        return false;
-                    }
-                    let d = p - pos[j];
-                    d.is_finite() && d.abs().max_element() <= CELL_M + CONTACT_TOLERANCE_M
-                })
-            })
-            .collect();
+        // Contact: any REV outside the creature within one cell (plus tolerance).
+        let mut foot_contact = Vec::with_capacity(layout.foot_local.len());
+        for &f in &layout.foot_local {
+            let p = pos[range.start + f];
+            cost.rev_reads += 1;
+            let mut touching = false;
+            for (j, other) in pos.iter().enumerate() {
+                if range.contains(&j) {
+                    continue;
+                }
+                cost.pair_tests += 1;
+                let d = p - *other;
+                if d.is_finite() && d.abs().max_element() <= CELL_M + CONTACT_TOLERANCE_M {
+                    touching = true;
+                    break;
+                }
+            }
+            foot_contact.push(touching);
+        }
 
         let dynamic: Vec<usize> = range.clone().filter(|&i| usable(i)).collect();
+        cost.rev_reads += range.len() as u64;
         let total_mass: f64 = dynamic.iter().map(|&i| f64::from(scene.voxels[i].mass)).sum();
-        let (com_velocity, omega) = if total_mass > 0.0 {
+        let (com, com_velocity, omega) = if total_mass > 0.0 {
             let com = dynamic.iter().fold(DVec3::ZERO, |s, &i| {
                 s + pos[i] * f64::from(scene.voxels[i].mass)
             }) / total_mass;
@@ -583,10 +942,49 @@ impl SensorReading {
             }) / total_mass;
             let (_, omega) =
                 crate::skeletal_actuator::rigid_kinematics(&dynamic, pos, &scene.voxels, com, vcom);
-            (vcom, omega)
+            (Some(com), vcom, omega)
         } else {
-            (DVec3::ZERO, DVec3::ZERO)
+            (None, DVec3::ZERO, DVec3::ZERO)
         };
+        // Support: what the environment must supply so that gravity, external
+        // and actuator loads produce the measured acceleration of the whole body.
+        // Internal bond forces cancel in the sum, so they are not read here.
+        let touching = foot_contact.iter().filter(|&&c| c).count();
+        let support_load = match up {
+            Some(up) if touching > 0 && total_mass > 0.0 => {
+                let mut needed = DVec3::ZERO;
+                for &i in &dynamic {
+                    let l = i - range.start;
+                    let m = f64::from(scene.voxels[i].mass);
+                    let actuator_force = actuator
+                        .and_then(|a| a.last_forces_n().get(l).copied())
+                        .unwrap_or(Vec3::ZERO)
+                        .as_dvec3();
+                    let inertial = acceleration_m_s2.map_or(DVec3::ZERO, |a| a[l].as_dvec3() * m);
+                    needed += inertial
+                        - gravity * m
+                        - scene.external_forces[i].as_dvec3()
+                        - scene.external_accelerations[i].as_dvec3() * m
+                        - actuator_force;
+                }
+                let load = needed.dot(up).max(0.0);
+                if load.is_finite() { load } else { 0.0 }
+            }
+            _ => 0.0,
+        };
+        let foot_normal_load_n: Vec<f32> = foot_contact
+            .iter()
+            .map(|&c| if c { (support_load / touching as f64) as f32 } else { 0.0 })
+            .collect();
+
+        let com_height_m = com.zip(up).map(|(c, u)| c.dot(u) as f32);
+        let body_height_m = com.zip(up).and_then(|(c, u)| {
+            dynamic
+                .iter()
+                .map(|&i| pos[i].dot(u))
+                .min_by(f64::total_cmp)
+                .map(|lowest| (c.dot(u) - lowest) as f32)
+        });
 
         let fit = |locals: &[usize]| -> Option<DQuat> {
             let mut rest = Vec::new();
@@ -608,9 +1006,13 @@ impl SensorReading {
             .root_group
             .and_then(|g| fit(&layout.groups[g].voxels))
             .or_else(|| fit(&all_local));
-        let up_in_body = body.and_then(|q| {
-            let g = Vec3::from_array(scene.config.gravity).as_dvec3();
-            (g.length() > 1e-9).then(|| (q.inverse() * (-g.normalize())).as_vec3())
+        let up_in_body = body.zip(up).map(|(q, u)| (q.inverse() * u).as_vec3());
+        // The body's own vertical is world up seen from the placement rotation;
+        // tilt is how far the fitted rotation has turned it away from world up.
+        let tilt_rad = body.zip(up).map(|(q, u)| {
+            let placed = layout.instance_rotation.as_dquat().inverse() * u;
+            let now = q * placed;
+            now.dot(u).clamp(-1.0, 1.0).acos() as f32
         });
 
         let fits: Vec<Option<DQuat>> = layout.groups.iter().map(|g| fit(&g.voxels)).collect();
@@ -634,17 +1036,104 @@ impl SensorReading {
             })
             .collect();
 
-        let reading = Self {
+        // Muscles: actuator load, bond stress and pose error per bone group.
+        let pose_error = actuator.and_then(|a| a.pose_error_m(pos, &scene.voxels, &scene.rotations));
+        let actuator_forces = actuator.map(|a| a.last_forces_n());
+        let rms = |locals: &[usize]| -> Option<f32> {
+            let errors = pose_error.as_ref()?;
+            let used: Vec<f64> = locals
+                .iter()
+                .filter(|&&l| usable(range.start + l))
+                .map(|&l| f64::from(errors[l]))
+                .collect();
+            (!used.is_empty())
+                .then(|| (used.iter().map(|e| e * e).sum::<f64>() / used.len() as f64).sqrt() as f32)
+        };
+        let face_area = CELL_M * CELL_M;
+        let muscles: Vec<MuscleReading> = layout
+            .groups
+            .iter()
+            .map(|group| {
+                let (mut load, mut stress, mut strain) = (0.0f64, 0.0f64, 0.0f64);
+                for &l in &group.voxels {
+                    cost.rev_reads += 1;
+                    let i = range.start + l;
+                    if let Some(f) = actuator_forces.and_then(|f| f.get(l)) {
+                        load += f64::from(f.length());
+                    }
+                    let young = f64::from(scene.properties[i].young).max(1.0);
+                    for b in &incident[l] {
+                        cost.bond_reads += 1;
+                        let (axis, owner) = (b.axis as usize, b.owner as usize);
+                        if scene.bonds[axis][owner].neighbor == crate::bond::EMPTY {
+                            continue;
+                        }
+                        let s = f64::from(scene.workspace[axis][owner].last_force.length()) / face_area;
+                        stress = stress.max(s);
+                        strain = strain.max(s / young);
+                    }
+                }
+                let finite = |v: f64| if v.is_finite() { v as f32 } else { 0.0 };
+                MuscleReading {
+                    bone_index: group.bone_index,
+                    actuator_load_n: finite(load),
+                    peak_tissue_stress_pa: finite(stress),
+                    peak_tissue_strain: finite(strain),
+                    pose_error_rms_m: rms(&group.voxels),
+                }
+            })
+            .collect();
+        let dynamic_local: Vec<usize> = dynamic.iter().map(|&i| i - range.start).collect();
+
+        let mut reading = Self {
             foot_contact,
+            foot_normal_load_n,
+            support_load_n: support_load as f32,
+            inertia_included: acceleration_m_s2.is_some(),
+            body_weight_n: (total_mass * gravity.length()) as f32,
+            com_height_m,
+            body_height_m,
+            tilt_rad,
             body_orientation: body.map(|q| q.as_quat()),
-            up_in_body,
+            up_in_body: up_in_body,
             angular_velocity_rad_s: omega.as_vec3(),
             com_velocity_m_s: com_velocity.as_vec3(),
             joints,
+            muscles,
+            pose_error_rms_m: rms(&dynamic_local),
             stored_energy_fraction: ledger.stored_fraction() as f32,
             hunger: ledger.hunger() as f32,
+            cost,
         };
+        reading.cost.values = reading.values().len() as u64;
         Ok(reading)
+    }
+
+    /// Every sensor value in the order of [`SensorLayout::catalog`]; `None`
+    /// where the quantity was unavailable at this instant.
+    pub fn values(&self) -> Vec<Option<f64>> {
+        let mut out: Vec<Option<f64>> = Vec::new();
+        out.extend(self.foot_contact.iter().map(|&c| Some(if c { 1.0 } else { 0.0 })));
+        out.extend(self.foot_normal_load_n.iter().map(|&l| Some(f64::from(l))));
+        out.push(Some(f64::from(self.support_load_n)));
+        out.push(self.com_height_m.map(f64::from));
+        out.push(self.body_height_m.map(f64::from));
+        out.push(self.tilt_rad.map(f64::from));
+        let w = self.angular_velocity_rad_s;
+        out.extend([w.x, w.y, w.z].map(|v| Some(f64::from(v))));
+        let v = self.com_velocity_m_s;
+        out.extend([v.x, v.y, v.z].map(|v| Some(f64::from(v))));
+        out.extend(self.joints.iter().map(|j| j.angle_rad().map(f64::from)));
+        out.push(self.pose_error_rms_m.map(f64::from));
+        for m in &self.muscles {
+            out.push(Some(f64::from(m.actuator_load_n)));
+            out.push(Some(f64::from(m.peak_tissue_stress_pa)));
+            out.push(Some(f64::from(m.peak_tissue_strain)));
+            out.push(m.pose_error_rms_m.map(f64::from));
+        }
+        out.push(Some(f64::from(self.stored_energy_fraction)));
+        out.push(Some(f64::from(self.hunger)));
+        out
     }
 
     /// True when every number in the reading is finite.
@@ -659,14 +1148,19 @@ impl SensorReading {
                 .all(|j| j.rotation_vector_rad.map_or(true, |v| v.is_finite()))
             && self.stored_energy_fraction.is_finite()
             && self.hunger.is_finite()
+            && self.values().iter().flatten().all(|v| v.is_finite())
     }
 
     /// Fixed-length, bounded encoding for the network: foot contacts (0/1),
-    /// up-in-body (3), tanh(omega / 2 rad/s) (3), joint angles / pi (one per
-    /// joint), stored energy fraction, hunger. Unavailable values encode as 0.
+    /// foot loads over body weight (clamped to 0..1), up-in-body (3),
+    /// tanh(omega / 2 rad/s) (3), joint angles / pi (one per joint), body-wide
+    /// pose error tanh(rms / 1 cm), peak tissue strain over 1 % (clamped),
+    /// stored energy fraction, hunger. Unavailable values encode as 0.
     pub fn encode(&self, out: &mut Vec<f32>) {
         out.clear();
         out.extend(self.foot_contact.iter().map(|&c| if c { 1.0 } else { 0.0 }));
+        let weight = self.body_weight_n.max(1e-9);
+        out.extend(self.foot_normal_load_n.iter().map(|&l| (l / weight).clamp(0.0, 1.0)));
         let up = self.up_in_body.unwrap_or(Vec3::ZERO);
         out.extend_from_slice(&[up.x, up.y, up.z]);
         let w = self.angular_velocity_rad_s;
@@ -674,6 +1168,9 @@ impl SensorReading {
         out.extend(self.joints.iter().map(|j| {
             (j.angle_rad().unwrap_or(0.0) / std::f32::consts::PI).clamp(0.0, 1.0)
         }));
+        out.push((self.pose_error_rms_m.unwrap_or(0.0) / CELL_M as f32).tanh());
+        let strain = self.muscles.iter().map(|m| m.peak_tissue_strain).fold(0.0f32, f32::max);
+        out.push((strain / 0.01).clamp(0.0, 1.0));
         out.push(self.stored_energy_fraction.clamp(0.0, 1.0));
         out.push(self.hunger.clamp(0.0, 1.0));
     }
@@ -1477,6 +1974,10 @@ impl HillClimber {
             learned.accepted_updates += 1;
             self.best_reward = Some(reward);
             self.sigma = (self.sigma * 1.3).min(self.sigma_max);
+        } else if reward.is_finite() && self.best_reward == Some(reward) {
+            // A tie carries no information about the step size: widen the
+            // search slowly so a flat reward plateau can be left.
+            self.sigma = (self.sigma * 1.05).min(self.sigma_max);
         } else {
             self.sigma = (self.sigma * 0.93).max(self.sigma_min);
         }
@@ -1519,6 +2020,22 @@ impl Controller for RecordedAnimationController {
     fn control(&mut self, _: f64, _: &SensorReading, actuator_count: usize) -> Result<ControlCommand, String> {
         Ok(ControlCommand {
             actuator_strength: vec![1.0; actuator_count],
+        })
+    }
+}
+
+/// Relaxed muscles: zero strength at every step (the actuator is switched off,
+/// so the body is passive and costs only its basal power).
+#[derive(Clone, Debug, Default)]
+pub struct PassiveController;
+
+impl Controller for PassiveController {
+    fn name(&self) -> &str {
+        "passive"
+    }
+    fn control(&mut self, _: f64, _: &SensorReading, actuator_count: usize) -> Result<ControlCommand, String> {
+        Ok(ControlCommand {
+            actuator_strength: vec![0.0; actuator_count],
         })
     }
 }
@@ -1608,12 +2125,25 @@ pub fn apply_command(command: &ControlCommand, limit: f32, actuators: &mut [Skel
 // The creature: genome + learned state + ledger + the glue of one step
 // ---------------------------------------------------------------------------
 
+/// Wall time of the parts of one driven step (s). Sensing, control and
+/// accounting are the creature's own cost; `solver_s` is the physics step.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StepTiming {
+    pub sensing_s: f64,
+    pub control_s: f64,
+    pub solver_s: f64,
+    pub accounting_s: f64,
+}
+
 /// What one driven step did.
 #[derive(Clone, Debug)]
 pub struct StepReport {
     pub commanded: f32,
     pub applied: f32,
     pub outcome: MuscleStepOutcome,
+    /// Cost of the sensor read that fed the controller.
+    pub sensor_cost: SensorCost,
+    pub timing: StepTiming,
 }
 
 pub struct Creature {
@@ -1622,6 +2152,10 @@ pub struct Creature {
     ledger: ResourceLedger,
     sensors: SensorLayout,
     actuator_index: usize,
+    /// Acceleration of each creature REV over the last driven step (m/s^2),
+    /// from the velocities at its start and end; feeds the foot-load sensors.
+    last_acceleration: Option<Vec<Vec3>>,
+    sensor_cost: SensorCost,
 }
 
 impl Creature {
@@ -1640,7 +2174,8 @@ impl Creature {
             .get(actuator_index)
             .ok_or("scene has no such actuator")?;
         let feet = genome.structure.foot_voxels.iter().map(|&f| f as usize).collect();
-        let sensors = SensorLayout::new(actuator, feet)?;
+        let mut sensors = SensorLayout::new(actuator, feet)?;
+        sensors.bind(scene)?;
         if genome.network.input_count as usize != sensors.input_count() {
             return Err(format!(
                 "network expects {} inputs but the body senses {}",
@@ -1661,6 +2196,8 @@ impl Creature {
             learned,
             sensors,
             actuator_index,
+            last_acceleration: None,
+            sensor_cost: SensorCost::default(),
         })
     }
 
@@ -1682,6 +2219,23 @@ impl Creature {
     pub fn sensor_layout(&self) -> &SensorLayout {
         &self.sensors
     }
+    /// Cumulative cost of every sensor read made through this creature.
+    pub fn sensor_cost_total(&self) -> SensorCost {
+        self.sensor_cost
+    }
+
+    /// Read the creature's sensors now, with the acceleration of the last
+    /// driven step when there is one. Counts towards `sensor_cost_total`.
+    pub fn sense(&mut self, scene: &Scene) -> Result<SensorReading, String> {
+        let reading = SensorReading::read_with_motion(
+            scene,
+            &self.sensors,
+            &self.ledger,
+            self.last_acceleration.as_deref(),
+        )?;
+        self.sensor_cost.accumulate(reading.cost);
+        Ok(reading)
+    }
 
     /// A fresh network built from the genome's layout and the current learned
     /// state.
@@ -1695,15 +2249,27 @@ impl Creature {
     /// One physical step with sensing, control, actuation, accounting and
     /// heat. `advance` must perform exactly one fixed solver step on the scene
     /// (for example `|s| solver::step(s, &mut None)`).
+    ///
+    /// The controller's strength factor is held for the whole fixed step: the
+    /// solver evaluates the actuator's loads once per step, so a command cannot
+    /// change inside it without a change to the solver. A spiking controller
+    /// still integrates its own state at the network step (1 ms by default).
     pub fn drive_step(
         &mut self,
         scene: &mut Scene,
         controller: &mut dyn Controller,
         advance: &mut dyn FnMut(&mut Scene),
     ) -> Result<StepReport, String> {
+        use std::time::Instant;
         let dt = f64::from(scene.config.fixed_dt);
-        let reading = SensorReading::read(scene, &self.sensors, &self.ledger)?;
+        let started = Instant::now();
+        let reading = self.sense(scene)?;
+        let sensing_s = started.elapsed().as_secs_f64();
+
+        let started = Instant::now();
         let command = controller.control(dt, &reading, 1)?;
+        let control_s = started.elapsed().as_secs_f64();
+
         let limit = self.ledger.strength_limit(dt);
         let idx = self.actuator_index;
         let actuators = scene
@@ -1718,27 +2284,67 @@ impl Creature {
             .clone()
             .filter(|&i| !scene.voxels[i].kinematic && scene.voxels[i].mass > 0.0)
             .collect();
-        let v0: Vec<Vec3> = muscle.iter().map(|&i| scene.voxels[i].velocity).collect();
+        let v0_all: Vec<Vec3> = range.clone().map(|i| scene.voxels[i].velocity).collect();
+        let started = Instant::now();
         advance(scene);
+        let solver_s = started.elapsed().as_secs_f64();
         if scene.voxels.len() != self.sensors.total_scene_voxels {
             return Err("scene topology changed during the step".into());
         }
+
+        let started = Instant::now();
         let loads = scene.skeletal_actuators[idx].last_forces_n();
         let forces: Vec<Vec3> = muscle
             .iter()
             .map(|&i| loads.get(i - range.start).copied().unwrap_or(Vec3::ZERO))
             .collect();
+        let v0: Vec<Vec3> = muscle.iter().map(|&i| v0_all[i - range.start]).collect();
         let v1: Vec<Vec3> = muscle.iter().map(|&i| scene.voxels[i].velocity).collect();
         let outcome = self.ledger.settle_muscle_step(dt, &forces, &v0, &v1)?;
         for (&i, &heat) in muscle.iter().zip(&outcome.heat_per_rev_j) {
             scene.voxels[i].add_internal_energy_j(heat);
         }
+        self.last_acceleration = Some(
+            range
+                .clone()
+                .zip(&v0_all)
+                .map(|(i, v0)| (scene.voxels[i].velocity - *v0) / dt as f32)
+                .collect(),
+        );
         self.learned.lifetime_s += dt;
+        let accounting_s = started.elapsed().as_secs_f64();
         Ok(StepReport {
             commanded: command.actuator_strength.first().copied().unwrap_or(0.0),
             applied,
             outcome,
+            sensor_cost: reading.cost,
+            timing: StepTiming {
+                sensing_s,
+                control_s,
+                solver_s,
+                accounting_s,
+            },
         })
+    }
+
+    /// Learn `task` from recorded sensor frames: reward-gated updates of this
+    /// creature's [`LearnedState`] only. The genome is never touched.
+    pub fn learn_activation_task(
+        &mut self,
+        task: &ActivationTask,
+        frames: &[SensorReading],
+        frame_dt_s: f64,
+        seed: u64,
+        trials: usize,
+    ) -> Result<TaskReport, String> {
+        task.learn(
+            &self.genome.network,
+            &mut self.learned,
+            frames,
+            frame_dt_s,
+            seed,
+            trials,
+        )
     }
 }
 
@@ -1764,6 +2370,9 @@ pub fn genome_for_body(
     genome.validate()?;
     Ok(genome)
 }
+
+pub mod task;
+pub use task::{ActivationTask, SensorCondition, TaskReport};
 
 #[cfg(test)]
 mod tests;

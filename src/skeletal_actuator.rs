@@ -110,6 +110,64 @@ impl SkeletalActuator {
         &self.last_forces_n
     }
 
+    /// Distance (m) of each REV from the pose the clip commands at the
+    /// actuator's current clip time, in the same mass-comoving, body-rotated
+    /// frame the force law uses (rigid translation and rotation of the whole
+    /// body do not count as error). Indexed from `voxel_range().start`; zero for
+    /// fixed REVs. Read-only: it changes neither the clip time nor any load.
+    /// `None` when the actuator is disabled by a topology change or the inputs
+    /// do not match its range.
+    pub fn pose_error_m(
+        &self,
+        positions: &[DVec3],
+        voxels: &[Voxel],
+        rotations: &[Quat],
+    ) -> Option<Vec<f32>> {
+        let count = positions.len();
+        if self.invalidated
+            || count != self.total_scene_voxels
+            || voxels.len() != count
+            || rotations.len() != count
+            || self.voxel_range.end > count
+        {
+            return None;
+        }
+        let clip = self.model.skeleton.as_ref()?.clips.get(self.clip_index)?;
+        let time = self.elapsed_s.rem_euclid(clip.duration_s.max(1e-6));
+        let poses = self
+            .prepared_animation
+            .evaluate(&self.model, self.clip_index, time)
+            .ok()
+            .filter(|poses| poses.len() == self.voxel_range.len())?;
+        let dynamic: Vec<usize> = self
+            .voxel_range
+            .clone()
+            .filter(|&i| !voxels[i].kinematic && voxels[i].mass.is_finite() && voxels[i].mass > 0.0)
+            .collect();
+        let total_mass: f64 = dynamic.iter().map(|&i| f64::from(voxels[i].mass)).sum();
+        if dynamic.is_empty() || !(total_mass.is_finite() && total_mass > 0.0) {
+            return None;
+        }
+        let mut current_com = DVec3::ZERO;
+        let mut target_com_local = DVec3::ZERO;
+        for &i in &dynamic {
+            let mass = f64::from(voxels[i].mass);
+            current_com += positions[i] * mass;
+            target_com_local += poses[i - self.voxel_range.start].position_m * mass;
+        }
+        current_com /= total_mass;
+        target_com_local /= total_mass;
+        let rotation = self.body_rotation(dynamic.iter().copied(), voxels, rotations);
+        let mut errors = vec![0.0f32; self.voxel_range.len()];
+        for &i in &dynamic {
+            let local = poses[i - self.voxel_range.start].position_m - target_com_local;
+            let target = current_com + rotation * local;
+            let error = (target - positions[i]).length();
+            errors[i - self.voxel_range.start] = if error.is_finite() { error as f32 } else { 0.0 };
+        }
+        Some(errors)
+    }
+
     /// Enables the editor preview's protection from material bond damage.
     /// Gameplay actors leave this disabled so ordinary world damage applies.
     pub fn set_editor_bond_protection(&mut self, enabled: bool) {
