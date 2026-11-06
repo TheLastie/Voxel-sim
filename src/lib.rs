@@ -2,6 +2,7 @@ pub mod aggregation;
 mod banded;
 pub mod budget;
 mod cell_two_level;
+pub mod beam;
 pub mod bond;
 pub mod collision;
 pub mod combustion;
