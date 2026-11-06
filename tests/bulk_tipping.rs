@@ -52,8 +52,12 @@ fn tip(width: i32, height: i32, steps: usize) -> (f64, f64, f64) {
     let wall_ms = started.elapsed().as_secs_f64() * 1000.0 / steps as f64;
     let p = &solver::CELL_PROFILE;
     let ms = |k: usize| p[k].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1.0e6 / steps as f64;
+    let solves = p[4].swap(0, std::sync::atomic::Ordering::Relaxed);
+    let iterations = p[3].swap(0, std::sync::atomic::Ordering::Relaxed);
+    let gpu = solver::CELL_GPU_SOLVES.swap(0, std::sync::atomic::Ordering::Relaxed);
     eprintln!(
-        "  PHASES per step: assemble={:.0} build={:.0} cg={:.0} (matrix={:.0} precondition={:.0} of which bottom={:.0}) ms",
+        "  PHASES per step: assemble={:.0} build={:.0} cg={:.0} (matrix={:.0} precondition={:.0} of which bottom={:.0}) ms; \
+         cell solves={solves} on GPU={gpu} iterations={iterations}",
         ms(0), ms(1), ms(2), ms(5), ms(6), ms(7)
     );
     // Rigid block pivoting about its front bottom edge, integrated exactly.

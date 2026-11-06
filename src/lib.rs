@@ -2,6 +2,8 @@ pub mod aggregation;
 mod banded;
 pub mod budget;
 mod cell_two_level;
+#[cfg(feature = "desktop")]
+mod cell_gpu;
 pub mod beam;
 pub mod bond;
 pub mod collision;
