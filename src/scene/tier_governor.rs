@@ -327,7 +327,9 @@ impl Scene {
     /// as free). Each result is (ascending member indices, slice count).
     fn find_beam_candidates(&self, fixed: &dyn Fn(&Scene, usize) -> bool) -> Vec<(Vec<usize>, usize, usize)> {
         let cell = f64::from(CELL);
-        let coordinate = |p: DVec3| [(p.x / cell).round() as i32, (p.y / cell).round() as i32, (p.z / cell).round() as i32];
+        // Cell centres sit at half-integer multiples of CELL; floor maps each to its cell
+        // index on both sides of zero (round() splits -0.5 and 0.5 apart).
+        let coordinate = |p: DVec3| [(p.x / cell).floor() as i32, (p.y / cell).floor() as i32, (p.z / cell).floor() as i32];
         let n = self.voxels.len();
         let coords: Vec<[i32; 3]> = self.rest_positions.iter().map(|&p| coordinate(p)).collect();
         let mut at: HashMap<[i32; 3], usize> = HashMap::with_capacity(n);
