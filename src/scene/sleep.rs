@@ -18,6 +18,12 @@ use super::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Temperature change (K) of a sleeping REV that wakes its cluster. Below it the thermal
+/// strain change is under alpha * dT = 6e-7 for iron (about 0.1 MPa of thermal stress at
+/// full constraint), far below any bond limit, so the frozen mechanical state stays within
+/// the paradigm's tolerance. Heat keeps flowing through sleepers either way.
+const WAKE_DELTA_K: f32 = 0.05;
+
 /// Edge of the coarse grid used to find sleepers near a moving REV, in cells.
 const GRID_CELLS: f64 = 4.0;
 
@@ -172,9 +178,10 @@ struct SleepRegion {
     /// the visit list, so conduction and melting go on as they do for awake REVs; the
     /// change of energy then wakes it at the next step, as always.
     unsettled: bool,
-    /// Internal energy and mass of each member when it fell asleep, as bits. A change
-    /// means heat, a reaction or a composition change reached the sleeper.
-    signature: Vec<(u64, u32)>,
+    /// Temperature (K) and mass (bits) of each member when it fell asleep. A change of
+    /// mass means a reaction or composition change; a temperature change above
+    /// `WAKE_DELTA_K` means heat that matters mechanically reached the sleeper.
+    signature: Vec<(f32, u32)>,
 }
 
 pub(crate) struct SleepState {
@@ -435,16 +442,26 @@ impl Scene {
     }
 
     fn wake_disturbed(&mut self, state: &mut SleepState) {
+        let debug = std::env::var_os("VOXEL_SLEEP_DEBUG").is_some();
+        let fixed_step = self.substep_index / (self.config.substeps.max(1) as u64);
         let mut wake: Vec<usize> = Vec::new();
         // Applied forces and accelerations on a sleeper.
         for (id, region) in state.regions.iter().enumerate() {
             let Some(region) = region else { continue };
-            let changed = region.members.iter().zip(&region.signature).any(|(&i, &(energy, mass))| {
-                self.voxels
-                    .get(i)
-                    .map_or(true, |v| v.total_internal_energy_j().to_bits() != energy || v.mass.to_bits() != mass)
+            let changed = region.members.iter().zip(&region.signature).any(|(&i, &(kelvin, mass))| {
+                self.voxels.get(i).map_or(true, |v| {
+                    v.mass.to_bits() != mass
+                        || (self.properties[i].temperature(v.mass, v.thermal_energy_f32()) - kelvin).abs() > WAKE_DELTA_K
+                })
             });
             if changed {
+                if debug {
+                    let worst = region.members.iter().zip(&region.signature).map(|(&i, &(kelvin, _))| {
+                        let v = &self.voxels[i];
+                        (self.properties[i].temperature(v.mass, v.thermal_energy_f32()) - kelvin).abs()
+                    }).fold(0.0f32, f32::max);
+                    eprintln!("SLEEP-WAKE step {fixed_step} region {id} ({} REVs): temperature/mass change, max |dT| {worst:.3e} K", region.members.len());
+                }
                 wake.push(id);
                 continue;
             }
@@ -453,6 +470,9 @@ impl Scene {
                     || self.external_accelerations.get(i).is_some_and(|a| *a != Vec3::ZERO)
             });
             if loaded {
+                if debug {
+                    eprintln!("SLEEP-WAKE step {fixed_step} region {id}: applied load");
+                }
                 wake.push(id);
             }
         }
@@ -480,6 +500,9 @@ impl Scene {
                 for y in lo[1]..=hi[1] {
                     for z in lo[2]..=hi[2] {
                         if let Some(ids) = state.grid.get(&[x, y, z]) {
+                            if debug && !ids.is_empty() {
+                                eprintln!("SLEEP-WAKE step {fixed_step} regions {ids:?}: mover REV {i} at speed {speed:.3e} m/s, z={:.4}", p.z);
+                            }
                             wake.extend_from_slice(ids);
                         }
                     }
@@ -548,7 +571,10 @@ impl Scene {
             let slot = state.regions.iter().position(Option::is_none).unwrap_or(state.regions.len());
             let signature = members
                 .iter()
-                .map(|&i| (self.voxels[i].total_internal_energy_j().to_bits(), self.voxels[i].mass.to_bits()))
+                .map(|&i| {
+                    let v = &self.voxels[i];
+                    (self.properties[i].temperature(v.mass, v.thermal_energy_f32()), v.mass.to_bits())
+                })
                 .collect();
             let region = SleepRegion { members, unsettled, signature };
             if slot == state.regions.len() {
@@ -558,6 +584,9 @@ impl Scene {
             }
         }
         let _ = self.set_voxels_kinematic_raw(&all, true);
+        if std::env::var_os("VOXEL_SLEEP_DEBUG").is_some() {
+            eprintln!("SLEEP step {} : {} REVs fall asleep", self.substep_index / (self.config.substeps.max(1) as u64), all.len());
+        }
         state.grid_dirty = true;
         state.live = self.compute_live(&state.regions);
     }
