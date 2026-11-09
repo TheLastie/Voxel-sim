@@ -9146,7 +9146,9 @@ fn solve_face_cells_sparse(
     let mut ap = vec![[0.0; 6]; count];
     let (force0, moment0) = (force_norm(&r), moment_norm(&r));
     let tolerance = f64::from(scene.config.solver_relative_tolerance);
-    let limit = scene.config.iterations.max(1) * 10;
+    // Real time first (9 November 2026): the cell solve stops at the configured cap
+    // (was ten times it); many simultaneous contacts cost 8-15 thousand iterations a step.
+    let limit = scene.config.iterations.max(1);
     let converged = |r: &[Vec6]| {
         force_norm(r) <= tolerance * force0.max(1.0e-12)
             && moment_norm(r) <= tolerance * moment0.max(1.0e-12)

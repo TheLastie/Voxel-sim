@@ -359,15 +359,17 @@ impl Default for SceneConfig {
             gravity: [0.0, 0.0, -9.81],
             atmosphere: AtmosphereConfig::default(),
             fixed_dt: 0.001,
-            // 2 since 8 November 2026 (was 4): every analytic reference stays within 5.3%
-            // at half the cost; 1 substep reaches 14% on edge tipping.
-            substeps: 2,
-            iterations: 80,
+            // Real time first (user, 9 November 2026): 1 substep (edge tipping 14%, within
+            // the 25% tolerance), at most 30 CG iterations per solve. Accuracy is cut until
+            // the step fits 10 ms; creature scenes still keep 4 substeps (documents.rs).
+            substeps: 1,
+            iterations: 30,
             cuda_iterations: default_cuda_iterations(),
             cpu_preconditioner: CpuPreconditioner::default(),
             solver_relative_tolerance: 1e-5,
             corotation_tolerance: 1e-5,
-            corotation_iterations: 2,
+            // Real time first (9 November 2026): one rotation linearisation per substep.
+            corotation_iterations: 1,
             fracture: Default::default(),
             initial_speed: 0.0,
             tool_start: [0.0; 3],
