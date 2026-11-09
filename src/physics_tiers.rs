@@ -69,6 +69,9 @@ pub struct TierSettings {
     pub interval_steps: u32,
     /// Beam integrator substeps per fixed step.
     pub beam_substeps: usize,
+    /// Let settled bodies sleep (`Scene::enable_sleep`). Absent in older files: off.
+    #[serde(default)]
+    pub sleep: bool,
 }
 
 impl Default for TierSettings {
@@ -82,6 +85,7 @@ impl Default for TierSettings {
             tolerance: config.tolerance,
             interval_steps: config.interval_steps,
             beam_substeps: config.beam_substeps,
+            sleep: false,
         }
     }
 }
@@ -248,6 +252,11 @@ impl TierSettings {
     /// it (regions it created go back to cells). Unchanged on error.
     pub fn apply(&self, scene: &mut Scene) -> Result<(), String> {
         self.validate()?;
+        if self.sleep {
+            scene.enable_sleep(crate::scene::SleepConfig::default())?;
+        } else {
+            scene.disable_sleep();
+        }
         if self.enabled {
             scene.enable_tier_governor(self.to_config())
         } else {
@@ -275,6 +284,7 @@ impl TierSettings {
             "tolerance": self.tolerance,
             "interval_steps": self.interval_steps,
             "beam_substeps": self.beam_substeps,
+            "sleep": self.sleep,
         })
     }
 }

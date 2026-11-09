@@ -262,6 +262,135 @@ pub fn create_animated_model_scene(
     Ok(document)
 }
 
+/// A sandbox to play with in the editor: a fixed stone ground; an oak tower 6×6×24; an iron ball rolling at the tower; an oak log lying on the ground to cut with
+/// the editor's tools; an oak plank clamped in a stone post (a cantilever the budget
+/// governor may run as a beam); and a loose pile of iron cubes. About 1 400 free REVs, so
+/// every body keeps cell rotations. A `<scene>.physics.json` beside it switches on sleep
+/// and the tier governor (5 ms budget) when a run starts.
+pub fn create_playground_scene(path: &Path) -> Result<SceneDocument, String> {
+    if path.extension().and_then(|p| p.to_str()) != Some("vxscene") {
+        return Err("playground scene output must end in .vxscene".into());
+    }
+    if path.exists() {
+        return Err("playground scene output already exists; choose a new path".into());
+    }
+    let id = |name: &str| Material::component_id(name).ok_or_else(|| format!("{name} material is unavailable"));
+    let (stone, oak, iron) = (id("stone")?, id("oak")?, id("iron")?);
+    let mut config = SceneConfig::default();
+    config.fixed_dt = 0.01;
+    config.substeps = 2;
+    let model = |name: &str, cells: Vec<([i32; 3], u16, bool)>| -> Result<VoxelModelDocument, String> {
+        let mut builder = SceneBuilder::new(config.clone());
+        for (cell, material, fixed) in cells {
+            let spawn = VoxelSpawn::at_cell(cell, material);
+            builder = builder.add_voxel(if fixed { spawn.fixed() } else { spawn });
+        }
+        let model = VoxelModelDocument::from_scene(name, &builder.build()?);
+        model.validate()?;
+        Ok(model)
+    };
+    let boxed = |nx: i32, ny: i32, nz: i32, material: u16| -> Vec<([i32; 3], u16, bool)> {
+        let mut cells = Vec::new();
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    cells.push(([x, y, z], material, false));
+                }
+            }
+        }
+        cells
+    };
+    let ground = model("Stone ground", (-40..40).flat_map(|y| (-40..40).map(move |x| ([x, y, -1], stone, true))).collect())?;
+    let block = model("Oak tower 6x6x24", boxed(6, 6, 24, oak))?;
+    let ball = model("Iron ball", {
+        let mut cells = Vec::new();
+        for z in -3..3 {
+            for y in -3..3 {
+                for x in -3..3 {
+                    let (cx, cy, cz) = (x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
+                    if cx * cx + cy * cy + cz * cz <= 9.0 {
+                        cells.push(([x, y, z], iron, false));
+                    }
+                }
+            }
+        }
+        cells
+    })?;
+    let log = model("Oak log", boxed(30, 5, 5, oak))?;
+    let cantilever = model("Plank in a stone post", {
+        let mut cells = Vec::new();
+        for z in 0..12 {
+            for y in 0..4 {
+                for x in 0..3 {
+                    cells.push(([x, y, z], stone, true));
+                }
+            }
+        }
+        // Plank bonded to the post's top: its first slice sits inside the post column.
+        for x in 2..32 {
+            for y in 0..4 {
+                cells.push(([x, y, 12], oak, x == 2));
+            }
+        }
+        cells
+    })?;
+    let cube = model("Iron cube 3", boxed(3, 3, 3, iron))?;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| format!("create scene folder: {e}"))?;
+    let stem = path.file_stem().and_then(|p| p.to_str()).unwrap_or("playground");
+    let mut sequence = 0;
+    let folder = loop {
+        let folder = if sequence == 0 { format!("{stem}-assets") } else { format!("{stem}-assets-{sequence}") };
+        match std::fs::create_dir(parent.join(&folder)) {
+            Ok(()) => break folder,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => sequence += 1,
+            Err(e) => return Err(format!("create playground asset folder: {e}")),
+        }
+    };
+    let mut assets = Vec::new();
+    for (file, document) in [
+        ("ground.vxm", &ground), ("oak-block.vxm", &block), ("iron-ball.vxm", &ball),
+        ("oak-log.vxm", &log), ("plank-post.vxm", &cantilever), ("iron-cube.vxm", &cube),
+    ] {
+        let asset = Path::new(&folder).join(file);
+        save_document(&parent.join(&asset), document)?;
+        assets.push(asset);
+    }
+    let (ground_a, block_a, ball_a, log_a, post_a, cube_a) =
+        (&assets[0], &assets[1], &assets[2], &assets[3], &assets[4], &assets[5]);
+    let c = CELL_M;
+    // (asset, translation in metres, initial velocity)
+    let mut placements: Vec<(&std::path::PathBuf, DVec3, Option<Vec3>)> = vec![(ground_a, DVec3::ZERO, None)];
+    // One bonded tower: separate stacked blocks meant many simultaneous body-body contacts,
+    // which the cell solver handled at 7-33 s per step (8 November 2026).
+    placements.push((block_a, DVec3::new(-0.20, -0.03, c), None));
+    placements.push((ball_a, DVec3::new(0.10, 0.0, 0.04), Some(Vec3::new(-1.5, 0.0, 0.0))));
+    placements.push((log_a, DVec3::new(-0.15, 0.15, c), None));
+    placements.push((post_a, DVec3::new(0.05, -0.25, 0.0), None));
+    for (x, y) in [(0.20, 0.15), (0.26, 0.15), (0.32, 0.15), (0.26, 0.21)] {
+        placements.push((cube_a, DVec3::new(x, y, c), None));
+    }
+    let mut document = SceneDocument::new("Playground", config)?;
+    for (index, (asset, translation_m, velocity)) in placements.into_iter().enumerate() {
+        document.add_model(ModelInstanceDocument {
+            asset_path: asset.clone(), translation_m, rotation: Quat::IDENTITY, scale: Vec3::ONE,
+        })?;
+        if let Some(velocity) = velocity {
+            let mut settings = document.object_settings(index);
+            settings.initial_velocity_m_s = Some(velocity);
+            document.set_object_settings(index, settings)?;
+        }
+    }
+    document.validate()?;
+    save_document(path, &document)?;
+    let mut tiers = crate::physics_tiers::TierSettings::default();
+    tiers.enabled = true;
+    tiers.sleep = true;
+    tiers.save(path)?;
+    Ok(document)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +406,41 @@ mod tests {
             "E:/CodexHome/tmp/voxel-sim-{label}-{}-{timestamp}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn playground_scene_builds_settles_and_sleeps() {
+        let root = unique_test_dir("playground");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("playground.vxscene");
+        let document = create_playground_scene(&path).unwrap();
+        let mut scene = document.build_scene(&path).unwrap();
+        let tiers = crate::physics_tiers::TierSettings::load(&path).unwrap();
+        assert!(tiers.enabled && tiers.sleep);
+        tiers.apply(&mut scene).unwrap();
+        let free = scene.voxels.iter().filter(|v| !v.kinematic).count();
+        let started = std::time::Instant::now();
+        let mut slowest = 0.0f64;
+        let steps: usize = std::env::var("PLAYGROUND_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+        for step in 0..steps {
+            let t = std::time::Instant::now();
+            crate::solver::step(&mut scene, &mut None);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            slowest = slowest.max(ms);
+            if step % 5 == 0 {
+                eprintln!("PLAYGROUND step {step} {ms:.0} ms census {:?} cells={}", scene.tier_census(), scene.cell_dofs);
+            }
+            assert!(scene.positions.iter().all(|p| p.is_finite()));
+        }
+        let census = scene.tier_census();
+        eprintln!(
+            "PLAYGROUND free={free} total={} 300 steps in {:.1} s, slowest {slowest:.0} ms, census {census:?}",
+            scene.voxels.len(),
+            started.elapsed().as_secs_f64()
+        );
+        assert!(free > 1000 && free <= 4096, "free REVs {free}");
+        assert_eq!(census.total(), scene.voxels.len());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

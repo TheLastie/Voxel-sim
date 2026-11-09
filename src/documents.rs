@@ -2752,6 +2752,12 @@ impl SceneDocument {
             scene.skeletal_actuators.push(actuator);
         }
         self.apply_simulation_settings(&mut scene)?;
+        // Creatures keep 4 substeps: at the 2-substep default (8 November 2026) a relaxed
+        // saved spider collapses after about 0.85 s and its feet stop carrying its weight
+        // through the support rows. Remove once that is understood and fixed.
+        if !scene.skeletal_actuators.is_empty() {
+            scene.config.substeps = scene.config.substeps.max(4);
+        }
         self.apply_manual_bonds(&mut scene, &instance_ranges)?;
         Ok(scene)
     }

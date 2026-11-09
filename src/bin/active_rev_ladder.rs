@@ -6,7 +6,7 @@
 //! not the full 5 ms acceptance measurement. Solver stage timings come from the
 //! engine's own step diagnostics; stderr carries the engine's profile lines.
 //!
-//! Usage: active_rev_ladder [--sides 8,20,30] [--steps 20] [--pre ic0,amg]
+//! Usage: active_rev_ladder [--sides 8,20,30] [--steps 20] [--substeps N] [--pre ic0,amg]
 //!                          [--limit 80] [--gap-m 0] [--speed 0.2] [--out DIR]
 use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 use voxel_physics_lab::{
@@ -18,6 +18,8 @@ use voxel_physics_lab::{
 struct Args {
     sides: Vec<usize>,
     steps: usize,
+    /// Substeps per fixed step; 0 keeps the scene's own.
+    substeps: usize,
     preconditioners: Vec<String>,
     limit: usize,
     gap_m: f64,
@@ -29,6 +31,7 @@ fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         sides: vec![8, 20, 30],
         steps: 20,
+        substeps: 0,
         preconditioners: vec!["ic0".into(), "amg".into()],
         limit: 80,
         gap_m: 0.0,
@@ -45,6 +48,7 @@ fn parse_args() -> Result<Args, String> {
                     .map(|side| side.parse().map_err(|e| format!("invalid side: {e}")))
                     .collect::<Result<_, _>>()?
             }
+            "--substeps" => args.substeps = value.parse().map_err(|e| format!("invalid substeps: {e}"))?,
             "--steps" => args.steps = value.parse().map_err(|e| format!("invalid steps: {e}"))?,
             "--pre" => args.preconditioners = value.split(',').map(str::to_owned).collect(),
             "--limit" => args.limit = value.parse().map_err(|e| format!("invalid limit: {e}"))?,
@@ -95,6 +99,9 @@ fn run() -> Result<(), String> {
             let mut scene = document.build_scene(&path)?;
             scene.config.cpu_preconditioner = preconditioner(name)?;
             scene.config.iterations = args.limit;
+            if args.substeps > 0 {
+                scene.config.substeps = args.substeps;
+            }
             let active = scene.voxels.iter().filter(|v| !v.kinematic).count();
             let mut wall = Vec::with_capacity(args.steps);
             let mut iterations = Vec::with_capacity(args.steps);

@@ -8260,6 +8260,50 @@ pub fn uses_cell_rotations(scene: &Scene) -> bool {
     decide_cell_dofs(scene)
 }
 
+/// Something in the scene needs cell rotations this step: a free REV that spins, one that
+/// rests on a fixed support, or an active contact between two bodies (all from the last
+/// step). Without any of these every free body only translates, and the translation
+/// solver gives the same motion.
+fn rotation_event(scene: &Scene) -> bool {
+    const SPIN_RAD_S: f64 = 1.0e-3;
+    let free = |i: usize| !scene.voxels[i].kinematic && scene.aggregate_of[i].is_none();
+    // Support loads are derived each step and not saved: a new or restored scene has none
+    // yet, so it cannot tell resting from flying and keeps rotations.
+    if scene.support_load_n.len() != scene.voxels.len() || !scene.skeletal_actuators.is_empty() {
+        return true;
+    }
+    // A free REV bonded to a fixed one is held by a constraint: the body bends and twists
+    // under load, which only the cell solver represents (translation-only bonds are far too
+    // stiff in bending: a clamped cantilever deflects about 30% too little).
+    let held = |i: usize| {
+        (0..3).any(|axis| {
+            scene.bonds[axis].get(i).is_some_and(|bond| {
+                bond.neighbor != u32::MAX
+                    && bond.damage < 1.0
+                    && scene.voxels.get(bond.neighbor as usize).is_some_and(|v| v.kinematic)
+            })
+        })
+    };
+    let held_from_below = |j: usize| {
+        // The reverse direction: a fixed REV whose +axis neighbour is free.
+        scene.voxels[j].kinematic
+            && (0..3).any(|axis| {
+                scene.bonds[axis].get(j).is_some_and(|bond| {
+                    bond.neighbor != u32::MAX && bond.damage < 1.0 && free(bond.neighbor as usize)
+                })
+            })
+    };
+    visit(&scene.step_live, scene.voxels.len()).any(|i| {
+        held_from_below(i)
+            || free(i)
+                && (scene.angular_velocities.get(i).is_some_and(|w| w.length() > SPIN_RAD_S)
+                    || scene.support_load_n.get(i).is_some_and(|&n| n > 0.0)
+                    || scene.external_forces.get(i).is_some_and(|f| *f != Vec3::ZERO)
+                    || scene.external_accelerations.get(i).is_some_and(|a| *a != Vec3::ZERO)
+                    || held(i))
+    }) || scene.solver_scratch.pair_contacts.iter().any(|pair| pair.active)
+}
+
 fn decide_cell_dofs(scene: &Scene) -> bool {
     #[cfg(test)]
     if let Some(forced) = FORCE_CELL_DOFS.with(std::cell::Cell::get) {
@@ -8275,6 +8319,9 @@ fn decide_cell_dofs(scene: &Scene) -> bool {
         .filter(|&i| !scene.voxels[i].kinematic && scene.aggregate_of[i].is_none())
         .count();
     let allowed = mechanical <= CELL_DOF_MAX_REVS;
+    if allowed && scene.rotation_only_at_events && !rotation_event(scene) {
+        return false;
+    }
     if !allowed {
         static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {

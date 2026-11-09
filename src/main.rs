@@ -3067,6 +3067,13 @@ fn run_with_app_kind(standalone_editor_app: bool) -> Result<(), Box<dyn std::err
     if let Some((path, options)) = creation.as_ref() {
         voxel_physics_lab::scene_presets::create_impact_scene_with_options(path, options)?;
     }
+    if let Some(index) = args.iter().position(|arg| arg == "--create-playground-scene") {
+        if creation.is_some() { return Err("choose one scene creation command".into()); }
+        let output = args.get(index+1).filter(|s| !s.starts_with("--"))
+            .ok_or("--create-playground-scene requires an output .vxscene path")?;
+        voxel_physics_lab::scene_presets::create_playground_scene(Path::new(output))?;
+        created_scene_path = Some(std::path::PathBuf::from(output));
+    }
     if let Some(index) = args.iter().position(|arg| arg == "--create-animated-scene") {
         if creation.is_some() { return Err("choose one scene creation command".into()); }
         let output = args.get(index+1).filter(|s| !s.starts_with("--"))

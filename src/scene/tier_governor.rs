@@ -36,7 +36,8 @@ pub struct TierGovernorConfig {
     pub cell_ms_per_rev: f64,
     /// Relative error of the beam against the fine solver for a valid region.
     pub beam_error: f64,
-    /// Error tolerated by the governor (the paradigm's 10%).
+    /// Error tolerated by the governor: 25%, the limit the user allowed on 8 November 2026
+    /// (was the paradigm's 10%).
     pub tolerance: f64,
     /// Beam integrator substeps per fixed step.
     pub beam_substeps: usize,
@@ -50,7 +51,7 @@ impl Default for TierGovernorConfig {
             budget_ms: 5.0,
             cell_ms_per_rev: 0.13,
             beam_error: 0.05,
-            tolerance: 0.10,
+            tolerance: 0.25,
             beam_substeps: 40,
             interval_steps: 10,
         }

@@ -359,7 +359,9 @@ impl Default for SceneConfig {
             gravity: [0.0, 0.0, -9.81],
             atmosphere: AtmosphereConfig::default(),
             fixed_dt: 0.001,
-            substeps: 4,
+            // 2 since 8 November 2026 (was 4): every analytic reference stays within 5.3%
+            // at half the cost; 1 substep reaches 14% on edge tipping.
+            substeps: 2,
             iterations: 80,
             cuda_iterations: default_cuda_iterations(),
             cpu_preconditioner: CpuPreconditioner::default(),
@@ -447,6 +449,7 @@ mod checkpoint;
 mod beam_region;
 mod tier_governor;
 mod sleep;
+mod thermal_rev;
 pub use sleep::SleepConfig;
 pub(crate) use sleep::{sync_visited, visit, visit_thermal, Live};
 pub use tier_governor::{TierCensus, TierGovernorConfig};
@@ -517,6 +520,14 @@ pub struct Scene {
     pub(crate) tier_governor: Option<Box<tier_governor::TierGovernor>>,
     /// Sleeping tier for settled clusters; see `sleep`.
     pub(crate) sleep: Option<Box<sleep::SleepState>>,
+    /// Conduct heat with one temperature per REV (true, the default since 8 November
+    /// 2026) or with 3×3×3 thermal control volumes inside each REV (false). Runtime
+    /// setting, not saved in scene documents.
+    pub thermal_per_rev: bool,
+    /// Solve cell rotations only while something needs them: a free REV spinning, resting
+    /// on a support or touching another body (default since 8 November 2026). Otherwise
+    /// the translation solver runs, which is exact for bodies that neither spin nor touch.
+    pub rotation_only_at_events: bool,
     /// REVs a sparse fixed step visits (see `sleep::Live`); set by the solver for the
     /// duration of one step and `None` otherwise, so every pass is complete by default.
     pub(crate) step_live: Option<std::sync::Arc<Live>>,
@@ -1165,6 +1176,8 @@ impl Scene {
             beam_regions: Vec::new(),
             tier_governor: None,
             sleep: None,
+            thermal_per_rev: true,
+            rotation_only_at_events: true,
             step_live: None,
             support_load_n: Vec::new(),
             precise_rotations: Vec::with_capacity(spawns.len()),
@@ -2755,6 +2768,9 @@ impl Scene {
         if elapsed_seconds == 0.0 || self.voxels.is_empty() {
             return Ok(0);
         }
+        if self.thermal_per_rev {
+            return self.conduct_heat_per_rev(elapsed_seconds);
+        }
 
         let voxel_count = self.voxels.len();
         let cells_per_voxel = crate::voxel::THERMAL_CELL_COUNT;
@@ -3300,6 +3316,8 @@ impl Scene {
             beam_regions: Vec::new(),
             tier_governor: None,
             sleep: None,
+            thermal_per_rev: true,
+            rotation_only_at_events: true,
             step_live: None,
             support_load_n: Vec::new(),
             precise_rotations: vec![glam::DQuat::IDENTITY; n],
@@ -3828,6 +3846,8 @@ mod thermal_transport_tests {
             .add_voxel(VoxelSpawn::at_cell([1, 0, 0], iron).at_temperature(300.0))
             .build()
             .unwrap();
+        // This test is about the 3x3x3 thermal control volumes, not the per-REV default.
+        scene.thermal_per_rev = false;
         let initial_energy: f64 = scene
             .voxels
             .iter()

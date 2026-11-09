@@ -26,7 +26,12 @@ fn material(name: &str) -> (u16, Material) {
 fn config(dt: f32, substeps: usize, gravity: [f32; 3]) -> SceneConfig {
     let mut config = SceneConfig::default();
     config.fixed_dt = dt;
-    config.substeps = substeps;
+    // VOXEL_REF_SUBSTEPS overrides the substep count of every 4-substep reference, to
+    // measure how much accuracy fewer substeps cost (decision of 8 November 2026).
+    config.substeps = match std::env::var("VOXEL_REF_SUBSTEPS").ok().and_then(|v| v.parse().ok()) {
+        Some(n) if substeps == 4 => n,
+        _ => substeps,
+    };
     config.gravity = gravity;
     config.atmosphere.pressure_pa = 0.0;
     config
